@@ -10,8 +10,9 @@ a long command, keep working, and be notified when it finishes, on any harness.
   workload continues under a surviving supervisor.
 - **Attached-required.** The tool must be invoked as an attached subprocess (so it can anchor the
   process tree). A detached invocation is rejected immediately.
-- **Process-tree capture via cgroup v2.** Every descendant — even ones that `setsid`/detach — is
-  tracked; subtree-empty is an event, not a poll.
+- **Process-tree capture via subreaper.** Every orphaned descendant — even ones that
+  `setsid`/detach — reparents to the supervisor and is reaped event-driven. Delegated cgroup v2
+  is used only when available as an optional live-set enhancement.
 - **Completion: exit *or* sentinel.** Finite jobs wake on process exit (`pidfd`); never-exiting
   servers report ready on a stdout marker. Nothing is assumed to exit.
 - **Delivery via agent-runner.** On completion the spooler asks agent-runner whose session the

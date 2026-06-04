@@ -29,10 +29,11 @@ agent-runner.
    liveness, the agent process tree, and delivery (resume for headless, PTY injection for
    interactive). This is where the **mailbox** lives; `--resume` is its delivery primitive.
 
-> The chain: spooler watches a generic PID/tree → on completion asks agent-runner "whose
-> session is PPID?" → hands agent-runner the result → agent-runner wakes/forwards to that
-> session. Some workloads are agents (launched via agent-runner), some are plain commands;
-> they are distinguished by which spool/binary launched them.
+> The chain: spooler watches a generic PID/tree → on completion hands agent-runner the result
+> plus the caller ancestry captured at launch → agent-runner resolves the owning session from
+> its own DB and wakes/forwards to that session. Some workloads are agents (launched via
+> agent-runner), some are plain commands; they are distinguished by which spool/binary launched
+> them.
 
 ## Spooler behavior (WU-C)
 
@@ -50,22 +51,30 @@ detached (PPID is `1`/a reaper, i.e. already reparented), it **exits immediately
 process tree is anchored. (agent-runner already uses this exact pattern —
 `validate_child_parent_pid` in `executor/cli/supervision.rs`.)
 
-### Process-tree capture — cgroup v2
-The workload is enrolled in a dedicated child cgroup at launch. Every descendant — **including
-ones that detach / `setsid`** — stays in that cgroup, so PPID-walking (which breaks on detach)
-is not relied upon. `cgroup.procs` is the live set; an inotify watch on `cgroup.events`
-(`populated` 1→0) fires when the whole subtree has exited. No polling loop, no root required
-(cgroup v2 delegation). Process-group + `killpg` (already used in agent-runner) is the fallback
-for teardown.
+### Process-tree capture — subreaper primary, cgroup v2 optional
+The detached supervisor calls `prctl(PR_SET_CHILD_SUBREAPER, 1)` before it spawns the workload.
+Every orphaned descendant — including `setsid` and double-forked grandchildren — reparents to
+the supervisor instead of init. The supervisor blocks on `signalfd`/`poll`, reaps with
+`waitpid(-1, ...)`, and considers the supervised subtree empty when `waitpid` reports
+`ECHILD`. This is the primary completion guarantee and works on cgroup-v1 hosts.
+
+If a delegated cgroup-v2 subtree is writable, the supervisor also enrolls the workload in a
+dedicated child cgroup before `execvp`. In that optional mode, `cgroup.procs` is available as a
+live set and `cgroup.events`/`populated` is watched for diagnostics and cleanup. If cgroup v2 is
+unavailable or not delegated, the spooler records `cgroup.mode="subreaper-only"` and continues
+without degradation because the subreaper remains authoritative. Process-group + `killpg`
+(already used in agent-runner) is only a teardown fallback.
 
 ### Detached supervisor
 `run` forks a supervisor that **survives the tool's return**. The supervisor owns the workload
-(via the cgroup + a `pidfd`), tees stdout/stderr to a per-handle log, and records exit
-code. The `run` invocation itself returns the handle and exits — it does not `wait`.
+(via subreaper reparenting plus a root `pidfd`, and optionally a cgroup-v2 live set), tees
+stdout/stderr to a per-handle log, and records exit code. The `run` invocation itself returns
+the handle and exits — it does not `wait`.
 
 ### Completion detection — two modes
-- **exit mode (default):** wake on process death — `pidfd_open` + `poll` (event-driven, even
-  for non-children; Linux ≥5.3), backed by `cgroup.events` `populated`→0 for the full subtree.
+- **exit mode (default):** wake on root process death with `pidfd_open` + `poll`, and finish
+  only after the subreaper has reaped all descendants (`waitpid` → `ECHILD`). Optional cgroup-v2
+  `populated` events may be recorded, but they are not required for correctness.
 - **sentinel / server mode (`--ready-sentinel <regex>`):** for workloads that never exit (a
   server). "Done/ready" is a stdout marker match, because there is no exit to wait on.
   *We never assume a workload will exit.*
@@ -75,6 +84,14 @@ code. The `run` invocation itself returns the handle and exits — it does not `
 `DONE rc=<n>` + captured output. This generalizes the current `agents-bg{,-poll}` tmux helpers
 into an event-driven, cgroup-tracked tool. The supervisor's poll of the PID is **harness-code
 polling (cheap, no LLM tokens)** — not the LLM self-polling that is forbidden.
+
+### Delivery resolution metadata
+At launch, while the caller is still alive and `/proc` is readable, the spooler records
+`caller_ppid` and a nearest-first `caller_chain` in `meta.json`. Each chain element contains
+`pid`, `/proc/<pid>/stat` field 22 as `starttime_ticks`, and the host `boot_id` from
+`/proc/sys/kernel/random/boot_id`. The delivery seam still passes `--caller-ppid` and
+`--meta <path>`; agent-runner resolves the owning session from the recorded chain by pure DB
+lookup. The spooler does not resolve sessions.
 
 ## agent-runner additions
 
@@ -114,4 +131,5 @@ contamination that currently blocks trustworthy S9a/S9b gate runs.
 - No foreground mode (ever).
 - No PTY turn-boundary detection (PTY = forward-whenever).
 - No agent-runner crate dependency in the spooler (CLI coupling only).
-- Linux-first (cgroup v2 + pidfd). Other platforms degrade to process-group + poll later.
+- Linux-first (subreaper + pidfd; optional cgroup v2 live-set support). Other platforms degrade
+  to process-group + poll later.
