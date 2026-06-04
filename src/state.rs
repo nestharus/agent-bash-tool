@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -288,6 +288,7 @@ pub(crate) fn create_log(paths: &StatePaths) -> io::Result<File> {
     OpenOptions::new()
         .create_new(true)
         .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .mode(0o600)
         .open(&paths.log)
 }
@@ -296,8 +297,16 @@ pub(crate) fn open_log_append(paths: &StatePaths) -> io::Result<File> {
     OpenOptions::new()
         .create(true)
         .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .mode(0o600)
         .open(&paths.log)
+}
+
+pub(crate) fn open_read_no_follow(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
 }
 
 pub(crate) fn write_meta_atomic(paths: &StatePaths, meta: &Meta) -> io::Result<()> {
@@ -307,7 +316,9 @@ pub(crate) fn write_meta_atomic(paths: &StatePaths, meta: &Meta) -> io::Result<(
 }
 
 pub(crate) fn read_meta(paths: &StatePaths) -> io::Result<Meta> {
-    let bytes = fs::read(&paths.meta)?;
+    let mut file = open_read_no_follow(&paths.meta)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 
@@ -316,7 +327,9 @@ pub(crate) fn write_rc_atomic(paths: &StatePaths, rc: i32) -> io::Result<()> {
 }
 
 pub(crate) fn read_rc(paths: &StatePaths) -> io::Result<i32> {
-    let contents = fs::read_to_string(&paths.rc)?;
+    let mut file = open_read_no_follow(&paths.rc)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
     contents
         .trim_end_matches('\n')
         .parse::<i32>()
@@ -465,6 +478,17 @@ mod tests {
         write_rc_atomic(&paths, 7).expect("write rc");
         assert_eq!(fs::read_to_string(&paths.rc).expect("rc"), "7\n");
         assert_eq!(read_rc(&paths).expect("read rc"), 7);
+    }
+
+    #[test]
+    fn open_read_no_follow_rejects_symlink() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target");
+        let link = temp.path().join("link");
+        fs::write(&target, "secret").expect("target");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let err = open_read_no_follow(&link).expect_err("symlink rejected");
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
     }
 
     #[test]

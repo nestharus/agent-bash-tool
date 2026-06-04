@@ -295,7 +295,7 @@ fn render_status_header(meta: &Meta, rc_from_file: Option<i32>) -> Result<String
 }
 
 fn read_log_for_status(path: &Path, full: bool, tail_bytes: u64) -> io::Result<Vec<u8>> {
-    let mut file = match std::fs::File::open(path) {
+    let mut file = match state::open_read_no_follow(path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err),
