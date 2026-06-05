@@ -446,19 +446,27 @@ pub(crate) fn capture_caller_chain(start_pid: libc::pid_t) -> Vec<CallerChainEnt
     let mut chain = Vec::new();
     let mut pid = start_pid;
     for _ in 0..128 {
-        if pid <= 0 {
+        if invalid_caller_chain_pid(pid) {
             break;
         }
         let Some(stat) = read_proc_stat(pid) else {
             break;
         };
-        chain.push(caller_chain_entry(pid, &stat, &boot_id));
-        if pid == 1 {
+        chain.push(caller_chain_entry_from_proc_stat(pid, &stat, &boot_id));
+        if terminal_caller_chain_pid(pid) {
             break;
         }
         pid = stat.ppid;
     }
     chain
+}
+
+fn invalid_caller_chain_pid(pid: libc::pid_t) -> bool {
+    pid <= 0
+}
+
+fn terminal_caller_chain_pid(pid: libc::pid_t) -> bool {
+    pid == 1
 }
 
 fn read_proc_stat(pid: libc::pid_t) -> Option<ProcStat> {
@@ -472,7 +480,11 @@ fn read_boot_id() -> String {
         .unwrap_or_default()
 }
 
-fn caller_chain_entry(pid: libc::pid_t, stat: &ProcStat, boot_id: &str) -> CallerChainEntry {
+fn caller_chain_entry_from_proc_stat(
+    pid: libc::pid_t,
+    stat: &ProcStat,
+    boot_id: &str,
+) -> CallerChainEntry {
     CallerChainEntry {
         pid,
         starttime_ticks: stat.starttime_ticks,

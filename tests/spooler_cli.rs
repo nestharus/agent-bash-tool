@@ -16,7 +16,8 @@ struct ProcIdentity {
 fn agent_bash(temp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("agent-bash").expect("agent-bash binary");
     cmd.env("XDG_STATE_HOME", temp.path())
-        .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true");
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env_remove("OULIPOLY_DATA_DIR");
     cmd
 }
 
@@ -27,31 +28,55 @@ fn run_cmd(temp: &tempfile::TempDir, args: &[&str]) -> (Output, Duration) {
 }
 
 fn parse_run_output(output: &Output) -> Value {
+    assert_command_success(output);
+    parse_stdout_json(output)
+}
+
+fn assert_command_success(output: &Output) {
     assert!(
         output.status.success(),
+        "{}",
+        command_failure_message(output)
+    );
+}
+
+fn command_failure_message(output: &Output) -> String {
+    format!(
         "status={:?}\nstdout={}\nstderr={}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    );
+    )
+}
+
+fn parse_stdout_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("run JSON")
 }
 
 fn status_text(temp: &tempfile::TempDir, handle: &str, full: bool) -> String {
+    let output = status_output(temp, handle, full);
+    assert_command_success(&output);
+    stdout_utf8(output, "status utf8")
+}
+
+fn status_output(temp: &tempfile::TempDir, handle: &str, full: bool) -> Output {
     let mut cmd = agent_bash(temp);
-    cmd.arg("status");
+    cmd.args(status_args(handle, full))
+        .output()
+        .expect("status command")
+}
+
+fn status_args(handle: &str, full: bool) -> Vec<&str> {
+    let mut args = vec!["status"];
     if full {
-        cmd.arg("--full");
+        args.push("--full");
     }
-    let output = cmd.arg(handle).output().expect("status command");
-    assert!(
-        output.status.success(),
-        "status={:?}\nstdout={}\nstderr={}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).expect("status utf8")
+    args.push(handle);
+    args
+}
+
+fn stdout_utf8(output: Output, context: &str) -> String {
+    String::from_utf8(output.stdout).expect(context)
 }
 
 fn wait_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
@@ -60,32 +85,58 @@ fn wait_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
         if let Some(value) = check() {
             return value;
         }
-        assert!(Instant::now() < deadline, "timed out after {timeout:?}");
+        assert_wait_pending(deadline, timeout);
         std::thread::sleep(Duration::from_millis(25));
     }
 }
 
+fn assert_wait_pending(deadline: Instant, timeout: Duration) {
+    assert!(Instant::now() < deadline, "timed out after {timeout:?}");
+}
+
 fn build_detached_guard_helper(temp: &tempfile::TempDir) -> PathBuf {
-    let source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/detached_guard_helper.c");
-    let helper = temp.path().join("detached_guard_helper");
+    let source = detached_guard_source_path();
+    let helper = detached_guard_helper_path(temp);
+    let output = compile_detached_guard_helper(&source, &helper);
+    assert_detached_guard_compiled(&output);
+    helper
+}
+
+fn detached_guard_source_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/detached_guard_helper.c")
+}
+
+fn detached_guard_helper_path(temp: &tempfile::TempDir) -> PathBuf {
+    temp.path().join("detached_guard_helper")
+}
+
+fn compile_detached_guard_helper(source: &Path, helper: &Path) -> Output {
     let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
-    let output = StdCommand::new(compiler)
+    StdCommand::new(compiler)
         .arg("-O2")
         .arg("-Wall")
         .arg("-Wextra")
-        .arg(&source)
+        .arg(source)
         .arg("-o")
-        .arg(&helper)
+        .arg(helper)
         .output()
-        .expect("compile detached helper");
+        .expect("compile detached helper")
+}
+
+fn assert_detached_guard_compiled(output: &Output) {
     assert!(
         output.status.success(),
+        "{}",
+        detached_guard_compile_failure_message(output)
+    );
+}
+
+fn detached_guard_compile_failure_message(output: &Output) -> String {
+    format!(
         "detached helper compile failed\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    );
-    helper
+    )
 }
 
 fn wait_for_status_prefix(temp: &tempfile::TempDir, handle: &str, prefix: &str) -> String {
@@ -116,17 +167,137 @@ fn read_meta(path: &Path) -> Value {
 }
 
 fn fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
-    let fake = temp.path().join("fake-agents");
-    let delivery_log = temp.path().join("delivery.log");
-    fs::write(
-        &fake,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\nexit 0\n",
-    )
-    .expect("write fake");
-    let mut perms = fs::metadata(&fake).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&fake, perms).expect("chmod fake");
+    let (fake, delivery_log) = fake_agents_paths(temp);
+    fs::write(&fake, fake_agents_script()).expect("write fake");
+    set_executable(&fake);
     (fake, delivery_log)
+}
+
+fn fake_agents_paths(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    (
+        temp.path().join("fake-agents"),
+        temp.path().join("delivery.log"),
+    )
+}
+
+fn fake_agents_script() -> &'static str {
+    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\nexit 0\n"
+}
+
+fn set_executable(path: &Path) {
+    let mut perms = fs::metadata(path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod fake");
+}
+
+fn write_adapter_driver(temp: &tempfile::TempDir) -> PathBuf {
+    let path = adapter_driver_path(temp);
+    fs::write(&path, adapter_driver_source()).expect("write adapter driver");
+    path
+}
+
+fn adapter_driver_path(temp: &tempfile::TempDir) -> PathBuf {
+    temp.path().join("opencode-adapter-driver.ts")
+}
+
+fn adapter_driver_source() -> &'static str {
+    r#"import { mock } from "bun:test"
+
+const optional = () => ({})
+const describe = () => ({ optional })
+const string = () => ({ describe })
+const tool = Object.assign((definition) => definition, { schema: { string } })
+
+mock.module("@opencode-ai/plugin", () => ({ tool }))
+
+const mode = process.argv[2]
+const adapterPath = process.argv[3]
+const handle = process.argv[4]
+const mod = await import(adapterPath)
+const args = mode === "poll" ? { handle } : { command: "printf 'adapter inline\\n'" }
+const result = await mod.default.execute(args)
+const text = typeof result === "string" ? result : String(result)
+const matched = text.match(/handle=([^\s)]+)/)
+
+console.log(JSON.stringify({ result: text, handle: matched?.[1] ?? null }))
+"#
+}
+
+fn run_adapter_driver(
+    temp: &tempfile::TempDir,
+    driver: &Path,
+    mode: &str,
+    handle: Option<&str>,
+) -> Value {
+    let mut command = adapter_driver_command(temp, driver, mode, handle);
+    let output = command.output().expect("adapter driver");
+    assert_command_success(&output);
+    parse_stdout_json(&output)
+}
+
+fn adapter_driver_command(
+    temp: &tempfile::TempDir,
+    driver: &Path,
+    mode: &str,
+    handle: Option<&str>,
+) -> StdCommand {
+    let mut command = StdCommand::new(bun_bin_path());
+    command
+        .arg(driver)
+        .arg(mode)
+        .arg(adapter_module_path())
+        .env("AGENT_BASH_BIN", assert_cmd::cargo::cargo_bin("agent-bash"))
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env("AGENT_BASH_TOOL_WAIT_MS", "5000")
+        .env("AGENT_BASH_TOOL_POLL_MS", "25")
+        .env("XDG_STATE_HOME", temp.path())
+        .env_remove("OULIPOLY_DATA_DIR");
+    if let Some(handle) = handle {
+        command.arg(handle);
+    }
+    command
+}
+
+fn bun_bin_path() -> PathBuf {
+    PathBuf::from("/home/nes/.bun/bin/bun")
+}
+
+fn assert_bun_available() {
+    let path = bun_bin_path();
+    assert!(
+        path.exists(),
+        "required bun binary is missing at {}",
+        path.display()
+    );
+}
+
+fn adapter_module_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("integrations/opencode/tools/bash.ts")
+}
+
+fn adapter_result_text(result: &Value) -> &str {
+    result["result"].as_str().expect("adapter result")
+}
+
+fn adapter_result_handle(result: &Value) -> &str {
+    result["handle"].as_str().expect("adapter handle")
+}
+
+fn consumed_marker_path_for_handle(temp: &tempfile::TempDir, handle: &str) -> PathBuf {
+    temp.path().join("agent-bash").join(handle).join("consumed")
+}
+
+fn assert_consumed_marker_exists(path: &Path) {
+    assert!(
+        path.exists(),
+        "consumed marker missing at {}",
+        path.display()
+    );
+}
+
+fn assert_adapter_result_contains(result: &Value, expected: &str) {
+    let text = adapter_result_text(result);
+    assert!(text.contains(expected), "{text}");
 }
 
 fn read_boot_id() -> String {
@@ -403,6 +574,41 @@ fn cgroup_disable_uses_subreaper_only_without_degradation() {
 }
 
 #[test]
+fn opencode_adapter_poll_path_marks_consumed_after_done() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (output, _) = run_cmd(
+        &temp,
+        &["run", "--", "bash", "-lc", "printf 'adapter poll\\n'"],
+    );
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+    assert!(final_status.contains("adapter poll\n"), "{final_status}");
+
+    let driver = write_adapter_driver(&temp);
+    let result = run_adapter_driver(&temp, &driver, "poll", Some(handle));
+
+    assert_adapter_result_contains(&result, "adapter poll");
+    assert_consumed_marker_exists(&state_dir_path(&json).join("consumed"));
+}
+
+#[test]
+fn opencode_adapter_in_call_fast_command_marks_consumed() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let result = run_adapter_driver(&temp, &driver, "run", None);
+
+    assert_adapter_result_contains(&result, "adapter inline");
+    assert_consumed_marker_exists(&consumed_marker_path_for_handle(
+        &temp,
+        adapter_result_handle(&result),
+    ));
+}
+
+#[test]
 fn delivery_seam_records_invocation_outcome() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
@@ -471,9 +677,17 @@ fn consumed_marker_before_completion_skips_delivery_notify() {
         !delivery_log.exists(),
         "delivery fixture should not be invoked when consumed marker exists"
     );
-    let meta = read_meta(&meta_path(&json));
+    let meta_path = meta_path(&json);
+    let meta = wait_until(Duration::from_secs(2), || {
+        let meta = read_meta(&meta_path);
+        delivery_metadata_observed(&meta).then_some(meta)
+    });
     assert_eq!(meta["delivery"]["attempted"], false);
     assert_eq!(meta["delivery"]["skipped"], "consumed_in_call");
+}
+
+fn delivery_metadata_observed(meta: &Value) -> bool {
+    meta["delivery"]["attempted"] == true || meta["delivery"]["skipped"].is_string()
 }
 
 #[test]

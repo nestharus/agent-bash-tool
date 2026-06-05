@@ -48,9 +48,78 @@ async function statusText(handle: string, headerOnly = false): Promise<string> {
 
 async function terminalStatus(handle: string, stateDir: string | undefined): Promise<string | undefined> {
   const status = await statusText(handle, true)
-  if (!status.startsWith("DONE")) return undefined
+  if (!isTerminalStatus(status)) return undefined
   await markConsumed(stateDir)
   return statusText(handle)
+}
+
+function isTerminalStatus(status: string): boolean {
+  return status.startsWith("DONE")
+}
+
+function commandProvided(command: string | undefined): command is string {
+  return Boolean(command)
+}
+
+function missingCommandResponse(): string {
+  return "error: provide `command` (to run) or `handle` (to poll an existing background command)"
+}
+
+type RunDispatch = {
+  handle: string
+  stateDir: string | undefined
+}
+
+function parseRunDispatch(runOut: string): RunDispatch | undefined {
+  try {
+    return runDispatchFromJson(JSON.parse(runOut))
+  } catch {
+    return undefined
+  }
+}
+
+function runDispatchFromJson(run: { handle: string; state_dir?: string }): RunDispatch {
+  return {
+    handle: run.handle,
+    stateDir: run.state_dir,
+  }
+}
+
+function dispatchErrorResponse(runOut: string): string {
+  return `agent-bash spooler error (could not dispatch): ${runOut}`
+}
+
+function waitDeadline(): number {
+  return Date.now() + WAIT_MS
+}
+
+function beforeDeadline(deadline: number): boolean {
+  return Date.now() < deadline
+}
+
+function foundStatus(status: string | undefined): status is string {
+  return status !== undefined
+}
+
+async function sleepPollInterval(): Promise<void> {
+  await new Promise((r) => setTimeout(r, POLL_MS))
+}
+
+async function waitForTerminalStatus(handle: string, stateDir: string | undefined): Promise<string | undefined> {
+  const deadline = waitDeadline()
+  while (beforeDeadline(deadline)) {
+    const status = await terminalStatus(handle, stateDir)
+    if (foundStatus(status)) return status
+    await sleepPollInterval()
+  }
+  return undefined
+}
+
+function backgroundStatusResponse(handle: string, status: string): string {
+  return (
+    `Still running in background (handle=${handle}). You will be woken with the result when it completes, ` +
+    `or call bash with { handle: "${handle}" } to poll.\n${status}`
+  )
 }
 
 export default tool({
@@ -69,31 +138,16 @@ export default tool({
     if (args.handle) {
       return (await terminalStatus(args.handle, stateDirForHandle(args.handle))) ?? statusText(args.handle)
     }
-    if (!args.command) {
-      return "error: provide `command` (to run) or `handle` (to poll an existing background command)"
+    if (!commandProvided(args.command)) {
+      return missingCommandResponse()
     }
 
     const runOut = (await Bun.$`${AGENT_BASH} run -- bash -lc ${args.command}`.nothrow().text()).trim()
-    let handle: string
-    let stateDir: string | undefined
-    try {
-      const run = JSON.parse(runOut)
-      handle = run.handle
-      stateDir = run.state_dir
-    } catch {
-      return `agent-bash spooler error (could not dispatch): ${runOut}`
-    }
+    const dispatch = parseRunDispatch(runOut)
+    if (!dispatch) return dispatchErrorResponse(runOut)
 
-    const deadline = Date.now() + WAIT_MS
-    while (Date.now() < deadline) {
-      const status = await terminalStatus(handle, stateDir)
-      if (status) return status
-      await new Promise((r) => setTimeout(r, POLL_MS))
-    }
-    const status = await statusText(handle)
-    return (
-      `Still running in background (handle=${handle}). You will be woken with the result when it completes, ` +
-      `or call bash with { handle: "${handle}" } to poll.\n${status}`
-    )
+    const status = await waitForTerminalStatus(dispatch.handle, dispatch.stateDir)
+    if (status) return status
+    return backgroundStatusResponse(dispatch.handle, await statusText(dispatch.handle))
   },
 })
