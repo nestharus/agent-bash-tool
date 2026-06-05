@@ -215,6 +215,11 @@ pub(crate) enum StateError {
     GetRandom(io::Error),
 }
 
+enum StateRootEnv<'a> {
+    Xdg(&'a OsStr),
+    Home(&'a OsStr),
+}
+
 pub(crate) fn unix_ms() -> u64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -231,17 +236,34 @@ pub(crate) fn state_root_from_env_values(
     xdg_state_home: Option<impl AsRef<OsStr>>,
     home: Option<impl AsRef<OsStr>>,
 ) -> Result<PathBuf, StateError> {
-    if let Some(xdg) = xdg_state_home
-        && !xdg.as_ref().is_empty()
-    {
-        return Ok(PathBuf::from(xdg.as_ref()).join("agent-bash"));
+    let xdg = xdg_state_home.as_ref().map(|value| value.as_ref());
+    let home = home.as_ref().map(|value| value.as_ref());
+    let selected = select_state_root_env(xdg, home)?;
+    Ok(state_root_path(selected))
+}
+
+fn select_state_root_env<'a>(
+    xdg_state_home: Option<&'a OsStr>,
+    home: Option<&'a OsStr>,
+) -> Result<StateRootEnv<'a>, StateError> {
+    if let Some(xdg) = non_empty_env_value(xdg_state_home) {
+        return Ok(StateRootEnv::Xdg(xdg));
     }
-    if let Some(home) = home
-        && !home.as_ref().is_empty()
-    {
-        return Ok(PathBuf::from(home.as_ref()).join(".local/state/agent-bash"));
+    if let Some(home) = non_empty_env_value(home) {
+        return Ok(StateRootEnv::Home(home));
     }
     Err(StateError::MissingHome)
+}
+
+fn non_empty_env_value(value: Option<&OsStr>) -> Option<&OsStr> {
+    value.filter(|value| !value.is_empty())
+}
+
+fn state_root_path(env: StateRootEnv<'_>) -> PathBuf {
+    match env {
+        StateRootEnv::Xdg(xdg) => PathBuf::from(xdg).join("agent-bash"),
+        StateRootEnv::Home(home) => PathBuf::from(home).join(".local/state/agent-bash"),
+    }
 }
 
 pub(crate) fn generate_handle() -> Result<String, StateError> {
@@ -310,46 +332,29 @@ pub(crate) fn open_read_no_follow(path: &Path) -> io::Result<File> {
 }
 
 pub(crate) fn write_meta_atomic(paths: &StatePaths, meta: &Meta) -> io::Result<()> {
-    let mut bytes = serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
-    bytes.push(b'\n');
+    let bytes = format_meta_bytes(meta)?;
     atomic_write(&paths.meta, &bytes)
 }
 
 pub(crate) fn read_meta(paths: &StatePaths) -> io::Result<Meta> {
-    let mut file = open_read_no_follow(&paths.meta)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    serde_json::from_slice(&bytes).map_err(io::Error::other)
+    let bytes = read_meta_bytes(paths)?;
+    parse_meta_bytes(&bytes)
 }
 
 pub(crate) fn write_rc_atomic(paths: &StatePaths, rc: i32) -> io::Result<()> {
-    atomic_write(&paths.rc, format!("{rc}\n").as_bytes())
+    let bytes = format_rc_bytes(rc);
+    atomic_write(&paths.rc, &bytes)
 }
 
 pub(crate) fn read_rc(paths: &StatePaths) -> io::Result<i32> {
-    let mut file = open_read_no_follow(&paths.rc)?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    contents
-        .trim_end_matches('\n')
-        .parse::<i32>()
-        .map_err(io::Error::other)
+    let contents = read_rc_text(paths)?;
+    parse_rc_text(&contents)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("path has no parent"))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| io::Error::other("path has no file name"))?
-        .to_string_lossy();
-    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(
-        ".{file_name}.tmp.{}.{}",
-        unsafe { libc::getpid() },
-        counter
-    ));
+    let parent = atomic_parent(path)?;
+    let file_name = atomic_file_name(path)?;
+    let tmp = atomic_temp_path(parent, file_name);
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -363,6 +368,69 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+fn format_meta_bytes(meta: &Meta) -> io::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn read_meta_bytes(paths: &StatePaths) -> io::Result<Vec<u8>> {
+    read_file_bytes(&paths.meta)
+}
+
+fn parse_meta_bytes(bytes: &[u8]) -> io::Result<Meta> {
+    serde_json::from_slice(bytes).map_err(io::Error::other)
+}
+
+fn format_rc_bytes(rc: i32) -> Vec<u8> {
+    format!("{rc}\n").into_bytes()
+}
+
+fn read_rc_text(paths: &StatePaths) -> io::Result<String> {
+    read_file_text(&paths.rc)
+}
+
+fn parse_rc_text(contents: &str) -> io::Result<i32> {
+    contents
+        .trim_end_matches('\n')
+        .parse::<i32>()
+        .map_err(io::Error::other)
+}
+
+fn read_file_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = open_read_no_follow(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_file_text(path: &Path) -> io::Result<String> {
+    let mut file = open_read_no_follow(path)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    Ok(contents)
+}
+
+fn atomic_parent(path: &Path) -> io::Result<&Path> {
+    path.parent()
+        .ok_or_else(|| io::Error::other("path has no parent"))
+}
+
+fn atomic_file_name(path: &Path) -> io::Result<&OsStr> {
+    path.file_name()
+        .ok_or_else(|| io::Error::other("path has no file name"))
+}
+
+fn atomic_temp_path(parent: &Path, file_name: &OsStr) -> PathBuf {
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        ".{}.tmp.{}.{}",
+        file_name.to_string_lossy(),
+        unsafe { libc::getpid() },
+        counter
+    ))
+}
+
 #[derive(Debug)]
 struct ProcStat {
     ppid: libc::pid_t,
@@ -370,9 +438,7 @@ struct ProcStat {
 }
 
 pub(crate) fn capture_caller_chain(start_pid: libc::pid_t) -> Vec<CallerChainEntry> {
-    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map(|value| value.trim().to_string())
-        .unwrap_or_default();
+    let boot_id = read_boot_id();
     let mut chain = Vec::new();
     let mut pid = start_pid;
     for _ in 0..128 {
@@ -382,11 +448,7 @@ pub(crate) fn capture_caller_chain(start_pid: libc::pid_t) -> Vec<CallerChainEnt
         let Some(stat) = read_proc_stat(pid) else {
             break;
         };
-        chain.push(CallerChainEntry {
-            pid,
-            starttime_ticks: stat.starttime_ticks,
-            boot_id: boot_id.clone(),
-        });
+        chain.push(caller_chain_entry(pid, &stat, &boot_id));
         if pid == 1 {
             break;
         }
@@ -396,7 +458,26 @@ pub(crate) fn capture_caller_chain(start_pid: libc::pid_t) -> Vec<CallerChainEnt
 }
 
 fn read_proc_stat(pid: libc::pid_t) -> Option<ProcStat> {
-    parse_proc_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+    let contents = read_proc_stat_text(pid)?;
+    parse_proc_stat(&contents)
+}
+
+fn read_boot_id() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn caller_chain_entry(pid: libc::pid_t, stat: &ProcStat, boot_id: &str) -> CallerChainEntry {
+    CallerChainEntry {
+        pid,
+        starttime_ticks: stat.starttime_ticks,
+        boot_id: boot_id.to_string(),
+    }
+}
+
+fn read_proc_stat_text(pid: libc::pid_t) -> Option<String> {
+    fs::read_to_string(format!("/proc/{pid}/stat")).ok()
 }
 
 fn parse_proc_stat(contents: &str) -> Option<ProcStat> {

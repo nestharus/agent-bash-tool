@@ -68,20 +68,16 @@ fn redirect_stdio_to_devnull() {
 }
 
 fn run_supervisor(config: SupervisorConfig) -> i32 {
-    unsafe {
-        libc::umask(0o077);
-    }
-    let mut meta = config.meta;
-    meta.supervisor_pid = Some(unsafe { libc::getpid() });
-    meta.touch();
+    set_private_umask();
+    let mut meta = supervisor_meta(config.meta);
 
-    let mut log = match state::open_log_append(&config.paths) {
+    let mut log = match open_supervisor_log(&config.paths) {
         Ok(file) => file,
         Err(err) => {
             let _ = record_supervisor_error(
                 &config.paths,
                 &mut meta,
-                format!("open log failed: {err}"),
+                open_log_failed_message(err),
                 None,
             );
             return EX_SOFTWARE;
@@ -92,7 +88,7 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
         let _ = record_supervisor_error(
             &config.paths,
             &mut meta,
-            format!("PR_SET_CHILD_SUBREAPER failed: {err}"),
+            subreaper_failed_message(err),
             Some(&mut log),
         );
         return EX_SOFTWARE;
@@ -104,7 +100,7 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
             let _ = record_supervisor_error(
                 &config.paths,
                 &mut meta,
-                format!("signalfd failed: {err}"),
+                signalfd_failed_message(err),
                 Some(&mut log),
             );
             return EX_SOFTWARE;
@@ -112,9 +108,8 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
     };
 
     let cgroup_setup = cgroup::setup(&meta.handle);
-    meta.cgroup = cgroup_setup.meta;
-    meta.touch();
-    let _ = state::write_meta_atomic(&config.paths, &meta);
+    apply_cgroup_setup_meta(&mut meta, cgroup_setup.meta.clone());
+    persist_supervisor_meta_best_effort(&config.paths, &meta);
 
     let c_argv = match argv_to_cstrings(&config.argv) {
         Ok(argv) => argv,
@@ -132,53 +127,143 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
             let _ = record_supervisor_error(
                 &config.paths,
                 &mut meta,
-                format!("spawn failed: {err}"),
+                spawn_failed_message(err),
                 Some(&mut log),
             );
             return EX_SOFTWARE;
         }
     };
 
-    meta.workload_pid = Some(spawn.pid);
-    meta.workload_pgid = Some(spawn.pid);
     let root_pidfd = pidfd_open(spawn.pid);
-    meta.workload_pidfd = root_pidfd.is_some();
-    meta.touch();
-    let _ = state::write_meta_atomic(&config.paths, &meta);
+    apply_spawn_metadata(&mut meta, &spawn, root_pidfd);
+    persist_supervisor_meta_best_effort(&config.paths, &meta);
 
-    let sentinel = match config.ready_sentinel.as_ref() {
-        Some(pattern) => match Regex::new(pattern) {
-            Ok(regex) => Some(SentinelMatcher::new(regex, pattern.len())),
-            Err(err) => {
-                let _ = record_supervisor_error(
-                    &config.paths,
-                    &mut meta,
-                    format!("invalid ready sentinel after fork: {err}"),
-                    Some(&mut log),
-                );
-                return EX_SOFTWARE;
-            }
-        },
-        None => None,
+    let sentinel = match sentinel_matcher(config.ready_sentinel.as_deref()) {
+        Ok(sentinel) => sentinel,
+        Err(err) => {
+            let _ = record_supervisor_error(
+                &config.paths,
+                &mut meta,
+                invalid_sentinel_after_fork_message(err),
+                Some(&mut log),
+            );
+            return EX_SOFTWARE;
+        }
     };
 
-    let result = event_loop(EventLoop {
-        paths: config.paths.clone(),
+    let loop_state = event_loop_state(EventLoopSeed {
+        paths: config.paths,
         meta,
         log,
         sigchld,
         cgroup: cgroup_setup.active,
-        root_pid: spawn.pid,
+        spawn,
         root_pidfd,
-        stdout_fd: Some(spawn.stdout_fd),
-        stderr_fd: Some(spawn.stderr_fd),
-        exec_err_fd: Some(spawn.exec_err_fd),
+        sentinel,
+    });
+    event_loop_exit_code(event_loop(loop_state))
+}
+
+fn set_private_umask() {
+    unsafe {
+        libc::umask(0o077);
+    }
+}
+
+fn supervisor_meta(mut meta: Meta) -> Meta {
+    meta.supervisor_pid = Some(current_pid());
+    meta.touch();
+    meta
+}
+
+fn open_supervisor_log(paths: &StatePaths) -> io::Result<File> {
+    state::open_log_append(paths)
+}
+
+fn open_log_failed_message(err: io::Error) -> String {
+    format!("open log failed: {err}")
+}
+
+fn subreaper_failed_message(err: io::Error) -> String {
+    format!("PR_SET_CHILD_SUBREAPER failed: {err}")
+}
+
+fn signalfd_failed_message(err: io::Error) -> String {
+    format!("signalfd failed: {err}")
+}
+
+fn spawn_failed_message(err: io::Error) -> String {
+    format!("spawn failed: {err}")
+}
+
+fn invalid_sentinel_after_fork_message(err: regex::Error) -> String {
+    format!("invalid ready sentinel after fork: {err}")
+}
+
+fn apply_cgroup_setup_meta(meta: &mut Meta, cgroup_meta: state::CgroupMeta) {
+    meta.cgroup = cgroup_meta;
+    meta.touch();
+}
+
+fn persist_supervisor_meta_best_effort(paths: &StatePaths, meta: &Meta) {
+    let _ = state::write_meta_atomic(paths, meta);
+}
+
+fn apply_spawn_metadata(meta: &mut Meta, spawn: &WorkloadSpawn, root_pidfd: Option<RawFd>) {
+    meta.workload_pid = Some(spawn.pid);
+    meta.workload_pgid = Some(spawn.pid);
+    meta.workload_pidfd = root_pidfd.is_some();
+    meta.touch();
+}
+
+fn sentinel_matcher(pattern: Option<&str>) -> Result<Option<SentinelMatcher>, regex::Error> {
+    let Some(pattern) = pattern else {
+        return Ok(None);
+    };
+    let regex = parse_sentinel_regex(pattern)?;
+    Ok(Some(map_sentinel_matcher(regex, pattern)))
+}
+
+fn parse_sentinel_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    Regex::new(pattern)
+}
+
+fn map_sentinel_matcher(regex: Regex, pattern: &str) -> SentinelMatcher {
+    SentinelMatcher::new(regex, pattern.len())
+}
+
+struct EventLoopSeed {
+    paths: StatePaths,
+    meta: Meta,
+    log: File,
+    sigchld: Sigchld,
+    cgroup: Option<ActiveCgroup>,
+    spawn: WorkloadSpawn,
+    root_pidfd: Option<RawFd>,
+    sentinel: Option<SentinelMatcher>,
+}
+
+fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
+    EventLoop {
+        paths: seed.paths,
+        meta: seed.meta,
+        log: seed.log,
+        sigchld: seed.sigchld,
+        cgroup: seed.cgroup,
+        root_pid: seed.spawn.pid,
+        root_pidfd: seed.root_pidfd,
+        stdout_fd: Some(seed.spawn.stdout_fd),
+        stderr_fd: Some(seed.spawn.stderr_fd),
+        exec_err_fd: Some(seed.spawn.exec_err_fd),
         root_status: None,
         tree_empty: false,
         completion_recorded: false,
-        sentinel,
+        sentinel: seed.sentinel,
         spawn_error: None,
-    });
+    }
+}
+
+fn event_loop_exit_code(result: io::Result<()>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(_) => EX_SOFTWARE,
@@ -195,11 +280,28 @@ fn set_subreaper() -> io::Result<()> {
 }
 
 fn argv_to_cstrings(argv: &[String]) -> Result<Vec<CString>, String> {
+    validate_cstring_argv(argv)?;
+    Ok(map_argv_to_cstrings(argv))
+}
+
+fn validate_cstring_argv(argv: &[String]) -> Result<(), String> {
+    for arg in argv {
+        if CString::new(arg.as_str()).is_err() {
+            return Err("workload argv contains NUL byte".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn map_argv_to_cstrings(argv: &[String]) -> Vec<CString> {
     argv.iter()
-        .map(|arg| {
-            CString::new(arg.as_str()).map_err(|_| "workload argv contains NUL byte".to_string())
-        })
+        .map(String::as_str)
+        .map(validated_arg_to_cstring)
         .collect()
+}
+
+fn validated_arg_to_cstring(arg: &str) -> CString {
+    CString::new(arg).expect("argv was validated")
 }
 
 struct WorkloadSpawn {
@@ -234,12 +336,26 @@ fn spawn_workload(c_argv: &[CString], cgroup_procs_fd: Option<RawFd>) -> io::Res
     set_nonblocking(stdout_pipe.read)?;
     set_nonblocking(stderr_pipe.read)?;
     set_nonblocking(exec_err_pipe.read)?;
-    Ok(WorkloadSpawn {
+    Ok(workload_spawn(
         pid,
-        stdout_fd: stdout_pipe.read,
-        stderr_fd: stderr_pipe.read,
-        exec_err_fd: exec_err_pipe.read,
-    })
+        stdout_pipe.read,
+        stderr_pipe.read,
+        exec_err_pipe.read,
+    ))
+}
+
+fn workload_spawn(
+    pid: libc::pid_t,
+    stdout_fd: RawFd,
+    stderr_fd: RawFd,
+    exec_err_fd: RawFd,
+) -> WorkloadSpawn {
+    WorkloadSpawn {
+        pid,
+        stdout_fd,
+        stderr_fd,
+        exec_err_fd,
+    }
 }
 
 unsafe fn workload_child(
@@ -250,15 +366,40 @@ unsafe fn workload_child(
     cgroup_procs_fd: Option<RawFd>,
 ) -> ! {
     unblock_sigchld();
+    set_workload_process_group();
+    enroll_workload_in_cgroup(cgroup_procs_fd, exec_err_pipe.write);
+    redirect_workload_output(stdout_pipe, stderr_pipe, exec_err_pipe);
+    redirect_workload_stdin();
+    close_workload_output_writes(stdout_pipe, stderr_pipe);
+    let pointers = argv_pointers(c_argv);
+    exec_workload(&pointers);
+    write_errno_and_exit(exec_err_pipe.write, 127);
+}
+
+fn set_workload_process_group() {
     unsafe {
         libc::setpgid(0, 0);
     }
-    if let Some(fd) = cgroup_procs_fd {
-        let pid = unsafe { libc::getpid() };
-        if cgroup::write_pid_to_procs_fd(fd, pid) != 0 {
-            write_errno_and_exit(exec_err_pipe.write, 126);
-        }
+}
+
+fn enroll_workload_in_cgroup(cgroup_procs_fd: Option<RawFd>, exec_error_fd: RawFd) {
+    let Some(fd) = cgroup_procs_fd else {
+        return;
+    };
+    if cgroup::write_pid_to_procs_fd(fd, current_pid()) != 0 {
+        write_errno_and_exit(exec_error_fd, 126);
     }
+}
+
+fn current_pid() -> libc::pid_t {
+    unsafe { libc::getpid() }
+}
+
+fn redirect_workload_output(
+    stdout_pipe: &mut Pipe,
+    stderr_pipe: &mut Pipe,
+    exec_err_pipe: &mut Pipe,
+) {
     unsafe {
         libc::close(stdout_pipe.read);
         libc::close(stderr_pipe.read);
@@ -266,23 +407,36 @@ unsafe fn workload_child(
         libc::dup2(stdout_pipe.write, libc::STDOUT_FILENO);
         libc::dup2(stderr_pipe.write, libc::STDERR_FILENO);
     }
+}
+
+fn redirect_workload_stdin() {
     let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if devnull >= 0 {
-        unsafe {
-            libc::dup2(devnull, libc::STDIN_FILENO);
-            libc::close(devnull);
-        }
+    if devnull < 0 {
+        return;
     }
+    unsafe {
+        libc::dup2(devnull, libc::STDIN_FILENO);
+        libc::close(devnull);
+    }
+}
+
+fn close_workload_output_writes(stdout_pipe: &Pipe, stderr_pipe: &Pipe) {
     unsafe {
         libc::close(stdout_pipe.write);
         libc::close(stderr_pipe.write);
     }
+}
+
+fn argv_pointers(c_argv: &[CString]) -> Vec<*const libc::c_char> {
     let mut pointers: Vec<*const libc::c_char> = c_argv.iter().map(|arg| arg.as_ptr()).collect();
     pointers.push(std::ptr::null());
+    pointers
+}
+
+fn exec_workload(pointers: &[*const libc::c_char]) {
     unsafe {
         libc::execvp(pointers[0], pointers.as_ptr());
     }
-    write_errno_and_exit(exec_err_pipe.write, 127);
 }
 
 fn unblock_sigchld() {
@@ -295,10 +449,22 @@ fn unblock_sigchld() {
 }
 
 fn write_errno_and_exit(fd: RawFd, code: i32) -> ! {
-    let errno = io::Error::last_os_error()
+    let errno = last_errno();
+    let bytes = errno_bytes(errno);
+    write_error_bytes_and_exit(fd, code, &bytes)
+}
+
+fn last_errno() -> i32 {
+    io::Error::last_os_error()
         .raw_os_error()
-        .unwrap_or(libc::EIO);
-    let bytes = errno.to_ne_bytes();
+        .unwrap_or(libc::EIO)
+}
+
+fn errno_bytes(errno: i32) -> [u8; 4] {
+    errno.to_ne_bytes()
+}
+
+fn write_error_bytes_and_exit(fd: RawFd, code: i32, bytes: &[u8]) -> ! {
     unsafe {
         libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len());
         libc::_exit(code);
@@ -430,11 +596,23 @@ impl SentinelMatcher {
     }
 
     fn push_stdout(&mut self, bytes: &[u8]) -> bool {
+        self.append_stdout(bytes);
+        self.trim_buffer();
+        self.matches()
+    }
+
+    fn append_stdout(&mut self, bytes: &[u8]) {
         self.buffer.extend_from_slice(bytes);
+    }
+
+    fn trim_buffer(&mut self) {
         if self.buffer.len() > self.limit {
             let excess = self.buffer.len() - self.limit;
             self.buffer.drain(..excess);
         }
+    }
+
+    fn matches(&self) -> bool {
         self.regex.is_match(&self.buffer)
     }
 }
@@ -467,6 +645,12 @@ enum PollKey {
     Cgroup,
 }
 
+struct PollEntry {
+    fd: RawFd,
+    events: libc::c_short,
+    key: PollKey,
+}
+
 fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
     loop {
         loop_state.maybe_finish()?;
@@ -474,167 +658,218 @@ fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
             return Ok(());
         }
 
-        let mut entries = Vec::new();
-        if let Some(fd) = loop_state.stdout_fd {
-            entries.push((
-                fd,
-                libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-                PollKey::Stdout,
-            ));
-        }
-        if let Some(fd) = loop_state.stderr_fd {
-            entries.push((
-                fd,
-                libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-                PollKey::Stderr,
-            ));
-        }
-        if let Some(fd) = loop_state.exec_err_fd {
-            entries.push((
-                fd,
-                libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-                PollKey::ExecErr,
-            ));
-        }
-        entries.push((loop_state.sigchld.fd, libc::POLLIN, PollKey::Sigchld));
-        if let Some(fd) = loop_state.root_pidfd {
-            entries.push((
-                fd,
-                libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-                PollKey::Pidfd,
-            ));
-        }
-        if let Some(fd) = loop_state
-            .cgroup
-            .as_ref()
-            .and_then(ActiveCgroup::inotify_fd)
-        {
-            entries.push((fd, libc::POLLIN, PollKey::Cgroup));
-        }
+        let entries = poll_entries(&loop_state);
+        let mut pollfds = pollfds_for_entries(&entries);
+        poll_until_ready(&mut pollfds)?;
+        dispatch_ready_pollfds(&mut loop_state, &entries, &pollfds)?;
+    }
+}
 
-        let mut pollfds: Vec<libc::pollfd> = entries
-            .iter()
-            .map(|(fd, events, _)| libc::pollfd {
-                fd: *fd,
-                events: *events,
-                revents: 0,
-            })
-            .collect();
+fn poll_entries(loop_state: &EventLoop) -> Vec<PollEntry> {
+    let mut entries = Vec::new();
+    push_optional_poll_entry(&mut entries, loop_state.stdout_fd, PollKey::Stdout);
+    push_optional_poll_entry(&mut entries, loop_state.stderr_fd, PollKey::Stderr);
+    push_optional_poll_entry(&mut entries, loop_state.exec_err_fd, PollKey::ExecErr);
+    entries.push(poll_entry(
+        loop_state.sigchld.fd,
+        libc::POLLIN,
+        PollKey::Sigchld,
+    ));
+    push_optional_poll_entry(&mut entries, loop_state.root_pidfd, PollKey::Pidfd);
+    push_optional_poll_entry(&mut entries, cgroup_inotify_fd(loop_state), PollKey::Cgroup);
+    entries
+}
+
+fn push_optional_poll_entry(entries: &mut Vec<PollEntry>, fd: Option<RawFd>, key: PollKey) {
+    let Some(fd) = fd else {
+        return;
+    };
+    entries.push(poll_entry(fd, readable_events(), key));
+}
+
+fn poll_entry(fd: RawFd, events: libc::c_short, key: PollKey) -> PollEntry {
+    PollEntry { fd, events, key }
+}
+
+fn readable_events() -> libc::c_short {
+    libc::POLLIN | libc::POLLHUP | libc::POLLERR
+}
+
+fn cgroup_inotify_fd(loop_state: &EventLoop) -> Option<RawFd> {
+    loop_state
+        .cgroup
+        .as_ref()
+        .and_then(ActiveCgroup::inotify_fd)
+}
+
+fn pollfds_for_entries(entries: &[PollEntry]) -> Vec<libc::pollfd> {
+    entries
+        .iter()
+        .map(|entry| libc::pollfd {
+            fd: entry.fd,
+            events: entry.events,
+            revents: 0,
+        })
+        .collect()
+}
+
+fn poll_until_ready(pollfds: &mut [libc::pollfd]) -> io::Result<()> {
+    loop {
         let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, -1) };
-        if rc < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
+        if rc >= 0 {
+            return Ok(());
         }
-        for (index, pollfd) in pollfds.iter().enumerate() {
-            if pollfd.revents == 0 {
-                continue;
-            }
-            match entries[index].2 {
-                PollKey::Stdout => loop_state.read_stdout()?,
-                PollKey::Stderr => loop_state.read_stderr()?,
-                PollKey::ExecErr => loop_state.read_exec_error(),
-                PollKey::Sigchld => {
-                    loop_state.sigchld.drain();
-                    loop_state.reap_children()?;
-                }
-                PollKey::Pidfd => {
-                    loop_state.reap_children()?;
-                }
-                PollKey::Cgroup => {
-                    if let Some(cgroup) = &loop_state.cgroup {
-                        cgroup.drain_inotify();
-                        let _ = cgroup.populated();
-                        let _ = cgroup.live_pids();
-                    }
-                }
-            }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
         }
     }
 }
 
+fn dispatch_ready_pollfds(
+    loop_state: &mut EventLoop,
+    entries: &[PollEntry],
+    pollfds: &[libc::pollfd],
+) -> io::Result<()> {
+    for (entry, pollfd) in entries.iter().zip(pollfds) {
+        if pollfd.revents == 0 {
+            continue;
+        }
+        loop_state.dispatch_poll_key(entry.key)?;
+    }
+    Ok(())
+}
+
 impl EventLoop {
+    fn dispatch_poll_key(&mut self, key: PollKey) -> io::Result<()> {
+        match key {
+            PollKey::Stdout => self.read_stdout(),
+            PollKey::Stderr => self.read_stderr(),
+            PollKey::ExecErr => {
+                self.read_exec_error();
+                Ok(())
+            }
+            PollKey::Sigchld => self.handle_sigchld(),
+            PollKey::Pidfd => self.reap_children(),
+            PollKey::Cgroup => {
+                self.handle_cgroup_event();
+                Ok(())
+            }
+        }
+    }
+
+    fn handle_sigchld(&mut self) -> io::Result<()> {
+        self.sigchld.drain();
+        self.reap_children()
+    }
+
+    fn handle_cgroup_event(&self) {
+        let Some(cgroup) = &self.cgroup else {
+            return;
+        };
+        cgroup.drain_inotify();
+        let _ = cgroup.populated();
+        let _ = cgroup.live_pids();
+    }
+
     fn read_stdout(&mut self) -> io::Result<()> {
         let Some(fd) = self.stdout_fd else {
             return Ok(());
         };
-        let mut closed = false;
-        read_available(
-            fd,
-            |bytes| {
-                self.log.write_all(bytes)?;
-                if !self.completion_recorded
-                    && let Some(matcher) = &mut self.sentinel
-                    && matcher.push_stdout(bytes)
-                {
-                    self.record_ready_sentinel()?;
-                }
-                Ok(())
-            },
-            &mut closed,
-        )?;
-        if closed {
-            close_fd(fd);
-            self.stdout_fd = None;
+        let available = read_available(fd)?;
+        self.handle_stdout_chunks(&available.chunks)?;
+        self.close_stdout_if_closed(fd, available.closed);
+        Ok(())
+    }
+
+    fn handle_stdout_chunks(&mut self, chunks: &[Vec<u8>]) -> io::Result<()> {
+        for bytes in chunks {
+            self.handle_stdout_bytes(bytes)?;
         }
         Ok(())
+    }
+
+    fn handle_stdout_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.log.write_all(bytes)?;
+        if self.stdout_reaches_sentinel(bytes) {
+            self.record_ready_sentinel()?;
+        }
+        Ok(())
+    }
+
+    fn stdout_reaches_sentinel(&mut self, bytes: &[u8]) -> bool {
+        let Some(matcher) = &mut self.sentinel else {
+            return false;
+        };
+        !self.completion_recorded && matcher.push_stdout(bytes)
+    }
+
+    fn close_stdout_if_closed(&mut self, fd: RawFd, closed: bool) {
+        if !closed {
+            return;
+        }
+        close_fd(fd);
+        self.stdout_fd = None;
     }
 
     fn read_stderr(&mut self) -> io::Result<()> {
         let Some(fd) = self.stderr_fd else {
             return Ok(());
         };
-        let mut closed = false;
-        read_available(
-            fd,
-            |bytes| {
-                self.log.write_all(bytes)?;
-                Ok(())
-            },
-            &mut closed,
-        )?;
-        if closed {
-            close_fd(fd);
-            self.stderr_fd = None;
+        let available = read_available(fd)?;
+        self.write_stderr_chunks(&available.chunks)?;
+        self.close_stderr_if_closed(fd, available.closed);
+        Ok(())
+    }
+
+    fn write_stderr_chunks(&mut self, chunks: &[Vec<u8>]) -> io::Result<()> {
+        for bytes in chunks {
+            self.log.write_all(bytes)?;
         }
         Ok(())
+    }
+
+    fn close_stderr_if_closed(&mut self, fd: RawFd, closed: bool) {
+        if !closed {
+            return;
+        }
+        close_fd(fd);
+        self.stderr_fd = None;
     }
 
     fn read_exec_error(&mut self) {
         let Some(fd) = self.exec_err_fd else {
             return;
         };
-        let mut buf = [0_u8; 4];
-        loop {
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
-            if n > 0 {
-                if usize::try_from(n).unwrap_or(0) == buf.len() {
-                    let errno = i32::from_ne_bytes(buf);
-                    self.spawn_error = Some(io::Error::from_raw_os_error(errno).to_string());
-                } else {
-                    self.spawn_error = Some("exec setup failed".to_string());
-                }
-                continue;
-            }
-            if n == 0 {
-                close_fd(fd);
-                self.exec_err_fd = None;
-                break;
-            }
-            let err = io::Error::last_os_error();
-            if matches!(err.raw_os_error(), Some(libc::EAGAIN)) {
-                break;
-            }
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            self.spawn_error = Some(err.to_string());
-            close_fd(fd);
-            self.exec_err_fd = None;
-            break;
+        match read_available(fd) {
+            Ok(available) => self.handle_exec_error_read(fd, available),
+            Err(err) => self.record_exec_error_read_failure(fd, err),
         }
+    }
+
+    fn handle_exec_error_read(&mut self, fd: RawFd, available: AvailableRead) {
+        self.record_exec_error_chunks(&available.chunks);
+        self.close_exec_error_if_closed(fd, available.closed);
+    }
+
+    fn record_exec_error_chunks(&mut self, chunks: &[Vec<u8>]) {
+        for bytes in chunks {
+            self.spawn_error = Some(exec_error_message(bytes));
+        }
+    }
+
+    fn close_exec_error_if_closed(&mut self, fd: RawFd, closed: bool) {
+        if !closed {
+            return;
+        }
+        close_fd(fd);
+        self.exec_err_fd = None;
+    }
+
+    fn record_exec_error_read_failure(&mut self, fd: RawFd, err: io::Error) {
+        self.spawn_error = Some(err.to_string());
+        close_fd(fd);
+        self.exec_err_fd = None;
     }
 
     fn reap_children(&mut self) -> io::Result<()> {
@@ -643,15 +878,7 @@ impl EventLoop {
             let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
             if pid > 0 {
                 if pid == self.root_pid {
-                    let root_status = status_to_root_status(status);
-                    self.root_status = Some(root_status);
-                    self.meta.workload_rc = Some(root_status.rc);
-                    self.meta.workload_signal = root_status.signal;
-                    self.meta.touch();
-                    state::write_meta_atomic(&self.paths, &self.meta)?;
-                    if let Some(fd) = self.root_pidfd.take() {
-                        close_fd(fd);
-                    }
+                    self.record_root_status(status)?;
                 }
                 continue;
             }
@@ -671,29 +898,52 @@ impl EventLoop {
         }
     }
 
+    fn record_root_status(&mut self, status: i32) -> io::Result<()> {
+        let root_status = status_to_root_status(status);
+        self.root_status = Some(root_status);
+        apply_root_status_metadata(&mut self.meta, root_status);
+        state::write_meta_atomic(&self.paths, &self.meta)?;
+        self.close_root_pidfd();
+        Ok(())
+    }
+
+    fn close_root_pidfd(&mut self) {
+        let Some(fd) = self.root_pidfd.take() else {
+            return;
+        };
+        close_fd(fd);
+    }
+
     fn maybe_finish(&mut self) -> io::Result<()> {
-        if self.completion_recorded {
-            return Ok(());
+        match finish_decision(self) {
+            FinishDecision::None => Ok(()),
+            FinishDecision::SpawnError(message) => self.record_supervisor_error_in_loop(message),
+            FinishDecision::Exit {
+                root_status,
+                reason,
+            } => self.record_exit_completion(root_status, reason),
         }
-        if self.spawn_error.is_some()
-            && self.root_status.is_some()
-            && self.tree_empty
-            && self.output_closed()
-        {
-            let message = self.spawn_error.clone().unwrap_or_default();
-            self.record_supervisor_error_in_loop(format!("workload spawn failed: {message}"))?;
-            return Ok(());
-        }
-        if let Some(root_status) = self.root_status
-            && self.tree_empty
-            && self.output_closed()
-        {
-            if self.sentinel.is_some() {
-                self.record_exit_completion(root_status, "exit-before-ready")?;
-            } else {
-                self.record_exit_completion(root_status, "exit")?;
-            }
-        }
+    }
+
+    fn apply_ready_sentinel_metadata(&mut self, now: u64) {
+        apply_ready_sentinel_metadata(&mut self.meta, now);
+    }
+
+    fn apply_exit_completion_metadata(&mut self, root_status: RootStatus, reason: &str) {
+        apply_exit_completion_metadata(&mut self.meta, root_status, reason);
+    }
+
+    fn apply_supervisor_error_metadata(&mut self, message: String) {
+        apply_supervisor_error_metadata(&mut self.meta, message);
+    }
+
+    fn persist_completion_and_delivery(&mut self) -> io::Result<()> {
+        state::write_meta_atomic(&self.paths, &self.meta)?;
+        self.meta.delivery =
+            delivery::notify(self.meta.caller_ppid, &self.meta.handle, &self.paths);
+        self.meta.touch();
+        state::write_meta_atomic(&self.paths, &self.meta)?;
+        self.completion_recorded = true;
         Ok(())
     }
 
@@ -712,85 +962,168 @@ impl EventLoop {
         let now = state::unix_ms();
         self.log.sync_all()?;
         state::write_rc_atomic(&self.paths, 0)?;
-        self.meta.state = "DONE".to_string();
-        self.meta.completion_reason = Some("ready-sentinel".to_string());
-        self.meta.rc = Some(0);
-        self.meta.signal = None;
-        self.meta.ready_at_unix_ms = Some(now);
-        self.meta.completed_at_unix_ms = Some(now);
-        self.meta.touch();
-        state::write_meta_atomic(&self.paths, &self.meta)?;
-        self.meta.delivery =
-            delivery::notify(self.meta.caller_ppid, &self.meta.handle, &self.paths);
-        self.meta.touch();
-        state::write_meta_atomic(&self.paths, &self.meta)?;
-        self.completion_recorded = true;
-        Ok(())
+        self.apply_ready_sentinel_metadata(now);
+        self.persist_completion_and_delivery()
     }
 
     fn record_exit_completion(&mut self, root_status: RootStatus, reason: &str) -> io::Result<()> {
         self.log.sync_all()?;
         state::write_rc_atomic(&self.paths, root_status.rc)?;
-        self.meta.state = "DONE".to_string();
-        self.meta.completion_reason = Some(reason.to_string());
-        self.meta.rc = Some(root_status.rc);
-        self.meta.signal = root_status.signal;
-        self.meta.completed_at_unix_ms = Some(state::unix_ms());
-        self.meta.touch();
-        state::write_meta_atomic(&self.paths, &self.meta)?;
-        self.meta.delivery =
-            delivery::notify(self.meta.caller_ppid, &self.meta.handle, &self.paths);
-        self.meta.touch();
-        state::write_meta_atomic(&self.paths, &self.meta)?;
-        self.completion_recorded = true;
-        Ok(())
+        self.apply_exit_completion_metadata(root_status, reason);
+        self.persist_completion_and_delivery()
     }
 
     fn record_supervisor_error_in_loop(&mut self, message: String) -> io::Result<()> {
         self.log.sync_all()?;
         state::write_rc_atomic(&self.paths, EX_SOFTWARE)?;
-        self.meta.state = "ERROR".to_string();
-        self.meta.completion_reason = Some("supervisor-error".to_string());
-        self.meta.rc = Some(EX_SOFTWARE);
-        self.meta.error = Some(message);
-        self.meta.completed_at_unix_ms = Some(state::unix_ms());
-        self.meta.touch();
-        state::write_meta_atomic(&self.paths, &self.meta)?;
-        self.meta.delivery =
-            delivery::notify(self.meta.caller_ppid, &self.meta.handle, &self.paths);
-        self.meta.touch();
-        state::write_meta_atomic(&self.paths, &self.meta)?;
-        self.completion_recorded = true;
-        Ok(())
+        self.apply_supervisor_error_metadata(message);
+        self.persist_completion_and_delivery()
     }
 }
 
-fn read_available(
-    fd: RawFd,
-    mut on_bytes: impl FnMut(&[u8]) -> io::Result<()>,
-    closed: &mut bool,
-) -> io::Result<()> {
+struct AvailableRead {
+    chunks: Vec<Vec<u8>>,
+    closed: bool,
+}
+
+enum FdRead {
+    Bytes(Vec<u8>),
+    Closed,
+    Pending,
+}
+
+fn read_available(fd: RawFd) -> io::Result<AvailableRead> {
+    let mut chunks = Vec::new();
     let mut buf = [0_u8; 8192];
     loop {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
-        if n > 0 {
-            on_bytes(&buf[..usize::try_from(n).unwrap_or(0)])?;
-            continue;
+        match read_fd_chunk(fd, &mut buf)? {
+            FdRead::Bytes(bytes) => chunks.push(bytes),
+            FdRead::Closed => return Ok(available_read(chunks, true)),
+            FdRead::Pending => return Ok(available_read(chunks, false)),
         }
-        if n == 0 {
-            *closed = true;
-            return Ok(());
-        }
-        let err = io::Error::last_os_error();
-        if matches!(err.raw_os_error(), Some(libc::EAGAIN)) {
-            return Ok(());
-        }
-        if err.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        *closed = true;
-        return Err(err);
     }
+}
+
+fn read_fd_chunk(fd: RawFd, buf: &mut [u8]) -> io::Result<FdRead> {
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+    if n > 0 {
+        return Ok(FdRead::Bytes(
+            buf[..usize::try_from(n).unwrap_or(0)].to_vec(),
+        ));
+    }
+    if n == 0 {
+        return Ok(FdRead::Closed);
+    }
+    let err = io::Error::last_os_error();
+    if matches!(err.raw_os_error(), Some(libc::EAGAIN)) {
+        return Ok(FdRead::Pending);
+    }
+    if err.kind() == io::ErrorKind::Interrupted {
+        return Ok(FdRead::Pending);
+    }
+    Err(err)
+}
+
+fn available_read(chunks: Vec<Vec<u8>>, closed: bool) -> AvailableRead {
+    AvailableRead { chunks, closed }
+}
+
+fn exec_error_message(bytes: &[u8]) -> String {
+    match exec_error_errno(bytes) {
+        Some(errno) => io::Error::from_raw_os_error(errno).to_string(),
+        None => "exec setup failed".to_string(),
+    }
+}
+
+fn exec_error_errno(bytes: &[u8]) -> Option<i32> {
+    let bytes: [u8; 4] = bytes.try_into().ok()?;
+    Some(i32::from_ne_bytes(bytes))
+}
+
+enum FinishDecision {
+    None,
+    SpawnError(String),
+    Exit {
+        root_status: RootStatus,
+        reason: &'static str,
+    },
+}
+
+fn finish_decision(loop_state: &EventLoop) -> FinishDecision {
+    if loop_state.completion_recorded {
+        return FinishDecision::None;
+    }
+    if spawn_error_complete(loop_state) {
+        return FinishDecision::SpawnError(spawn_error_message_for_completion(loop_state));
+    }
+    let Some(root_status) = loop_state.root_status else {
+        return FinishDecision::None;
+    };
+    if !exit_completion_ready(loop_state) {
+        return FinishDecision::None;
+    }
+    FinishDecision::Exit {
+        root_status,
+        reason: exit_completion_reason(loop_state),
+    }
+}
+
+fn spawn_error_complete(loop_state: &EventLoop) -> bool {
+    loop_state.spawn_error.is_some()
+        && loop_state.root_status.is_some()
+        && loop_state.tree_empty
+        && loop_state.output_closed()
+}
+
+fn spawn_error_message_for_completion(loop_state: &EventLoop) -> String {
+    let message = loop_state.spawn_error.clone().unwrap_or_default();
+    format!("workload spawn failed: {message}")
+}
+
+fn exit_completion_ready(loop_state: &EventLoop) -> bool {
+    loop_state.tree_empty && loop_state.output_closed()
+}
+
+fn exit_completion_reason(loop_state: &EventLoop) -> &'static str {
+    if loop_state.sentinel.is_some() {
+        "exit-before-ready"
+    } else {
+        "exit"
+    }
+}
+
+fn apply_root_status_metadata(meta: &mut Meta, root_status: RootStatus) {
+    meta.workload_rc = Some(root_status.rc);
+    meta.workload_signal = root_status.signal;
+    meta.touch();
+}
+
+fn apply_ready_sentinel_metadata(meta: &mut Meta, now: u64) {
+    meta.state = "DONE".to_string();
+    meta.completion_reason = Some("ready-sentinel".to_string());
+    meta.rc = Some(0);
+    meta.signal = None;
+    meta.ready_at_unix_ms = Some(now);
+    meta.completed_at_unix_ms = Some(now);
+    meta.touch();
+}
+
+fn apply_exit_completion_metadata(meta: &mut Meta, root_status: RootStatus, reason: &str) {
+    meta.state = "DONE".to_string();
+    meta.completion_reason = Some(reason.to_string());
+    meta.rc = Some(root_status.rc);
+    meta.signal = root_status.signal;
+    meta.completed_at_unix_ms = Some(state::unix_ms());
+    meta.touch();
+}
+
+fn apply_supervisor_error_metadata(meta: &mut Meta, message: String) {
+    meta.state = "ERROR".to_string();
+    meta.completion_reason = Some("supervisor-error".to_string());
+    meta.rc = Some(EX_SOFTWARE);
+    meta.error = Some(message);
+    meta.completed_at_unix_ms = Some(state::unix_ms());
+    meta.touch();
 }
 
 fn status_to_root_status(status: i32) -> RootStatus {
@@ -823,16 +1156,20 @@ fn record_supervisor_error(
     message: String,
     log: Option<&mut File>,
 ) -> io::Result<()> {
-    if let Some(log) = log {
-        log.sync_all()?;
-    }
+    sync_optional_log(log)?;
     state::write_rc_atomic(paths, EX_SOFTWARE)?;
-    meta.state = "ERROR".to_string();
-    meta.completion_reason = Some("supervisor-error".to_string());
-    meta.rc = Some(EX_SOFTWARE);
-    meta.error = Some(message);
-    meta.completed_at_unix_ms = Some(state::unix_ms());
-    meta.touch();
+    apply_supervisor_error_metadata(meta, message);
+    persist_meta_with_delivery(paths, meta)
+}
+
+fn sync_optional_log(log: Option<&mut File>) -> io::Result<()> {
+    let Some(log) = log else {
+        return Ok(());
+    };
+    log.sync_all()
+}
+
+fn persist_meta_with_delivery(paths: &StatePaths, meta: &mut Meta) -> io::Result<()> {
     state::write_meta_atomic(paths, meta)?;
     meta.delivery = delivery::notify(meta.caller_ppid, &meta.handle, paths);
     meta.touch();

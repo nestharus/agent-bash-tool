@@ -1,7 +1,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command as StdCommand, Output};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
@@ -59,6 +59,29 @@ fn wait_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
     }
 }
 
+fn build_detached_guard_helper(temp: &tempfile::TempDir) -> PathBuf {
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/detached_guard_helper.c");
+    let helper = temp.path().join("detached_guard_helper");
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let output = StdCommand::new(compiler)
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg(&source)
+        .arg("-o")
+        .arg(&helper)
+        .output()
+        .expect("compile detached helper");
+    assert!(
+        output.status.success(),
+        "detached helper compile failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    helper
+}
+
 fn wait_for_status_prefix(temp: &tempfile::TempDir, handle: &str, prefix: &str) -> String {
     wait_until(Duration::from_secs(6), || {
         let text = status_text(temp, handle, true);
@@ -110,39 +133,28 @@ fn attached_guard_rejects_detached_invocation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let out = temp.path().join("out");
     let err = temp.path().join("err");
+    let rc = temp.path().join("rc");
+    let ppid_trace = temp.path().join("ppid-trace");
     let bin = assert_cmd::cargo::cargo_bin("agent-bash");
-    let script = r#"
-(
-  (
-    trap '' HUP
-    sleep 0.2
-    XDG_STATE_HOME="$4" AGENT_BASH_AGENT_RUNNER_BIN=/bin/true exec "$3" list --json >"$1" 2>"$2"
-  ) &
-  exit 0
-)
-for _ in {1..50}; do
-  if [ -s "$2" ]; then exit 0; fi
-  sleep 0.1
-done
-exit 0
-"#;
-    let status = std::process::Command::new("bash")
-        .arg("-c")
-        .arg(script)
-        .arg("agent-bash-detached-test")
-        .arg(&out)
-        .arg(&err)
+    let helper = build_detached_guard_helper(&temp);
+    let status = StdCommand::new(&helper)
         .arg(&bin)
         .arg(temp.path())
+        .arg(&out)
+        .arg(&err)
+        .arg(&rc)
+        .arg(&ppid_trace)
         .status()
-        .expect("bash detached helper");
-    assert!(status.success(), "detached helper did not finish");
-    let stderr = fs::read_to_string(&err).unwrap_or_default();
-    if stderr.is_empty() {
-        // Some test supervisors are subreapers. The guard cannot prove that case,
-        // which is the documented limitation; pure guard tests cover the PID-1 path.
-        return;
-    }
+        .expect("detached helper launcher");
+    assert!(status.success(), "detached helper launcher failed");
+    let child_rc = wait_until(Duration::from_secs(3), || fs::read_to_string(&rc).ok());
+    assert_eq!(child_rc.trim(), "64", "detached child rc");
+    let observed_ppids = fs::read_to_string(&ppid_trace).expect("ppid trace");
+    let ppids: Vec<_> = observed_ppids.lines().collect();
+    assert_eq!(ppids.len(), 2, "expected startup and reparented PPIDs");
+    assert_ne!(ppids[0], ppids[1], "agent-bash parent did not change");
+    assert_eq!(fs::read(&out).expect("detached stdout"), b"");
+    let stderr = fs::read_to_string(&err).expect("detached stderr");
     assert_eq!(
         stderr,
         "agent-bash: must be called as an attached subprocess\n"
@@ -179,10 +191,18 @@ fn exit_mode_completion_rc_and_captured_output() {
     assert_eq!(meta["state"], "DONE");
     assert_eq!(meta["completion_reason"], "exit");
     assert_eq!(meta["rc"], 7);
+    let caller_chain = meta["caller_chain"].as_array().expect("caller chain");
+    let first_caller = caller_chain.first().expect("first caller");
+    assert_eq!(first_caller["pid"], json["caller_ppid"]);
     assert!(
-        meta["caller_chain"]
-            .as_array()
-            .is_some_and(|chain| !chain.is_empty())
+        first_caller["starttime_ticks"]
+            .as_u64()
+            .is_some_and(|value| value > 0)
+    );
+    assert!(
+        first_caller["boot_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
     );
 }
 
@@ -324,14 +344,29 @@ fn delivery_seam_records_invocation_outcome() {
     let delivered = wait_until(Duration::from_secs(2), || {
         fs::read_to_string(&delivery_log).ok()
     });
-    let lines: Vec<_> = delivered.lines().collect();
-    assert_eq!(lines[0], "notify");
-    assert_eq!(lines[1], "agent-bash-complete");
-    assert!(lines.contains(&"--caller-ppid"));
-    assert!(lines.contains(&"--handle"));
-    assert!(lines.contains(&handle));
-    assert!(lines.contains(&"--meta"));
-    assert!(lines.contains(&json["meta"].as_str().expect("meta")));
+    let lines: Vec<_> = delivered.lines().map(str::to_string).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "notify".to_string(),
+            "agent-bash-complete".to_string(),
+            "--caller-ppid".to_string(),
+            json["caller_ppid"]
+                .as_i64()
+                .expect("caller ppid")
+                .to_string(),
+            "--handle".to_string(),
+            handle.to_string(),
+            "--state-dir".to_string(),
+            json["state_dir"].as_str().expect("state dir").to_string(),
+            "--meta".to_string(),
+            json["meta"].as_str().expect("meta").to_string(),
+            "--log".to_string(),
+            json["log"].as_str().expect("log").to_string(),
+            "--rc".to_string(),
+            json["rc"].as_str().expect("rc").to_string(),
+        ]
+    );
     let meta = read_meta(&meta_path(&json));
     assert_eq!(meta["delivery"]["attempted"], true);
     assert_eq!(meta["delivery"]["exit_code"], 0);
