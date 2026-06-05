@@ -313,19 +313,26 @@ fn status_command(handle: String, tail_bytes: u64, full: bool) -> Result<(), App
 
     emit_status_header(&meta, rc_from_file)?;
     emit_output_separator();
-    let output = read_log_for_status(&paths.log, full, tail_bytes).map_err(|err| {
-        AppError::new(
-            EX_IOERR,
-            format!("agent-bash: failed to read log for {handle}: {err}"),
-        )
-    })?;
-    io::stdout().write_all(&output).map_err(|err| {
-        AppError::new(
-            EX_IOERR,
-            format!("agent-bash: failed to write status: {err}"),
-        )
-    })?;
+    let output = read_log_for_status(&paths.log, full, tail_bytes)
+        .map_err(|err| status_log_read_error(&handle, err))?;
+    io::stdout()
+        .write_all(&output)
+        .map_err(status_write_error)?;
     Ok(())
+}
+
+fn status_log_read_error(handle: &str, err: io::Error) -> AppError {
+    AppError::new(
+        EX_IOERR,
+        format!("agent-bash: failed to read log for {handle}: {err}"),
+    )
+}
+
+fn status_write_error(err: io::Error) -> AppError {
+    AppError::new(
+        EX_IOERR,
+        format!("agent-bash: failed to write status: {err}"),
+    )
 }
 
 fn read_meta_for_handle(paths: &StatePaths, handle: &str) -> Result<Meta, AppError> {

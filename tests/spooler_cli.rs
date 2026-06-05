@@ -7,6 +7,12 @@ use std::time::{Duration, Instant};
 use assert_cmd::Command;
 use serde_json::Value;
 
+#[derive(Debug, PartialEq, Eq)]
+struct ProcIdentity {
+    pid: libc::pid_t,
+    starttime_ticks: u64,
+}
+
 fn agent_bash(temp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("agent-bash").expect("agent-bash binary");
     cmd.env("XDG_STATE_HOME", temp.path())
@@ -105,6 +111,52 @@ fn read_meta(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).expect("read meta")).expect("meta json")
 }
 
+fn read_boot_id() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .expect("boot id")
+        .trim()
+        .to_string()
+}
+
+fn proc_ancestry(start_pid: libc::pid_t) -> Vec<ProcIdentity> {
+    let mut chain = Vec::new();
+    let mut pid = start_pid;
+    for _ in 0..128 {
+        if pid <= 0 {
+            break;
+        }
+        let Some((identity, ppid)) = proc_identity(pid) else {
+            break;
+        };
+        chain.push(identity);
+        if pid == 1 {
+            break;
+        }
+        pid = ppid;
+    }
+    chain
+}
+
+fn proc_identity(pid: libc::pid_t) -> Option<(ProcIdentity, libc::pid_t)> {
+    let contents = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end_comm = contents.rfind(") ")?;
+    let fields: Vec<_> = contents[end_comm + 2..].split_whitespace().collect();
+    let ppid = fields.get(1)?.parse::<libc::pid_t>().ok()?;
+    let starttime_ticks = fields.get(19)?.parse::<u64>().ok()?;
+    Some((
+        ProcIdentity {
+            pid,
+            starttime_ticks,
+        },
+        ppid,
+    ))
+}
+
+fn assert_process_alive(pid: libc::pid_t) {
+    let rc = unsafe { libc::kill(pid, 0) };
+    assert_eq!(rc, 0, "expected live process pid {pid}");
+}
+
 fn kill_process_group(meta: &Value) {
     if let Some(pgid) = meta["workload_pgid"].as_i64() {
         unsafe {
@@ -192,18 +244,29 @@ fn exit_mode_completion_rc_and_captured_output() {
     assert_eq!(meta["completion_reason"], "exit");
     assert_eq!(meta["rc"], 7);
     let caller_chain = meta["caller_chain"].as_array().expect("caller chain");
-    let first_caller = caller_chain.first().expect("first caller");
-    assert_eq!(first_caller["pid"], json["caller_ppid"]);
+    let expected_boot_id = read_boot_id();
+    let expected_chain = proc_ancestry(unsafe { libc::getpid() });
     assert!(
-        first_caller["starttime_ticks"]
-            .as_u64()
-            .is_some_and(|value| value > 0)
+        expected_chain.len() > 1,
+        "expected current process to have ancestry beyond itself"
     );
-    assert!(
-        first_caller["boot_id"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty())
+    assert_eq!(
+        caller_chain.len(),
+        expected_chain.len(),
+        "full caller chain"
     );
+    assert_eq!(caller_chain[0]["pid"], json["caller_ppid"]);
+    for (entry, expected) in caller_chain.iter().zip(expected_chain) {
+        assert_eq!(entry["pid"], expected.pid);
+        assert_eq!(entry["starttime_ticks"], expected.starttime_ticks);
+        assert!(expected.pid > 0, "caller-chain pid must be positive");
+        assert!(
+            expected.starttime_ticks > 0,
+            "caller-chain starttime_ticks must be positive"
+        );
+        assert_eq!(entry["boot_id"], expected_boot_id);
+        assert!(!expected_boot_id.is_empty(), "boot_id must be non-empty");
+    }
 }
 
 #[test]
@@ -236,6 +299,8 @@ fn ready_sentinel_reports_done_without_killing_workload() {
     assert_eq!(meta["rc"], 0);
     assert!(meta["ready_at_unix_ms"].is_number());
     assert!(meta["workload_rc"].is_null());
+    let workload_pid = meta["workload_pid"].as_i64().expect("workload pid");
+    assert_process_alive(workload_pid as libc::pid_t);
     kill_process_group(&meta);
 }
 
@@ -367,7 +432,11 @@ fn delivery_seam_records_invocation_outcome() {
             json["rc"].as_str().expect("rc").to_string(),
         ]
     );
-    let meta = read_meta(&meta_path(&json));
+    let meta_path = meta_path(&json);
+    let meta = wait_until(Duration::from_secs(2), || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["attempted"] == true).then_some(meta)
+    });
     assert_eq!(meta["delivery"]["attempted"], true);
     assert_eq!(meta["delivery"]["exit_code"], 0);
 }
