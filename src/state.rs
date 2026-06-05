@@ -21,6 +21,7 @@ pub(crate) struct StatePaths {
     pub(crate) log: PathBuf,
     pub(crate) rc: PathBuf,
     pub(crate) meta: PathBuf,
+    pub(crate) consumed: PathBuf,
 }
 
 impl StatePaths {
@@ -32,6 +33,7 @@ impl StatePaths {
             log: state_dir.join("log"),
             rc: state_dir.join("rc"),
             meta: state_dir.join("meta.json"),
+            consumed: state_dir.join("consumed"),
             state_dir,
         }
     }
@@ -49,6 +51,8 @@ pub(crate) struct DeliveryMeta {
     pub(crate) attempted: bool,
     pub(crate) exit_code: Option<i32>,
     pub(crate) error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) skipped: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

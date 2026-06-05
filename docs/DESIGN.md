@@ -93,6 +93,18 @@ At launch, while the caller is still alive and `/proc` is readable, the spooler 
 `--meta <path>`; agent-runner resolves the owning session from the recorded chain by pure DB
 lookup. The spooler does not resolve sessions.
 
+### Consumed marker duplicate suppression
+A file named `consumed` inside a handle state directory means the caller already received the
+terminal result in-call. Immediately before invoking `agents notify agent-bash-complete ...`, the
+supervisor checks `<state>/<handle>/consumed`; when present, it skips the notify and records
+`delivery: {"attempted": false, "skipped": "consumed_in_call"}` in `meta.json`.
+
+The marker-write vs notify check is intentionally racy. If the opencode tool writes the marker
+after the supervisor has already delivered, the worst case is a duplicate envelope for a result the
+caller already saw. This preserves at-least-once delivery: the marker only suppresses notification
+when it exists before the delivery seam runs, and if the in-call wait times out no marker exists so
+normal completion notification still fires.
+
 ## agent-runner additions
 
 ### WU-A — session/PID query primitives

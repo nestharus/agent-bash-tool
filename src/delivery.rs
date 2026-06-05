@@ -7,11 +7,18 @@ use std::os::unix::process::ExitStatusExt;
 use crate::state::{DeliveryMeta, StatePaths};
 
 pub(crate) fn notify(caller_ppid: libc::pid_t, handle: &str, paths: &StatePaths) -> DeliveryMeta {
+    if consumed_marker_exists(paths) {
+        return skipped_delivery_meta("consumed_in_call");
+    }
     let request = notify_request(caller_ppid, handle, paths);
     match run_notify_command(&request) {
         Ok(status) => delivery_meta_from_status(status),
         Err(err) => delivery_meta_from_error(err),
     }
+}
+
+fn consumed_marker_exists(paths: &StatePaths) -> bool {
+    paths.consumed.exists()
 }
 
 struct NotifyRequest {
@@ -83,6 +90,16 @@ fn attempted_delivery_meta() -> DeliveryMeta {
         attempted: true,
         exit_code: None,
         error: None,
+        skipped: None,
+    }
+}
+
+fn skipped_delivery_meta(reason: &str) -> DeliveryMeta {
+    DeliveryMeta {
+        attempted: false,
+        exit_code: None,
+        error: None,
+        skipped: Some(reason.to_string()),
     }
 }
 

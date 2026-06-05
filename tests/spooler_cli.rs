@@ -107,8 +107,26 @@ fn rc_path(run_json: &Value) -> PathBuf {
     PathBuf::from(run_json["rc"].as_str().expect("rc path"))
 }
 
+fn state_dir_path(run_json: &Value) -> PathBuf {
+    PathBuf::from(run_json["state_dir"].as_str().expect("state dir"))
+}
+
 fn read_meta(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).expect("read meta")).expect("meta json")
+}
+
+fn fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join("fake-agents");
+    let delivery_log = temp.path().join("delivery.log");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\nexit 0\n",
+    )
+    .expect("write fake");
+    let mut perms = fs::metadata(&fake).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&fake, perms).expect("chmod fake");
+    (fake, delivery_log)
 }
 
 fn read_boot_id() -> String {
@@ -387,16 +405,7 @@ fn cgroup_disable_uses_subreaper_only_without_degradation() {
 #[test]
 fn delivery_seam_records_invocation_outcome() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let fake = temp.path().join("fake-agents");
-    let delivery_log = temp.path().join("delivery.log");
-    fs::write(
-        &fake,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\nexit 0\n",
-    )
-    .expect("write fake");
-    let mut perms = fs::metadata(&fake).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&fake, perms).expect("chmod fake");
+    let (fake, delivery_log) = fake_agents(&temp);
 
     let mut cmd = agent_bash(&temp);
     cmd.env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
@@ -439,4 +448,56 @@ fn delivery_seam_records_invocation_outcome() {
     });
     assert_eq!(meta["delivery"]["attempted"], true);
     assert_eq!(meta["delivery"]["exit_code"], 0);
+    assert!(meta["delivery"]["skipped"].is_null());
+}
+
+#[test]
+fn consumed_marker_before_completion_skips_delivery_notify() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = fake_agents(&temp);
+
+    let mut cmd = agent_bash(&temp);
+    cmd.env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--", "bash", "-lc", "sleep 1; echo consumed"]);
+    let output = cmd.output().expect("run");
+    let json = parse_run_output(&output);
+    fs::write(state_dir_path(&json).join("consumed"), b"").expect("write consumed marker");
+
+    let handle = json["handle"].as_str().expect("handle");
+    let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+    assert!(final_status.contains("consumed\n"), "{final_status}");
+    assert!(
+        !delivery_log.exists(),
+        "delivery fixture should not be invoked when consumed marker exists"
+    );
+    let meta = read_meta(&meta_path(&json));
+    assert_eq!(meta["delivery"]["attempted"], false);
+    assert_eq!(meta["delivery"]["skipped"], "consumed_in_call");
+}
+
+#[test]
+fn consumed_marker_after_delivery_does_not_rewrite_delivery_meta() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = fake_agents(&temp);
+
+    let mut cmd = agent_bash(&temp);
+    cmd.env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--", "bash", "-lc", "echo delivered"]);
+    let output = cmd.output().expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+    let meta_path = meta_path(&json);
+    let before = wait_until(Duration::from_secs(2), || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["attempted"] == true).then_some(meta["delivery"].clone())
+    });
+    assert!(delivery_log.exists(), "delivery fixture should be invoked");
+
+    fs::write(state_dir_path(&json).join("consumed"), b"").expect("write consumed marker");
+    std::thread::sleep(Duration::from_millis(100));
+    let after = read_meta(&meta_path)["delivery"].clone();
+    assert_eq!(after, before);
 }
