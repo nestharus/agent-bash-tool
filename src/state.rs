@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const SCHEMA_VERSION: u8 = 1;
+const DEFAULT_STATE_TTL_SECS: u64 = 48 * 60 * 60;
+const DEFAULT_REAP_MAX_DIRS: usize = 128;
+const DEFAULT_REAP_MAX_SCAN: usize = 4096;
+const PENDING_DELIVERY_GRACE_MULTIPLIER: u64 = 7;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -328,6 +332,165 @@ pub(crate) fn open_log_append(paths: &StatePaths) -> io::Result<File> {
         .open(&paths.log)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReapConfig {
+    ttl_secs: u64,
+    max_dirs: usize,
+    max_scan: usize,
+    now_unix_ms: u64,
+}
+
+impl ReapConfig {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            ttl_secs: env_u64("AGENT_BASH_STATE_TTL_SECS", DEFAULT_STATE_TTL_SECS),
+            max_dirs: env_usize("AGENT_BASH_STATE_REAP_MAX_DIRS", DEFAULT_REAP_MAX_DIRS),
+            max_scan: env_usize("AGENT_BASH_STATE_REAP_MAX_SCAN", DEFAULT_REAP_MAX_SCAN),
+            now_unix_ms: unix_ms(),
+        }
+    }
+
+    fn ttl_ms(self) -> u64 {
+        secs_to_ms(self.ttl_secs)
+    }
+
+    fn pending_delivery_moot_ms(self) -> u64 {
+        secs_to_ms(
+            self.ttl_secs
+                .saturating_mul(PENDING_DELIVERY_GRACE_MULTIPLIER),
+        )
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ReapStats {
+    pub(crate) scanned: usize,
+    pub(crate) reaped: usize,
+    pub(crate) errors: usize,
+}
+
+pub(crate) fn reap_state_dirs(root: &Path, config: ReapConfig) -> ReapStats {
+    let mut stats = ReapStats::default();
+    if config.max_dirs == 0 || config.max_scan == 0 {
+        return stats;
+    }
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return stats,
+        Err(_) => {
+            stats.errors += 1;
+            return stats;
+        }
+    };
+    for entry in entries {
+        if reap_limits_reached(&stats, config) {
+            break;
+        }
+        stats.scanned += 1;
+        reap_state_entry(root, entry, config, &mut stats);
+    }
+    stats
+}
+
+fn reap_limits_reached(stats: &ReapStats, config: ReapConfig) -> bool {
+    stats.scanned >= config.max_scan || stats.reaped >= config.max_dirs
+}
+
+fn reap_state_entry(
+    root: &Path,
+    entry: io::Result<fs::DirEntry>,
+    config: ReapConfig,
+    stats: &mut ReapStats,
+) {
+    let Ok(entry) = entry else {
+        stats.errors += 1;
+        return;
+    };
+    if !reap_entry_is_handle_dir(&entry) {
+        return;
+    }
+    let paths = StatePaths::new(
+        root.to_path_buf(),
+        entry.file_name().to_string_lossy().into_owned(),
+    );
+    if !state_dir_reap_eligible(&paths, config) {
+        return;
+    }
+    match fs::remove_dir_all(&paths.state_dir) {
+        Ok(()) => stats.reaped += 1,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => stats.errors += 1,
+    }
+}
+
+fn reap_entry_is_handle_dir(entry: &fs::DirEntry) -> bool {
+    entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false)
+        && entry.file_name().to_string_lossy().starts_with("ab_")
+}
+
+fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig) -> bool {
+    let Ok(meta) = read_meta(paths) else {
+        return false;
+    };
+    if !meta_is_reap_terminal(&meta) {
+        return false;
+    }
+    let age_ms = state_dir_reap_age_ms(paths, &meta, config.now_unix_ms);
+    if age_ms < config.ttl_ms() {
+        return false;
+    }
+    paths.consumed.exists() || age_ms >= config.pending_delivery_moot_ms()
+}
+
+fn meta_is_reap_terminal(meta: &Meta) -> bool {
+    meta.state == "DONE"
+        && meta.completed_at_unix_ms.is_some()
+        && !ready_sentinel_workload_running(meta)
+}
+
+fn ready_sentinel_workload_running(meta: &Meta) -> bool {
+    meta.completion_reason.as_deref() == Some("ready-sentinel")
+        && meta.workload_rc.is_none()
+        && meta.workload_signal.is_none()
+}
+
+fn state_dir_reap_age_ms(paths: &StatePaths, meta: &Meta, now_unix_ms: u64) -> u64 {
+    let reference = meta
+        .completed_at_unix_ms
+        .unwrap_or(0)
+        .max(meta.updated_at_unix_ms);
+    if reference > 0 {
+        return now_unix_ms.saturating_sub(reference);
+    }
+    dir_mtime_unix_ms(&paths.state_dir)
+        .map(|mtime| now_unix_ms.saturating_sub(mtime))
+        .unwrap_or(0)
+}
+
+fn dir_mtime_unix_ms(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let millis = modified.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    u64::try_from(millis).ok()
+}
+
+fn secs_to_ms(secs: u64) -> u64 {
+    secs.saturating_mul(1000)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 pub(crate) fn open_read_no_follow(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
@@ -511,6 +674,104 @@ fn parse_proc_stat(contents: &str) -> Option<ProcStat> {
 mod tests {
     use super::*;
 
+    fn test_reap_config(now_unix_ms: u64, ttl_secs: u64, max_dirs: usize) -> ReapConfig {
+        ReapConfig {
+            ttl_secs,
+            max_dirs,
+            max_scan: 100,
+            now_unix_ms,
+        }
+    }
+
+    fn write_reap_state(
+        root: &Path,
+        handle: &str,
+        state_name: &str,
+        updated_at_unix_ms: u64,
+        consumed: bool,
+    ) -> StatePaths {
+        write_reap_state_with_completion(
+            root,
+            handle,
+            state_name,
+            updated_at_unix_ms,
+            consumed,
+            "exit",
+            Some(0),
+        )
+    }
+
+    fn write_reap_state_with_completion(
+        root: &Path,
+        handle: &str,
+        state_name: &str,
+        updated_at_unix_ms: u64,
+        consumed: bool,
+        completion_reason: &str,
+        workload_rc: Option<i32>,
+    ) -> StatePaths {
+        let paths = StatePaths::new(root.to_path_buf(), handle.to_string());
+        create_handle_state(&paths).expect("create state");
+        let mut meta = reap_state_meta(handle, state_name, updated_at_unix_ms);
+        if reap_state_name_is_done(state_name) {
+            apply_reap_state_completion(
+                &mut meta,
+                updated_at_unix_ms,
+                completion_reason,
+                workload_rc,
+            );
+        }
+        write_meta_atomic(&paths, &meta).expect("write meta");
+        if consumed {
+            write_reap_state_consumed_marker(&paths);
+        }
+        paths
+    }
+
+    fn reap_state_meta(handle: &str, state_name: &str, updated_at_unix_ms: u64) -> Meta {
+        let mut meta = Meta::new(
+            handle.to_string(),
+            123,
+            456,
+            vec!["sh".to_string()],
+            PathBuf::from("/tmp"),
+            "exit",
+            None,
+            Vec::new(),
+        );
+        meta.state = state_name.to_string();
+        meta.updated_at_unix_ms = updated_at_unix_ms;
+        meta
+    }
+
+    fn reap_state_name_is_done(state_name: &str) -> bool {
+        state_name == "DONE"
+    }
+
+    fn apply_reap_state_completion(
+        meta: &mut Meta,
+        updated_at_unix_ms: u64,
+        completion_reason: &str,
+        workload_rc: Option<i32>,
+    ) {
+        meta.completed_at_unix_ms = Some(updated_at_unix_ms);
+        meta.completion_reason = Some(completion_reason.to_string());
+        meta.rc = Some(0);
+        meta.workload_rc = workload_rc;
+    }
+
+    fn write_reap_state_consumed_marker(paths: &StatePaths) {
+        fs::write(&paths.consumed, b"").expect("write consumed");
+    }
+
+    fn existing_handle_dirs(root: &Path) -> usize {
+        fs::read_dir(root)
+            .expect("read root")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("ab_"))
+            .count()
+    }
+
     #[test]
     fn state_root_uses_xdg_state_home() {
         let root = state_root_from_env_values(Some("/tmp/example-state"), Some("/home/alice"))
@@ -575,6 +836,113 @@ mod tests {
         write_rc_atomic(&paths, 7).expect("write rc");
         assert_eq!(fs::read_to_string(&paths.rc).expect("rc"), "7\n");
         assert_eq!(read_rc(&paths).expect("read rc"), 7);
+    }
+
+    #[test]
+    fn reaper_removes_done_old_consumed_state_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_done_old", "DONE", now - 20_000, true);
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 1);
+        assert!(!paths.state_dir.exists());
+    }
+
+    #[test]
+    fn reaper_keeps_running_state_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_running", "RUNNING", now - 20_000, true);
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 0);
+        assert!(paths.state_dir.exists());
+    }
+
+    #[test]
+    fn reaper_keeps_recent_done_state_dir_within_ttl() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_recent", "DONE", now - 5_000, true);
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 0);
+        assert!(paths.state_dir.exists());
+    }
+
+    #[test]
+    fn reaper_keeps_pending_undelivered_state_dir_until_moot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_pending", "DONE", now - 20_000, false);
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 0);
+        assert!(paths.state_dir.exists());
+    }
+
+    #[test]
+    fn reaper_keeps_ready_sentinel_done_with_running_workload() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state_with_completion(
+            temp.path(),
+            "ab_sentinel_running",
+            "DONE",
+            now - 20_000,
+            true,
+            "ready-sentinel",
+            None,
+        );
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 0);
+        assert!(paths.state_dir.exists());
+    }
+
+    #[test]
+    fn reaper_respects_max_dirs_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        for index in 0..3 {
+            write_reap_state(
+                temp.path(),
+                &format!("ab_done_old_{index}"),
+                "DONE",
+                now - 20_000,
+                true,
+            );
+        }
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 2));
+
+        assert_eq!(stats.reaped, 2);
+        assert_eq!(existing_handle_dirs(temp.path()), 1);
+    }
+
+    #[test]
+    fn reaper_is_best_effort_when_removal_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_locked", "DONE", now - 20_000, true);
+        let mut perms = fs::metadata(temp.path()).expect("metadata").permissions();
+        perms.set_mode(0o500);
+        fs::set_permissions(temp.path(), perms).expect("chmod root readonly");
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        let mut perms = fs::metadata(temp.path()).expect("metadata").permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(temp.path(), perms).expect("restore perms");
+        assert_eq!(stats.reaped, 0);
+        assert_eq!(stats.errors, 1);
+        assert!(paths.state_dir.exists());
     }
 
     #[test]

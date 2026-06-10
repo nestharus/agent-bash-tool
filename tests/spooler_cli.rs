@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -5,7 +6,7 @@ use std::process::{Command as StdCommand, Output};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 #[derive(Debug, PartialEq, Eq)]
 struct ProcIdentity {
@@ -166,6 +167,88 @@ fn read_meta(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).expect("read meta")).expect("meta json")
 }
 
+fn unix_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("unix time")
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn seed_done_state_dir(
+    temp: &tempfile::TempDir,
+    handle: &str,
+    updated_at_unix_ms: u64,
+    consumed: bool,
+) -> PathBuf {
+    let root = temp.path().join("agent-bash");
+    let state_dir = root.join(handle);
+    fs::create_dir_all(&state_dir).expect("state dir");
+    let meta = done_state_meta(handle, updated_at_unix_ms);
+    write_seeded_state_files(&state_dir, &meta);
+    if consumed {
+        write_consumed_marker(&state_dir);
+    }
+    state_dir
+}
+
+fn done_state_meta(handle: &str, updated_at_unix_ms: u64) -> Value {
+    json!({
+        "schema_version": 1,
+        "handle": handle,
+        "created_at_unix_ms": updated_at_unix_ms,
+        "updated_at_unix_ms": updated_at_unix_ms,
+        "state": "DONE",
+        "completion_reason": "exit",
+        "caller_ppid": unsafe { libc::getpid() },
+        "caller_chain": [],
+        "launcher_pid": unsafe { libc::getpid() },
+        "supervisor_pid": null,
+        "workload_pid": null,
+        "workload_pgid": null,
+        "workload_pidfd": false,
+        "argv": ["bash", "-lc", "true"],
+        "cwd": "/tmp",
+        "mode": "exit",
+        "ready_sentinel": null,
+        "ready_at_unix_ms": null,
+        "completed_at_unix_ms": updated_at_unix_ms,
+        "rc": 0,
+        "signal": null,
+        "workload_rc": 0,
+        "workload_signal": null,
+        "delivery": {
+            "attempted": false,
+            "exit_code": null,
+            "error": null
+        },
+        "cgroup": {
+            "mode": "subreaper-only",
+            "path": null,
+            "delegated": false,
+            "events_watch": false,
+            "degraded_reason": null
+        },
+        "error": null
+    })
+}
+
+fn format_seeded_meta(meta: &Value) -> Vec<u8> {
+    serde_json::to_vec_pretty(&meta).expect("meta json")
+}
+
+fn write_seeded_state_files(state_dir: &Path, meta: &Value) {
+    fs::write(state_dir.join("meta.json"), format_seeded_meta(meta)).expect("write meta");
+    fs::write(state_dir.join("rc"), b"0\n").expect("write rc");
+    fs::write(state_dir.join("log"), b"old\n").expect("write log");
+}
+
+fn write_consumed_marker(state_dir: &Path) {
+    fs::write(state_dir.join("consumed"), b"").expect("write consumed");
+}
+
 fn fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
     let (fake, delivery_log) = fake_agents_paths(temp);
     fs::write(&fake, fake_agents_script()).expect("write fake");
@@ -259,16 +342,23 @@ fn adapter_driver_command(
 }
 
 fn bun_bin_path() -> PathBuf {
-    PathBuf::from("/home/nes/.bun/bin/bun")
+    env::var_os("BUN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("bun"))
 }
 
 fn assert_bun_available() {
     let path = bun_bin_path();
-    assert!(
-        path.exists(),
-        "required bun binary is missing at {}",
-        path.display()
-    );
+    let output = StdCommand::new(&path)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|err| {
+            panic!(
+                "required bun binary is missing at {}: {err}",
+                path.display()
+            )
+        });
+    assert_command_success(&output);
 }
 
 fn adapter_module_path() -> PathBuf {
@@ -413,6 +503,26 @@ fn run_returns_immediately_and_later_completes() {
     assert!(immediate.starts_with("RUNNING handle="), "{immediate}");
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.contains("late\n"), "{final_status}");
+}
+
+#[test]
+fn run_startup_reaps_old_consumed_state_dir_without_stdout_pollution() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let old = seed_done_state_dir(&temp, "ab_old_consumed", unix_ms() - 2_000, true);
+
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_STATE_TTL_SECS", "1")
+        .env("AGENT_BASH_STATE_REAP_MAX_DIRS", "1")
+        .args(["run", "--", "bash", "-lc", "true"])
+        .output()
+        .expect("run");
+
+    let json = parse_run_output(&output);
+    assert!(json["handle"].as_str().expect("handle").starts_with("ab_"));
+    assert!(!old.exists(), "old state dir should be reaped");
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(stderr.contains("state reaper"), "{stderr}");
+    assert!(stderr.contains("reaped=1"), "{stderr}");
 }
 
 #[test]
