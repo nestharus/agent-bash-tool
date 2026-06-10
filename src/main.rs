@@ -124,6 +124,7 @@ fn run_command(
     supervisor::validate_argv(&argv).map_err(workload_argv_error)?;
 
     let state_root = load_state_root().map_err(state_root_unavailable)?;
+    reap_state_dirs_at_startup(&state_root);
     let handle = state::generate_handle().map_err(supervisor_bootstrap_error)?;
     let paths = state_paths(state_root, handle.clone());
     create_run_state(&paths)?;
@@ -179,6 +180,24 @@ fn state_root_unavailable(err: state::StateError) -> AppError {
         EX_CANTCREAT,
         format!("agent-bash: state root unavailable: {err}"),
     )
+}
+
+fn reap_state_dirs_at_startup(root: &Path) {
+    let stats = state::reap_state_dirs(root, state::ReapConfig::from_env());
+    if should_report_reap_stats(&stats) {
+        report_reap_stats(&stats);
+    }
+}
+
+fn should_report_reap_stats(stats: &state::ReapStats) -> bool {
+    stats.reaped > 0 || stats.errors > 0
+}
+
+fn report_reap_stats(stats: &state::ReapStats) {
+    eprintln!(
+        "agent-bash: state reaper scanned={} reaped={} errors={}",
+        stats.scanned, stats.reaped, stats.errors
+    );
 }
 
 fn supervisor_bootstrap_error(err: impl std::fmt::Display) -> AppError {
