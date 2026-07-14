@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, Output, Stdio};
+use std::process::{Child, Command as StdCommand, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
@@ -262,6 +262,77 @@ fn write_seeded_state_files(state_dir: &Path, meta: &Value) {
     fs::write(state_dir.join("log"), b"old\n").expect("write log");
 }
 
+fn active_state_meta(handle: &str, caller_ppid: libc::pid_t, caller_chain: Value) -> Value {
+    json!({
+        "schema_version": 1,
+        "handle": handle,
+        "created_at_unix_ms": unix_ms(),
+        "updated_at_unix_ms": unix_ms(),
+        "state": "RUNNING",
+        "completion_reason": null,
+        "caller_ppid": caller_ppid,
+        "caller_chain": caller_chain,
+        "launcher_pid": caller_ppid,
+        "supervisor_pid": null,
+        "workload_pid": null,
+        "workload_pgid": null,
+        "workload_pidfd": false,
+        "argv": ["bash", "-lc", "sleep 1"],
+        "cwd": "/tmp",
+        "mode": "exit",
+        "ready_sentinel": null,
+        "ready_at_unix_ms": null,
+        "completed_at_unix_ms": null,
+        "rc": null,
+        "signal": null,
+        "workload_rc": null,
+        "workload_signal": null,
+        "delivery": {
+            "attempted": false,
+            "exit_code": null,
+            "error": null
+        },
+        "cgroup": {
+            "mode": "subreaper-only",
+            "path": null,
+            "delegated": false,
+            "events_watch": false,
+            "degraded_reason": null
+        },
+        "error": null
+    })
+}
+
+fn seed_active_state_dir(temp: &tempfile::TempDir, handle: &str, meta: &Value) {
+    let state_dir = temp.path().join("agent-bash").join(handle);
+    fs::create_dir_all(&state_dir).expect("state dir");
+    fs::write(state_dir.join("meta.json"), format_seeded_meta(meta)).expect("write meta");
+    fs::write(state_dir.join("log"), b"").expect("write log");
+}
+
+fn state_dir_count(temp: &tempfile::TempDir) -> usize {
+    let root = temp.path().join("agent-bash");
+    match fs::read_dir(root) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+            .count(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => panic!("read isolated state root: {err}"),
+    }
+}
+
+fn list_json(temp: &tempfile::TempDir, all: bool) -> Vec<Value> {
+    let mut command = agent_bash(temp);
+    command.arg("list");
+    if all {
+        command.arg("--all");
+    }
+    let output = command.arg("--json").output().expect("list command");
+    assert_command_success(&output);
+    serde_json::from_slice(&output.stdout).expect("list JSON")
+}
+
 fn write_consumed_marker(state_dir: &Path) {
     fs::write(state_dir.join("consumed"), b"").expect("write consumed");
 }
@@ -362,11 +433,30 @@ mock.module("@opencode-ai/plugin", () => ({ tool }))
 
 const mode = process.argv[2]
 const adapterPath = process.argv[3]
-const handle = process.argv[4]
+const value = process.argv[4]
 const mod = await import(adapterPath)
 const controller = new AbortController()
+
+if (mode === "joint") {
+  const launched = await mod.default.execute(
+    { command: "sleep 1; printf 'adapter joint done\\n'", delivery: "async" },
+    { abort: controller.signal },
+  )
+  const launchedResult = typeof launched === "string" ? launched : String(launched)
+  const launchedHandle = launchedResult.match(/handle=([^\s)]+)/)?.[1]
+  if (!launchedHandle) throw new Error(`joint launch did not return a handle: ${launchedResult}`)
+
+  const listed = await mod.default.execute(
+    { command: `${process.env.AGENT_BASH_BIN} list --json` },
+    { abort: controller.signal },
+  )
+  const listResult = typeof listed === "string" ? listed : String(listed)
+  console.log(JSON.stringify({ launchedResult, launchedHandle, listResult }))
+  process.exit(0)
+}
+
 const args = mode === "poll"
-  ? { handle }
+  ? { handle: value }
   : mode === "async"
     ? { command: "sleep 1; printf 'adapter async\\n'", delivery: "async" }
     : mode === "abort"
@@ -379,9 +469,11 @@ const args = mode === "poll"
         ? { command: `XDG_STATE_HOME=${process.env.XDG_STATE_HOME} ${process.env.AGENT_BASH_BIN} run -- agents --version` }
       : mode === "agent-sync"
         ? { command: "agents --version", delivery: "sync" }
-    : mode === "agent"
-      ? { command: "agents --version" }
-      : { command: "printf 'adapter inline\\n'" }
+        : mode === "agent"
+          ? { command: "agents --version" }
+          : mode === "control"
+            ? { command: value }
+            : { command: "printf 'adapter inline\\n'" }
 if (mode === "abort") setTimeout(() => controller.abort(), 100)
 const result = await mod.default.execute(args, { abort: controller.signal })
 const text = typeof result === "string" ? result : String(result)
@@ -663,6 +755,69 @@ fn wait_for_process_gone(pid: libc::pid_t) {
     wait_until(Duration::from_secs(6), || {
         proc_identity(pid).is_none().then_some(())
     });
+}
+
+struct OwnerScenario {
+    child: Child,
+    run_json: PathBuf,
+    ready: PathBuf,
+    list_now: PathBuf,
+    owner_list: PathBuf,
+    list_caller_pid: PathBuf,
+}
+
+fn spawn_owner_scenario(temp: &tempfile::TempDir) -> OwnerScenario {
+    let run_json = temp.path().join("owner-run.json");
+    let ready = temp.path().join("owner-ready");
+    let list_now = temp.path().join("owner-list-now");
+    let owner_list = temp.path().join("owner-list.json");
+    let list_caller_pid = temp.path().join("owner-list-caller-pid");
+    let script = r#"
+set -eu
+"$AGENT_BASH_BIN" run -- bash -lc 'sleep 5' > "$RUN_JSON"
+: > "$READY"
+while [ ! -e "$LIST_NOW" ]; do sleep 0.01; done
+bash -c 'printf "%s\n" "$$" > "$LIST_CALLER_PID"; "$AGENT_BASH_BIN" list --json > "$OWNER_LIST"; rc=$?; exit "$rc"'
+rc=$?
+:
+exit "$rc"
+"#;
+    let child = StdCommand::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env("AGENT_BASH_BIN", assert_cmd::cargo::cargo_bin("agent-bash"))
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env("XDG_STATE_HOME", temp.path())
+        .env("RUN_JSON", &run_json)
+        .env("READY", &ready)
+        .env("LIST_NOW", &list_now)
+        .env("OWNER_LIST", &owner_list)
+        .env("LIST_CALLER_PID", &list_caller_pid)
+        .spawn()
+        .expect("spawn owner scenario");
+    OwnerScenario {
+        child,
+        run_json,
+        ready,
+        list_now,
+        owner_list,
+        list_caller_pid,
+    }
+}
+
+fn shell_list_json(temp: &tempfile::TempDir, all: bool) -> Vec<Value> {
+    let all_arg = if all { " --all" } else { "" };
+    let script = format!("\"$AGENT_BASH_BIN\" list{all_arg} --json; rc=$?; exit \"$rc\"");
+    let output = StdCommand::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env("AGENT_BASH_BIN", assert_cmd::cargo::cargo_bin("agent-bash"))
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env("XDG_STATE_HOME", temp.path())
+        .output()
+        .expect("shell list command");
+    assert_command_success(&output);
+    serde_json::from_slice(&output.stdout).expect("shell list JSON")
 }
 
 fn kill_process_group(meta: &Value) {
@@ -1241,6 +1396,293 @@ fn opencode_adapter_sync_wait_returns_when_handle_is_detached() {
         "{final_status}"
     );
     assert!(adapter.wait().expect("adapter exit").success());
+}
+
+#[test]
+fn rca_agent_bash_visibility_opencode_list_control_does_not_spool() {
+    // Verifies that OpenCode executes agent-bash list as a control command without creating a workload.
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+    let command = format!(
+        "{} list --all --json",
+        assert_cmd::cargo::cargo_bin("agent-bash").display()
+    );
+
+    let configured_result = run_adapter_driver(&temp, &driver, "control", Some(&command));
+    let bare_result = run_adapter_driver(
+        &temp,
+        &driver,
+        "control",
+        Some("agent-bash list --json --all"),
+    );
+
+    assert_eq!(
+        state_dir_count(&temp),
+        0,
+        "OpenCode list control created nested spool state; configured result={}; bare result={}",
+        adapter_result_text(&configured_result),
+        adapter_result_text(&bare_result)
+    );
+    for result in [&configured_result, &bare_result] {
+        let listed: Vec<Value> =
+            serde_json::from_str(adapter_result_text(result)).expect("direct list JSON result");
+        assert!(listed.is_empty(), "isolated state should list empty");
+    }
+}
+
+#[test]
+fn rca_agent_bash_visibility_persistent_adapter_lists_owned_active_workload() {
+    // Verifies launch and direct default-list ownership through one persistent adapter process.
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let result = run_adapter_driver(&temp, &driver, "joint", None);
+    let handle = result["launchedHandle"]
+        .as_str()
+        .expect("joint launched handle");
+    let launched = result["launchedResult"]
+        .as_str()
+        .expect("joint launched result");
+    let listed: Vec<Value> =
+        serde_json::from_str(result["listResult"].as_str().expect("joint list result"))
+            .expect("joint list JSON");
+
+    assert!(launched.contains("Running asynchronously"), "{launched}");
+    assert!(
+        listed
+            .iter()
+            .any(|entry| entry["handle"] == handle && entry["state"] == "RUNNING"),
+        "persistent adapter did not list its active workload {handle}: {listed:?}"
+    );
+    assert_eq!(
+        state_dir_count(&temp),
+        1,
+        "direct list created a second workload state directory"
+    );
+
+    let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+    assert!(
+        final_status.contains("adapter joint done\n"),
+        "{final_status}"
+    );
+}
+
+#[test]
+fn rca_agent_bash_visibility_non_list_only_commands_still_spool() {
+    // Verifies that shell operators and incidental list text cannot enter the control path.
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+    let compound = format!(
+        "{} list --json; printf 'compound marker\\n'",
+        assert_cmd::cargo::cargo_bin("agent-bash").display()
+    );
+
+    let compound_result = run_adapter_driver(&temp, &driver, "control", Some(&compound));
+    assert_adapter_result_contains(&compound_result, "compound marker");
+    assert_eq!(
+        state_dir_count(&temp),
+        1,
+        "compound command was not spooled"
+    );
+    assert!(
+        adapter_result_text(&compound_result).starts_with("DONE rc=0"),
+        "compound workload did not complete through the adapter"
+    );
+
+    let incidental_result = run_adapter_driver(
+        &temp,
+        &driver,
+        "control",
+        Some("printf '%s\\n' 'agent-bash list --json'"),
+    );
+    assert_adapter_result_contains(&incidental_result, "agent-bash list --json");
+    assert_eq!(
+        state_dir_count(&temp),
+        2,
+        "incidental list text was not spooled"
+    );
+    assert!(
+        adapter_result_text(&incidental_result).starts_with("DONE rc=0"),
+        "incidental-text workload did not complete through the adapter"
+    );
+}
+
+#[test]
+fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
+    // Verifies owner-tree visibility and unrelated-caller isolation at the real CLI/process seam.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut owner = spawn_owner_scenario(&temp);
+    wait_until(Duration::from_secs(3), || {
+        owner.ready.exists().then_some(())
+    });
+    let run_json: Value =
+        serde_json::from_slice(&fs::read(&owner.run_json).expect("owner run JSON"))
+            .expect("owner run JSON value");
+    let handle = run_json["handle"].as_str().expect("handle").to_string();
+    let active_status = status_text(&temp, &handle, false);
+    let unrelated = shell_list_json(&temp, false);
+    let all_access = shell_list_json(&temp, true);
+
+    fs::write(&owner.list_now, b"").expect("release owner list");
+    let owner_status = owner.child.wait().expect("owner scenario");
+    let owner_list: Vec<Value> =
+        serde_json::from_slice(&fs::read(&owner.owner_list).expect("owner list"))
+            .expect("owner list JSON");
+    let owner_pid = run_json["caller_ppid"].as_i64().expect("owner pid");
+    let list_caller_pid: i64 = fs::read_to_string(&owner.list_caller_pid)
+        .expect("list caller pid")
+        .trim()
+        .parse()
+        .expect("numeric list caller pid");
+    let final_status =
+        wait_for_status_prefix(&temp, &handle, &format!("DONE rc=0 handle={handle}"));
+
+    eprintln!(
+        "owner scenario handle={handle} owner_pid={owner_pid} list_caller_pid={list_caller_pid} active_status={active_status:?} owner_list={owner_list:?} unrelated_list={unrelated:?} all_list={all_access:?}"
+    );
+    assert!(owner_status.success(), "owner scenario failed");
+    assert!(
+        active_status.starts_with(&format!("RUNNING handle={handle}")),
+        "owned workload was not active: {active_status}"
+    );
+    assert_ne!(
+        owner_pid, list_caller_pid,
+        "owner listing must execute from a descendant, not the original caller PID"
+    );
+    assert!(
+        owner_list.iter().any(|entry| entry["handle"] == handle),
+        "owning process tree could not see active workload {handle}: {owner_list:?}"
+    );
+    assert!(
+        unrelated.iter().all(|entry| entry["handle"] != handle),
+        "unrelated caller saw owned workload without --all: {unrelated:?}"
+    );
+    assert!(
+        all_access.iter().any(|entry| entry["handle"] == handle),
+        "explicit --all did not expose workload {handle}: {all_access:?}"
+    );
+    assert!(final_status.contains("--- output ---"));
+}
+
+#[test]
+fn rca_agent_bash_visibility_rejects_reused_pid_identity() {
+    // Verifies that stale, absent, or invalid nearest ownership identities fail closed.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pid = unsafe { libc::getpid() };
+    let (identity, _) = proc_identity(pid).expect("current process identity");
+    let boot_id = read_boot_id();
+    let stale_start_handle = "ab_rca_stale_start";
+    let stale_boot_handle = "ab_rca_stale_boot";
+    let empty_chain_handle = "ab_rca_empty_chain";
+    let invalid_pid_handle = "ab_rca_invalid_pid";
+    let invalid_start_handle = "ab_rca_invalid_start";
+    let invalid_boot_handle = "ab_rca_invalid_boot";
+    let missing_live_handle = "ab_rca_missing_live";
+    let stale_start = active_state_meta(
+        stale_start_handle,
+        pid,
+        json!([{
+            "pid": pid,
+            "starttime_ticks": identity.starttime_ticks.saturating_add(1),
+            "boot_id": boot_id.clone()
+        }]),
+    );
+    let stale_boot = active_state_meta(
+        stale_boot_handle,
+        pid,
+        json!([{
+            "pid": pid,
+            "starttime_ticks": identity.starttime_ticks,
+            "boot_id": "different-boot-id"
+        }]),
+    );
+    let empty_chain = active_state_meta(empty_chain_handle, pid, json!([]));
+    let invalid_pid = active_state_meta(
+        invalid_pid_handle,
+        pid,
+        json!([
+            {
+                "pid": 1,
+                "starttime_ticks": 1,
+                "boot_id": boot_id.clone()
+            },
+            {
+                "pid": pid,
+                "starttime_ticks": identity.starttime_ticks,
+                "boot_id": boot_id.clone()
+            }
+        ]),
+    );
+    let invalid_start = active_state_meta(
+        invalid_start_handle,
+        pid,
+        json!([{
+            "pid": pid,
+            "starttime_ticks": 0,
+            "boot_id": boot_id.clone()
+        }]),
+    );
+    let invalid_boot = active_state_meta(
+        invalid_boot_handle,
+        pid,
+        json!([{
+            "pid": pid,
+            "starttime_ticks": identity.starttime_ticks,
+            "boot_id": ""
+        }]),
+    );
+    let missing_live = active_state_meta(
+        missing_live_handle,
+        pid,
+        json!([{
+            "pid": 999_999,
+            "starttime_ticks": 1,
+            "boot_id": boot_id
+        }]),
+    );
+    seed_active_state_dir(&temp, stale_start_handle, &stale_start);
+    seed_active_state_dir(&temp, stale_boot_handle, &stale_boot);
+    seed_active_state_dir(&temp, empty_chain_handle, &empty_chain);
+    seed_active_state_dir(&temp, invalid_pid_handle, &invalid_pid);
+    seed_active_state_dir(&temp, invalid_start_handle, &invalid_start);
+    seed_active_state_dir(&temp, invalid_boot_handle, &invalid_boot);
+    seed_active_state_dir(&temp, missing_live_handle, &missing_live);
+
+    let owned = list_json(&temp, false);
+    let all_access = list_json(&temp, true);
+
+    assert!(
+        owned.is_empty(),
+        "unverifiable identities were treated as owned: {owned:?}"
+    );
+    assert_eq!(all_access.len(), 7, "--all should bypass ownership only");
+}
+
+#[test]
+fn rca_agent_bash_visibility_many_synthetic_entries_is_bounded() {
+    // Verifies that listing thousands of isolated state entries completes within a practical bound.
+    const ENTRY_COUNT: usize = 4096;
+    const LIST_BOUND: Duration = Duration::from_secs(5);
+    let temp = tempfile::tempdir().expect("tempdir");
+    for index in 0..ENTRY_COUNT {
+        let handle = format!("ab_rca_scale_{index:05}");
+        let meta = active_state_meta(&handle, 999_999, json!([]));
+        seed_active_state_dir(&temp, &handle, &meta);
+    }
+
+    let start = Instant::now();
+    let listed = list_json(&temp, true);
+    let elapsed = start.elapsed();
+
+    assert_eq!(listed.len(), ENTRY_COUNT);
+    assert!(
+        elapsed < LIST_BOUND,
+        "listing {ENTRY_COUNT} synthetic entries took {elapsed:?}, bound is {LIST_BOUND:?}"
+    );
+    eprintln!("listed {ENTRY_COUNT} synthetic entries in {elapsed:?}");
 }
 
 #[test]

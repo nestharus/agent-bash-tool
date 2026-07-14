@@ -114,8 +114,9 @@ agent-bash list [--all] [--json]
 
 Defaults:
 
-- Without `--all`, list handles whose `meta.json.caller_ppid` equals the current attached caller PPID. This keeps `list` scoped to the invoking agent/harness tree.
-- `--all` lists all handles under the state root.
+- Without `--all`, capture the attached caller's live ancestry once and treat each workload's nearest recorded `caller_chain` entry as its ownership anchor. Include the workload only when that anchor has a PID greater than 1, a positive start-time tick value, and a non-empty boot ID, and the exact PID/start-time/boot-ID tuple occurs in the current caller ancestry. Matching is directional (workload anchor in current ancestry), so a shared higher ancestor does not confer ownership.
+- An empty, invalid, or unmatched ownership anchor fails closed with no `caller_ppid` fallback.
+- `--all` explicitly bypasses the ownership filter and lists all handles under the state root.
 - Without `--json`, output is one line per handle:
 
 ```text
