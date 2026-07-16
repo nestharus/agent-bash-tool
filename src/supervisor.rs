@@ -171,7 +171,11 @@ fn set_private_umask() {
 }
 
 fn supervisor_meta(mut meta: Meta) -> Meta {
-    meta.supervisor_pid = Some(current_pid());
+    let pid = current_pid();
+    meta.supervisor_pid = Some(pid);
+    meta.supervisor_pid_starttime_ticks = state::process_starttime_ticks(pid);
+    let boot_id = state::current_boot_id();
+    meta.process_boot_id = (!boot_id.is_empty()).then_some(boot_id);
     meta.touch();
     meta
 }
@@ -211,6 +215,7 @@ fn persist_supervisor_meta_best_effort(paths: &StatePaths, meta: &Meta) {
 
 fn apply_spawn_metadata(meta: &mut Meta, spawn: &WorkloadSpawn, root_pidfd: Option<RawFd>) {
     meta.workload_pid = Some(spawn.pid);
+    meta.workload_pid_starttime_ticks = state::process_starttime_ticks(spawn.pid);
     meta.workload_pgid = Some(spawn.pid);
     meta.workload_pidfd = root_pidfd.is_some();
     meta.touch();
@@ -1174,6 +1179,29 @@ fn persist_meta_with_delivery(paths: &StatePaths, meta: &mut Meta) -> io::Result
     meta.delivery = delivery::notify(meta.caller_ppid, &meta.handle, paths);
     meta.touch();
     state::write_meta_atomic(paths, meta)
+}
+
+pub(crate) fn reconcile_lost_supervisor(paths: &StatePaths) -> io::Result<Meta> {
+    let _lock = state::lock_reconciliation(paths)?;
+    let mut meta = state::read_meta(paths)?;
+    if !state::exact_supervisor_and_workload_are_gone(&meta) {
+        return Ok(meta);
+    }
+
+    state::write_rc_atomic(paths, EX_SOFTWARE)?;
+    apply_lost_supervisor_metadata(&mut meta);
+    persist_meta_with_delivery(paths, &mut meta)?;
+    Ok(meta)
+}
+
+fn apply_lost_supervisor_metadata(meta: &mut Meta) {
+    meta.state = "ERROR".to_string();
+    meta.completion_reason = Some("supervisor-lost".to_string());
+    meta.rc = Some(EX_SOFTWARE);
+    meta.signal = None;
+    meta.completed_at_unix_ms = Some(state::unix_ms());
+    meta.error = Some("supervisor and workload process identities are gone".to_string());
+    meta.touch();
 }
 
 impl Drop for EventLoop {

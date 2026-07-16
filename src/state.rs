@@ -26,6 +26,7 @@ pub(crate) struct StatePaths {
     pub(crate) rc: PathBuf,
     pub(crate) meta: PathBuf,
     pub(crate) consumed: PathBuf,
+    pub(crate) reconciliation_lock: PathBuf,
 }
 
 impl StatePaths {
@@ -38,6 +39,7 @@ impl StatePaths {
             rc: state_dir.join("rc"),
             meta: state_dir.join("meta.json"),
             consumed: state_dir.join("consumed"),
+            reconciliation_lock: state_dir.join("reconciliation.lock"),
             state_dir,
         }
     }
@@ -92,7 +94,13 @@ pub(crate) struct Meta {
     pub(crate) caller_chain: Vec<CallerChainEntry>,
     pub(crate) launcher_pid: libc::pid_t,
     pub(crate) supervisor_pid: Option<libc::pid_t>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) supervisor_pid_starttime_ticks: Option<u64>,
     pub(crate) workload_pid: Option<libc::pid_t>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workload_pid_starttime_ticks: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) process_boot_id: Option<String>,
     pub(crate) workload_pgid: Option<libc::pid_t>,
     pub(crate) workload_pidfd: bool,
     pub(crate) argv: Vec<String>,
@@ -134,7 +142,10 @@ impl Meta {
             caller_chain,
             launcher_pid,
             supervisor_pid: None,
+            supervisor_pid_starttime_ticks: None,
             workload_pid: None,
+            workload_pid_starttime_ticks: None,
+            process_boot_id: None,
             workload_pgid: None,
             workload_pidfd: false,
             argv,
@@ -330,6 +341,32 @@ pub(crate) fn open_log_append(paths: &StatePaths) -> io::Result<File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .mode(0o600)
         .open(&paths.log)
+}
+
+pub(crate) fn lock_reconciliation(paths: &StatePaths) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&paths.reconciliation_lock)?;
+    lock_file_exclusive(&file)?;
+    Ok(file)
+}
+
+fn lock_file_exclusive(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -633,14 +670,92 @@ fn terminal_caller_chain_pid(pid: libc::pid_t) -> bool {
 }
 
 fn read_proc_stat(pid: libc::pid_t) -> Option<ProcStat> {
-    let contents = read_proc_stat_text(pid)?;
+    read_proc_stat_result(pid).ok()
+}
+
+fn read_proc_stat_result(pid: libc::pid_t) -> io::Result<ProcStat> {
+    let contents = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     parse_proc_stat(&contents)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid /proc stat"))
 }
 
 fn read_boot_id() -> String {
     fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|value| value.trim().to_string())
         .unwrap_or_default()
+}
+
+pub(crate) fn current_boot_id() -> String {
+    read_boot_id()
+}
+
+pub(crate) fn process_starttime_ticks(pid: libc::pid_t) -> Option<u64> {
+    read_proc_stat(pid).map(|stat| stat.starttime_ticks)
+}
+
+pub(crate) fn running_exit_mode(meta: &Meta) -> bool {
+    meta.state == "RUNNING" && meta.mode == "exit"
+}
+
+pub(crate) fn exact_supervisor_and_workload_are_gone(meta: &Meta) -> bool {
+    if !running_exit_mode(meta) {
+        return false;
+    }
+    let current_boot_id = read_boot_id();
+    if current_boot_id.is_empty() {
+        return false;
+    }
+    matches!(
+        inspect_process_identity(
+            meta.supervisor_pid,
+            meta.supervisor_pid_starttime_ticks,
+            meta.process_boot_id.as_deref(),
+            &current_boot_id,
+        ),
+        ProcessIdentityEvidence::Gone
+    ) && matches!(
+        inspect_process_identity(
+            meta.workload_pid,
+            meta.workload_pid_starttime_ticks,
+            meta.process_boot_id.as_deref(),
+            &current_boot_id,
+        ),
+        ProcessIdentityEvidence::Gone
+    )
+}
+
+enum ProcessIdentityEvidence {
+    Live,
+    Gone,
+    Mismatch,
+    Unavailable,
+}
+
+fn inspect_process_identity(
+    pid: Option<libc::pid_t>,
+    expected_starttime_ticks: Option<u64>,
+    expected_boot_id: Option<&str>,
+    current_boot_id: &str,
+) -> ProcessIdentityEvidence {
+    let (Some(pid), Some(expected_starttime_ticks), Some(expected_boot_id)) =
+        (pid, expected_starttime_ticks, expected_boot_id)
+    else {
+        return ProcessIdentityEvidence::Unavailable;
+    };
+    if pid <= 1 || expected_starttime_ticks == 0 || expected_boot_id.is_empty() {
+        return ProcessIdentityEvidence::Unavailable;
+    }
+    if expected_boot_id != current_boot_id {
+        return ProcessIdentityEvidence::Mismatch;
+    }
+    match read_proc_stat_result(pid) {
+        Ok(actual) if actual.starttime_ticks == expected_starttime_ticks => {
+            ProcessIdentityEvidence::Live
+        }
+        Ok(_) => ProcessIdentityEvidence::Mismatch,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => ProcessIdentityEvidence::Gone,
+        Err(_) => ProcessIdentityEvidence::Unavailable,
+    }
 }
 
 fn caller_chain_entry_from_proc_stat(
@@ -653,10 +768,6 @@ fn caller_chain_entry_from_proc_stat(
         starttime_ticks: stat.starttime_ticks,
         boot_id: boot_id.to_string(),
     }
-}
-
-fn read_proc_stat_text(pid: libc::pid_t) -> Option<String> {
-    fs::read_to_string(format!("/proc/{pid}/stat")).ok()
 }
 
 fn parse_proc_stat(contents: &str) -> Option<ProcStat> {

@@ -322,7 +322,7 @@ fn json_write_error(err: impl std::fmt::Display) -> AppError {
 
 fn status_command(handle: String, tail_bytes: u64, full: bool) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
-    let meta = read_meta_for_handle(&paths, &handle)?;
+    let meta = reconcile_status_meta(&paths, &handle)?;
 
     let rc_from_file = if rc_file_exists(&paths) {
         Some(read_rc_for_handle(&paths, &handle)?)
@@ -338,6 +338,22 @@ fn status_command(handle: String, tail_bytes: u64, full: bool) -> Result<(), App
         .write_all(&output)
         .map_err(status_write_error)?;
     Ok(())
+}
+
+fn reconcile_status_meta(paths: &StatePaths, handle: &str) -> Result<Meta, AppError> {
+    let meta = read_meta_for_handle(paths, handle)?;
+    if !state::running_exit_mode(&meta) {
+        return Ok(meta);
+    }
+    supervisor::reconcile_lost_supervisor(paths)
+        .map_err(|err| status_reconciliation_error(handle, err))
+}
+
+fn status_reconciliation_error(handle: &str, err: io::Error) -> AppError {
+    AppError::new(
+        EX_IOERR,
+        format!("agent-bash: failed to reconcile state for {handle}: {err}"),
+    )
 }
 
 fn status_log_read_error(handle: &str, err: io::Error) -> AppError {

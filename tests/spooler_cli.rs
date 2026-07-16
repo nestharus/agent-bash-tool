@@ -267,6 +267,34 @@ fn fake_agents_script() -> &'static str {
     "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\nexit 0\n"
 }
 
+fn observing_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let fake = temp.path().join("observing-fake-agents");
+    let delivery_log = temp.path().join("observed-delivery.log");
+    let meta_snapshot = temp.path().join("delivery-meta-snapshot.json");
+    let rc_snapshot = temp.path().join("delivery-rc-snapshot");
+    fs::write(&fake, observing_fake_agents_script()).expect("write observing fake");
+    set_executable(&fake);
+    (fake, delivery_log, meta_snapshot, rc_snapshot)
+}
+
+fn observing_fake_agents_script() -> &'static str {
+    r#"#!/bin/sh
+meta=
+rc=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --meta) shift; meta=$1 ;;
+        --rc) shift; rc=$1 ;;
+    esac
+    shift
+done
+cp "$meta" "$AGENT_BASH_FAKE_META_SNAPSHOT"
+cp "$rc" "$AGENT_BASH_FAKE_RC_SNAPSHOT"
+printf 'delivery\n' >> "$AGENT_BASH_FAKE_DELIVERY_LOG"
+exit 0
+"#
+}
+
 fn set_executable(path: &Path) {
     let mut perms = fs::metadata(path).expect("metadata").permissions();
     perms.set_mode(0o755);
@@ -431,6 +459,137 @@ fn proc_identity(pid: libc::pid_t) -> Option<(ProcIdentity, libc::pid_t)> {
     ))
 }
 
+fn exact_identity(identity: &ProcIdentity) -> Value {
+    json!({
+        "pid": identity.pid,
+        "starttime_ticks": identity.starttime_ticks,
+        "boot_id": read_boot_id()
+    })
+}
+
+fn terminated_process_identity() -> ProcIdentity {
+    let mut child = StdCommand::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn identity process");
+    let pid = child.id() as libc::pid_t;
+    let (identity, _) = proc_identity(pid).expect("read live process identity");
+    child.kill().expect("kill identity process");
+    child.wait().expect("reap identity process");
+    assert!(
+        proc_identity(pid).is_none(),
+        "identity process must be gone"
+    );
+    identity
+}
+
+fn seed_running_state_dir(
+    temp: &tempfile::TempDir,
+    handle: &str,
+    mode: &str,
+    supervisor_identity: Option<Value>,
+    workload_identity: Option<Value>,
+    consumed: bool,
+) -> Value {
+    let state_dir = temp.path().join("agent-bash").join(handle);
+    fs::create_dir_all(&state_dir).expect("state dir");
+    let meta = json!({
+        "schema_version": 1,
+        "handle": handle,
+        "created_at_unix_ms": unix_ms(),
+        "updated_at_unix_ms": unix_ms(),
+        "state": "RUNNING",
+        "completion_reason": null,
+        "caller_ppid": unsafe { libc::getpid() },
+        "caller_chain": [],
+        "launcher_pid": unsafe { libc::getpid() },
+        "supervisor_pid": supervisor_identity.as_ref().and_then(|value| value["pid"].as_i64()),
+        "supervisor_pid_starttime_ticks": supervisor_identity
+            .as_ref()
+            .and_then(|value| value["starttime_ticks"].as_u64()),
+        "workload_pid": workload_identity.as_ref().and_then(|value| value["pid"].as_i64()),
+        "workload_pid_starttime_ticks": workload_identity
+            .as_ref()
+            .and_then(|value| value["starttime_ticks"].as_u64()),
+        "process_boot_id": supervisor_identity
+            .as_ref()
+            .and_then(|value| value["boot_id"].as_str()),
+        "workload_pgid": null,
+        "workload_pidfd": false,
+        "argv": ["bash", "-lc", "printf retained"],
+        "cwd": "/tmp",
+        "mode": mode,
+        "ready_sentinel": if mode == "sentinel" { Value::String("READY".to_string()) } else { Value::Null },
+        "ready_at_unix_ms": null,
+        "completed_at_unix_ms": null,
+        "rc": null,
+        "signal": null,
+        "workload_rc": null,
+        "workload_signal": null,
+        "delivery": {
+            "attempted": false,
+            "exit_code": null,
+            "error": null
+        },
+        "cgroup": {
+            "mode": "subreaper-only",
+            "path": null,
+            "delegated": false,
+            "events_watch": false,
+            "degraded_reason": null
+        },
+        "error": null
+    });
+    fs::write(state_dir.join("meta.json"), format_seeded_meta(&meta)).expect("write meta");
+    fs::write(state_dir.join("log"), b"retained log\n").expect("write log");
+    if consumed {
+        write_consumed_marker(&state_dir);
+    }
+    meta
+}
+
+fn status_with_observing_delivery(
+    temp: &tempfile::TempDir,
+    handle: &str,
+    fake: &Path,
+    delivery_log: &Path,
+    meta_snapshot: &Path,
+    rc_snapshot: &Path,
+) -> Output {
+    let mut cmd = agent_bash(temp);
+    cmd.env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", delivery_log)
+        .env("AGENT_BASH_FAKE_META_SNAPSHOT", meta_snapshot)
+        .env("AGENT_BASH_FAKE_RC_SNAPSHOT", rc_snapshot)
+        .args(["status", "--full", handle])
+        .output()
+        .expect("status command")
+}
+
+fn assert_running_without_delivery(
+    temp: &tempfile::TempDir,
+    handle: &str,
+    fake: &Path,
+    delivery_log: &Path,
+    meta_snapshot: &Path,
+    rc_snapshot: &Path,
+) {
+    let output = status_with_observing_delivery(
+        temp,
+        handle,
+        fake,
+        delivery_log,
+        meta_snapshot,
+        rc_snapshot,
+    );
+    assert_command_success(&output);
+    let text = stdout_utf8(output, "status utf8");
+    assert!(
+        text.starts_with(&format!("RUNNING handle={handle}")),
+        "{text}"
+    );
+}
+
 fn assert_process_alive(pid: libc::pid_t) {
     let rc = unsafe { libc::kill(pid, 0) };
     assert_eq!(rc, 0, "expected live process pid {pid}");
@@ -544,6 +703,9 @@ fn exit_mode_completion_rc_and_captured_output() {
     assert_eq!(meta["rc"], 7);
     let caller_chain = meta["caller_chain"].as_array().expect("caller chain");
     let expected_boot_id = read_boot_id();
+    assert!(meta["supervisor_pid_starttime_ticks"].is_number());
+    assert!(meta["workload_pid_starttime_ticks"].is_number());
+    assert_eq!(meta["process_boot_id"], expected_boot_id);
     let expected_chain = proc_ancestry(unsafe { libc::getpid() });
     assert!(
         expected_chain.len() > 1,
@@ -824,4 +986,222 @@ fn consumed_marker_after_delivery_does_not_rewrite_delivery_meta() {
     std::thread::sleep(Duration::from_millis(100));
     let after = read_meta(&meta_path)["delivery"].clone();
     assert_eq!(after, before);
+}
+
+#[test]
+fn status_reconciles_conclusively_lost_supervisor_once_and_fails_closed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log, meta_snapshot, rc_snapshot) = observing_fake_agents(&temp);
+    let dead_supervisor = terminated_process_identity();
+    let dead_workload = terminated_process_identity();
+    let dead_supervisor = exact_identity(&dead_supervisor);
+    let dead_workload = exact_identity(&dead_workload);
+
+    let lost_handle = "ab_lost_supervisor";
+    seed_running_state_dir(
+        &temp,
+        lost_handle,
+        "exit",
+        Some(dead_supervisor.clone()),
+        Some(dead_workload.clone()),
+        false,
+    );
+
+    let first = status_with_observing_delivery(
+        &temp,
+        lost_handle,
+        &fake,
+        &delivery_log,
+        &meta_snapshot,
+        &rc_snapshot,
+    );
+    assert_command_success(&first);
+    let first = stdout_utf8(first, "status utf8");
+    assert!(
+        first.starts_with(&format!("ERROR rc=70 handle={lost_handle}")),
+        "{first}"
+    );
+    assert!(first.contains("retained log\n"), "{first}");
+    assert_eq!(
+        fs::read_to_string(&rc_snapshot).expect("delivery rc"),
+        "70\n"
+    );
+    let delivered_meta = read_meta(&meta_snapshot);
+    assert_eq!(delivered_meta["state"], "ERROR");
+    assert_eq!(delivered_meta["completion_reason"], "supervisor-lost");
+    assert_eq!(delivered_meta["rc"], 70);
+
+    let terminal_meta = read_meta(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(lost_handle)
+            .join("meta.json"),
+    );
+    assert_eq!(terminal_meta["state"], "ERROR");
+    assert_eq!(terminal_meta["delivery"]["attempted"], true);
+    assert_eq!(terminal_meta["delivery"]["exit_code"], 0);
+    assert_eq!(
+        fs::read_to_string(temp.path().join("agent-bash").join(lost_handle).join("rc"))
+            .expect("terminal rc"),
+        "70\n"
+    );
+
+    let replay = status_with_observing_delivery(
+        &temp,
+        lost_handle,
+        &fake,
+        &delivery_log,
+        &meta_snapshot,
+        &rc_snapshot,
+    );
+    assert_command_success(&replay);
+    assert_eq!(
+        fs::read_to_string(&delivery_log).expect("delivery log"),
+        "delivery\n",
+        "terminal replay must not deliver twice"
+    );
+
+    let (live_identity, _) = proc_identity(unsafe { libc::getpid() }).expect("live identity");
+    let live_identity = exact_identity(&live_identity);
+    seed_running_state_dir(
+        &temp,
+        "ab_live_exact",
+        "exit",
+        Some(live_identity.clone()),
+        Some(live_identity.clone()),
+        false,
+    );
+    assert_running_without_delivery(
+        &temp,
+        "ab_live_exact",
+        &fake,
+        &delivery_log,
+        &meta_snapshot,
+        &rc_snapshot,
+    );
+
+    let mut mismatched_identity = live_identity;
+    mismatched_identity["starttime_ticks"] = json!(
+        mismatched_identity["starttime_ticks"]
+            .as_u64()
+            .expect("start time")
+            + 1
+    );
+    seed_running_state_dir(
+        &temp,
+        "ab_pid_reused",
+        "exit",
+        Some(mismatched_identity.clone()),
+        Some(mismatched_identity),
+        false,
+    );
+    assert_running_without_delivery(
+        &temp,
+        "ab_pid_reused",
+        &fake,
+        &delivery_log,
+        &meta_snapshot,
+        &rc_snapshot,
+    );
+
+    let mut boot_mismatch = exact_identity(
+        &proc_identity(unsafe { libc::getpid() })
+            .expect("live identity")
+            .0,
+    );
+    boot_mismatch["boot_id"] = json!("different-boot-id");
+    seed_running_state_dir(
+        &temp,
+        "ab_boot_mismatch",
+        "exit",
+        Some(boot_mismatch.clone()),
+        Some(boot_mismatch),
+        false,
+    );
+    assert_running_without_delivery(
+        &temp,
+        "ab_boot_mismatch",
+        &fake,
+        &delivery_log,
+        &meta_snapshot,
+        &rc_snapshot,
+    );
+
+    let missing_identity = json!({
+        "pid": dead_supervisor["pid"],
+        "starttime_ticks": null,
+        "boot_id": null
+    });
+    seed_running_state_dir(
+        &temp,
+        "ab_missing_identity",
+        "exit",
+        Some(missing_identity.clone()),
+        Some(missing_identity),
+        false,
+    );
+    assert_running_without_delivery(
+        &temp,
+        "ab_missing_identity",
+        &fake,
+        &delivery_log,
+        &meta_snapshot,
+        &rc_snapshot,
+    );
+
+    seed_running_state_dir(
+        &temp,
+        "ab_ready_sentinel",
+        "sentinel",
+        Some(dead_supervisor.clone()),
+        Some(dead_workload.clone()),
+        false,
+    );
+    assert_running_without_delivery(
+        &temp,
+        "ab_ready_sentinel",
+        &fake,
+        &delivery_log,
+        &meta_snapshot,
+        &rc_snapshot,
+    );
+
+    let consumed_handle = "ab_lost_consumed";
+    seed_running_state_dir(
+        &temp,
+        consumed_handle,
+        "exit",
+        Some(dead_supervisor),
+        Some(dead_workload),
+        true,
+    );
+    let consumed = status_with_observing_delivery(
+        &temp,
+        consumed_handle,
+        &fake,
+        &delivery_log,
+        &meta_snapshot,
+        &rc_snapshot,
+    );
+    assert_command_success(&consumed);
+    let consumed = stdout_utf8(consumed, "status utf8");
+    assert!(
+        consumed.starts_with(&format!("ERROR rc=70 handle={consumed_handle}")),
+        "{consumed}"
+    );
+    assert_eq!(
+        fs::read_to_string(&delivery_log).expect("delivery log"),
+        "delivery\n",
+        "consumed reconciliation must not invoke delivery"
+    );
+    let consumed_meta = read_meta(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(consumed_handle)
+            .join("meta.json"),
+    );
+    assert_eq!(consumed_meta["delivery"]["attempted"], false);
+    assert_eq!(consumed_meta["delivery"]["skipped"], "consumed_in_call");
 }
