@@ -944,10 +944,7 @@ impl EventLoop {
 
     fn persist_completion_and_delivery(&mut self) -> io::Result<()> {
         state::write_meta_atomic(&self.paths, &self.meta)?;
-        self.meta.delivery =
-            delivery::notify(self.meta.caller_ppid, &self.meta.handle, &self.paths);
-        self.meta.touch();
-        state::write_meta_atomic(&self.paths, &self.meta)?;
+        delivery::complete(&self.paths, &mut self.meta)?;
         self.completion_recorded = true;
         Ok(())
     }
@@ -1176,9 +1173,7 @@ fn sync_optional_log(log: Option<&mut File>) -> io::Result<()> {
 
 fn persist_meta_with_delivery(paths: &StatePaths, meta: &mut Meta) -> io::Result<()> {
     state::write_meta_atomic(paths, meta)?;
-    meta.delivery = delivery::notify(meta.caller_ppid, &meta.handle, paths);
-    meta.touch();
-    state::write_meta_atomic(paths, meta)
+    delivery::complete(paths, meta)
 }
 
 pub(crate) fn reconcile_lost_supervisor(paths: &StatePaths) -> io::Result<Meta> {

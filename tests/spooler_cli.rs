@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, Output};
+use std::process::{Command as StdCommand, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
@@ -58,6 +58,15 @@ fn status_text(temp: &tempfile::TempDir, handle: &str, full: bool) -> String {
     let output = status_output(temp, handle, full);
     assert_command_success(&output);
     stdout_utf8(output, "status utf8")
+}
+
+fn mode_text(temp: &tempfile::TempDir, handle: &str) -> String {
+    let output = agent_bash(temp)
+        .args(["mode", handle])
+        .output()
+        .expect("mode command");
+    assert_command_success(&output);
+    stdout_utf8(output, "mode utf8").trim().to_string()
 }
 
 fn status_output(temp: &tempfile::TempDir, handle: &str, full: bool) -> Output {
@@ -267,6 +276,28 @@ fn fake_agents_script() -> &'static str {
     "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\nexit 0\n"
 }
 
+fn delivery_attempt_count(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == "notify")
+        .count()
+}
+
+fn detach_with_fake(
+    temp: &tempfile::TempDir,
+    handle: &str,
+    fake: &Path,
+    delivery_log: &Path,
+) -> Output {
+    agent_bash(temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", delivery_log)
+        .args(["detach", handle])
+        .output()
+        .expect("detach command")
+}
+
 fn observing_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let fake = temp.path().join("observing-fake-agents");
     let delivery_log = temp.path().join("observed-delivery.log");
@@ -325,7 +356,17 @@ const mode = process.argv[2]
 const adapterPath = process.argv[3]
 const handle = process.argv[4]
 const mod = await import(adapterPath)
-const args = mode === "poll" ? { handle } : { command: "printf 'adapter inline\\n'" }
+const args = mode === "poll"
+  ? { handle }
+  : mode === "async"
+    ? { command: "sleep 1; printf 'adapter async\\n'", delivery: "async" }
+    : mode === "detachable"
+      ? { command: "sleep 2; printf 'adapter detached\\n'" }
+      : mode === "wrapper"
+        ? { command: `${process.env.AGENT_BASH_BIN} run -- agents --version` }
+    : mode === "agent"
+      ? { command: "agents --version" }
+      : { command: "printf 'adapter inline\\n'" }
 const result = await mod.default.execute(args)
 const text = typeof result === "string" ? result : String(result)
 const matched = text.match(/handle=([^\s)]+)/)
@@ -359,7 +400,6 @@ fn adapter_driver_command(
         .arg(adapter_module_path())
         .env("AGENT_BASH_BIN", assert_cmd::cargo::cargo_bin("agent-bash"))
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
-        .env("AGENT_BASH_TOOL_WAIT_MS", "5000")
         .env("AGENT_BASH_TOOL_POLL_MS", "25")
         .env("XDG_STATE_HOME", temp.path())
         .env_remove("OULIPOLY_DATA_DIR");
@@ -401,21 +441,28 @@ fn adapter_result_handle(result: &Value) -> &str {
     result["handle"].as_str().expect("adapter handle")
 }
 
-fn consumed_marker_path_for_handle(temp: &tempfile::TempDir, handle: &str) -> PathBuf {
-    temp.path().join("agent-bash").join(handle).join("consumed")
-}
-
-fn assert_consumed_marker_exists(path: &Path) {
-    assert!(
-        path.exists(),
-        "consumed marker missing at {}",
-        path.display()
-    );
-}
-
 fn assert_adapter_result_contains(result: &Value, expected: &str) {
     let text = adapter_result_text(result);
     assert!(text.contains(expected), "{text}");
+}
+
+fn state_handles(temp: &tempfile::TempDir) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(temp.path().join("agent-bash")) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("ab_"))
+        .collect()
+}
+
+fn initialized_state_handle(temp: &tempfile::TempDir) -> Option<String> {
+    state_handles(temp).into_iter().find(|handle| {
+        let state_dir = temp.path().join("agent-bash").join(handle);
+        state_dir.join("meta.json").exists() && state_dir.join("delivery-mode").exists()
+    })
 }
 
 fn read_boot_id() -> String {
@@ -846,7 +893,7 @@ fn cgroup_disable_uses_subreaper_only_without_degradation() {
 }
 
 #[test]
-fn opencode_adapter_poll_path_marks_consumed_after_done() {
+fn opencode_adapter_poll_returns_terminal_result_without_mutating_delivery_mode() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let (output, _) = run_cmd(
@@ -862,11 +909,12 @@ fn opencode_adapter_poll_path_marks_consumed_after_done() {
     let result = run_adapter_driver(&temp, &driver, "poll", Some(handle));
 
     assert_adapter_result_contains(&result, "adapter poll");
-    assert_consumed_marker_exists(&state_dir_path(&json).join("consumed"));
+    assert_eq!(mode_text(&temp, handle), "async");
+    assert!(!state_dir_path(&json).join("consumed").exists());
 }
 
 #[test]
-fn opencode_adapter_in_call_fast_command_marks_consumed() {
+fn opencode_adapter_ordinary_command_completes_in_band_in_sync_mode() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -874,10 +922,91 @@ fn opencode_adapter_in_call_fast_command_marks_consumed() {
     let result = run_adapter_driver(&temp, &driver, "run", None);
 
     assert_adapter_result_contains(&result, "adapter inline");
-    assert_consumed_marker_exists(&consumed_marker_path_for_handle(
-        &temp,
-        adapter_result_handle(&result),
-    ));
+    let handle = adapter_result_handle(&result);
+    assert_eq!(mode_text(&temp, handle), "sync");
+    let meta = read_meta(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(handle)
+            .join("meta.json"),
+    );
+    assert_eq!(meta["delivery_mode"], "sync");
+    assert_eq!(meta["delivery"]["attempted"], false);
+    assert_eq!(meta["delivery"]["skipped"], "sync_in_band");
+}
+
+#[test]
+fn opencode_adapter_explicit_async_returns_handle_immediately() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+    let start = Instant::now();
+
+    let result = run_adapter_driver(&temp, &driver, "async", None);
+
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert_adapter_result_contains(&result, "Running asynchronously");
+    assert_eq!(mode_text(&temp, adapter_result_handle(&result)), "async");
+}
+
+#[test]
+fn opencode_adapter_agent_dispatch_defaults_to_async() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let result = run_adapter_driver(&temp, &driver, "agent", None);
+
+    assert_adapter_result_contains(&result, "Running asynchronously");
+    assert_eq!(mode_text(&temp, adapter_result_handle(&result)), "async");
+}
+
+#[test]
+fn opencode_adapter_explicit_agent_bash_run_is_not_nested() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let result = run_adapter_driver(&temp, &driver, "wrapper", None);
+
+    assert_adapter_result_contains(&result, "Running asynchronously");
+    assert_eq!(state_handles(&temp), vec![adapter_result_handle(&result)]);
+}
+
+#[test]
+fn opencode_adapter_sync_wait_returns_when_handle_is_detached() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+    let adapter = adapter_driver_command(&temp, &driver, "detachable", None)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn adapter driver");
+    let handle = wait_until(Duration::from_secs(2), || initialized_state_handle(&temp));
+    assert_eq!(mode_text(&temp, &handle), "sync");
+
+    let detach = agent_bash(&temp)
+        .args(["detach", &handle])
+        .output()
+        .expect("detach command");
+    assert_command_success(&detach);
+    assert_eq!(parse_stdout_json(&detach)["transitioned"], true);
+    let detached_at = Instant::now();
+    let result = adapter.wait_with_output().expect("adapter result");
+    assert!(detached_at.elapsed() < Duration::from_secs(1));
+    assert_command_success(&result);
+    let result = parse_stdout_json(&result);
+
+    assert_adapter_result_contains(&result, "Running asynchronously");
+    assert_eq!(adapter_result_handle(&result), handle);
+    let final_status =
+        wait_for_status_prefix(&temp, &handle, &format!("DONE rc=0 handle={handle}"));
+    assert!(
+        final_status.contains("adapter detached\n"),
+        "{final_status}"
+    );
 }
 
 #[test]
@@ -892,6 +1021,8 @@ fn delivery_seam_records_invocation_outcome() {
     let output = cmd.output().expect("run");
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
+    assert_eq!(json["delivery_mode"], "async");
+    assert_eq!(mode_text(&temp, handle), "async");
     let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     let delivered = wait_until(Duration::from_secs(2), || {
         fs::read_to_string(&delivery_log).ok()
@@ -930,7 +1061,145 @@ fn delivery_seam_records_invocation_outcome() {
 }
 
 #[test]
-fn consumed_marker_before_completion_skips_delivery_notify() {
+fn sync_completion_stays_in_band_without_notifying() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = fake_agents(&temp);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args([
+            "run",
+            "--delivery",
+            "sync",
+            "--",
+            "bash",
+            "-lc",
+            "echo sync",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+
+    let status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+
+    assert!(status.contains("sync\n"), "{status}");
+    assert_eq!(json["delivery_mode"], "sync");
+    assert_eq!(mode_text(&temp, handle), "sync");
+    assert!(!delivery_log.exists());
+    let meta = wait_until(Duration::from_secs(2), || {
+        let meta = read_meta(&meta_path(&json));
+        (meta["delivery"]["skipped"] == "sync_in_band").then_some(meta)
+    });
+    assert_eq!(meta["delivery_mode"], "sync");
+    assert_eq!(meta["delivery"]["attempted"], false);
+    assert_eq!(meta["delivery"]["skipped"], "sync_in_band");
+}
+
+#[test]
+fn detach_after_sync_completion_notifies_once() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = fake_agents(&temp);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args([
+            "run",
+            "--delivery",
+            "sync",
+            "--",
+            "bash",
+            "-lc",
+            "echo complete",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+
+    let first = detach_with_fake(&temp, handle, &fake, &delivery_log);
+    let second = detach_with_fake(&temp, handle, &fake, &delivery_log);
+
+    let first = parse_stdout_json(&first);
+    let second = parse_stdout_json(&second);
+    assert_eq!(first["transitioned"], true);
+    assert_eq!(first["notification_attempted"], true);
+    assert_eq!(second["transitioned"], false);
+    assert_eq!(second["notification_attempted"], false);
+    assert_eq!(mode_text(&temp, handle), "async");
+    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    let meta = read_meta(&meta_path(&json));
+    assert_eq!(meta["delivery_mode"], "async");
+    assert_eq!(meta["delivery"]["attempted"], true);
+}
+
+#[test]
+fn concurrent_detach_and_completion_produce_one_notification() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = fake_agents(&temp);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args([
+            "run",
+            "--delivery",
+            "sync",
+            "--",
+            "bash",
+            "-lc",
+            "sleep 0.1; echo race",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle").to_string();
+    std::thread::sleep(Duration::from_millis(75));
+
+    let mut detach_threads = Vec::new();
+    for _ in 0..8 {
+        let binary = assert_cmd::cargo::cargo_bin("agent-bash");
+        let state_root = temp.path().to_path_buf();
+        let fake = fake.clone();
+        let delivery_log = delivery_log.clone();
+        let handle = handle.clone();
+        detach_threads.push(std::thread::spawn(move || {
+            StdCommand::new(binary)
+                .env("XDG_STATE_HOME", state_root)
+                .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+                .env("AGENT_BASH_FAKE_DELIVERY_LOG", delivery_log)
+                .args(["detach", &handle])
+                .output()
+                .expect("concurrent detach")
+        }));
+    }
+    let outcomes: Vec<Value> = detach_threads
+        .into_iter()
+        .map(|thread| thread.join().expect("detach thread"))
+        .map(|output| {
+            assert_command_success(&output);
+            parse_stdout_json(&output)
+        })
+        .collect();
+
+    let status = wait_for_status_prefix(&temp, &handle, &format!("DONE rc=0 handle={handle}"));
+    assert!(status.contains("race\n"), "{status}");
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome["transitioned"] == true)
+            .count(),
+        1
+    );
+    wait_until(Duration::from_secs(2), || {
+        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+    });
+    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(mode_text(&temp, &handle), "async");
+}
+
+#[test]
+fn legacy_consumed_marker_cannot_suppress_explicit_async_delivery() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
 
@@ -945,17 +1214,16 @@ fn consumed_marker_before_completion_skips_delivery_notify() {
     let handle = json["handle"].as_str().expect("handle");
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.contains("consumed\n"), "{final_status}");
-    assert!(
-        !delivery_log.exists(),
-        "delivery fixture should not be invoked when consumed marker exists"
-    );
+    wait_until(Duration::from_secs(2), || {
+        delivery_log.exists().then_some(())
+    });
     let meta_path = meta_path(&json);
     let meta = wait_until(Duration::from_secs(2), || {
         let meta = read_meta(&meta_path);
         delivery_metadata_observed(&meta).then_some(meta)
     });
-    assert_eq!(meta["delivery"]["attempted"], false);
-    assert_eq!(meta["delivery"]["skipped"], "consumed_in_call");
+    assert_eq!(meta["delivery"]["attempted"], true);
+    assert_eq!(meta["delivery"]["exit_code"], 0);
 }
 
 fn delivery_metadata_observed(meta: &Value) -> bool {
@@ -1192,8 +1460,8 @@ fn status_reconciles_conclusively_lost_supervisor_once_and_fails_closed() {
     );
     assert_eq!(
         fs::read_to_string(&delivery_log).expect("delivery log"),
-        "delivery\n",
-        "consumed reconciliation must not invoke delivery"
+        "delivery\ndelivery\n",
+        "legacy consumed markers must not suppress async delivery"
     );
     let consumed_meta = read_meta(
         &temp
@@ -1202,6 +1470,6 @@ fn status_reconciles_conclusively_lost_supervisor_once_and_fails_closed() {
             .join(consumed_handle)
             .join("meta.json"),
     );
-    assert_eq!(consumed_meta["delivery"]["attempted"], false);
-    assert_eq!(consumed_meta["delivery"]["skipped"], "consumed_in_call");
+    assert_eq!(consumed_meta["delivery"]["attempted"], true);
+    assert_eq!(consumed_meta["delivery"]["exit_code"], 0);
 }

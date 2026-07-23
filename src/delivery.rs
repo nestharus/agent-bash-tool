@@ -4,21 +4,81 @@ use std::process::{Command, ExitStatus, Stdio};
 
 use std::os::unix::process::ExitStatusExt;
 
-use crate::state::{DeliveryMeta, StatePaths};
+use serde::Serialize;
 
-pub(crate) fn notify(caller_ppid: libc::pid_t, handle: &str, paths: &StatePaths) -> DeliveryMeta {
-    if consumed_marker_exists(paths) {
-        return skipped_delivery_meta("consumed_in_call");
+use crate::state::{self, DeliveryMeta, DeliveryMode, Meta, StatePaths};
+
+const SYNC_IN_BAND: &str = "sync_in_band";
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DetachOutcome {
+    handle: String,
+    delivery_mode: DeliveryMode,
+    state: String,
+    transitioned: bool,
+    notification_attempted: bool,
+}
+
+pub(crate) fn complete(paths: &StatePaths, meta: &mut Meta) -> std::io::Result<()> {
+    let _lock = state::lock_delivery(paths)?;
+    let persisted = state::read_meta(paths)?;
+    let mode = state::read_delivery_mode(paths)?;
+    meta.delivery_mode = mode;
+    meta.delivery = completion_delivery(mode, &persisted.delivery, meta, paths);
+    meta.touch();
+    state::write_meta_atomic(paths, meta)
+}
+
+pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
+    let _lock = state::lock_delivery(paths)?;
+    let mode = state::read_delivery_mode(paths)?;
+    let mut meta = state::read_meta(paths)?;
+    if mode == DeliveryMode::Async {
+        return Ok(detach_outcome(&meta, false, false));
     }
+
+    state::write_delivery_mode_atomic(paths, DeliveryMode::Async)?;
+    meta.delivery_mode = DeliveryMode::Async;
+    state::write_meta_atomic(paths, &meta)?;
+
+    let notified = state::terminal(&meta) && !meta.delivery.attempted;
+    if notified {
+        meta.delivery = notify(meta.caller_ppid, &meta.handle, paths);
+        meta.touch();
+        state::write_meta_atomic(paths, &meta)?;
+    }
+    Ok(detach_outcome(&meta, true, notified))
+}
+
+fn completion_delivery(
+    mode: DeliveryMode,
+    persisted: &DeliveryMeta,
+    meta: &Meta,
+    paths: &StatePaths,
+) -> DeliveryMeta {
+    match mode {
+        DeliveryMode::Sync => skipped_delivery_meta(SYNC_IN_BAND),
+        DeliveryMode::Async if persisted.attempted => persisted.clone(),
+        DeliveryMode::Async => notify(meta.caller_ppid, &meta.handle, paths),
+    }
+}
+
+fn detach_outcome(meta: &Meta, transitioned: bool, notification_attempted: bool) -> DetachOutcome {
+    DetachOutcome {
+        handle: meta.handle.clone(),
+        delivery_mode: meta.delivery_mode,
+        state: meta.state.clone(),
+        transitioned,
+        notification_attempted,
+    }
+}
+
+fn notify(caller_ppid: libc::pid_t, handle: &str, paths: &StatePaths) -> DeliveryMeta {
     let request = notify_request(caller_ppid, handle, paths);
     match run_notify_command(&request) {
         Ok(status) => delivery_meta_from_status(status),
         Err(err) => delivery_meta_from_error(err),
     }
-}
-
-fn consumed_marker_exists(paths: &StatePaths) -> bool {
-    paths.consumed.exists()
 }
 
 struct NotifyRequest {

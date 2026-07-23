@@ -26,6 +26,8 @@ pub(crate) struct StatePaths {
     pub(crate) rc: PathBuf,
     pub(crate) meta: PathBuf,
     pub(crate) consumed: PathBuf,
+    pub(crate) delivery_mode: PathBuf,
+    pub(crate) delivery_lock: PathBuf,
     pub(crate) reconciliation_lock: PathBuf,
 }
 
@@ -39,8 +41,38 @@ impl StatePaths {
             rc: state_dir.join("rc"),
             meta: state_dir.join("meta.json"),
             consumed: state_dir.join("consumed"),
+            delivery_mode: state_dir.join("delivery-mode"),
+            delivery_lock: state_dir.join("delivery.lock"),
             reconciliation_lock: state_dir.join("reconciliation.lock"),
             state_dir,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DeliveryMode {
+    Sync,
+    #[default]
+    Async,
+}
+
+impl DeliveryMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Async => "async",
+        }
+    }
+
+    fn parse(value: &str) -> io::Result<Self> {
+        match value.trim() {
+            "sync" => Ok(Self::Sync),
+            "async" => Ok(Self::Async),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid delivery mode",
+            )),
         }
     }
 }
@@ -106,6 +138,8 @@ pub(crate) struct Meta {
     pub(crate) argv: Vec<String>,
     pub(crate) cwd: String,
     pub(crate) mode: String,
+    #[serde(default)]
+    pub(crate) delivery_mode: DeliveryMode,
     pub(crate) ready_sentinel: Option<String>,
     pub(crate) ready_at_unix_ms: Option<u64>,
     pub(crate) completed_at_unix_ms: Option<u64>,
@@ -127,6 +161,7 @@ impl Meta {
         argv: Vec<String>,
         cwd: PathBuf,
         mode: &str,
+        delivery_mode: DeliveryMode,
         ready_sentinel: Option<String>,
         caller_chain: Vec<CallerChainEntry>,
     ) -> Self {
@@ -151,6 +186,7 @@ impl Meta {
             argv,
             cwd: cwd.display().to_string(),
             mode: mode.to_string(),
+            delivery_mode,
             ready_sentinel,
             ready_at_unix_ms: None,
             completed_at_unix_ms: None,
@@ -179,6 +215,7 @@ pub(crate) struct RunOutput {
     meta: PathBuf,
     caller_ppid: libc::pid_t,
     mode: String,
+    delivery_mode: DeliveryMode,
     ready_sentinel: Option<String>,
 }
 
@@ -187,6 +224,7 @@ impl RunOutput {
         paths: StatePaths,
         caller_ppid: libc::pid_t,
         mode: &str,
+        delivery_mode: DeliveryMode,
         ready_sentinel: Option<String>,
     ) -> Self {
         Self {
@@ -198,6 +236,7 @@ impl RunOutput {
             meta: paths.meta,
             caller_ppid,
             mode: mode.to_string(),
+            delivery_mode,
             ready_sentinel,
         }
     }
@@ -209,6 +248,7 @@ pub(crate) struct ListSummary {
     pub(crate) state: String,
     pub(crate) rc: Option<i32>,
     pub(crate) mode: String,
+    pub(crate) delivery_mode: DeliveryMode,
     pub(crate) created_at_unix_ms: u64,
     pub(crate) state_dir: PathBuf,
 }
@@ -220,6 +260,7 @@ impl ListSummary {
             state: meta.state.clone(),
             rc: meta.rc,
             mode: meta.mode.clone(),
+            delivery_mode: meta.delivery_mode,
             created_at_unix_ms: meta.created_at_unix_ms,
             state_dir,
         }
@@ -355,6 +396,18 @@ pub(crate) fn lock_reconciliation(paths: &StatePaths) -> io::Result<File> {
     Ok(file)
 }
 
+pub(crate) fn lock_delivery(paths: &StatePaths) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&paths.delivery_lock)?;
+    lock_file_exclusive(&file)?;
+    Ok(file)
+}
+
 fn lock_file_exclusive(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -476,7 +529,13 @@ fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig) -> bool {
     if age_ms < config.ttl_ms() {
         return false;
     }
-    paths.consumed.exists() || age_ms >= config.pending_delivery_moot_ms()
+    delivery_is_settled(paths, &meta) || age_ms >= config.pending_delivery_moot_ms()
+}
+
+fn delivery_is_settled(paths: &StatePaths, meta: &Meta) -> bool {
+    paths.consumed.exists()
+        || meta.delivery.attempted
+        || meta.delivery.skipped.as_deref() == Some("sync_in_band")
 }
 
 fn meta_is_reap_terminal(meta: &Meta) -> bool {
@@ -536,8 +595,27 @@ pub(crate) fn open_read_no_follow(path: &Path) -> io::Result<File> {
 }
 
 pub(crate) fn write_meta_atomic(paths: &StatePaths, meta: &Meta) -> io::Result<()> {
-    let bytes = format_meta_bytes(meta)?;
+    let mut persisted = meta.clone();
+    if let Ok(delivery_mode) = read_delivery_mode(paths) {
+        persisted.delivery_mode = delivery_mode;
+    }
+    let bytes = format_meta_bytes(&persisted)?;
     atomic_write(&paths.meta, &bytes)
+}
+
+pub(crate) fn write_delivery_mode_atomic(
+    paths: &StatePaths,
+    delivery_mode: DeliveryMode,
+) -> io::Result<()> {
+    atomic_write(&paths.delivery_mode, delivery_mode.as_str().as_bytes())
+}
+
+pub(crate) fn read_delivery_mode(paths: &StatePaths) -> io::Result<DeliveryMode> {
+    match read_file_text(&paths.delivery_mode) {
+        Ok(value) => DeliveryMode::parse(&value),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(DeliveryMode::Async),
+        Err(err) => Err(err),
+    }
 }
 
 pub(crate) fn read_meta(paths: &StatePaths) -> io::Result<Meta> {
@@ -697,6 +775,10 @@ pub(crate) fn running_exit_mode(meta: &Meta) -> bool {
     meta.state == "RUNNING" && meta.mode == "exit"
 }
 
+pub(crate) fn terminal(meta: &Meta) -> bool {
+    matches!(meta.state.as_str(), "DONE" | "ERROR") && meta.completed_at_unix_ms.is_some()
+}
+
 pub(crate) fn exact_supervisor_and_workload_are_gone(meta: &Meta) -> bool {
     if !running_exit_mode(meta) {
         return false;
@@ -847,6 +929,7 @@ mod tests {
             vec!["sh".to_string()],
             PathBuf::from("/tmp"),
             "exit",
+            DeliveryMode::Async,
             None,
             Vec::new(),
         );
@@ -925,6 +1008,7 @@ mod tests {
             vec!["sh".to_string()],
             PathBuf::from("/tmp"),
             "exit",
+            DeliveryMode::Async,
             None,
             vec![CallerChainEntry {
                 pid: 123,
@@ -937,6 +1021,23 @@ mod tests {
         assert_eq!(read.schema_version, 1);
         assert_eq!(read.handle, paths.handle);
         assert_eq!(read.caller_chain[0].pid, 123);
+    }
+
+    #[test]
+    fn delivery_mode_round_trip_and_legacy_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_test".to_string());
+        create_handle_state(&paths).expect("create state");
+
+        assert_eq!(
+            read_delivery_mode(&paths).expect("legacy mode"),
+            DeliveryMode::Async
+        );
+        write_delivery_mode_atomic(&paths, DeliveryMode::Sync).expect("write mode");
+        assert_eq!(
+            read_delivery_mode(&paths).expect("sync mode"),
+            DeliveryMode::Sync
+        );
     }
 
     #[test]
@@ -995,6 +1096,21 @@ mod tests {
 
         assert_eq!(stats.reaped, 0);
         assert!(paths.state_dir.exists());
+    }
+
+    #[test]
+    fn reaper_removes_old_sync_in_band_state_without_consumed_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_sync", "DONE", now - 20_000, false);
+        let mut meta = read_meta(&paths).expect("read meta");
+        meta.delivery.skipped = Some("sync_in_band".to_string());
+        write_meta_atomic(&paths, &meta).expect("write settled meta");
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 1);
+        assert!(!paths.state_dir.exists());
     }
 
     #[test]
