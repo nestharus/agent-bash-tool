@@ -1,4 +1,4 @@
-//! `agent-bash` — general-purpose always-background bash spooler for AI agents.
+//! `agent-bash` - general-purpose detached bash spooler for AI agents.
 
 mod cgroup;
 mod delivery;
@@ -9,10 +9,10 @@ mod supervisor;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::guard::AttachedGuard;
-use crate::state::{ListSummary, Meta, RunOutput, StatePaths};
+use crate::state::{DeliveryMode, ListSummary, Meta, RunOutput, StatePaths};
 
 const EX_USAGE: i32 = 64;
 const EX_DATAERR: i32 = 65;
@@ -24,7 +24,7 @@ const EX_IOERR: i32 = 74;
 #[derive(Parser)]
 #[command(
     name = "agent-bash",
-    about = "Always-background bash spooler. Foreground is not offered; detached invocation is rejected."
+    about = "Detached bash spooler with explicit synchronous or asynchronous completion delivery."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,8 +33,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Spool a command. Always runs in the background; returns a handle immediately.
+    /// Spool a command under a surviving detached supervisor.
     Run {
+        /// Completion delivery policy. Sync results stay in-band; async results notify the mailbox.
+        #[arg(long, value_enum, default_value_t = CliDeliveryMode::Async)]
+        delivery: CliDeliveryMode,
         /// Treat the workload as a long-lived server: report ready on this stdout
         /// marker (regex) instead of waiting for process-tree exit.
         #[arg(long)]
@@ -43,6 +46,10 @@ enum Command {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
+    /// Convert a running synchronous call to asynchronous mailbox delivery.
+    Detach { handle: String },
+    /// Print the current completion delivery mode for a handle.
+    Mode { handle: String },
     /// Non-blocking status of a spooled job: RUNNING, or DONE rc=<n> + captured output.
     Status {
         /// Print this many trailing log bytes. Defaults to 65536.
@@ -62,6 +69,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliDeliveryMode {
+    Sync,
+    Async,
+}
+
+impl From<CliDeliveryMode> for DeliveryMode {
+    fn from(value: CliDeliveryMode) -> Self {
+        match value {
+            CliDeliveryMode::Sync => Self::Sync,
+            CliDeliveryMode::Async => Self::Async,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -94,9 +116,12 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
     validate_guard(&guard)?;
     match cli.command {
         Command::Run {
+            delivery,
             ready_sentinel,
             argv,
-        } => run_command(guard, ready_sentinel, argv),
+        } => run_command(guard, delivery.into(), ready_sentinel, argv),
+        Command::Detach { handle } => detach_command(handle),
+        Command::Mode { handle } => mode_command(handle),
         Command::Status {
             tail_bytes,
             full,
@@ -117,6 +142,7 @@ fn validate_guard(guard: &AttachedGuard) -> Result<(), AppError> {
 
 fn run_command(
     guard: AttachedGuard,
+    delivery_mode: DeliveryMode,
     ready_sentinel: Option<String>,
     argv: Vec<String>,
 ) -> Result<(), AppError> {
@@ -128,16 +154,19 @@ fn run_command(
     let handle = state::generate_handle().map_err(supervisor_bootstrap_error)?;
     let paths = state_paths(state_root, handle.clone());
     create_run_state(&paths)?;
+    persist_delivery_mode(&paths, delivery_mode)?;
 
     let caller_chain = state::capture_caller_chain(guard.startup_ppid());
     let cwd = current_directory().map_err(current_directory_error)?;
     let mode = run_mode(&ready_sentinel);
-    let meta = initial_meta(
-        &guard,
+    let meta = Meta::new(
         handle,
+        guard.startup_ppid(),
+        unsafe { libc::getpid() },
         argv.clone(),
         cwd,
         mode,
+        delivery_mode,
         ready_sentinel.clone(),
         caller_chain,
     );
@@ -147,9 +176,13 @@ fn run_command(
     let config = supervisor_config(paths.clone(), meta.clone(), argv, ready_sentinel.clone());
     supervisor::fork_supervisor(config).map_err(supervisor_bootstrap_error)?;
 
-    let output = run_output(paths, meta.caller_ppid, mode, ready_sentinel);
+    let output = run_output(paths, meta.caller_ppid, mode, delivery_mode, ready_sentinel);
     emit_run_output(&output)?;
     Ok(())
+}
+
+fn persist_delivery_mode(paths: &StatePaths, delivery_mode: DeliveryMode) -> Result<(), AppError> {
+    state::write_delivery_mode_atomic(paths, delivery_mode).map_err(initial_meta_create_error)
 }
 
 fn validate_ready_sentinel(pattern: Option<&str>) -> Result<(), AppError> {
@@ -256,27 +289,6 @@ fn run_mode(ready_sentinel: &Option<String>) -> &'static str {
     }
 }
 
-fn initial_meta(
-    guard: &AttachedGuard,
-    handle: String,
-    argv: Vec<String>,
-    cwd: PathBuf,
-    mode: &str,
-    ready_sentinel: Option<String>,
-    caller_chain: Vec<state::CallerChainEntry>,
-) -> Meta {
-    Meta::new(
-        handle,
-        guard.startup_ppid(),
-        unsafe { libc::getpid() },
-        argv,
-        cwd,
-        mode,
-        ready_sentinel,
-        caller_chain,
-    )
-}
-
 fn persist_initial_meta(paths: &StatePaths, meta: &Meta) -> Result<(), AppError> {
     state::write_meta_atomic(paths, meta).map_err(initial_meta_create_error)
 }
@@ -306,9 +318,32 @@ fn run_output(
     paths: StatePaths,
     caller_ppid: libc::pid_t,
     mode: &str,
+    delivery_mode: DeliveryMode,
     ready_sentinel: Option<String>,
 ) -> RunOutput {
-    RunOutput::new(paths, caller_ppid, mode, ready_sentinel)
+    RunOutput::new(paths, caller_ppid, mode, delivery_mode, ready_sentinel)
+}
+
+fn detach_command(handle: String) -> Result<(), AppError> {
+    let paths = paths_for_existing_handle(&handle)?;
+    let outcome = delivery::detach(&paths).map_err(|err| delivery_mode_error(&handle, err))?;
+    serde_json::to_writer(io::stdout(), &outcome).map_err(json_write_error)?;
+    io::stdout().write_all(b"\n").map_err(json_write_error)
+}
+
+fn mode_command(handle: String) -> Result<(), AppError> {
+    let paths = paths_for_existing_handle(&handle)?;
+    let mode =
+        state::read_delivery_mode(&paths).map_err(|err| delivery_mode_error(&handle, err))?;
+    println!("{}", mode.as_str());
+    Ok(())
+}
+
+fn delivery_mode_error(handle: &str, err: io::Error) -> AppError {
+    AppError::new(
+        EX_IOERR,
+        format!("agent-bash: failed to update delivery mode for {handle}: {err}"),
+    )
 }
 
 fn emit_run_output(output: &RunOutput) -> Result<(), AppError> {
@@ -664,11 +699,12 @@ fn emit_text_list_summaries(summaries: &[ListSummary]) {
 
 fn format_list_summary(summary: &ListSummary) -> String {
     format!(
-        "{} {} rc={} mode={} created_at={} state_dir={}",
+        "{} {} rc={} mode={} delivery={} created_at={} state_dir={}",
         summary.handle,
         summary.state,
         format_optional_rc(summary.rc),
         summary.mode,
+        summary.delivery_mode.as_str(),
         summary.created_at_unix_ms,
         summary.state_dir.display()
     )

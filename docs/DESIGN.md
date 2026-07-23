@@ -37,11 +37,20 @@ agent-runner.
 
 ## Spooler behavior (WU-C)
 
-### Always background — foreground is not offered
-There is no foreground mode. Every `run` detaches the workload and returns a handle
-immediately. Even if an agent's harness *thinks* it is running us in the foreground, we return
-right away (the harness sees a fast, clean exit), and the workload keeps going under our
-supervisor. We never give agents the option to block on a workload.
+### Detached execution and explicit delivery
+There is no foreground execution mode. Every `run` detaches the workload, returns a handle
+immediately, and leaves the workload under the surviving supervisor. Execution lifetime and result
+delivery are separate choices:
+
+- `run --delivery sync` records completion for in-band consumption and does not invoke the
+  agent-runner notification seam.
+- `run --delivery async` invokes the notification seam at completion.
+- The CLI defaults to `async` so handles created by older callers retain their behavior.
+- The OpenCode adapter defaults ordinary shell commands to `sync`, defaults child-agent dispatches
+  to `async`, and accepts an explicit override.
+
+A synchronous adapter call can block for its result without owning the workload process. Harness
+timeout or caller death therefore does not terminate the detached workload.
 
 ### Attached-required — detached invocation bombs out
 At startup the tool captures `getppid()`. The tool itself must be a real, attached subprocess
@@ -93,17 +102,24 @@ At launch, while the caller is still alive and `/proc` is readable, the spooler 
 `--meta <path>`; agent-runner resolves the owning session from the recorded chain by pure DB
 lookup. The spooler does not resolve sessions.
 
-### Consumed marker duplicate suppression
-A file named `consumed` inside a handle state directory means the caller already received the
-terminal result in-call. Immediately before invoking `agents notify agent-bash-complete ...`, the
-supervisor checks `<state>/<handle>/consumed`; when present, it skips the notify and records
-`delivery: {"attempted": false, "skipped": "consumed_in_call"}` in `meta.json`.
+### Durable delivery mode and atomic detach
+Each handle stores its canonical delivery mode in `delivery-mode`; `meta.json.delivery_mode` mirrors
+that value for observability. Missing mode files are interpreted as `async` for handles created by
+older versions.
 
-The marker-write vs notify check is intentionally racy. If the opencode tool writes the marker
-after the supervisor has already delivered, the worst case is a duplicate envelope for a result the
-caller already saw. This preserves at-least-once delivery: the marker only suppresses notification
-when it exists before the delivery seam runs, and if the in-call wait times out no marker exists so
-normal completion notification still fires.
+`detach <handle>` converts `sync` to `async`. Detach and terminal completion both hold
+`delivery.lock` while deciding whether to invoke the external notification seam. Terminal state is
+persisted before that decision so detach can safely observe a completion that won the race.
+
+- If detach wins while the workload is running, it persists `async`; completion later notifies.
+- If sync completion wins, it records `delivery.skipped="sync_in_band"`; a later detach transitions
+  the terminal handle and notifies.
+- If detach observes terminal state before completion's delivery step, detach notifies and records
+  the attempt; completion reloads that record and does not notify again.
+- Repeated detach calls observe `async` and are no-ops.
+
+The old best-effort `consumed` marker is not consulted for delivery decisions. Existing marker files
+remain relevant only to state-retention cleanup for persisted legacy handles.
 
 ## agent-runner additions
 
@@ -140,7 +156,7 @@ getting reliable detached background + out-of-band wake — which removes the br
 contamination that currently blocks trustworthy S9a/S9b gate runs.
 
 ## Non-goals (v1)
-- No foreground mode (ever).
+- No foreground execution mode; synchronous delivery still uses a detached workload.
 - No PTY turn-boundary detection (PTY = forward-whenever).
 - No agent-runner crate dependency in the spooler (CLI coupling only).
 - Linux-first (subreaper + pidfd; optional cgroup v2 live-set support). Other platforms degrade
