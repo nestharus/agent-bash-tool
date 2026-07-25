@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::ffi::CString;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::fd::RawFd;
+use std::time::{Duration, Instant};
 
 use regex::bytes::Regex;
 
@@ -11,6 +13,9 @@ use crate::state::{self, Meta, StatePaths};
 
 const EX_SOFTWARE: i32 = 70;
 const ONE_MIB: usize = 1024 * 1024;
+const CANCEL_GRACE: Duration = Duration::from_secs(2);
+const CANCEL_POLL: Duration = Duration::from_millis(100);
+const OWNER_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub(crate) struct SupervisorConfig {
@@ -37,6 +42,50 @@ pub(crate) fn fork_supervisor(config: SupervisorConfig) -> io::Result<()> {
         -1 => Err(io::Error::last_os_error()),
         0 => unsafe { daemonization_child(config) },
         _ => Ok(()),
+    }
+}
+
+pub(crate) fn request_cancel(paths: &StatePaths) -> io::Result<bool> {
+    let meta = wait_for_supervisor_metadata(paths)?;
+    let supervisor = meta
+        .supervisor_pid
+        .zip(meta.supervisor_pid_starttime_ticks)
+        .zip(meta.process_boot_id.as_deref());
+    let Some(((pid, starttime_ticks), boot_id)) = supervisor else {
+        reconcile_lost_supervisor(paths)?;
+        return Ok(false);
+    };
+    let identity = state::CallerChainEntry {
+        pid,
+        starttime_ticks,
+        boot_id: boot_id.to_string(),
+    };
+    if !state::process_identity_is_live(&identity) {
+        reconcile_lost_supervisor(paths)?;
+        return Ok(false);
+    }
+    let rc = unsafe { libc::kill(pid, libc::SIGUSR1) };
+    if rc == 0 {
+        Ok(true)
+    } else {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            reconcile_lost_supervisor(paths)?;
+            Ok(false)
+        } else {
+            Err(err)
+        }
+    }
+}
+
+fn wait_for_supervisor_metadata(paths: &StatePaths) -> io::Result<Meta> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let meta = state::read_meta(paths)?;
+        if meta.supervisor_pid.is_some() || state::terminal(&meta) || Instant::now() >= deadline {
+            return Ok(meta);
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -135,6 +184,7 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
     };
 
     let root_pidfd = pidfd_open(spawn.pid);
+    let owner_pidfd = owner_pidfd(&meta);
     apply_spawn_metadata(&mut meta, &spawn, root_pidfd);
     persist_supervisor_meta_best_effort(&config.paths, &meta);
 
@@ -159,6 +209,7 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
         cgroup: cgroup_setup.active,
         spawn,
         root_pidfd,
+        owner_pidfd,
         sentinel,
     });
     event_loop_exit_code(event_loop(loop_state))
@@ -245,6 +296,7 @@ struct EventLoopSeed {
     cgroup: Option<ActiveCgroup>,
     spawn: WorkloadSpawn,
     root_pidfd: Option<RawFd>,
+    owner_pidfd: Option<RawFd>,
     sentinel: Option<SentinelMatcher>,
 }
 
@@ -257,6 +309,7 @@ fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
         cgroup: seed.cgroup,
         root_pid: seed.spawn.pid,
         root_pidfd: seed.root_pidfd,
+        owner_pidfd: seed.owner_pidfd,
         stdout_fd: Some(seed.spawn.stdout_fd),
         stderr_fd: Some(seed.spawn.stderr_fd),
         exec_err_fd: Some(seed.spawn.exec_err_fd),
@@ -265,6 +318,21 @@ fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
         completion_recorded: false,
         sentinel: seed.sentinel,
         spawn_error: None,
+        cancellation: None,
+    }
+}
+
+fn owner_pidfd(meta: &Meta) -> Option<RawFd> {
+    let owner = meta.cancel_owner.as_ref()?;
+    if !state::process_identity_is_live(owner) {
+        return None;
+    }
+    let fd = pidfd_open(owner.pid)?;
+    if state::process_identity_is_live(owner) {
+        Some(fd)
+    } else {
+        close_fd(fd);
+        None
     }
 }
 
@@ -370,7 +438,7 @@ unsafe fn workload_child(
     exec_err_pipe: &mut Pipe,
     cgroup_procs_fd: Option<RawFd>,
 ) -> ! {
-    unblock_sigchld();
+    unblock_supervisor_signals();
     set_workload_process_group();
     enroll_workload_in_cgroup(cgroup_procs_fd, exec_err_pipe.write);
     redirect_workload_output(stdout_pipe, stderr_pipe, exec_err_pipe);
@@ -398,6 +466,54 @@ fn enroll_workload_in_cgroup(cgroup_procs_fd: Option<RawFd>, exec_error_fd: RawF
 
 fn current_pid() -> libc::pid_t {
     unsafe { libc::getpid() }
+}
+
+fn signal_descendants(root_pid: libc::pid_t, signal: i32) {
+    for pid in descendant_pids(root_pid) {
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+}
+
+fn descendant_pids(root_pid: libc::pid_t) -> Vec<libc::pid_t> {
+    let parents = proc_parent_map();
+    let mut descendants: Vec<_> = parents
+        .keys()
+        .filter_map(|pid| descendant_depth(*pid, root_pid, &parents).map(|depth| (*pid, depth)))
+        .collect();
+    descendants.sort_unstable_by_key(|(_, depth)| std::cmp::Reverse(*depth));
+    descendants.into_iter().map(|(pid, _)| pid).collect()
+}
+
+fn proc_parent_map() -> HashMap<libc::pid_t, libc::pid_t> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return HashMap::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<libc::pid_t>().ok())
+        .filter_map(|pid| state::process_parent_pid(pid).map(|ppid| (pid, ppid)))
+        .collect()
+}
+
+fn descendant_depth(
+    pid: libc::pid_t,
+    root_pid: libc::pid_t,
+    parents: &HashMap<libc::pid_t, libc::pid_t>,
+) -> Option<usize> {
+    let mut current = pid;
+    for depth in 1..=parents.len() {
+        let parent = *parents.get(&current)?;
+        if parent == root_pid {
+            return Some(depth);
+        }
+        if parent <= 1 || parent == current {
+            return None;
+        }
+        current = parent;
+    }
+    None
 }
 
 fn redirect_workload_output(
@@ -444,11 +560,12 @@ fn exec_workload(pointers: &[*const libc::c_char]) {
     }
 }
 
-fn unblock_sigchld() {
+fn unblock_supervisor_signals() {
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGCHLD);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
         libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
     }
 }
@@ -524,6 +641,7 @@ impl Sigchld {
             let mut mask: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut mask);
             libc::sigaddset(&mut mask, libc::SIGCHLD);
+            libc::sigaddset(&mut mask, libc::SIGUSR1);
             if libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -536,7 +654,8 @@ impl Sigchld {
         }
     }
 
-    fn drain(&self) {
+    fn drain(&self) -> SignalEvents {
+        let mut events = SignalEvents::default();
         let mut info = unsafe { std::mem::zeroed::<libc::signalfd_siginfo>() };
         loop {
             let n = unsafe {
@@ -547,6 +666,9 @@ impl Sigchld {
                 )
             };
             if n > 0 {
+                if info.ssi_signo == libc::SIGUSR1 as u32 {
+                    events.cancel_requested = true;
+                }
                 continue;
             }
             if n == 0 {
@@ -561,7 +683,13 @@ impl Sigchld {
             }
             break;
         }
+        events
     }
+}
+
+#[derive(Default)]
+struct SignalEvents {
+    cancel_requested: bool,
 }
 
 impl Drop for Sigchld {
@@ -630,6 +758,7 @@ struct EventLoop {
     cgroup: Option<ActiveCgroup>,
     root_pid: libc::pid_t,
     root_pidfd: Option<RawFd>,
+    owner_pidfd: Option<RawFd>,
     stdout_fd: Option<RawFd>,
     stderr_fd: Option<RawFd>,
     exec_err_fd: Option<RawFd>,
@@ -638,6 +767,12 @@ struct EventLoop {
     completion_recorded: bool,
     sentinel: Option<SentinelMatcher>,
     spawn_error: Option<String>,
+    cancellation: Option<Cancellation>,
+}
+
+struct Cancellation {
+    reason: &'static str,
+    started_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -647,6 +782,7 @@ enum PollKey {
     ExecErr,
     Sigchld,
     Pidfd,
+    OwnerPidfd,
     Cgroup,
 }
 
@@ -658,6 +794,8 @@ struct PollEntry {
 
 fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
     loop {
+        loop_state.check_polled_owner();
+        loop_state.drive_cancellation();
         loop_state.maybe_finish()?;
         if loop_state.should_exit() {
             return Ok(());
@@ -665,7 +803,7 @@ fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
 
         let entries = poll_entries(&loop_state);
         let mut pollfds = pollfds_for_entries(&entries);
-        poll_until_ready(&mut pollfds)?;
+        poll_until_ready(&mut pollfds, loop_state.poll_timeout())?;
         dispatch_ready_pollfds(&mut loop_state, &entries, &pollfds)?;
     }
 }
@@ -681,6 +819,7 @@ fn poll_entries(loop_state: &EventLoop) -> Vec<PollEntry> {
         PollKey::Sigchld,
     ));
     push_optional_poll_entry(&mut entries, loop_state.root_pidfd, PollKey::Pidfd);
+    push_optional_poll_entry(&mut entries, loop_state.owner_pidfd, PollKey::OwnerPidfd);
     push_optional_poll_entry(&mut entries, cgroup_inotify_fd(loop_state), PollKey::Cgroup);
     entries
 }
@@ -718,9 +857,18 @@ fn pollfds_for_entries(entries: &[PollEntry]) -> Vec<libc::pollfd> {
         .collect()
 }
 
-fn poll_until_ready(pollfds: &mut [libc::pollfd]) -> io::Result<()> {
+fn poll_until_ready(pollfds: &mut [libc::pollfd], timeout: Option<Duration>) -> io::Result<()> {
+    let timeout_ms = timeout
+        .map(|duration| i32::try_from(duration.as_millis()).unwrap_or(i32::MAX))
+        .unwrap_or(-1);
     loop {
-        let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, -1) };
+        let rc = unsafe {
+            libc::poll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
         if rc >= 0 {
             return Ok(());
         }
@@ -756,6 +904,11 @@ impl EventLoop {
             }
             PollKey::Sigchld => self.handle_sigchld(),
             PollKey::Pidfd => self.reap_children(),
+            PollKey::OwnerPidfd => {
+                self.close_owner_pidfd();
+                self.request_cancellation("owner-exit");
+                Ok(())
+            }
             PollKey::Cgroup => {
                 self.handle_cgroup_event();
                 Ok(())
@@ -764,8 +917,61 @@ impl EventLoop {
     }
 
     fn handle_sigchld(&mut self) -> io::Result<()> {
-        self.sigchld.drain();
+        let signals = self.sigchld.drain();
+        if signals.cancel_requested {
+            self.request_cancellation("cancel-request");
+        }
         self.reap_children()
+    }
+
+    fn poll_timeout(&self) -> Option<Duration> {
+        if self.cancellation.is_some() {
+            Some(CANCEL_POLL)
+        } else if self.meta.cancel_owner.is_some() && self.owner_pidfd.is_none() {
+            Some(OWNER_POLL)
+        } else {
+            None
+        }
+    }
+
+    fn check_polled_owner(&mut self) {
+        if self.owner_pidfd.is_some() || self.cancellation.is_some() {
+            return;
+        }
+        let Some(owner) = self.meta.cancel_owner.as_ref() else {
+            return;
+        };
+        if !state::process_identity_is_live(owner) {
+            self.request_cancellation("owner-exit");
+        }
+    }
+
+    fn close_owner_pidfd(&mut self) {
+        if let Some(fd) = self.owner_pidfd.take() {
+            close_fd(fd);
+        }
+    }
+
+    fn request_cancellation(&mut self, reason: &'static str) {
+        if self.cancellation.is_none() {
+            self.cancellation = Some(Cancellation {
+                reason,
+                started_at: Instant::now(),
+            });
+        }
+        self.drive_cancellation();
+    }
+
+    fn drive_cancellation(&mut self) {
+        let Some(cancellation) = self.cancellation.as_mut() else {
+            return;
+        };
+        let signal = if cancellation.started_at.elapsed() >= CANCEL_GRACE {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        };
+        signal_descendants(current_pid(), signal);
     }
 
     fn handle_cgroup_event(&self) {
@@ -1087,7 +1293,9 @@ fn exit_completion_ready(loop_state: &EventLoop) -> bool {
 }
 
 fn exit_completion_reason(loop_state: &EventLoop) -> &'static str {
-    if loop_state.sentinel.is_some() {
+    if let Some(cancellation) = &loop_state.cancellation {
+        cancellation.reason
+    } else if loop_state.sentinel.is_some() {
         "exit-before-ready"
     } else {
         "exit"
@@ -1177,6 +1385,14 @@ fn persist_meta_with_delivery(paths: &StatePaths, meta: &mut Meta) -> io::Result
 }
 
 pub(crate) fn reconcile_lost_supervisor(paths: &StatePaths) -> io::Result<Meta> {
+    reconcile_lost_supervisor_with_delivery(paths, true)
+}
+
+pub(crate) fn reconcile_lost_supervisor_without_delivery(paths: &StatePaths) -> io::Result<Meta> {
+    reconcile_lost_supervisor_with_delivery(paths, false)
+}
+
+fn reconcile_lost_supervisor_with_delivery(paths: &StatePaths, deliver: bool) -> io::Result<Meta> {
     let _lock = state::lock_reconciliation(paths)?;
     let mut meta = state::read_meta(paths)?;
     if !state::exact_supervisor_and_workload_are_gone(&meta) {
@@ -1185,7 +1401,11 @@ pub(crate) fn reconcile_lost_supervisor(paths: &StatePaths) -> io::Result<Meta> 
 
     state::write_rc_atomic(paths, EX_SOFTWARE)?;
     apply_lost_supervisor_metadata(&mut meta);
-    persist_meta_with_delivery(paths, &mut meta)?;
+    if deliver {
+        persist_meta_with_delivery(paths, &mut meta)?;
+    } else {
+        state::write_meta_atomic(paths, &meta)?;
+    }
     Ok(meta)
 }
 
@@ -1213,6 +1433,7 @@ impl Drop for EventLoop {
         if let Some(fd) = self.root_pidfd.take() {
             close_fd(fd);
         }
+        self.close_owner_pidfd();
     }
 }
 

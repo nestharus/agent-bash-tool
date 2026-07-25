@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Output, Stdio};
@@ -157,6 +158,13 @@ fn wait_for_status_prefix(temp: &tempfile::TempDir, handle: &str, prefix: &str) 
         } else {
             None
         }
+    })
+}
+
+fn wait_for_terminal_status(temp: &tempfile::TempDir, handle: &str) -> String {
+    wait_until(Duration::from_secs(6), || {
+        let text = status_text(temp, handle, true);
+        (!text.starts_with("RUNNING ")).then_some(text)
     })
 }
 
@@ -356,22 +364,27 @@ const mode = process.argv[2]
 const adapterPath = process.argv[3]
 const handle = process.argv[4]
 const mod = await import(adapterPath)
+const controller = new AbortController()
 const args = mode === "poll"
   ? { handle }
   : mode === "async"
     ? { command: "sleep 1; printf 'adapter async\\n'", delivery: "async" }
-    : mode === "detachable"
-      ? { command: "sleep 2; printf 'adapter detached\\n'" }
-      : mode === "wrapper"
-        ? { command: `${process.env.AGENT_BASH_BIN} run -- agents --version` }
+    : mode === "abort"
+      ? { command: "sleep 60; printf 'adapter abort failed\\n'" }
+      : mode === "detachable"
+        ? { command: "sleep 2; printf 'adapter detached\\n'" }
+        : mode === "wrapper"
+          ? { command: `${process.env.AGENT_BASH_BIN} run -- agents --version` }
     : mode === "agent"
       ? { command: "agents --version" }
       : { command: "printf 'adapter inline\\n'" }
-const result = await mod.default.execute(args)
+if (mode === "abort") setTimeout(() => controller.abort(), 100)
+const result = await mod.default.execute(args, { abort: controller.signal })
 const text = typeof result === "string" ? result : String(result)
 const matched = text.match(/handle=([^\s)]+)/)
 
 console.log(JSON.stringify({ result: text, handle: matched?.[1] ?? null }))
+if (mode === "detachable") await Bun.sleep(3000)
 "#
 }
 
@@ -642,6 +655,12 @@ fn assert_process_alive(pid: libc::pid_t) {
     assert_eq!(rc, 0, "expected live process pid {pid}");
 }
 
+fn wait_for_process_gone(pid: libc::pid_t) {
+    wait_until(Duration::from_secs(6), || {
+        proc_identity(pid).is_none().then_some(())
+    });
+}
+
 fn kill_process_group(meta: &Value) {
     if let Some(pgid) = meta["workload_pgid"].as_i64() {
         unsafe {
@@ -709,6 +728,109 @@ fn run_returns_immediately_and_later_completes() {
     assert!(immediate.starts_with("RUNNING handle="), "{immediate}");
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.contains("late\n"), "{final_status}");
+}
+
+#[test]
+fn cancel_terminates_the_entire_adopted_process_tree() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let child_pid_path = temp.path().join("child.pid");
+    let script = format!("sleep 60 & echo $! > {}; wait", child_pid_path.display());
+    let (output, _) = run_cmd(&temp, &["run", "--", "bash", "-lc", &script]);
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+    let workload_pid = wait_until(Duration::from_secs(2), || {
+        read_meta(&meta_path)["workload_pid"]
+            .as_i64()
+            .map(|pid| pid as libc::pid_t)
+    });
+    let child_pid = wait_until(Duration::from_secs(2), || {
+        fs::read_to_string(&child_pid_path)
+            .ok()?
+            .trim()
+            .parse::<libc::pid_t>()
+            .ok()
+    });
+    assert_process_alive(workload_pid);
+    assert_process_alive(child_pid);
+
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel command");
+    assert_command_success(&cancel);
+    assert_eq!(parse_stdout_json(&cancel)["requested"], true);
+    let status = wait_for_terminal_status(&temp, handle);
+    assert!(
+        status.starts_with(&format!(
+            "DONE rc=143 handle={handle} reason=cancel-request"
+        )),
+        "{status}"
+    );
+    wait_for_process_gone(workload_pid);
+    wait_for_process_gone(child_pid);
+}
+
+#[test]
+fn cancel_immediately_after_run_is_not_lost_during_supervisor_startup() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (output, _) = run_cmd(&temp, &["run", "--", "sleep", "60"]);
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel command");
+    assert_command_success(&cancel);
+    assert_eq!(parse_stdout_json(&cancel)["requested"], true);
+    let status = wait_for_terminal_status(&temp, handle);
+    assert!(status.contains("reason=cancel-request"), "{status}");
+}
+
+#[test]
+fn owner_exit_cancels_opted_in_workload_and_descendants() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let child_pid_path = temp.path().join("owner-child.pid");
+    let workload_script = format!("sleep 60 & echo $! > {}; wait", child_pid_path.display());
+    let binary = assert_cmd::cargo::cargo_bin("agent-bash");
+    let launcher_script = format!(
+        "\"{}\" run --cancel-on-owner-exit --owner-pid \"$BASHPID\" -- bash -lc \"$WORKLOAD_SCRIPT\"; rc=$?; for _ in {{1..250}}; do [ -s \"$CHILD_PID_PATH\" ] && break; sleep 0.02; done; exit $rc",
+        binary.display()
+    );
+    let output = StdCommand::new("bash")
+        .args(["-c", &launcher_script])
+        .env("XDG_STATE_HOME", temp.path())
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env("WORKLOAD_SCRIPT", workload_script)
+        .env("CHILD_PID_PATH", &child_pid_path)
+        .env_remove("OULIPOLY_DATA_DIR")
+        .output()
+        .expect("owner launcher");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+    let meta = wait_until(Duration::from_secs(2), || {
+        let meta = read_meta(&meta_path);
+        meta["workload_pid"].is_number().then_some(meta)
+    });
+    assert_eq!(meta["cancel_owner"]["pid"], meta["caller_ppid"]);
+    let workload_pid = meta["workload_pid"].as_i64().expect("workload pid") as libc::pid_t;
+    let child_pid = wait_until(Duration::from_secs(2), || {
+        fs::read_to_string(&child_pid_path)
+            .ok()?
+            .trim()
+            .parse::<libc::pid_t>()
+            .ok()
+    });
+
+    let status = wait_for_terminal_status(&temp, handle);
+    assert!(
+        status.starts_with(&format!("DONE rc=143 handle={handle} reason=owner-exit")),
+        "{status}"
+    );
+    wait_for_process_gone(workload_pid);
+    wait_for_process_gone(child_pid);
 }
 
 #[test]
@@ -932,6 +1054,7 @@ fn opencode_adapter_ordinary_command_completes_in_band_in_sync_mode() {
             .join("meta.json"),
     );
     assert_eq!(meta["delivery_mode"], "sync");
+    assert!(meta["cancel_owner"]["pid"].is_number());
     assert_eq!(meta["delivery"]["attempted"], false);
     assert_eq!(meta["delivery"]["skipped"], "sync_in_band");
 }
@@ -947,7 +1070,24 @@ fn opencode_adapter_explicit_async_returns_handle_immediately() {
 
     assert!(start.elapsed() < Duration::from_secs(1));
     assert_adapter_result_contains(&result, "Running asynchronously");
-    assert_eq!(mode_text(&temp, adapter_result_handle(&result)), "async");
+    let handle = adapter_result_handle(&result);
+    assert_eq!(mode_text(&temp, handle), "async");
+    let status = wait_for_terminal_status(&temp, handle);
+    assert!(status.contains("reason=owner-exit"), "{status}");
+}
+
+#[test]
+fn opencode_adapter_abort_signal_cancels_sync_workload() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let result = run_adapter_driver(&temp, &driver, "abort", None);
+
+    assert_adapter_result_contains(&result, "Cancellation requested");
+    let handle = adapter_result_handle(&result);
+    let status = wait_for_terminal_status(&temp, handle);
+    assert!(status.contains("reason=cancel-request"), "{status}");
 }
 
 #[test]
@@ -979,7 +1119,7 @@ fn opencode_adapter_sync_wait_returns_when_handle_is_detached() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
-    let adapter = adapter_driver_command(&temp, &driver, "detachable", None)
+    let mut adapter = adapter_driver_command(&temp, &driver, "detachable", None)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -994,10 +1134,14 @@ fn opencode_adapter_sync_wait_returns_when_handle_is_detached() {
     assert_command_success(&detach);
     assert_eq!(parse_stdout_json(&detach)["transitioned"], true);
     let detached_at = Instant::now();
-    let result = adapter.wait_with_output().expect("adapter result");
+    let stdout = adapter.stdout.take().expect("adapter stdout");
+    let line = BufReader::new(stdout)
+        .lines()
+        .next()
+        .expect("adapter result line")
+        .expect("adapter result");
     assert!(detached_at.elapsed() < Duration::from_secs(1));
-    assert_command_success(&result);
-    let result = parse_stdout_json(&result);
+    let result: Value = serde_json::from_str(&line).expect("adapter result json");
 
     assert_adapter_result_contains(&result, "Running asynchronously");
     assert_eq!(adapter_result_handle(&result), handle);
@@ -1007,6 +1151,7 @@ fn opencode_adapter_sync_wait_returns_when_handle_is_detached() {
         final_status.contains("adapter detached\n"),
         "{final_status}"
     );
+    assert!(adapter.wait().expect("adapter exit").success());
 }
 
 #[test]
@@ -1472,4 +1617,38 @@ fn status_reconciles_conclusively_lost_supervisor_once_and_fails_closed() {
     );
     assert_eq!(consumed_meta["delivery"]["attempted"], true);
     assert_eq!(consumed_meta["delivery"]["exit_code"], 0);
+}
+
+#[test]
+fn list_all_reconciles_lost_supervisors_without_async_delivery() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dead_supervisor = exact_identity(&terminated_process_identity());
+    let dead_workload = exact_identity(&terminated_process_identity());
+    let handle = "ab_list_lost_supervisor";
+    seed_running_state_dir(
+        &temp,
+        handle,
+        "exit",
+        Some(dead_supervisor),
+        Some(dead_workload),
+        false,
+    );
+
+    let output = agent_bash(&temp)
+        .args(["list", "--all", "--json"])
+        .output()
+        .expect("list all");
+    assert_command_success(&output);
+    let summaries = parse_stdout_json(&output);
+    assert_eq!(summaries[0]["handle"], handle);
+    assert_eq!(summaries[0]["state"], "ERROR");
+    let meta = read_meta(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(handle)
+            .join("meta.json"),
+    );
+    assert_eq!(meta["completion_reason"], "supervisor-lost");
+    assert_eq!(meta["delivery"]["attempted"], false);
 }

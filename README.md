@@ -20,6 +20,10 @@ completion returns synchronously in-band or asynchronously through the agent mai
 - **Process-tree capture via subreaper.** Every orphaned descendant — even ones that
   `setsid`/detach — reparents to the supervisor and is reaped event-driven. Delegated cgroup v2
   is used only when available as an optional live-set enhancement.
+- **Owner-scoped cancellation.** Integrations can opt into an exact PID/start-time/boot-ID lease
+  with `run --cancel-on-owner-exit --owner-pid <pid>`. `cancel <handle>`, an owner exit, or an
+  OpenCode tool abort terminates the complete adopted process tree, escalating to `SIGKILL` after
+  a bounded grace period. Direct CLI runs remain detached unless they explicitly request a lease.
 - **Completion: exit *or* sentinel.** Finite jobs wake on process exit (`pidfd`); never-exiting
   servers report ready on a stdout marker. Nothing is assumed to exit.
 - **Async delivery via agent-runner.** For asynchronous completion the spooler asks agent-runner

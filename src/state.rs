@@ -77,7 +77,7 @@ impl DeliveryMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CallerChainEntry {
     pub(crate) pid: libc::pid_t,
     pub(crate) starttime_ticks: u64,
@@ -124,6 +124,8 @@ pub(crate) struct Meta {
     pub(crate) completion_reason: Option<String>,
     pub(crate) caller_ppid: libc::pid_t,
     pub(crate) caller_chain: Vec<CallerChainEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cancel_owner: Option<CallerChainEntry>,
     pub(crate) launcher_pid: libc::pid_t,
     pub(crate) supervisor_pid: Option<libc::pid_t>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,6 +166,7 @@ impl Meta {
         delivery_mode: DeliveryMode,
         ready_sentinel: Option<String>,
         caller_chain: Vec<CallerChainEntry>,
+        cancel_owner: Option<CallerChainEntry>,
     ) -> Self {
         let now = unix_ms();
         Self {
@@ -175,6 +178,7 @@ impl Meta {
             completion_reason: None,
             caller_ppid,
             caller_chain,
+            cancel_owner,
             launcher_pid,
             supervisor_pid: None,
             supervisor_pid_starttime_ticks: None,
@@ -771,6 +775,23 @@ pub(crate) fn process_starttime_ticks(pid: libc::pid_t) -> Option<u64> {
     read_proc_stat(pid).map(|stat| stat.starttime_ticks)
 }
 
+pub(crate) fn process_parent_pid(pid: libc::pid_t) -> Option<libc::pid_t> {
+    read_proc_stat(pid).map(|stat| stat.ppid)
+}
+
+pub(crate) fn process_identity_is_live(identity: &CallerChainEntry) -> bool {
+    let current_boot_id = read_boot_id();
+    matches!(
+        inspect_process_identity(
+            Some(identity.pid),
+            Some(identity.starttime_ticks),
+            Some(identity.boot_id.as_str()),
+            &current_boot_id,
+        ),
+        ProcessIdentityEvidence::Live
+    )
+}
+
 pub(crate) fn running_exit_mode(meta: &Meta) -> bool {
     meta.state == "RUNNING" && meta.mode == "exit"
 }
@@ -932,6 +953,7 @@ mod tests {
             DeliveryMode::Async,
             None,
             Vec::new(),
+            None,
         );
         meta.state = state_name.to_string();
         meta.updated_at_unix_ms = updated_at_unix_ms;
@@ -1015,6 +1037,7 @@ mod tests {
                 starttime_ticks: 99,
                 boot_id: "boot".to_string(),
             }],
+            None,
         );
         write_meta_atomic(&paths, &meta).expect("write meta");
         let read = read_meta(&paths).expect("read meta");

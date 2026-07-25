@@ -1,8 +1,8 @@
 import { tool } from "@opencode-ai/plugin"
 
 /**
- * opencode `bash` tool override. All workloads survive opencode's shell timeout under agent-bash;
- * delivery mode controls whether completion returns in this call or through the agent mailbox.
+ * opencode `bash` tool override. Workloads survive shell timeouts under agent-bash, but remain
+ * leased to this opencode process so aborting the tool or closing the session cancels the tree.
  */
 
 const AGENT_BASH = process.env.AGENT_BASH_BIN || `${process.env.HOME}/.local/bin/agent-bash`
@@ -103,7 +103,10 @@ function commandWithDelivery(command: string, delivery: DeliveryMode): string {
   if (!prefix) return command
   const suffix = trimmed.slice(prefix.length)
   const normalizedSuffix = suffix.replace(/^\s+--delivery\s+(?:sync|async)\b/, "")
-  return `${leadingWhitespace}${prefix} --delivery ${delivery}${normalizedSuffix}`
+  return (
+    `${leadingWhitespace}${prefix} --cancel-on-owner-exit --owner-pid ${process.pid} ` +
+    `--delivery ${delivery}${normalizedSuffix}`
+  )
 }
 
 async function dispatchCommand(command: string, delivery: DeliveryMode): Promise<string> {
@@ -112,16 +115,29 @@ async function dispatchCommand(command: string, delivery: DeliveryMode): Promise
     return (await Bun.$`bash -lc ${explicitRun}`.env(runEnv()).nothrow().text()).trim()
   }
   return (
-    await Bun.$`${AGENT_BASH} run --delivery ${delivery} -- bash -lc ${command}`.env(runEnv()).nothrow().text()
+    await Bun.$`${AGENT_BASH} run --cancel-on-owner-exit --owner-pid ${process.pid} --delivery ${delivery} -- bash -lc ${command}`
+      .env(runEnv())
+      .nothrow()
+      .text()
   ).trim()
 }
 
-async function waitForSyncResult(handle: string): Promise<string> {
+async function cancelResult(handle: string): Promise<string> {
+  const result = (await Bun.$`${AGENT_BASH} cancel ${handle}`.env(runEnv()).nothrow().text()).trim()
+  return `Cancellation requested (handle=${handle}). ${result}`
+}
+
+async function waitForSyncResult(handle: string, abort: AbortSignal): Promise<string> {
+  const aborted = new Promise<void>((resolve) => {
+    if (abort.aborted) resolve()
+    else abort.addEventListener("abort", () => resolve(), { once: true })
+  })
   while (true) {
+    if (abort.aborted) return cancelResult(handle)
     const status = await statusText(handle, true)
     if (isTerminalStatus(status)) return statusText(handle)
     if ((await modeText(handle)) === "async") return asyncDispatchResponse(handle)
-    await Bun.sleep(POLL_MS)
+    await Promise.race([Bun.sleep(POLL_MS), aborted])
   }
 }
 
@@ -142,18 +158,20 @@ export default tool({
     handle: tool.schema.string().describe("poll an existing asynchronous command by its handle").optional(),
     delivery: tool.schema.string().describe('completion delivery: "sync" or "async"').optional(),
   },
-  async execute(args) {
+  async execute(args, context) {
     if (args.handle) return statusText(args.handle)
     if (!commandProvided(args.command)) return missingCommandResponse()
     if (args.delivery !== undefined && !validDeliveryMode(args.delivery)) {
       return invalidDeliveryResponse(args.delivery)
     }
 
+    if (context.abort.aborted) return "Cancellation requested before dispatch."
     const delivery = selectedDelivery(args.command, args.delivery)
     const runOut = await dispatchCommand(args.command, delivery)
     const dispatch = parseRunDispatch(runOut)
     if (!dispatch) return dispatchErrorResponse(runOut)
+    if (context.abort.aborted) return cancelResult(dispatch.handle)
     if (delivery === "async") return asyncDispatchResponse(dispatch.handle)
-    return waitForSyncResult(dispatch.handle)
+    return waitForSyncResult(dispatch.handle, context.abort)
   },
 })
