@@ -795,7 +795,7 @@ fn owner_exit_cancels_opted_in_workload_and_descendants() {
     let workload_script = format!("sleep 60 & echo $! > {}; wait", child_pid_path.display());
     let binary = assert_cmd::cargo::cargo_bin("agent-bash");
     let launcher_script = format!(
-        "\"{}\" run --cancel-on-owner-exit --owner-pid \"$BASHPID\" -- bash -lc \"$WORKLOAD_SCRIPT\"; rc=$?; sleep 0.1; exit $rc",
+        "\"{}\" run --cancel-on-owner-exit --owner-pid \"$BASHPID\" -- bash -lc \"$WORKLOAD_SCRIPT\"; rc=$?; for _ in {{1..250}}; do [ -s \"$CHILD_PID_PATH\" ] && break; sleep 0.02; done; exit $rc",
         binary.display()
     );
     let output = StdCommand::new("bash")
@@ -803,6 +803,7 @@ fn owner_exit_cancels_opted_in_workload_and_descendants() {
         .env("XDG_STATE_HOME", temp.path())
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
         .env("WORKLOAD_SCRIPT", workload_script)
+        .env("CHILD_PID_PATH", &child_pid_path)
         .env_remove("OULIPOLY_DATA_DIR")
         .output()
         .expect("owner launcher");
