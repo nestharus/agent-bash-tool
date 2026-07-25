@@ -482,7 +482,7 @@ fn descendant_pids(root_pid: libc::pid_t) -> Vec<libc::pid_t> {
         .keys()
         .filter_map(|pid| descendant_depth(*pid, root_pid, &parents).map(|depth| (*pid, depth)))
         .collect();
-    descendants.sort_unstable_by(|left, right| right.1.cmp(&left.1));
+    descendants.sort_unstable_by_key(|(_, depth)| std::cmp::Reverse(*depth));
     descendants.into_iter().map(|(pid, _)| pid).collect()
 }
 
