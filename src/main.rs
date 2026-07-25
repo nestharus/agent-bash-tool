@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::guard::AttachedGuard;
-use crate::state::{DeliveryMode, ListSummary, Meta, RunOutput, StatePaths};
+use crate::state::{CallerChainEntry, DeliveryMode, ListSummary, Meta, RunOutput, StatePaths};
 
 const EX_USAGE: i32 = 64;
 const EX_DATAERR: i32 = 65;
@@ -42,12 +42,20 @@ enum Command {
         /// marker (regex) instead of waiting for process-tree exit.
         #[arg(long)]
         ready_sentinel: Option<String>,
+        /// Cancel the supervised process tree when the exact owner PID exits.
+        #[arg(long, requires = "owner_pid")]
+        cancel_on_owner_exit: bool,
+        /// Ancestor PID whose identity owns this workload lease.
+        #[arg(long, requires = "cancel_on_owner_exit")]
+        owner_pid: Option<libc::pid_t>,
         /// The command and its arguments (after `--`).
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
     /// Convert a running synchronous call to asynchronous mailbox delivery.
     Detach { handle: String },
+    /// Cancel a supervised workload and all of its adopted descendants.
+    Cancel { handle: String },
     /// Print the current completion delivery mode for a handle.
     Mode { handle: String },
     /// Non-blocking status of a spooled job: RUNNING, or DONE rc=<n> + captured output.
@@ -118,9 +126,19 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
         Command::Run {
             delivery,
             ready_sentinel,
+            cancel_on_owner_exit,
+            owner_pid,
             argv,
-        } => run_command(guard, delivery.into(), ready_sentinel, argv),
+        } => run_command(
+            guard,
+            delivery.into(),
+            ready_sentinel,
+            cancel_on_owner_exit,
+            owner_pid,
+            argv,
+        ),
         Command::Detach { handle } => detach_command(handle),
+        Command::Cancel { handle } => cancel_command(handle),
         Command::Mode { handle } => mode_command(handle),
         Command::Status {
             tail_bytes,
@@ -144,6 +162,8 @@ fn run_command(
     guard: AttachedGuard,
     delivery_mode: DeliveryMode,
     ready_sentinel: Option<String>,
+    cancel_on_owner_exit: bool,
+    owner_pid: Option<libc::pid_t>,
     argv: Vec<String>,
 ) -> Result<(), AppError> {
     validate_ready_sentinel(ready_sentinel.as_deref())?;
@@ -157,6 +177,7 @@ fn run_command(
     persist_delivery_mode(&paths, delivery_mode)?;
 
     let caller_chain = state::capture_caller_chain(guard.startup_ppid());
+    let cancel_owner = resolve_cancel_owner(&caller_chain, cancel_on_owner_exit, owner_pid)?;
     let cwd = current_directory().map_err(current_directory_error)?;
     let mode = run_mode(&ready_sentinel);
     let meta = Meta::new(
@@ -169,6 +190,7 @@ fn run_command(
         delivery_mode,
         ready_sentinel.clone(),
         caller_chain,
+        cancel_owner,
     );
     persist_initial_meta(&paths, &meta)?;
 
@@ -179,6 +201,52 @@ fn run_command(
     let output = run_output(paths, meta.caller_ppid, mode, delivery_mode, ready_sentinel);
     emit_run_output(&output)?;
     Ok(())
+}
+
+fn resolve_cancel_owner(
+    caller_chain: &[CallerChainEntry],
+    enabled: bool,
+    owner_pid: Option<libc::pid_t>,
+) -> Result<Option<CallerChainEntry>, AppError> {
+    if !enabled {
+        return Ok(None);
+    }
+    let owner_pid = owner_pid.ok_or_else(|| {
+        AppError::new(
+            EX_USAGE,
+            "agent-bash: --cancel-on-owner-exit requires --owner-pid",
+        )
+    })?;
+    caller_chain
+        .iter()
+        .find(|entry| entry.pid == owner_pid)
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| {
+            AppError::new(
+                EX_USAGE,
+                format!("agent-bash: owner PID {owner_pid} is not in the caller ancestry"),
+            )
+        })
+}
+
+fn cancel_command(handle: String) -> Result<(), AppError> {
+    let paths = paths_for_existing_handle(&handle)?;
+    let requested =
+        supervisor::request_cancel(&paths).map_err(|err| cancel_request_error(&handle, err))?;
+    serde_json::to_writer(
+        io::stdout(),
+        &serde_json::json!({ "handle": handle, "requested": requested }),
+    )
+    .map_err(json_write_error)?;
+    io::stdout().write_all(b"\n").map_err(json_write_error)
+}
+
+fn cancel_request_error(handle: &str, err: io::Error) -> AppError {
+    AppError::new(
+        EX_IOERR,
+        format!("agent-bash: failed to cancel {handle}: {err}"),
+    )
 }
 
 fn persist_delivery_mode(paths: &StatePaths, delivery_mode: DeliveryMode) -> Result<(), AppError> {
@@ -460,6 +528,8 @@ enum DoneReason {
     Exit,
     ReadySentinel { workload_running: bool },
     ExitBeforeReady,
+    CancelRequest,
+    OwnerExit,
 }
 
 fn render_status_header(meta: &Meta, rc_from_file: Option<i32>) -> Result<String, AppError> {
@@ -518,6 +588,8 @@ fn done_reason(meta: &Meta) -> DoneReason {
             workload_running: meta.workload_rc.is_none(),
         },
         ("sentinel", Some("exit-before-ready")) => DoneReason::ExitBeforeReady,
+        (_, Some("cancel-request")) => DoneReason::CancelRequest,
+        (_, Some("owner-exit")) => DoneReason::OwnerExit,
         _ => DoneReason::Exit,
     }
 }
@@ -539,6 +611,10 @@ fn format_done_header(handle: &str, rc: i32, reason: &DoneReason) -> String {
         DoneReason::ExitBeforeReady => {
             format!("DONE rc={rc} handle={handle} reason=exit-before-ready")
         }
+        DoneReason::CancelRequest => {
+            format!("DONE rc={rc} handle={handle} reason=cancel-request")
+        }
+        DoneReason::OwnerExit => format!("DONE rc={rc} handle={handle} reason=owner-exit"),
         DoneReason::Exit => format!("DONE rc={rc} handle={handle}"),
     }
 }
@@ -642,11 +718,18 @@ fn list_summary_for_entry(
         return None;
     }
     let paths = paths_for_entry(root, &entry);
-    let meta = read_entry_meta(&paths)?;
+    let meta = reconcile_list_meta(&paths, read_entry_meta(&paths)?)?;
     if !include_list_meta(&meta, caller_ppid, all) {
         return None;
     }
     Some(list_summary_from_meta(&meta, paths.state_dir))
+}
+
+fn reconcile_list_meta(paths: &StatePaths, meta: Meta) -> Option<Meta> {
+    if !state::running_exit_mode(&meta) {
+        return Some(meta);
+    }
+    supervisor::reconcile_lost_supervisor_without_delivery(paths).ok()
 }
 
 fn entry_is_state_dir(entry: &std::fs::DirEntry) -> bool {
