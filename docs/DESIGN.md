@@ -80,6 +80,13 @@ without degradation because the subreaper remains authoritative. Process-group +
 stdout/stderr to a per-handle log, and records exit code. The `run` invocation itself returns
 the handle and exits — it does not `wait`.
 
+The intermediate daemon process remains as a guardian for the exact supervisor child. A clean
+supervisor exit ends the guardian. After an abnormal exit, including `SIGKILL`, the guardian uses
+the persisted PID/start-time/boot-ID identities and per-handle reconciliation lock to wait until
+supervisor loss is conclusive, record `supervisor-lost`, and run any pending async delivery. A
+persisted root exit code remains diagnostic evidence; supervisor loss is still `ERROR rc=70`
+because full process-tree completion can no longer be proven.
+
 ### Completion detection — two modes
 - **exit mode (default):** wake on root process death with `pidfd_open` + `poll`, and finish
   only after the subreaper has reaped all descendants (`waitpid` → `ECHILD`). Optional cgroup-v2
