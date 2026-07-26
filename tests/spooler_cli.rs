@@ -1620,6 +1620,67 @@ fn status_reconciles_conclusively_lost_supervisor_once_and_fails_closed() {
 }
 
 #[test]
+fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = fake_agents(&temp);
+    let child_pid_path = temp.path().join("retained-child-pid");
+
+    let mut cmd = agent_bash(&temp);
+    cmd.env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .env("CHILD_PID_PATH", &child_pid_path)
+        .args([
+            "run",
+            "--delivery",
+            "async",
+            "--",
+            "bash",
+            "-lc",
+            "sleep 60 >/dev/null 2>&1 & printf '%s\\n' \"$!\" > \"$CHILD_PID_PATH\"",
+        ]);
+    let output = cmd.output().expect("run");
+    let json = parse_run_output(&output);
+    let meta_path = meta_path(&json);
+    let running_meta = wait_until(Duration::from_secs(3), || {
+        let meta = read_meta(&meta_path);
+        (meta["workload_rc"] == 0 && child_pid_path.exists()).then_some(meta)
+    });
+    let supervisor_pid = running_meta["supervisor_pid"]
+        .as_i64()
+        .expect("supervisor pid") as libc::pid_t;
+
+    assert_eq!(unsafe { libc::kill(supervisor_pid, libc::SIGKILL) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !delivery_log.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    kill_process_group(&running_meta);
+
+    assert!(
+        delivery_log.exists(),
+        "supervisor loss must deliver without a status poll"
+    );
+    let terminal_meta = wait_until(Duration::from_secs(2), || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["attempted"] == true).then_some(meta)
+    });
+    assert_eq!(terminal_meta["state"], "ERROR");
+    assert_eq!(terminal_meta["completion_reason"], "supervisor-lost");
+    assert_eq!(terminal_meta["rc"], 70);
+    assert_eq!(terminal_meta["workload_rc"], 0);
+    assert_eq!(terminal_meta["delivery"]["exit_code"], 0);
+    let notifications = fs::read_to_string(&delivery_log)
+        .expect("delivery log")
+        .lines()
+        .filter(|line| *line == "notify")
+        .count();
+    assert_eq!(
+        notifications, 1,
+        "supervisor loss must deliver exactly once"
+    );
+}
+
+#[test]
 fn list_all_reconciles_lost_supervisors_without_async_delivery() {
     let temp = tempfile::tempdir().expect("tempdir");
     let dead_supervisor = exact_identity(&terminated_process_identity());

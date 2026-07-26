@@ -16,6 +16,7 @@ const ONE_MIB: usize = 1024 * 1024;
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 const OWNER_POLL: Duration = Duration::from_millis(250);
+const SUPERVISOR_RECOVERY_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub(crate) struct SupervisorConfig {
@@ -94,13 +95,52 @@ unsafe fn daemonization_child(config: SupervisorConfig) -> ! {
     if unsafe { libc::setsid() } < 0 {
         unsafe { libc::_exit(EX_SOFTWARE) };
     }
+    let guardian_paths = config.paths.clone();
     match unsafe { libc::fork() } {
         -1 => unsafe { libc::_exit(EX_SOFTWARE) },
         0 => {
             let code = run_supervisor(config);
             unsafe { libc::_exit(code) };
         }
-        _ => unsafe { libc::_exit(0) },
+        supervisor_pid => {
+            let code = guard_supervisor_exit(&guardian_paths, supervisor_pid);
+            unsafe { libc::_exit(code) };
+        }
+    }
+}
+
+fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32 {
+    let status = match wait_for_exact_child(supervisor_pid) {
+        Ok(status) => status,
+        Err(_) => return EX_SOFTWARE,
+    };
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+        return 0;
+    }
+
+    loop {
+        match reconcile_lost_supervisor(paths) {
+            Ok(meta) if state::terminal(&meta) => return 0,
+            Ok(meta) if !state::running_exit_mode(&meta) => return 0,
+            Ok(_) => std::thread::sleep(SUPERVISOR_RECOVERY_POLL),
+            Err(_) => return EX_SOFTWARE,
+        }
+    }
+}
+
+fn wait_for_exact_child(pid: libc::pid_t) -> io::Result<i32> {
+    loop {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if waited == pid {
+            return Ok(status);
+        }
+        if waited < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
     }
 }
 
@@ -1395,6 +1435,12 @@ pub(crate) fn reconcile_lost_supervisor_without_delivery(paths: &StatePaths) -> 
 fn reconcile_lost_supervisor_with_delivery(paths: &StatePaths, deliver: bool) -> io::Result<Meta> {
     let _lock = state::lock_reconciliation(paths)?;
     let mut meta = state::read_meta(paths)?;
+    if state::terminal(&meta) {
+        if deliver {
+            delivery::complete(paths, &mut meta)?;
+        }
+        return Ok(meta);
+    }
     if !state::exact_supervisor_and_workload_are_gone(&meta) {
         return Ok(meta);
     }
