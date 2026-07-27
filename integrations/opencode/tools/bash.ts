@@ -120,22 +120,36 @@ function selectedDelivery(command: string, requested: string | undefined): Deliv
   return isAgentDispatch(command) ? "async" : "sync"
 }
 
-function commandWithDelivery(command: string, delivery: DeliveryMode): string {
+function leaseToCaller(delivery: DeliveryMode): boolean {
+  return delivery === "sync" || !isHeadlessCaller()
+}
+
+function commandWithDelivery(command: string, delivery: DeliveryMode, ownerLease: boolean): string {
   const shellCommand = splitShellCommand(command)
   const prefix = agentBashRunPrefix(shellCommand.body)
   if (!prefix) return command
   const suffix = shellCommand.body.slice(prefix.length)
   const normalizedSuffix = suffix.replace(/^\s+--delivery\s+(?:sync|async)\b/, "")
-  return (
-    `${shellCommand.prefix}${prefix} --cancel-on-owner-exit --owner-pid ${process.pid} ` +
-    `--delivery ${delivery}${normalizedSuffix}`
-  )
+  const lease = ownerLease ? ` --cancel-on-owner-exit --owner-pid ${process.pid}` : ""
+  return `${shellCommand.prefix}${prefix}${lease} --delivery ${delivery}${normalizedSuffix}`
 }
 
-async function dispatchCommand(command: string, delivery: DeliveryMode): Promise<string> {
+async function dispatchCommand(
+  command: string,
+  delivery: DeliveryMode,
+  ownerLease: boolean,
+): Promise<string> {
   if (isAgentBashRun(command)) {
-    const explicitRun = commandWithDelivery(command, delivery)
+    const explicitRun = commandWithDelivery(command, delivery, ownerLease)
     return (await Bun.$`bash -lc ${explicitRun}`.env(runEnv()).nothrow().text()).trim()
+  }
+  if (!ownerLease) {
+    return (
+      await Bun.$`${AGENT_BASH} run --delivery ${delivery} -- bash -lc ${command}`
+        .env(runEnv())
+        .nothrow()
+        .text()
+    ).trim()
   }
   return (
     await Bun.$`${AGENT_BASH} run --cancel-on-owner-exit --owner-pid ${process.pid} --delivery ${delivery} -- bash -lc ${command}`
@@ -191,7 +205,7 @@ export default tool({
 
     if (context.abort.aborted) return "Cancellation requested before dispatch."
     const delivery = selectedDelivery(args.command, args.delivery)
-    const runOut = await dispatchCommand(args.command, delivery)
+    const runOut = await dispatchCommand(args.command, delivery, leaseToCaller(delivery))
     const dispatch = parseRunDispatch(runOut)
     if (!dispatch) return dispatchErrorResponse(runOut)
     if (context.abort.aborted) return cancelResult(dispatch.handle)
