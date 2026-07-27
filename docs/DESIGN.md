@@ -50,6 +50,9 @@ delivery are separate choices:
   to `async`, and accepts an explicit override except for headless child-agent dispatches. Those
   remain asynchronous so the caller can end its turn and become resumable; an interactive PTY
   caller may explicitly select synchronous foreground delivery.
+- A headless asynchronous handle has no process owner lease because normal completion of a
+  headless turn destroys that OpenCode process. The detached workload survives and notifies the
+  durable session. Synchronous handles and interactive PTY handles remain owner-leased.
 - Leading shell environment assignments are ignored when classifying the command. An explicit
   `VAR=value agent-bash run -- agents ...` command is dispatched directly as one asynchronous
   spool instead of being captured by a synchronous outer spool.

@@ -1077,7 +1077,19 @@ fn opencode_adapter_explicit_async_returns_handle_immediately() {
     let handle = adapter_result_handle(&result);
     assert_eq!(mode_text(&temp, handle), "async");
     let status = wait_for_terminal_status(&temp, handle);
-    assert!(status.contains("reason=owner-exit"), "{status}");
+    assert!(
+        status.starts_with(&format!("DONE rc=0 handle={handle}")),
+        "{status}"
+    );
+    assert!(status.contains("adapter async\n"), "{status}");
+    let meta = read_meta(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(handle)
+            .join("meta.json"),
+    );
+    assert!(meta["cancel_owner"].is_null());
 }
 
 #[test]
@@ -1127,7 +1139,16 @@ fn opencode_adapter_environment_prefixed_agent_bash_run_is_not_nested() {
     let result = run_adapter_driver(&temp, &driver, "wrapper-env", None);
 
     assert_adapter_result_contains(&result, "Running asynchronously");
-    assert_eq!(state_handles(&temp), vec![adapter_result_handle(&result)]);
+    let handle = adapter_result_handle(&result);
+    assert_eq!(state_handles(&temp), vec![handle]);
+    let meta = read_meta(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(handle)
+            .join("meta.json"),
+    );
+    assert!(meta["cancel_owner"].is_null());
 }
 
 #[test]
@@ -1140,7 +1161,16 @@ fn opencode_adapter_headless_agent_dispatch_forces_async_delivery() {
 
     assert_adapter_result_contains(&result, "Running asynchronously");
     assert_adapter_result_contains(&result, "End this headless turn now");
-    assert_eq!(mode_text(&temp, adapter_result_handle(&result)), "async");
+    let handle = adapter_result_handle(&result);
+    assert_eq!(mode_text(&temp, handle), "async");
+    let meta = read_meta(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(handle)
+            .join("meta.json"),
+    );
+    assert!(meta["cancel_owner"].is_null());
 }
 
 #[test]

@@ -13,7 +13,8 @@ completion returns synchronously in-band or asynchronously through the agent mai
   existing callers, while the OpenCode adapter defaults ordinary shell commands to `sync` and
   child-agent dispatches to `async`. A headless OpenCode caller cannot override a child-agent
   dispatch to `sync`; it must end its turn so the mailbox can resume it when the child completes.
-  Interactive PTY callers retain the explicit foreground option.
+  Headless asynchronous work is not leased to the caller process, so it survives that normal turn
+  exit. Interactive PTY callers retain the explicit foreground option and owner-exit cancellation.
 - **Atomic detach.** `detach <handle>` converts a running synchronous call to asynchronous delivery.
   Completion and detach serialize on a per-handle lock, so either race ordering emits at most one
   mailbox notification.
