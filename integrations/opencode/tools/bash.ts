@@ -15,6 +15,11 @@ type RunDispatch = {
   handle: string
 }
 
+type ShellCommand = {
+  prefix: string
+  body: string
+}
+
 function runEnv() {
   return {
     ...process.env,
@@ -70,9 +75,23 @@ function startsWithToken(command: string, token: string): boolean {
   return command === token || command.startsWith(`${token} `)
 }
 
+function splitShellCommand(command: string): ShellCommand {
+  const leadingWhitespace = command.match(/^\s*/)?.[0] || ""
+  let body = command.slice(leadingWhitespace.length)
+  let environmentPrefix = ""
+  const assignment = /^[A-Za-z_][A-Za-z0-9_]*=(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s]*)\s+/
+  while (true) {
+    const matched = body.match(assignment)?.[0]
+    if (!matched) break
+    environmentPrefix += matched
+    body = body.slice(matched.length)
+  }
+  return { prefix: leadingWhitespace + environmentPrefix, body }
+}
+
 function agentBashRunPrefix(command: string): string | undefined {
-  const trimmed = command.trimStart()
-  return [`${AGENT_BASH} run`, "agent-bash run"].find((prefix) => startsWithToken(trimmed, prefix))
+  const { body } = splitShellCommand(command)
+  return [`${AGENT_BASH} run`, "agent-bash run"].find((prefix) => startsWithToken(body, prefix))
 }
 
 function isAgentBashRun(command: string): boolean {
@@ -80,31 +99,35 @@ function isAgentBashRun(command: string): boolean {
 }
 
 function isAgentDispatch(command: string): boolean {
-  const trimmed = command.trimStart()
+  const { body } = splitShellCommand(command)
   if (
-    startsWithToken(trimmed, "agents") ||
-    startsWithToken(trimmed, AGENTS) ||
-    startsWithToken(trimmed, "oulipoly-agent-runner")
+    startsWithToken(body, "agents") ||
+    startsWithToken(body, AGENTS) ||
+    startsWithToken(body, "oulipoly-agent-runner")
   ) {
     return true
   }
-  return isAgentBashRun(trimmed) && /\s--\s+(?:[^\s]+\/)?(?:agents|oulipoly-agent-runner)(?:\s|$)/.test(trimmed)
+  return isAgentBashRun(body) && /\s--\s+(?:[^\s]+\/)?(?:agents|oulipoly-agent-runner)(?:\s|$)/.test(body)
+}
+
+function isHeadlessCaller(): boolean {
+  return process.stdin.isTTY !== true
 }
 
 function selectedDelivery(command: string, requested: string | undefined): DeliveryMode {
+  if (isAgentDispatch(command) && isHeadlessCaller()) return "async"
   if (validDeliveryMode(requested)) return requested
   return isAgentDispatch(command) ? "async" : "sync"
 }
 
 function commandWithDelivery(command: string, delivery: DeliveryMode): string {
-  const trimmed = command.trimStart()
-  const leadingWhitespace = command.slice(0, command.length - trimmed.length)
-  const prefix = agentBashRunPrefix(trimmed)
+  const shellCommand = splitShellCommand(command)
+  const prefix = agentBashRunPrefix(shellCommand.body)
   if (!prefix) return command
-  const suffix = trimmed.slice(prefix.length)
+  const suffix = shellCommand.body.slice(prefix.length)
   const normalizedSuffix = suffix.replace(/^\s+--delivery\s+(?:sync|async)\b/, "")
   return (
-    `${leadingWhitespace}${prefix} --cancel-on-owner-exit --owner-pid ${process.pid} ` +
+    `${shellCommand.prefix}${prefix} --cancel-on-owner-exit --owner-pid ${process.pid} ` +
     `--delivery ${delivery}${normalizedSuffix}`
   )
 }
@@ -141,18 +164,19 @@ async function waitForSyncResult(handle: string, abort: AbortSignal): Promise<st
   }
 }
 
-function asyncDispatchResponse(handle: string): string {
-  return (
+function asyncDispatchResponse(handle: string, endHeadlessTurn = false): string {
+  const response =
     `Running asynchronously (handle=${handle}). You will be woken with the result when it completes, ` +
     `or call bash with { handle: "${handle}" } to poll.`
-  )
+  return endHeadlessTurn ? `${response} End this headless turn now so the notification can resume it.` : response
 }
 
 export default tool({
   description:
     "Run a shell command under a detached supervisor. Ordinary commands default to synchronous in-band completion; " +
     "child-agent dispatches default to asynchronous mailbox delivery and return a handle immediately. Set `delivery` " +
-    "to override either default. A synchronous call can be detached externally without terminating its workload.",
+    "to override either default. Headless child-agent dispatches remain asynchronous so their caller can end its turn. " +
+    "A synchronous call can be detached externally without terminating its workload.",
   args: {
     command: tool.schema.string().describe("the shell command to run").optional(),
     handle: tool.schema.string().describe("poll an existing asynchronous command by its handle").optional(),
@@ -171,7 +195,9 @@ export default tool({
     const dispatch = parseRunDispatch(runOut)
     if (!dispatch) return dispatchErrorResponse(runOut)
     if (context.abort.aborted) return cancelResult(dispatch.handle)
-    if (delivery === "async") return asyncDispatchResponse(dispatch.handle)
+    if (delivery === "async") {
+      return asyncDispatchResponse(dispatch.handle, isAgentDispatch(args.command) && isHeadlessCaller())
+    }
     return waitForSyncResult(dispatch.handle, context.abort)
   },
 })
