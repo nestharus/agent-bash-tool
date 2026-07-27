@@ -373,8 +373,12 @@ const args = mode === "poll"
       ? { command: "sleep 60; printf 'adapter abort failed\\n'" }
       : mode === "detachable"
         ? { command: "sleep 2; printf 'adapter detached\\n'" }
-        : mode === "wrapper"
-          ? { command: `${process.env.AGENT_BASH_BIN} run -- agents --version` }
+      : mode === "wrapper"
+        ? { command: `${process.env.AGENT_BASH_BIN} run -- agents --version` }
+      : mode === "wrapper-env"
+        ? { command: `XDG_STATE_HOME=${process.env.XDG_STATE_HOME} ${process.env.AGENT_BASH_BIN} run -- agents --version` }
+      : mode === "agent-sync"
+        ? { command: "agents --version", delivery: "sync" }
     : mode === "agent"
       ? { command: "agents --version" }
       : { command: "printf 'adapter inline\\n'" }
@@ -1112,6 +1116,31 @@ fn opencode_adapter_explicit_agent_bash_run_is_not_nested() {
 
     assert_adapter_result_contains(&result, "Running asynchronously");
     assert_eq!(state_handles(&temp), vec![adapter_result_handle(&result)]);
+}
+
+#[test]
+fn opencode_adapter_environment_prefixed_agent_bash_run_is_not_nested() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let result = run_adapter_driver(&temp, &driver, "wrapper-env", None);
+
+    assert_adapter_result_contains(&result, "Running asynchronously");
+    assert_eq!(state_handles(&temp), vec![adapter_result_handle(&result)]);
+}
+
+#[test]
+fn opencode_adapter_headless_agent_dispatch_forces_async_delivery() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let result = run_adapter_driver(&temp, &driver, "agent-sync", None);
+
+    assert_adapter_result_contains(&result, "Running asynchronously");
+    assert_adapter_result_contains(&result, "End this headless turn now");
+    assert_eq!(mode_text(&temp, adapter_result_handle(&result)), "async");
 }
 
 #[test]

@@ -47,7 +47,12 @@ delivery are separate choices:
 - `run --delivery async` invokes the notification seam at completion.
 - The CLI defaults to `async` so handles created by older callers retain their behavior.
 - The OpenCode adapter defaults ordinary shell commands to `sync`, defaults child-agent dispatches
-  to `async`, and accepts an explicit override.
+  to `async`, and accepts an explicit override except for headless child-agent dispatches. Those
+  remain asynchronous so the caller can end its turn and become resumable; an interactive PTY
+  caller may explicitly select synchronous foreground delivery.
+- Leading shell environment assignments are ignored when classifying the command. An explicit
+  `VAR=value agent-bash run -- agents ...` command is dispatched directly as one asynchronous
+  spool instead of being captured by a synchronous outer spool.
 
 A synchronous adapter call can block for its result without owning the workload process. Harness
 timeout or caller death therefore does not terminate the detached workload.
