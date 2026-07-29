@@ -23,7 +23,14 @@ pub(crate) struct SupervisorConfig {
     pub(crate) paths: StatePaths,
     pub(crate) meta: Meta,
     pub(crate) argv: Vec<String>,
+    pub(crate) completion_scope: CompletionScope,
     pub(crate) ready_sentinel: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionScope {
+    Tree,
+    Root,
 }
 
 pub(crate) fn validate_argv(argv: &[String]) -> Result<(), String> {
@@ -250,6 +257,7 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
         spawn,
         root_pidfd,
         owner_pidfd,
+        completion_scope: config.completion_scope,
         sentinel,
     });
     event_loop_exit_code(event_loop(loop_state))
@@ -337,6 +345,7 @@ struct EventLoopSeed {
     spawn: WorkloadSpawn,
     root_pidfd: Option<RawFd>,
     owner_pidfd: Option<RawFd>,
+    completion_scope: CompletionScope,
     sentinel: Option<SentinelMatcher>,
 }
 
@@ -350,6 +359,7 @@ fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
         root_pid: seed.spawn.pid,
         root_pidfd: seed.root_pidfd,
         owner_pidfd: seed.owner_pidfd,
+        completion_scope: seed.completion_scope,
         stdout_fd: Some(seed.spawn.stdout_fd),
         stderr_fd: Some(seed.spawn.stderr_fd),
         exec_err_fd: Some(seed.spawn.exec_err_fd),
@@ -799,6 +809,7 @@ struct EventLoop {
     root_pid: libc::pid_t,
     root_pidfd: Option<RawFd>,
     owner_pidfd: Option<RawFd>,
+    completion_scope: CompletionScope,
     stdout_fd: Option<RawFd>,
     stderr_fd: Option<RawFd>,
     exec_err_fd: Option<RawFd>,
@@ -1202,7 +1213,7 @@ impl EventLoop {
     fn should_exit(&self) -> bool {
         self.completion_recorded
             && self.root_status.is_some()
-            && self.tree_empty
+            && self.completion_scope.is_complete(self.tree_empty)
             && self.output_closed()
     }
 
@@ -1329,7 +1340,16 @@ fn spawn_error_message_for_completion(loop_state: &EventLoop) -> String {
 }
 
 fn exit_completion_ready(loop_state: &EventLoop) -> bool {
-    loop_state.tree_empty && loop_state.output_closed()
+    loop_state
+        .completion_scope
+        .is_complete(loop_state.tree_empty)
+        && loop_state.output_closed()
+}
+
+impl CompletionScope {
+    fn is_complete(self, tree_empty: bool) -> bool {
+        self == Self::Root || tree_empty
+    }
 }
 
 fn exit_completion_reason(loop_state: &EventLoop) -> &'static str {

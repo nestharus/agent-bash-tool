@@ -46,10 +46,11 @@ delivery are separate choices:
   agent-runner notification seam.
 - `run --delivery async` invokes the notification seam at completion.
 - The CLI defaults to `async` so handles created by older callers retain their behavior.
-- The OpenCode adapter defaults ordinary shell commands to `sync`, defaults child-agent dispatches
-  to `async`, and accepts an explicit override except for headless child-agent dispatches. Those
-  remain asynchronous so the caller can end its turn and become resumable; an interactive PTY
-  caller may explicitly select synchronous foreground delivery.
+- The OpenCode adapter defaults ordinary shell commands to `sync` with root-process completion,
+  defaults child-agent dispatches to `async` with full-tree completion, and accepts an explicit
+  delivery override except for headless child-agent dispatches. Those remain asynchronous so the
+  caller can end its turn and become resumable; an interactive PTY caller may explicitly select
+  synchronous foreground delivery.
 - A headless asynchronous handle has no process owner lease because normal completion of a
   headless turn destroys that OpenCode process. The detached workload survives and notifies the
   durable session. Synchronous handles and interactive PTY handles remain owner-leased.
@@ -95,10 +96,13 @@ supervisor loss is conclusive, record `supervisor-lost`, and run any pending asy
 persisted root exit code remains diagnostic evidence; supervisor loss is still `ERROR rc=70`
 because full process-tree completion can no longer be proven.
 
-### Completion detection — two modes
-- **exit mode (default):** wake on root process death with `pidfd_open` + `poll`, and finish
+### Completion detection — three modes
+- **tree exit mode (default):** wake on root process death with `pidfd_open` + `poll`, and finish
   only after the subreaper has reaped all descendants (`waitpid` → `ECHILD`). Optional cgroup-v2
   `populated` events may be recorded, but they are not required for correctness.
+- **root exit mode (`--completion-scope root`):** finish after the launched process exits and its
+  captured output closes. Adopted descendants are reparented when the supervisor exits, so
+  intentionally daemonized helpers do not keep an ordinary synchronous shell command running.
 - **sentinel / server mode (`--ready-sentinel <regex>`):** for workloads that never exit (a
   server). "Done/ready" is a stdout marker match, because there is no exit to wait on.
   *We never assume a workload will exit.*

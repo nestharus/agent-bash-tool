@@ -20,9 +20,11 @@ completion returns synchronously in-band or asynchronously through the agent mai
   mailbox notification.
 - **Attached-required.** The tool must be invoked as an attached subprocess (so it can anchor the
   process tree). A detached invocation is rejected immediately.
-- **Process-tree capture via subreaper.** Every orphaned descendant — even ones that
-  `setsid`/detach — reparents to the supervisor and is reaped event-driven. Delegated cgroup v2
-  is used only when available as an optional live-set enhancement.
+- **Explicit completion scope.** Tree scope remains the CLI default and waits for every orphaned
+  descendant, including processes that `setsid`/detach. Root scope completes after the launched
+  process exits and its captured output closes, allowing intentionally daemonized helpers to
+  survive. The OpenCode adapter uses root scope for ordinary commands and tree scope for child
+  agents. Delegated cgroup v2 remains an optional live-set enhancement.
 - **Supervisor-loss recovery.** A detached guardian waits on the exact supervisor child. If the
   supervisor exits abnormally, the guardian reconciles durable process identity and terminal state
   and performs pending asynchronous delivery without requiring a caller to poll `status`.
@@ -30,8 +32,8 @@ completion returns synchronously in-band or asynchronously through the agent mai
   with `run --cancel-on-owner-exit --owner-pid <pid>`. `cancel <handle>`, an owner exit, or an
   OpenCode tool abort terminates the complete adopted process tree, escalating to `SIGKILL` after
   a bounded grace period. Direct CLI runs remain detached unless they explicitly request a lease.
-- **Completion: exit *or* sentinel.** Finite jobs wake on process exit (`pidfd`); never-exiting
-  servers report ready on a stdout marker. Nothing is assumed to exit.
+- **Completion: root, tree, or sentinel.** Finite jobs use an explicit process boundary;
+  never-exiting servers report ready on a stdout marker. Nothing is assumed to exit.
 - **Async delivery via agent-runner.** For asynchronous completion the spooler asks agent-runner
   whose session the caller is and hands over the result; agent-runner wakes (headless: `resume`) or
   forwards (PTY). Synchronous completion never enters that mailbox.

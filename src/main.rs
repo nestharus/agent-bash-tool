@@ -38,6 +38,10 @@ enum Command {
         /// Completion delivery policy. Sync results stay in-band; async results notify the mailbox.
         #[arg(long, value_enum, default_value_t = CliDeliveryMode::Async)]
         delivery: CliDeliveryMode,
+        /// Completion boundary for exit-mode workloads. Tree waits for every adopted
+        /// descendant; root completes when the launched process exits and output closes.
+        #[arg(long, value_enum, default_value_t = CliCompletionScope::Tree)]
+        completion_scope: CliCompletionScope,
         /// Treat the workload as a long-lived server: report ready on this stdout
         /// marker (regex) instead of waiting for process-tree exit.
         #[arg(long)]
@@ -85,6 +89,21 @@ enum CliDeliveryMode {
     Async,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum CliCompletionScope {
+    Tree,
+    Root,
+}
+
+impl From<CliCompletionScope> for supervisor::CompletionScope {
+    fn from(value: CliCompletionScope) -> Self {
+        match value {
+            CliCompletionScope::Tree => Self::Tree,
+            CliCompletionScope::Root => Self::Root,
+        }
+    }
+}
+
 impl From<CliDeliveryMode> for DeliveryMode {
     fn from(value: CliDeliveryMode) -> Self {
         match value {
@@ -125,6 +144,7 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
     match cli.command {
         Command::Run {
             delivery,
+            completion_scope,
             ready_sentinel,
             cancel_on_owner_exit,
             owner_pid,
@@ -132,6 +152,7 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
         } => run_command(
             guard,
             delivery.into(),
+            completion_scope.into(),
             ready_sentinel,
             cancel_on_owner_exit,
             owner_pid,
@@ -161,6 +182,7 @@ fn validate_guard(guard: &AttachedGuard) -> Result<(), AppError> {
 fn run_command(
     guard: AttachedGuard,
     delivery_mode: DeliveryMode,
+    completion_scope: supervisor::CompletionScope,
     ready_sentinel: Option<String>,
     cancel_on_owner_exit: bool,
     owner_pid: Option<libc::pid_t>,
@@ -195,7 +217,13 @@ fn run_command(
     persist_initial_meta(&paths, &meta)?;
 
     validate_guard(&guard)?;
-    let config = supervisor_config(paths.clone(), meta.clone(), argv, ready_sentinel.clone());
+    let config = supervisor_config(
+        paths.clone(),
+        meta.clone(),
+        argv,
+        completion_scope,
+        ready_sentinel.clone(),
+    );
     supervisor::fork_supervisor(config).map_err(supervisor_bootstrap_error)?;
 
     let output = run_output(paths, meta.caller_ppid, mode, delivery_mode, ready_sentinel);
@@ -372,12 +400,14 @@ fn supervisor_config(
     paths: StatePaths,
     meta: Meta,
     argv: Vec<String>,
+    completion_scope: supervisor::CompletionScope,
     ready_sentinel: Option<String>,
 ) -> supervisor::SupervisorConfig {
     supervisor::SupervisorConfig {
         paths,
         meta,
         argv,
+        completion_scope,
         ready_sentinel,
     }
 }

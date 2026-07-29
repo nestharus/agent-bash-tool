@@ -10,6 +10,7 @@ const AGENTS = process.env.AGENT_BASH_AGENT_RUNNER_BIN || `${process.env.HOME}/.
 const POLL_MS = Number(process.env.AGENT_BASH_TOOL_POLL_MS || 500)
 
 type DeliveryMode = "sync" | "async"
+type CompletionScope = "root" | "tree"
 
 type RunDispatch = {
   handle: string
@@ -124,6 +125,10 @@ function leaseToCaller(delivery: DeliveryMode): boolean {
   return delivery === "sync" || !isHeadlessCaller()
 }
 
+function selectedCompletionScope(command: string): CompletionScope {
+  return isAgentDispatch(command) ? "tree" : "root"
+}
+
 function commandWithDelivery(command: string, delivery: DeliveryMode, ownerLease: boolean): string {
   const shellCommand = splitShellCommand(command)
   const prefix = agentBashRunPrefix(shellCommand.body)
@@ -138,6 +143,7 @@ async function dispatchCommand(
   command: string,
   delivery: DeliveryMode,
   ownerLease: boolean,
+  completionScope: CompletionScope,
 ): Promise<string> {
   if (isAgentBashRun(command)) {
     const explicitRun = commandWithDelivery(command, delivery, ownerLease)
@@ -145,14 +151,14 @@ async function dispatchCommand(
   }
   if (!ownerLease) {
     return (
-      await Bun.$`${AGENT_BASH} run --delivery ${delivery} -- bash -lc ${command}`
+      await Bun.$`${AGENT_BASH} run --completion-scope ${completionScope} --delivery ${delivery} -- bash -lc ${command}`
         .env(runEnv())
         .nothrow()
         .text()
     ).trim()
   }
   return (
-    await Bun.$`${AGENT_BASH} run --cancel-on-owner-exit --owner-pid ${process.pid} --delivery ${delivery} -- bash -lc ${command}`
+    await Bun.$`${AGENT_BASH} run --cancel-on-owner-exit --owner-pid ${process.pid} --completion-scope ${completionScope} --delivery ${delivery} -- bash -lc ${command}`
       .env(runEnv())
       .nothrow()
       .text()
@@ -188,7 +194,8 @@ function asyncDispatchResponse(handle: string, endHeadlessTurn = false): string 
 export default tool({
   description:
     "Run a shell command under a detached supervisor. Ordinary commands default to synchronous in-band completion; " +
-    "child-agent dispatches default to asynchronous mailbox delivery and return a handle immediately. Set `delivery` " +
+    "ordinary commands complete with their root process, while child-agent dispatches retain full-tree completion. " +
+    "Child-agent dispatches default to asynchronous mailbox delivery and return a handle immediately. Set `delivery` " +
     "to override either default. Headless child-agent dispatches remain asynchronous so their caller can end its turn. " +
     "A synchronous call can be detached externally without terminating its workload.",
   args: {
@@ -205,7 +212,12 @@ export default tool({
 
     if (context.abort.aborted) return "Cancellation requested before dispatch."
     const delivery = selectedDelivery(args.command, args.delivery)
-    const runOut = await dispatchCommand(args.command, delivery, leaseToCaller(delivery))
+    const runOut = await dispatchCommand(
+      args.command,
+      delivery,
+      leaseToCaller(delivery),
+      selectedCompletionScope(args.command),
+    )
     const dispatch = parseRunDispatch(runOut)
     if (!dispatch) return dispatchErrorResponse(runOut)
     if (context.abort.aborted) return cancelResult(dispatch.handle)
