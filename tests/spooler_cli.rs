@@ -978,6 +978,36 @@ fn tree_capture_waits_for_setsid_detached_grandchild_via_subreaper() {
 }
 
 #[test]
+fn root_completion_does_not_wait_for_setsid_detached_grandchild() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let marker = temp.path().join("root-completion-grandchild-marker");
+    let script =
+        "(setsid sh -c 'sleep 2; printf grandchild > \"$MARKER\"' >/dev/null 2>&1 &) ; exit 0";
+    let mut cmd = agent_bash(&temp);
+    cmd.env("MARKER", &marker).args([
+        "run",
+        "--completion-scope",
+        "root",
+        "--",
+        "bash",
+        "-lc",
+        script,
+    ]);
+    let output = cmd.output().expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+
+    let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+    assert!(final_status.starts_with(&format!("DONE rc=0 handle={handle}")));
+    assert!(
+        !marker.exists(),
+        "root completion waited for the detached grandchild"
+    );
+
+    wait_until(Duration::from_secs(5), || marker.exists().then_some(()));
+}
+
+#[test]
 fn cgroup_v2_live_set_path_runs_when_delegated_and_skips_otherwise() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (output, _) = run_cmd(&temp, &["run", "--", "bash", "-lc", "sleep 1.5"]);
