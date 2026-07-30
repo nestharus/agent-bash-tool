@@ -3,6 +3,7 @@ import { tool } from "@opencode-ai/plugin"
 /**
  * opencode `bash` tool override. Workloads survive shell timeouts under agent-bash, but remain
  * leased to this opencode process so aborting the tool or closing the session cancels the tree.
+ * Exact `agent-bash list [--all] [--json]` observations run attached without creating a workload.
  */
 
 const AGENT_BASH = process.env.AGENT_BASH_BIN || `${process.env.HOME}/.local/bin/agent-bash`
@@ -57,6 +58,50 @@ function missingCommandResponse(): string {
 
 function invalidDeliveryResponse(value: string): string {
   return `error: delivery must be \"sync\" or \"async\", got ${JSON.stringify(value)}`
+}
+
+type ListControl = {
+  all: boolean
+  json: boolean
+}
+
+function classifyListControl(command: string): ListControl | undefined {
+  const trimmed = command.trim()
+  if (!trimmed) return undefined
+  const tokens = trimmed.split(/\s+/)
+  if (tokens.length < 2 || tokens.length > 4) return undefined
+  if ((tokens[0] !== AGENT_BASH && tokens[0] !== "agent-bash") || tokens[1] !== "list") return undefined
+
+  let all = false
+  let json = false
+  for (const token of tokens.slice(2)) {
+    if (token === "--all" && !all) {
+      all = true
+    } else if (token === "--json" && !json) {
+      json = true
+    } else {
+      return undefined
+    }
+  }
+  return { all, json }
+}
+
+async function executeListControl(control: ListControl): Promise<string> {
+  const argv = [AGENT_BASH, "list"]
+  if (control.all) argv.push("--all")
+  if (control.json) argv.push("--json")
+
+  const child = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" })
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ])
+  if (exitCode !== 0) {
+    const detail = stderr.trim()
+    throw new Error(`agent-bash list failed with exit code ${exitCode}${detail ? `: ${detail}` : ""}`)
+  }
+  return stdout
 }
 
 function parseRunDispatch(runOut: string): RunDispatch | undefined {
@@ -197,7 +242,8 @@ export default tool({
     "ordinary commands complete with their root process, while child-agent dispatches retain full-tree completion. " +
     "Child-agent dispatches default to asynchronous mailbox delivery and return a handle immediately. Set `delivery` " +
     "to override either default. Headless child-agent dispatches remain asynchronous so their caller can end its turn. " +
-    "A synchronous call can be detached externally without terminating its workload.",
+    "A synchronous call can be detached externally without terminating its workload. Exact " +
+    "`agent-bash list [--all] [--json]` observations run attached without creating a workload handle.",
   args: {
     command: tool.schema.string().describe("the shell command to run").optional(),
     handle: tool.schema.string().describe("poll an existing asynchronous command by its handle").optional(),
@@ -208,6 +254,10 @@ export default tool({
     if (!commandProvided(args.command)) return missingCommandResponse()
     if (args.delivery !== undefined && !validDeliveryMode(args.delivery)) {
       return invalidDeliveryResponse(args.delivery)
+    }
+    const listControl = classifyListControl(args.command)
+    if (listControl) {
+      return executeListControl(listControl)
     }
 
     if (context.abort.aborted) return "Cancellation requested before dispatch."

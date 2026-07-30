@@ -74,7 +74,7 @@ enum Command {
     },
     /// List spooled jobs owned by the calling agent's process tree.
     List {
-        /// List all handles under the state root, not just this caller PPID.
+        /// List all handles under the state root, not just this caller's process tree.
         #[arg(long)]
         all: bool,
         /// Emit JSON instead of line-oriented text.
@@ -688,7 +688,12 @@ fn read_open_status_log(mut file: std::fs::File) -> io::Result<Vec<u8>> {
 
 fn list_command(caller_ppid: libc::pid_t, all: bool, json: bool) -> Result<(), AppError> {
     let root = load_state_root().map_err(state_root_unavailable)?;
-    let mut summaries = list_summaries(&root, caller_ppid, all)?;
+    let caller_chain = if all {
+        Vec::new()
+    } else {
+        state::capture_caller_chain(caller_ppid)
+    };
+    let mut summaries = list_summaries(&root, &caller_chain, all)?;
     sort_summaries(&mut summaries);
     emit_list_summaries(&summaries, json)?;
     Ok(())
@@ -696,7 +701,7 @@ fn list_command(caller_ppid: libc::pid_t, all: bool, json: bool) -> Result<(), A
 
 fn list_summaries(
     root: &Path,
-    caller_ppid: libc::pid_t,
+    caller_chain: &[state::CallerChainEntry],
     all: bool,
 ) -> Result<Vec<ListSummary>, AppError> {
     if !root.exists() {
@@ -706,7 +711,7 @@ fn list_summaries(
     let mut summaries = Vec::new();
     for entry in entries {
         let entry = read_state_entry(entry)?;
-        if let Some(summary) = list_summary_for_entry(root, entry, caller_ppid, all) {
+        if let Some(summary) = list_summary_for_entry(root, entry, caller_chain, all) {
             summaries.push(summary);
         }
     }
@@ -741,7 +746,7 @@ fn read_state_entry_error(err: io::Error) -> AppError {
 fn list_summary_for_entry(
     root: &Path,
     entry: std::fs::DirEntry,
-    caller_ppid: libc::pid_t,
+    caller_chain: &[state::CallerChainEntry],
     all: bool,
 ) -> Option<ListSummary> {
     if !entry_is_state_dir(&entry) {
@@ -749,7 +754,7 @@ fn list_summary_for_entry(
     }
     let paths = paths_for_entry(root, &entry);
     let meta = reconcile_list_meta(&paths, read_entry_meta(&paths)?)?;
-    if !include_list_meta(&meta, caller_ppid, all) {
+    if !include_list_meta(&meta, caller_chain, all) {
         return None;
     }
     Some(list_summary_from_meta(&meta, paths.state_dir))
@@ -775,8 +780,21 @@ fn read_entry_meta(paths: &StatePaths) -> Option<Meta> {
     state::read_meta(paths).ok()
 }
 
-fn include_list_meta(meta: &Meta, caller_ppid: libc::pid_t, all: bool) -> bool {
-    all || meta.caller_ppid == caller_ppid
+fn include_list_meta(meta: &Meta, caller_chain: &[state::CallerChainEntry], all: bool) -> bool {
+    if all {
+        return true;
+    }
+    let Some(anchor) = meta.caller_chain.first() else {
+        return false;
+    };
+    if anchor.pid <= 1 || anchor.starttime_ticks == 0 || anchor.boot_id.is_empty() {
+        return false;
+    }
+    caller_chain.iter().any(|entry| {
+        entry.pid == anchor.pid
+            && entry.starttime_ticks == anchor.starttime_ticks
+            && entry.boot_id == anchor.boot_id
+    })
 }
 
 fn list_summary_from_meta(meta: &Meta, state_dir: PathBuf) -> ListSummary {
