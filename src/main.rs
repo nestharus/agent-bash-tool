@@ -20,6 +20,13 @@ const EX_NOINPUT: i32 = 66;
 const EX_SOFTWARE: i32 = 70;
 const EX_CANTCREAT: i32 = 73;
 const EX_IOERR: i32 = 74;
+const OWNER_SESSION_ID_ENV: &str = "AGENT_BASH_OWNER_SESSION_ID";
+const OWNER_INVOCATION_UUID_ENV: &str = "AGENT_BASH_OWNER_INVOCATION_UUID";
+
+struct OwnerContext {
+    session_id: Option<String>,
+    invocation_uuid: Option<String>,
+}
 
 #[derive(Parser)]
 #[command(
@@ -166,7 +173,12 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
             full,
             handle,
         } => status_command(handle, tail_bytes.unwrap_or(65_536), full),
-        Command::List { all, json } => list_command(guard.startup_ppid(), all, json),
+        Command::List { all, json } => list_command(
+            guard.startup_ppid(),
+            nonempty_env(OWNER_SESSION_ID_ENV),
+            all,
+            json,
+        ),
     }
 }
 
@@ -202,6 +214,7 @@ fn run_command(
     let cancel_owner = resolve_cancel_owner(&caller_chain, cancel_on_owner_exit, owner_pid)?;
     let cwd = current_directory().map_err(current_directory_error)?;
     let mode = run_mode(&ready_sentinel);
+    let owner = owner_context();
     let meta = Meta::new(
         handle,
         guard.startup_ppid(),
@@ -213,7 +226,8 @@ fn run_command(
         ready_sentinel.clone(),
         caller_chain,
         cancel_owner,
-    );
+    )
+    .with_owner_context(owner.session_id, owner.invocation_uuid);
     persist_initial_meta(&paths, &meta)?;
 
     validate_guard(&guard)?;
@@ -385,8 +399,23 @@ fn run_mode(ready_sentinel: &Option<String>) -> &'static str {
     }
 }
 
+fn owner_context() -> OwnerContext {
+    OwnerContext {
+        session_id: nonempty_env(OWNER_SESSION_ID_ENV),
+        invocation_uuid: nonempty_env(OWNER_INVOCATION_UUID_ENV),
+    }
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
 fn persist_initial_meta(paths: &StatePaths, meta: &Meta) -> Result<(), AppError> {
-    state::write_meta_atomic(paths, meta).map_err(initial_meta_create_error)
+    state::write_meta_atomic(paths, meta).map_err(initial_meta_create_error)?;
+    state::write_owner_atomic(paths, &state::OwnerMeta::from_meta(meta))
+        .map_err(initial_meta_create_error)
 }
 
 fn initial_meta_create_error(err: io::Error) -> AppError {
@@ -686,14 +715,19 @@ fn read_open_status_log(mut file: std::fs::File) -> io::Result<Vec<u8>> {
     Ok(output)
 }
 
-fn list_command(caller_ppid: libc::pid_t, all: bool, json: bool) -> Result<(), AppError> {
+fn list_command(
+    caller_ppid: libc::pid_t,
+    owner_session_id: Option<String>,
+    all: bool,
+    json: bool,
+) -> Result<(), AppError> {
     let root = load_state_root().map_err(state_root_unavailable)?;
     let caller_chain = if all {
         Vec::new()
     } else {
         state::capture_caller_chain(caller_ppid)
     };
-    let mut summaries = list_summaries(&root, &caller_chain, all)?;
+    let mut summaries = list_summaries(&root, &caller_chain, owner_session_id.as_deref(), all)?;
     sort_summaries(&mut summaries);
     emit_list_summaries(&summaries, json)?;
     Ok(())
@@ -702,6 +736,7 @@ fn list_command(caller_ppid: libc::pid_t, all: bool, json: bool) -> Result<(), A
 fn list_summaries(
     root: &Path,
     caller_chain: &[state::CallerChainEntry],
+    owner_session_id: Option<&str>,
     all: bool,
 ) -> Result<Vec<ListSummary>, AppError> {
     if !root.exists() {
@@ -711,7 +746,9 @@ fn list_summaries(
     let mut summaries = Vec::new();
     for entry in entries {
         let entry = read_state_entry(entry)?;
-        if let Some(summary) = list_summary_for_entry(root, entry, caller_chain, all) {
+        if let Some(summary) =
+            list_summary_for_entry(root, entry, caller_chain, owner_session_id, all)
+        {
             summaries.push(summary);
         }
     }
@@ -747,6 +784,7 @@ fn list_summary_for_entry(
     root: &Path,
     entry: std::fs::DirEntry,
     caller_chain: &[state::CallerChainEntry],
+    owner_session_id: Option<&str>,
     all: bool,
 ) -> Option<ListSummary> {
     if !entry_is_state_dir(&entry) {
@@ -754,7 +792,7 @@ fn list_summary_for_entry(
     }
     let paths = paths_for_entry(root, &entry);
     let meta = reconcile_list_meta(&paths, read_entry_meta(&paths)?)?;
-    if !include_list_meta(&meta, caller_chain, all) {
+    if !include_list_meta(&meta, &paths, caller_chain, owner_session_id, all) {
         return None;
     }
     Some(list_summary_from_meta(&meta, paths.state_dir))
@@ -780,8 +818,17 @@ fn read_entry_meta(paths: &StatePaths) -> Option<Meta> {
     state::read_meta(paths).ok()
 }
 
-fn include_list_meta(meta: &Meta, caller_chain: &[state::CallerChainEntry], all: bool) -> bool {
+fn include_list_meta(
+    meta: &Meta,
+    paths: &StatePaths,
+    caller_chain: &[state::CallerChainEntry],
+    owner_session_id: Option<&str>,
+    all: bool,
+) -> bool {
     if all {
+        return true;
+    }
+    if owner_session_matches(meta, paths, owner_session_id) {
         return true;
     }
     let Some(anchor) = meta.caller_chain.first() else {
@@ -795,6 +842,20 @@ fn include_list_meta(meta: &Meta, caller_chain: &[state::CallerChainEntry], all:
             && entry.starttime_ticks == anchor.starttime_ticks
             && entry.boot_id == anchor.boot_id
     })
+}
+
+fn owner_session_matches(meta: &Meta, paths: &StatePaths, owner_session_id: Option<&str>) -> bool {
+    let Some(session_id) = owner_session_id else {
+        return false;
+    };
+    if let Some(meta_session_id) = meta.owner_session_id.as_deref() {
+        return meta_session_id == session_id;
+    }
+    state::read_owner(paths)
+        .ok()
+        .and_then(|owner| owner.owner_session_id)
+        .as_deref()
+        == Some(session_id)
 }
 
 fn list_summary_from_meta(meta: &Meta, state_dir: PathBuf) -> ListSummary {

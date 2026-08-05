@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use std::os::unix::process::ExitStatusExt;
 
@@ -9,6 +10,9 @@ use serde::Serialize;
 use crate::state::{self, DeliveryMeta, DeliveryMode, Meta, StatePaths};
 
 const SYNC_IN_BAND: &str = "sync_in_band";
+const CONSUMER_GRACE_MS_ENV: &str = "AGENT_BASH_CONSUMER_GRACE_MS";
+const MAX_CONSUMER_GRACE_MS: u64 = 10_000;
+const CONSUMER_GRACE_POLL_MS: u64 = 25;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct DetachOutcome {
@@ -74,11 +78,45 @@ fn detach_outcome(meta: &Meta, transitioned: bool, notification_attempted: bool)
 }
 
 fn notify(caller_ppid: libc::pid_t, handle: &str, paths: &StatePaths) -> DeliveryMeta {
+    if consumed_before_delivery(paths) {
+        return skipped_delivery_meta("consumed_in_call");
+    }
     let request = notify_request(caller_ppid, handle, paths);
     match run_notify_command(&request) {
         Ok(status) => delivery_meta_from_status(status),
         Err(err) => delivery_meta_from_error(err),
     }
+}
+
+fn consumed_before_delivery(paths: &StatePaths) -> bool {
+    if paths.consumed.exists() {
+        return true;
+    }
+    let grace = consumer_grace();
+    if grace.is_zero() {
+        return false;
+    }
+    wait_for_consumed_marker(paths, grace)
+}
+
+fn consumer_grace() -> Duration {
+    let millis = std::env::var(CONSUMER_GRACE_MS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(MAX_CONSUMER_GRACE_MS);
+    Duration::from_millis(millis)
+}
+
+fn wait_for_consumed_marker(paths: &StatePaths, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(CONSUMER_GRACE_POLL_MS));
+        if paths.consumed.exists() {
+            return true;
+        }
+    }
+    false
 }
 
 struct NotifyRequest {

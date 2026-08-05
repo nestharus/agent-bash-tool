@@ -1,20 +1,25 @@
 import { tool } from "@opencode-ai/plugin"
+import { join } from "node:path"
 
 /**
  * opencode `bash` tool override. Workloads survive shell timeouts under agent-bash, but remain
  * leased to this opencode process so aborting the tool or closing the session cancels the tree.
- * Exact `agent-bash list [--all] [--json]` observations run attached without creating a workload.
+ * Exact `agent-bash list [--all] [--json]` observations and standalone sleeps run attached without
+ * creating a workload. Session ownership metadata lets resumed processes rediscover their handles.
  */
 
 const AGENT_BASH = process.env.AGENT_BASH_BIN || `${process.env.HOME}/.local/bin/agent-bash`
 const AGENTS = process.env.AGENT_BASH_AGENT_RUNNER_BIN || `${process.env.HOME}/.local/bin/agents`
 const POLL_MS = Number(process.env.AGENT_BASH_TOOL_POLL_MS || 500)
+const CONSUMER_GRACE_MS = Number(process.env.AGENT_BASH_CONSUMER_GRACE_MS || Math.max(POLL_MS * 3, 1500))
+const MAX_FOREGROUND_SLEEP_MS = Number(process.env.AGENT_BASH_TOOL_MAX_FOREGROUND_SLEEP_MS || 300000)
 
 type DeliveryMode = "sync" | "async"
 type CompletionScope = "root" | "tree"
 
 type RunDispatch = {
   handle: string
+  stateDir: string | undefined
 }
 
 type ShellCommand = {
@@ -22,18 +27,64 @@ type ShellCommand = {
   body: string
 }
 
-function runEnv() {
-  return {
-    ...process.env,
-    AGENT_BASH_AGENT_RUNNER_BIN: AGENTS,
+function ownerInvocationUuid(): string | undefined {
+  const raw = process.env.OULIPOLY_PARENT_INVOCATION
+  if (!raw) return undefined
+  try {
+    const parsed = JSON.parse(raw)
+    return typeof parsed.id === "string" && parsed.id.length > 0 ? parsed.id : undefined
+  } catch {
+    return undefined
   }
 }
 
-async function statusText(handle: string, headerOnly = false): Promise<string> {
-  if (headerOnly) {
-    return (await Bun.$`${AGENT_BASH} status --tail-bytes 0 ${handle}`.env(runEnv()).nothrow().text()).trim()
+function runEnv(ownerSessionId?: string) {
+  const invocationUuid = ownerInvocationUuid()
+  return {
+    ...process.env,
+    AGENT_BASH_AGENT_RUNNER_BIN: AGENTS,
+    AGENT_BASH_CONSUMER_GRACE_MS: String(CONSUMER_GRACE_MS),
+    ...(ownerSessionId ? { AGENT_BASH_OWNER_SESSION_ID: ownerSessionId } : {}),
+    ...(invocationUuid ? { AGENT_BASH_OWNER_INVOCATION_UUID: invocationUuid } : {}),
   }
-  return (await Bun.$`${AGENT_BASH} status ${handle}`.env(runEnv()).nothrow().text()).trim()
+}
+
+function stateRoot(): string | undefined {
+  if (process.env.XDG_STATE_HOME) return join(process.env.XDG_STATE_HOME, "agent-bash")
+  if (process.env.HOME) return join(process.env.HOME, ".local/state/agent-bash")
+  return undefined
+}
+
+function stateDirForHandle(handle: string): string | undefined {
+  const root = stateRoot()
+  return root ? join(root, handle) : undefined
+}
+
+async function markConsumed(stateDir: string | undefined) {
+  if (!stateDir) return
+  try {
+    await Bun.write(join(stateDir, "consumed"), "")
+  } catch {
+    // Best-effort: failure only risks a duplicate completion notification.
+  }
+}
+
+async function statusText(handle: string, headerOnly = false, ownerSessionId?: string): Promise<string> {
+  if (headerOnly) {
+    return (await Bun.$`${AGENT_BASH} status --tail-bytes 0 ${handle}`.env(runEnv(ownerSessionId)).nothrow().text()).trim()
+  }
+  return (await Bun.$`${AGENT_BASH} status ${handle}`.env(runEnv(ownerSessionId)).nothrow().text()).trim()
+}
+
+async function terminalStatus(
+  handle: string,
+  stateDir: string | undefined,
+  ownerSessionId?: string,
+): Promise<string | undefined> {
+  const status = await statusText(handle, true, ownerSessionId)
+  if (!isTerminalStatus(status)) return undefined
+  await markConsumed(stateDir)
+  return statusText(handle, false, ownerSessionId)
 }
 
 async function modeText(handle: string): Promise<string> {
@@ -46,6 +97,22 @@ function isTerminalStatus(status: string): boolean {
 
 function commandProvided(command: string | undefined): command is string {
   return Boolean(command)
+}
+
+export function standaloneSleepMilliseconds(command: string): number | undefined {
+  const match = /^\s*sleep\s+((?:\d+(?:\.\d*)?|\.\d+))\s*$/.exec(command)
+  if (!match) return undefined
+
+  const milliseconds = Math.ceil(Number(match[1]) * 1000)
+  if (!Number.isFinite(milliseconds) || milliseconds < 0 || milliseconds > MAX_FOREGROUND_SLEEP_MS) {
+    return undefined
+  }
+  return milliseconds
+}
+
+async function runStandaloneSleep(milliseconds: number): Promise<string> {
+  await Bun.sleep(milliseconds)
+  return "DONE rc=0\n--- output ---"
 }
 
 function validDeliveryMode(value: string | undefined): value is DeliveryMode {
@@ -86,12 +153,12 @@ function classifyListControl(command: string): ListControl | undefined {
   return { all, json }
 }
 
-async function executeListControl(control: ListControl): Promise<string> {
+async function executeListControl(control: ListControl, ownerSessionId: string): Promise<string> {
   const argv = [AGENT_BASH, "list"]
   if (control.all) argv.push("--all")
   if (control.json) argv.push("--json")
 
-  const child = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" })
+  const child = Bun.spawn(argv, { env: runEnv(ownerSessionId), stdout: "pipe", stderr: "pipe" })
   const [exitCode, stdout, stderr] = await Promise.all([
     child.exited,
     new Response(child.stdout).text(),
@@ -107,7 +174,9 @@ async function executeListControl(control: ListControl): Promise<string> {
 function parseRunDispatch(runOut: string): RunDispatch | undefined {
   try {
     const parsed = JSON.parse(runOut)
-    return typeof parsed.handle === "string" ? { handle: parsed.handle } : undefined
+    return typeof parsed.handle === "string"
+      ? { handle: parsed.handle, stateDir: typeof parsed.state_dir === "string" ? parsed.state_dir : undefined }
+      : undefined
   } catch {
     return undefined
   }
@@ -119,6 +188,10 @@ function dispatchErrorResponse(runOut: string): string {
 
 function startsWithToken(command: string, token: string): boolean {
   return command === token || command.startsWith(`${token} `)
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
 function splitShellCommand(command: string): ShellCommand {
@@ -156,6 +229,18 @@ function isAgentDispatch(command: string): boolean {
   return isAgentBashRun(body) && /\s--\s+(?:[^\s]+\/)?(?:agents|oulipoly-agent-runner)(?:\s|$)/.test(body)
 }
 
+function pinAgentRunnerBinary(command: string): string {
+  const shellCommand = splitShellCommand(command)
+  let body = shellCommand.body
+  for (const token of ["agents", "oulipoly-agent-runner"]) {
+    if (startsWithToken(body, token)) {
+      return `${shellCommand.prefix}${shellQuote(AGENTS)}${body.slice(token.length)}`
+    }
+  }
+  body = body.replace(/(\s--\s+)(?:agents|oulipoly-agent-runner)(?=\s|$)/, `$1${shellQuote(AGENTS)}`)
+  return `${shellCommand.prefix}${body}`
+}
+
 function isHeadlessCaller(): boolean {
   return process.stdin.isTTY !== true
 }
@@ -189,41 +274,48 @@ async function dispatchCommand(
   delivery: DeliveryMode,
   ownerLease: boolean,
   completionScope: CompletionScope,
+  ownerSessionId: string,
 ): Promise<string> {
+  command = pinAgentRunnerBinary(command)
   if (isAgentBashRun(command)) {
     const explicitRun = commandWithDelivery(command, delivery, ownerLease)
-    return (await Bun.$`bash -lc ${explicitRun}`.env(runEnv()).nothrow().text()).trim()
+    return (await Bun.$`bash -lc ${explicitRun}`.env(runEnv(ownerSessionId)).nothrow().text()).trim()
   }
   if (!ownerLease) {
     return (
       await Bun.$`${AGENT_BASH} run --completion-scope ${completionScope} --delivery ${delivery} -- bash -lc ${command}`
-        .env(runEnv())
+        .env(runEnv(ownerSessionId))
         .nothrow()
         .text()
     ).trim()
   }
   return (
     await Bun.$`${AGENT_BASH} run --cancel-on-owner-exit --owner-pid ${process.pid} --completion-scope ${completionScope} --delivery ${delivery} -- bash -lc ${command}`
-      .env(runEnv())
+      .env(runEnv(ownerSessionId))
       .nothrow()
       .text()
   ).trim()
 }
 
-async function cancelResult(handle: string): Promise<string> {
-  const result = (await Bun.$`${AGENT_BASH} cancel ${handle}`.env(runEnv()).nothrow().text()).trim()
+async function cancelResult(handle: string, ownerSessionId: string): Promise<string> {
+  const result = (await Bun.$`${AGENT_BASH} cancel ${handle}`.env(runEnv(ownerSessionId)).nothrow().text()).trim()
   return `Cancellation requested (handle=${handle}). ${result}`
 }
 
-async function waitForSyncResult(handle: string, abort: AbortSignal): Promise<string> {
+async function waitForSyncResult(
+  handle: string,
+  stateDir: string | undefined,
+  abort: AbortSignal,
+  ownerSessionId: string,
+): Promise<string> {
   const aborted = new Promise<void>((resolve) => {
     if (abort.aborted) resolve()
     else abort.addEventListener("abort", () => resolve(), { once: true })
   })
   while (true) {
-    if (abort.aborted) return cancelResult(handle)
-    const status = await statusText(handle, true)
-    if (isTerminalStatus(status)) return statusText(handle)
+    if (abort.aborted) return cancelResult(handle, ownerSessionId)
+    const status = await terminalStatus(handle, stateDir, ownerSessionId)
+    if (status !== undefined) return status
     if ((await modeText(handle)) === "async") return asyncDispatchResponse(handle)
     await Promise.race([Bun.sleep(POLL_MS), aborted])
   }
@@ -243,37 +335,48 @@ export default tool({
     "Child-agent dispatches default to asynchronous mailbox delivery and return a handle immediately. Set `delivery` " +
     "to override either default. Headless child-agent dispatches remain asynchronous so their caller can end its turn. " +
     "A synchronous call can be detached externally without terminating its workload. Exact " +
-    "`agent-bash list [--all] [--json]` observations run attached without creating a workload handle.",
+    "`agent-bash list [--all] [--json]` observations and bounded standalone sleeps run attached without creating a " +
+    `workload handle. Leading agent-runner commands are pinned to ${AGENTS}.`,
   args: {
     command: tool.schema.string().describe("the shell command to run").optional(),
     handle: tool.schema.string().describe("poll an existing asynchronous command by its handle").optional(),
     delivery: tool.schema.string().describe('completion delivery: "sync" or "async"').optional(),
   },
   async execute(args, context) {
-    if (args.handle) return statusText(args.handle)
+    if (args.handle) {
+      return (
+        (await terminalStatus(args.handle, stateDirForHandle(args.handle), context.sessionID)) ??
+        statusText(args.handle, false, context.sessionID)
+      )
+    }
     if (!commandProvided(args.command)) return missingCommandResponse()
     if (args.delivery !== undefined && !validDeliveryMode(args.delivery)) {
       return invalidDeliveryResponse(args.delivery)
     }
     const listControl = classifyListControl(args.command)
     if (listControl) {
-      return executeListControl(listControl)
+      return executeListControl(listControl, context.sessionID)
     }
 
     if (context.abort.aborted) return "Cancellation requested before dispatch."
     const delivery = selectedDelivery(args.command, args.delivery)
+    const sleepMilliseconds = standaloneSleepMilliseconds(args.command)
+    if (delivery === "sync" && sleepMilliseconds !== undefined) {
+      return runStandaloneSleep(sleepMilliseconds)
+    }
     const runOut = await dispatchCommand(
       args.command,
       delivery,
       leaseToCaller(delivery),
       selectedCompletionScope(args.command),
+      context.sessionID,
     )
     const dispatch = parseRunDispatch(runOut)
     if (!dispatch) return dispatchErrorResponse(runOut)
-    if (context.abort.aborted) return cancelResult(dispatch.handle)
+    if (context.abort.aborted) return cancelResult(dispatch.handle, context.sessionID)
     if (delivery === "async") {
       return asyncDispatchResponse(dispatch.handle, isAgentDispatch(args.command) && isHeadlessCaller())
     }
-    return waitForSyncResult(dispatch.handle, context.abort)
+    return waitForSyncResult(dispatch.handle, dispatch.stateDir, context.abort, context.sessionID)
   },
 })
