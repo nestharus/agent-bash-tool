@@ -14,7 +14,9 @@ const SCHEMA_VERSION: u8 = 1;
 const DEFAULT_STATE_TTL_SECS: u64 = 48 * 60 * 60;
 const DEFAULT_REAP_MAX_DIRS: usize = 128;
 const DEFAULT_REAP_MAX_SCAN: usize = 4096;
+const DEFAULT_REAP_SHARDS: usize = 16;
 const PENDING_DELIVERY_GRACE_MULTIPLIER: u64 = 7;
+const REAP_SHARD_CURSOR_FILE: &str = ".reap-shard";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -25,6 +27,7 @@ pub(crate) struct StatePaths {
     pub(crate) log: PathBuf,
     pub(crate) rc: PathBuf,
     pub(crate) meta: PathBuf,
+    pub(crate) owner: PathBuf,
     pub(crate) consumed: PathBuf,
     pub(crate) delivery_mode: PathBuf,
     pub(crate) delivery_lock: PathBuf,
@@ -40,6 +43,7 @@ impl StatePaths {
             log: state_dir.join("log"),
             rc: state_dir.join("rc"),
             meta: state_dir.join("meta.json"),
+            owner: state_dir.join("owner.json"),
             consumed: state_dir.join("consumed"),
             delivery_mode: state_dir.join("delivery-mode"),
             delivery_lock: state_dir.join("delivery.lock"),
@@ -84,6 +88,21 @@ pub(crate) struct CallerChainEntry {
     pub(crate) boot_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct OwnerMeta {
+    pub(crate) owner_session_id: Option<String>,
+    pub(crate) owner_invocation_uuid: Option<String>,
+}
+
+impl OwnerMeta {
+    pub(crate) fn from_meta(meta: &Meta) -> Self {
+        Self {
+            owner_session_id: meta.owner_session_id.clone(),
+            owner_invocation_uuid: meta.owner_invocation_uuid.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct DeliveryMeta {
     pub(crate) attempted: bool,
@@ -126,6 +145,10 @@ pub(crate) struct Meta {
     pub(crate) caller_chain: Vec<CallerChainEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cancel_owner: Option<CallerChainEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owner_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owner_invocation_uuid: Option<String>,
     pub(crate) launcher_pid: libc::pid_t,
     pub(crate) supervisor_pid: Option<libc::pid_t>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,6 +202,8 @@ impl Meta {
             caller_ppid,
             caller_chain,
             cancel_owner,
+            owner_session_id: None,
+            owner_invocation_uuid: None,
             launcher_pid,
             supervisor_pid: None,
             supervisor_pid_starttime_ticks: None,
@@ -206,6 +231,16 @@ impl Meta {
 
     pub(crate) fn touch(&mut self) {
         self.updated_at_unix_ms = unix_ms();
+    }
+
+    pub(crate) fn with_owner_context(
+        mut self,
+        session_id: Option<String>,
+        invocation_uuid: Option<String>,
+    ) -> Self {
+        self.owner_session_id = session_id;
+        self.owner_invocation_uuid = invocation_uuid;
+        self
     }
 }
 
@@ -382,6 +417,7 @@ pub(crate) fn create_log(paths: &StatePaths) -> io::Result<File> {
 pub(crate) fn open_log_append(paths: &StatePaths) -> io::Result<File> {
     OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .mode(0o600)
@@ -431,6 +467,7 @@ pub(crate) struct ReapConfig {
     ttl_secs: u64,
     max_dirs: usize,
     max_scan: usize,
+    shards: usize,
     now_unix_ms: u64,
 }
 
@@ -440,6 +477,7 @@ impl ReapConfig {
             ttl_secs: env_u64("AGENT_BASH_STATE_TTL_SECS", DEFAULT_STATE_TTL_SECS),
             max_dirs: env_usize("AGENT_BASH_STATE_REAP_MAX_DIRS", DEFAULT_REAP_MAX_DIRS),
             max_scan: env_usize("AGENT_BASH_STATE_REAP_MAX_SCAN", DEFAULT_REAP_MAX_SCAN),
+            shards: env_usize("AGENT_BASH_STATE_REAP_SHARDS", DEFAULT_REAP_SHARDS).max(1),
             now_unix_ms: unix_ms(),
         }
     }
@@ -476,14 +514,48 @@ pub(crate) fn reap_state_dirs(root: &Path, config: ReapConfig) -> ReapStats {
             return stats;
         }
     };
+    let shard = next_reap_shard(root, config.shards);
+    let boot_id = read_boot_id();
     for entry in entries {
         if reap_limits_reached(&stats, config) {
             break;
         }
+        let Ok(entry) = entry else {
+            stats.errors += 1;
+            continue;
+        };
+        if !reap_entry_is_handle_dir(&entry)
+            || handle_reap_shard(&entry.file_name(), config.shards) != shard
+        {
+            continue;
+        }
         stats.scanned += 1;
-        reap_state_entry(root, entry, config, &mut stats);
+        reap_state_entry(root, entry, config, &boot_id, &mut stats);
     }
     stats
+}
+
+fn next_reap_shard(root: &Path, shards: usize) -> usize {
+    if shards <= 1 {
+        return 0;
+    }
+    let path = root.join(REAP_SHARD_CURSOR_FILE);
+    let current = fs::read_to_string(&path)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+        % shards;
+    let _ = fs::write(path, format!("{}\n", (current + 1) % shards));
+    current
+}
+
+fn handle_reap_shard(name: &OsStr, shards: usize) -> usize {
+    name.as_encoded_bytes()
+        .iter()
+        .fold(2_166_136_261_usize, |hash, byte| {
+            hash.wrapping_mul(16_777_619) ^ usize::from(*byte)
+        })
+        % shards.max(1)
 }
 
 fn reap_limits_reached(stats: &ReapStats, config: ReapConfig) -> bool {
@@ -492,22 +564,16 @@ fn reap_limits_reached(stats: &ReapStats, config: ReapConfig) -> bool {
 
 fn reap_state_entry(
     root: &Path,
-    entry: io::Result<fs::DirEntry>,
+    entry: fs::DirEntry,
     config: ReapConfig,
+    boot_id: &str,
     stats: &mut ReapStats,
 ) {
-    let Ok(entry) = entry else {
-        stats.errors += 1;
-        return;
-    };
-    if !reap_entry_is_handle_dir(&entry) {
-        return;
-    }
     let paths = StatePaths::new(
         root.to_path_buf(),
         entry.file_name().to_string_lossy().into_owned(),
     );
-    if !state_dir_reap_eligible(&paths, config) {
+    if !state_dir_reap_eligible(&paths, config, boot_id) {
         return;
     }
     match fs::remove_dir_all(&paths.state_dir) {
@@ -522,18 +588,18 @@ fn reap_entry_is_handle_dir(entry: &fs::DirEntry) -> bool {
         && entry.file_name().to_string_lossy().starts_with("ab_")
 }
 
-fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig) -> bool {
+fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig, boot_id: &str) -> bool {
     let Ok(meta) = read_meta(paths) else {
         return false;
     };
-    if !meta_is_reap_terminal(&meta) {
-        return false;
-    }
     let age_ms = state_dir_reap_age_ms(paths, &meta, config.now_unix_ms);
     if age_ms < config.ttl_ms() {
         return false;
     }
-    delivery_is_settled(paths, &meta) || age_ms >= config.pending_delivery_moot_ms()
+    if meta_is_reap_terminal(&meta, boot_id) {
+        return delivery_is_settled(paths, &meta) || age_ms >= config.pending_delivery_moot_ms();
+    }
+    meta.state == "RUNNING" && meta_processes_are_gone_or_reused(&meta, boot_id)
 }
 
 fn delivery_is_settled(paths: &StatePaths, meta: &Meta) -> bool {
@@ -542,16 +608,54 @@ fn delivery_is_settled(paths: &StatePaths, meta: &Meta) -> bool {
         || meta.delivery.skipped.as_deref() == Some("sync_in_band")
 }
 
-fn meta_is_reap_terminal(meta: &Meta) -> bool {
-    meta.state == "DONE"
+fn meta_is_reap_terminal(meta: &Meta, boot_id: &str) -> bool {
+    matches!(meta.state.as_str(), "DONE" | "ERROR")
         && meta.completed_at_unix_ms.is_some()
-        && !ready_sentinel_workload_running(meta)
+        && !ready_sentinel_workload_may_be_running(meta, boot_id)
 }
 
-fn ready_sentinel_workload_running(meta: &Meta) -> bool {
-    meta.completion_reason.as_deref() == Some("ready-sentinel")
-        && meta.workload_rc.is_none()
-        && meta.workload_signal.is_none()
+fn ready_sentinel_workload_may_be_running(meta: &Meta, boot_id: &str) -> bool {
+    if meta.completion_reason.as_deref() != Some("ready-sentinel")
+        || meta.workload_rc.is_some()
+        || meta.workload_signal.is_some()
+    {
+        return false;
+    }
+    !matches!(
+        inspect_process_identity(
+            meta.workload_pid,
+            meta.workload_pid_starttime_ticks,
+            meta.process_boot_id.as_deref(),
+            boot_id,
+        ),
+        ProcessIdentityEvidence::Gone | ProcessIdentityEvidence::Mismatch
+    )
+}
+
+fn meta_processes_are_gone_or_reused(meta: &Meta, boot_id: &str) -> bool {
+    process_is_gone_or_reused(
+        meta.supervisor_pid,
+        meta.supervisor_pid_starttime_ticks,
+        meta.process_boot_id.as_deref(),
+        boot_id,
+    ) && process_is_gone_or_reused(
+        meta.workload_pid,
+        meta.workload_pid_starttime_ticks,
+        meta.process_boot_id.as_deref(),
+        boot_id,
+    )
+}
+
+fn process_is_gone_or_reused(
+    pid: Option<libc::pid_t>,
+    starttime_ticks: Option<u64>,
+    process_boot_id: Option<&str>,
+    current_boot_id: &str,
+) -> bool {
+    matches!(
+        inspect_process_identity(pid, starttime_ticks, process_boot_id, current_boot_id),
+        ProcessIdentityEvidence::Gone | ProcessIdentityEvidence::Mismatch
+    )
 }
 
 fn state_dir_reap_age_ms(paths: &StatePaths, meta: &Meta, now_unix_ms: u64) -> u64 {
@@ -605,6 +709,17 @@ pub(crate) fn write_meta_atomic(paths: &StatePaths, meta: &Meta) -> io::Result<(
     }
     let bytes = format_meta_bytes(&persisted)?;
     atomic_write(&paths.meta, &bytes)
+}
+
+pub(crate) fn write_owner_atomic(paths: &StatePaths, owner: &OwnerMeta) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(owner).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    atomic_write(&paths.owner, &bytes)
+}
+
+pub(crate) fn read_owner(paths: &StatePaths) -> io::Result<OwnerMeta> {
+    let bytes = read_file_bytes(&paths.owner)?;
+    serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 
 pub(crate) fn write_delivery_mode_atomic(
@@ -893,6 +1008,7 @@ mod tests {
             ttl_secs,
             max_dirs,
             max_scan: 100,
+            shards: 1,
             now_unix_ms,
         }
     }
@@ -927,7 +1043,7 @@ mod tests {
         let paths = StatePaths::new(root.to_path_buf(), handle.to_string());
         create_handle_state(&paths).expect("create state");
         let mut meta = reap_state_meta(handle, state_name, updated_at_unix_ms);
-        if reap_state_name_is_done(state_name) {
+        if reap_state_name_is_terminal(state_name) {
             apply_reap_state_completion(
                 &mut meta,
                 updated_at_unix_ms,
@@ -960,8 +1076,8 @@ mod tests {
         meta
     }
 
-    fn reap_state_name_is_done(state_name: &str) -> bool {
-        state_name == "DONE"
+    fn reap_state_name_is_terminal(state_name: &str) -> bool {
+        matches!(state_name, "DONE" | "ERROR")
     }
 
     fn apply_reap_state_completion(
@@ -1038,10 +1154,19 @@ mod tests {
                 boot_id: "boot".to_string(),
             }],
             None,
+        )
+        .with_owner_context(
+            Some("ses_test".to_string()),
+            Some("11111111-1111-4111-8111-111111111111".to_string()),
         );
         write_meta_atomic(&paths, &meta).expect("write meta");
         let read = read_meta(&paths).expect("read meta");
         assert_eq!(read.schema_version, 1);
+        assert_eq!(read.owner_session_id.as_deref(), Some("ses_test"));
+        assert_eq!(
+            read.owner_invocation_uuid.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
         assert_eq!(read.handle, paths.handle);
         assert_eq!(read.caller_chain[0].pid, 123);
     }
@@ -1086,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn reaper_keeps_running_state_dir() {
+    fn reaper_keeps_running_state_without_exact_process_identities() {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_running", "RUNNING", now - 20_000, true);
@@ -1095,6 +1220,33 @@ mod tests {
 
         assert_eq!(stats.reaped, 0);
         assert!(paths.state_dir.exists());
+    }
+
+    #[test]
+    fn reaper_removes_old_running_state_after_pid_reuse() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(
+            temp.path(),
+            "ab_running_reused",
+            "RUNNING",
+            now - 20_000,
+            true,
+        );
+        let mut meta = read_meta(&paths).expect("read meta");
+        let pid = i32::try_from(std::process::id()).expect("pid");
+        let actual = process_starttime_ticks(pid).expect("process start time");
+        meta.supervisor_pid = Some(pid);
+        meta.supervisor_pid_starttime_ticks = Some(actual.saturating_add(1));
+        meta.workload_pid = Some(pid);
+        meta.workload_pid_starttime_ticks = Some(actual.saturating_add(1));
+        meta.process_boot_id = Some(current_boot_id());
+        write_meta_atomic(&paths, &meta).expect("write reused identity");
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 1);
+        assert!(!paths.state_dir.exists());
     }
 
     #[test]
@@ -1107,6 +1259,18 @@ mod tests {
 
         assert_eq!(stats.reaped, 0);
         assert!(paths.state_dir.exists());
+    }
+
+    #[test]
+    fn reaper_removes_completed_error_state_under_normal_retention() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_error", "ERROR", now - 20_000, true);
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 1);
+        assert!(!paths.state_dir.exists());
     }
 
     #[test]
@@ -1149,6 +1313,12 @@ mod tests {
             "ready-sentinel",
             None,
         );
+        let mut meta = read_meta(&paths).expect("read meta");
+        let pid = i32::try_from(std::process::id()).expect("pid");
+        meta.workload_pid = Some(pid);
+        meta.workload_pid_starttime_ticks = process_starttime_ticks(pid);
+        meta.process_boot_id = Some(current_boot_id());
+        write_meta_atomic(&paths, &meta).expect("write live workload identity");
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
 
@@ -1174,6 +1344,34 @@ mod tests {
 
         assert_eq!(stats.reaped, 2);
         assert_eq!(existing_handle_dirs(temp.path()), 1);
+    }
+
+    #[test]
+    fn reaper_rotates_across_all_configured_shards() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        for index in 0..40 {
+            write_reap_state(
+                temp.path(),
+                &format!("ab_sharded_{index}"),
+                "DONE",
+                now - 20_000,
+                true,
+            );
+        }
+        let config = ReapConfig {
+            ttl_secs: 10,
+            max_dirs: 100,
+            max_scan: 100,
+            shards: 4,
+            now_unix_ms: now,
+        };
+
+        for _ in 0..4 {
+            reap_state_dirs(temp.path(), config);
+        }
+
+        assert_eq!(existing_handle_dirs(temp.path()), 0);
     }
 
     #[test]

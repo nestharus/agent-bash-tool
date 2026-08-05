@@ -436,11 +436,21 @@ const adapterPath = process.argv[3]
 const value = process.argv[4]
 const mod = await import(adapterPath)
 const controller = new AbortController()
+const context = {
+  sessionID: "ses_adapter",
+  messageID: "msg_adapter",
+  agent: "test",
+  directory: process.cwd(),
+  worktree: process.cwd(),
+  abort: controller.signal,
+  metadata: () => {},
+  ask: async () => {},
+}
 
 if (mode === "joint") {
   const launched = await mod.default.execute(
     { command: "sleep 1; printf 'adapter joint done\\n'", delivery: "async" },
-    { abort: controller.signal },
+    context,
   )
   const launchedResult = typeof launched === "string" ? launched : String(launched)
   const launchedHandle = launchedResult.match(/handle=([^\s)]+)/)?.[1]
@@ -448,7 +458,7 @@ if (mode === "joint") {
 
   const listed = await mod.default.execute(
     { command: `${process.env.AGENT_BASH_BIN} list --json` },
-    { abort: controller.signal },
+    context,
   )
   const listResult = typeof listed === "string" ? listed : String(listed)
   console.log(JSON.stringify({ launchedResult, launchedHandle, listResult }))
@@ -459,6 +469,8 @@ const args = mode === "poll"
   ? { handle: value }
   : mode === "async"
     ? { command: "sleep 1; printf 'adapter async\\n'", delivery: "async" }
+    : mode === "sleep"
+      ? { command: "sleep 0.05" }
     : mode === "abort"
       ? { command: "sleep 60; printf 'adapter abort failed\\n'" }
       : mode === "detachable"
@@ -475,7 +487,7 @@ const args = mode === "poll"
             ? { command: value }
             : { command: "printf 'adapter inline\\n'" }
 if (mode === "abort") setTimeout(() => controller.abort(), 100)
-const result = await mod.default.execute(args, { abort: controller.signal })
+const result = await mod.default.execute(args, context)
 const text = typeof result === "string" ? result : String(result)
 const matched = text.match(/handle=([^\s)]+)/)
 
@@ -511,6 +523,10 @@ fn adapter_driver_command(
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
         .env("AGENT_BASH_TOOL_POLL_MS", "25")
         .env("XDG_STATE_HOME", temp.path())
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"source":"opencode","id":"11111111-1111-4111-8111-111111111111"}"#,
+        )
         .env_remove("OULIPOLY_DATA_DIR");
     if let Some(handle) = handle {
         command.arg(handle);
@@ -1000,6 +1016,7 @@ fn run_startup_reaps_old_consumed_state_dir_without_stdout_pollution() {
     let output = agent_bash(&temp)
         .env("AGENT_BASH_STATE_TTL_SECS", "1")
         .env("AGENT_BASH_STATE_REAP_MAX_DIRS", "1")
+        .env("AGENT_BASH_STATE_REAP_SHARDS", "1")
         .args(["run", "--", "bash", "-lc", "true"])
         .output()
         .expect("run");
@@ -1056,6 +1073,33 @@ fn exit_mode_completion_rc_and_captured_output() {
         assert_eq!(entry["boot_id"], expected_boot_id);
         assert!(!expected_boot_id.is_empty(), "boot_id must be non-empty");
     }
+}
+
+#[test]
+fn captured_log_is_bounded_and_retains_newest_output() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_LOG_MAX_BYTES", "65536")
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            "head -c 200000 /dev/zero | tr '\\0' x; printf 'tail-marker\\n'",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+
+    let log = fs::read(json["log"].as_str().expect("log path")).expect("read log");
+    assert!(log.len() <= 65_536, "retained {} bytes", log.len());
+    assert!(
+        log.windows(b"[agent-bash log truncated".len())
+            .any(|window| window == b"[agent-bash log truncated")
+    );
+    assert!(log.ends_with(b"tail-marker\n"));
 }
 
 #[test]
@@ -1204,7 +1248,7 @@ fn cgroup_disable_uses_subreaper_only_without_degradation() {
 }
 
 #[test]
-fn opencode_adapter_poll_returns_terminal_result_without_mutating_delivery_mode() {
+fn opencode_adapter_poll_marks_terminal_result_consumed_without_mutating_delivery_mode() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let (output, _) = run_cmd(
@@ -1221,7 +1265,7 @@ fn opencode_adapter_poll_returns_terminal_result_without_mutating_delivery_mode(
 
     assert_adapter_result_contains(&result, "adapter poll");
     assert_eq!(mode_text(&temp, handle), "async");
-    assert!(!state_dir_path(&json).join("consumed").exists());
+    assert!(state_dir_path(&json).join("consumed").exists());
 }
 
 #[test]
@@ -1244,8 +1288,73 @@ fn opencode_adapter_ordinary_command_completes_in_band_in_sync_mode() {
     );
     assert_eq!(meta["delivery_mode"], "sync");
     assert!(meta["cancel_owner"]["pid"].is_number());
+    assert_eq!(meta["owner_session_id"], "ses_adapter");
+    assert_eq!(
+        meta["owner_invocation_uuid"],
+        "11111111-1111-4111-8111-111111111111"
+    );
     assert_eq!(meta["delivery"]["attempted"], false);
     assert_eq!(meta["delivery"]["skipped"], "sync_in_band");
+    let owner = read_meta(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(handle)
+            .join("owner.json"),
+    );
+    assert_eq!(owner["owner_session_id"], "ses_adapter");
+    assert_eq!(
+        owner["owner_invocation_uuid"],
+        "11111111-1111-4111-8111-111111111111"
+    );
+}
+
+#[test]
+fn opencode_adapter_standalone_sleep_does_not_create_spool_state() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let result = run_adapter_driver(&temp, &driver, "sleep", None);
+
+    assert_eq!(adapter_result_text(&result), "DONE rc=0\n--- output ---");
+    assert!(
+        !temp.path().join("agent-bash").exists(),
+        "standalone sleep must not create agent-bash state"
+    );
+}
+
+#[test]
+fn list_adopts_handle_owned_by_resumed_session_after_caller_pid_changes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = seed_done_state_dir(&temp, "ab_resumed_owner", unix_ms(), false);
+    let meta_path = state_dir.join("meta.json");
+    let mut meta = read_meta(&meta_path);
+    meta["caller_ppid"] = json!(i32::MAX);
+    fs::write(&meta_path, format_seeded_meta(&meta)).expect("write resumed owner meta");
+    fs::write(
+        state_dir.join("owner.json"),
+        r#"{"owner_session_id":"ses_resumed","owner_invocation_uuid":"11111111-1111-4111-8111-111111111111"}"#,
+    )
+    .expect("write durable owner");
+
+    let matching = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_resumed")
+        .args(["list", "--json"])
+        .output()
+        .expect("matching list");
+    assert_command_success(&matching);
+    let matching = parse_stdout_json(&matching);
+    assert_eq!(matching.as_array().expect("list").len(), 1);
+    assert_eq!(matching[0]["handle"], "ab_resumed_owner");
+
+    let other = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_other")
+        .args(["list", "--json"])
+        .output()
+        .expect("other list");
+    assert_command_success(&other);
+    assert_eq!(parse_stdout_json(&other), json!([]));
 }
 
 #[test]
@@ -1300,7 +1409,24 @@ fn opencode_adapter_agent_dispatch_defaults_to_async() {
     let result = run_adapter_driver(&temp, &driver, "agent", None);
 
     assert_adapter_result_contains(&result, "Running asynchronously");
-    assert_eq!(mode_text(&temp, adapter_result_handle(&result)), "async");
+    let handle = adapter_result_handle(&result);
+    assert_eq!(mode_text(&temp, handle), "async");
+    let meta = read_meta(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(handle)
+            .join("meta.json"),
+    );
+    assert!(
+        meta["argv"]
+            .as_array()
+            .expect("argv")
+            .iter()
+            .any(|arg| arg.as_str().is_some_and(|arg| arg.contains("/bin/true"))),
+        "configured agent-runner binary was not pinned: {}",
+        meta["argv"]
+    );
 }
 
 #[test]
@@ -1875,7 +2001,7 @@ fn concurrent_detach_and_completion_produce_one_notification() {
 }
 
 #[test]
-fn legacy_consumed_marker_cannot_suppress_explicit_async_delivery() {
+fn consumed_marker_before_completion_suppresses_async_delivery() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
 
@@ -1890,16 +2016,48 @@ fn legacy_consumed_marker_cannot_suppress_explicit_async_delivery() {
     let handle = json["handle"].as_str().expect("handle");
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.contains("consumed\n"), "{final_status}");
-    wait_until(Duration::from_secs(2), || {
-        delivery_log.exists().then_some(())
-    });
     let meta_path = meta_path(&json);
     let meta = wait_until(Duration::from_secs(2), || {
         let meta = read_meta(&meta_path);
         delivery_metadata_observed(&meta).then_some(meta)
     });
-    assert_eq!(meta["delivery"]["attempted"], true);
-    assert_eq!(meta["delivery"]["exit_code"], 0);
+    assert!(!delivery_log.exists());
+    assert_eq!(meta["delivery"]["attempted"], false);
+    assert_eq!(meta["delivery"]["skipped"], "consumed_in_call");
+}
+
+#[test]
+fn consumed_marker_during_delivery_grace_suppresses_async_delivery() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = fake_agents(&temp);
+
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .env("AGENT_BASH_CONSUMER_GRACE_MS", "2000")
+        .args(["run", "--", "bash", "-lc", "echo consumed-after-rc"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    wait_until(Duration::from_secs(2), || {
+        rc_path(&json).exists().then_some(())
+    });
+    fs::write(state_dir_path(&json).join("consumed"), b"").expect("write consumed marker");
+
+    let handle = json["handle"].as_str().expect("handle");
+    let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+    assert!(
+        final_status.contains("consumed-after-rc\n"),
+        "{final_status}"
+    );
+    assert!(!delivery_log.exists());
+    let meta_path = meta_path(&json);
+    let meta = wait_until(Duration::from_secs(2), || {
+        let meta = read_meta(&meta_path);
+        delivery_metadata_observed(&meta).then_some(meta)
+    });
+    assert_eq!(meta["delivery"]["attempted"], false);
+    assert_eq!(meta["delivery"]["skipped"], "consumed_in_call");
 }
 
 fn delivery_metadata_observed(meta: &Value) -> bool {
@@ -2136,8 +2294,8 @@ fn status_reconciles_conclusively_lost_supervisor_once_and_fails_closed() {
     );
     assert_eq!(
         fs::read_to_string(&delivery_log).expect("delivery log"),
-        "delivery\ndelivery\n",
-        "legacy consumed markers must not suppress async delivery"
+        "delivery\n",
+        "consumed markers must suppress duplicate async delivery"
     );
     let consumed_meta = read_meta(
         &temp
@@ -2146,8 +2304,8 @@ fn status_reconciles_conclusively_lost_supervisor_once_and_fails_closed() {
             .join(consumed_handle)
             .join("meta.json"),
     );
-    assert_eq!(consumed_meta["delivery"]["attempted"], true);
-    assert_eq!(consumed_meta["delivery"]["exit_code"], 0);
+    assert_eq!(consumed_meta["delivery"]["attempted"], false);
+    assert_eq!(consumed_meta["delivery"]["skipped"], "consumed_in_call");
 }
 
 #[test]

@@ -57,6 +57,10 @@ delivery are separate choices:
 - Leading shell environment assignments are ignored when classifying the command. An explicit
   `VAR=value agent-bash run -- agents ...` command is dispatched directly as one asynchronous
   spool instead of being captured by a synchronous outer spool.
+- The adapter resolves a leading `agents` or `oulipoly-agent-runner` command to the configured
+  `AGENT_BASH_AGENT_RUNNER_BIN`, avoiding PATH drift between interactive and detached execution.
+- A standalone `sleep N` stays inside the adapter for up to five minutes by default, so passive
+  waits do not create detached workloads or overlapping wake notifications.
 
 A synchronous adapter call can block for its result without owning the workload process. Harness
 timeout or caller death therefore does not terminate the detached workload.
@@ -88,6 +92,10 @@ without degradation because the subreaper remains authoritative. Process-group +
 (via subreaper reparenting plus a root `pidfd`, and optionally a cgroup-v2 live set), tees
 stdout/stderr to a per-handle log, and records exit code. The `run` invocation itself returns
 the handle and exits — it does not `wait`.
+
+Captured output is bounded by `AGENT_BASH_LOG_MAX_BYTES` (16 MiB by default, clamped between
+64 KiB and 1 GiB). When the limit is crossed, the log records a truncation marker and retains the
+newest output rather than allowing an unbounded state-directory file.
 
 The intermediate daemon process remains as a guardian for the exact supervisor child. A clean
 supervisor exit ends the guardian. After an abnormal exit, including `SIGKILL`, the guardian uses
@@ -121,6 +129,12 @@ At launch, while the caller is still alive and `/proc` is readable, the spooler 
 `--meta <path>`; agent-runner resolves the owning session from the recorded chain by pure DB
 lookup. The spooler does not resolve sessions.
 
+The OpenCode adapter also supplies its provider session ID and parent invocation UUID. The spooler
+records these as optional fields in `meta.json` and in a separate `owner.json`, allowing a resumed
+session to rediscover its handles after the adapter process and caller PID change. Agent-runner may
+use this pair as a delivery fallback only after confirming that the invocation belongs to the same
+provider session.
+
 ### Durable delivery mode and atomic detach
 Each handle stores its canonical delivery mode in `delivery-mode`; `meta.json.delivery_mode` mirrors
 that value for observability. Missing mode files are interpreted as `async` for handles created by
@@ -137,8 +151,17 @@ persisted before that decision so detach can safely observe a completion that wo
   the attempt; completion reloads that record and does not notify again.
 - Repeated detach calls observe `async` and are no-ops.
 
-The old best-effort `consumed` marker is not consulted for delivery decisions. Existing marker files
-remain relevant only to state-retention cleanup for persisted legacy handles.
+Before asynchronous notification, the supervisor checks the best-effort `consumed` marker. If
+`AGENT_BASH_CONSUMER_GRACE_MS` is nonzero, it waits up to that bounded interval (clamped to ten
+seconds) for an in-call consumer to create the marker. A marker suppresses the duplicate
+notification and records `delivery.skipped="consumed_in_call"`; delivery locking still makes the
+decision atomic with detach and completion.
+
+Startup retention work is sharded by `AGENT_BASH_STATE_REAP_SHARDS` (16 by default) so large state
+roots are scanned incrementally. In addition to settled terminal handles, the reaper may remove an
+expired `ERROR` handle or `RUNNING` handle whose exact supervisor and workload identities are both
+conclusively gone or reused. Missing or unreadable process identity evidence fails closed and keeps
+the state directory.
 
 ## agent-runner additions
 

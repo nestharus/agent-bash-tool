@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,11 @@ const CANCEL_GRACE: Duration = Duration::from_secs(2);
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 const OWNER_POLL: Duration = Duration::from_millis(250);
 const SUPERVISOR_RECOVERY_POLL: Duration = Duration::from_millis(100);
+const LOG_MAX_BYTES_ENV: &str = "AGENT_BASH_LOG_MAX_BYTES";
+const DEFAULT_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const MIN_LOG_MAX_BYTES: u64 = 64 * 1024;
+const MAX_LOG_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const LOG_TRUNCATED_MARKER: &[u8] = b"\n[agent-bash log truncated; retaining newest output]\n";
 
 #[derive(Clone)]
 pub(crate) struct SupervisorConfig {
@@ -279,8 +284,94 @@ fn supervisor_meta(mut meta: Meta) -> Meta {
     meta
 }
 
-fn open_supervisor_log(paths: &StatePaths) -> io::Result<File> {
-    state::open_log_append(paths)
+fn open_supervisor_log(paths: &StatePaths) -> io::Result<BoundedLog> {
+    BoundedLog::new(state::open_log_append(paths)?, log_max_bytes())
+}
+
+fn log_max_bytes() -> u64 {
+    std::env::var(LOG_MAX_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_LOG_MAX_BYTES)
+        .clamp(MIN_LOG_MAX_BYTES, MAX_LOG_MAX_BYTES)
+}
+
+struct BoundedLog {
+    file: File,
+    max_bytes: u64,
+    len: u64,
+}
+
+impl BoundedLog {
+    fn new(file: File, max_bytes: u64) -> io::Result<Self> {
+        let len = file.metadata()?.len();
+        let mut log = Self {
+            file,
+            max_bytes: max_bytes.max(1),
+            len,
+        };
+        if len > log.max_bytes {
+            log.reset_with_tail(&[])?;
+        }
+        Ok(log)
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self
+            .len
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            > self.max_bytes
+        {
+            return self.reset_with_tail(bytes);
+        }
+        self.file.write_all(bytes)?;
+        self.len = self
+            .len
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        Ok(())
+    }
+
+    fn reset_with_tail(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let marker = retained_suffix(LOG_TRUNCATED_MARKER, self.max_bytes);
+        let payload_budget = self
+            .max_bytes
+            .saturating_sub(u64::try_from(marker.len()).unwrap_or(self.max_bytes));
+        let new_tail = retained_suffix(bytes, payload_budget);
+        let old_budget =
+            payload_budget.saturating_sub(u64::try_from(new_tail.len()).unwrap_or(payload_budget));
+        let old_tail = self.read_tail(old_budget)?;
+
+        self.file.set_len(0)?;
+        self.file.write_all(marker)?;
+        self.file.write_all(&old_tail)?;
+        self.file.write_all(new_tail)?;
+        self.len =
+            u64::try_from(marker.len() + old_tail.len() + new_tail.len()).unwrap_or(self.max_bytes);
+        Ok(())
+    }
+
+    fn read_tail(&mut self, max_bytes: u64) -> io::Result<Vec<u8>> {
+        let keep = self.len.min(max_bytes);
+        if keep == 0 {
+            return Ok(Vec::new());
+        }
+        self.file
+            .seek(SeekFrom::End(-i64::try_from(keep).unwrap_or(i64::MAX)))?;
+        let mut tail = vec![0; usize::try_from(keep).unwrap_or(usize::MAX)];
+        self.file.read_exact(&mut tail)?;
+        Ok(tail)
+    }
+
+    fn sync_all(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+}
+
+fn retained_suffix(bytes: &[u8], max_bytes: u64) -> &[u8] {
+    let keep = usize::try_from(max_bytes)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    &bytes[bytes.len().saturating_sub(keep)..]
 }
 
 fn open_log_failed_message(err: io::Error) -> String {
@@ -339,7 +430,7 @@ fn map_sentinel_matcher(regex: Regex, pattern: &str) -> SentinelMatcher {
 struct EventLoopSeed {
     paths: StatePaths,
     meta: Meta,
-    log: File,
+    log: BoundedLog,
     sigchld: Sigchld,
     cgroup: Option<ActiveCgroup>,
     spawn: WorkloadSpawn,
@@ -803,7 +894,7 @@ impl SentinelMatcher {
 struct EventLoop {
     paths: StatePaths,
     meta: Meta,
-    log: File,
+    log: BoundedLog,
     sigchld: Sigchld,
     cgroup: Option<ActiveCgroup>,
     root_pid: libc::pid_t,
@@ -1424,7 +1515,7 @@ fn record_supervisor_error(
     paths: &StatePaths,
     meta: &mut Meta,
     message: String,
-    log: Option<&mut File>,
+    log: Option<&mut BoundedLog>,
 ) -> io::Result<()> {
     sync_optional_log(log)?;
     state::write_rc_atomic(paths, EX_SOFTWARE)?;
@@ -1432,7 +1523,7 @@ fn record_supervisor_error(
     persist_meta_with_delivery(paths, meta)
 }
 
-fn sync_optional_log(log: Option<&mut File>) -> io::Result<()> {
+fn sync_optional_log(log: Option<&mut BoundedLog>) -> io::Result<()> {
     let Some(log) = log else {
         return Ok(());
     };
@@ -1522,5 +1613,55 @@ mod tests {
     #[test]
     fn signal_to_shell_rc_maps_signal() {
         assert_eq!(signal_to_shell_rc(15), 143);
+    }
+
+    #[test]
+    fn bounded_log_discards_old_output_and_retains_newest_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("log");
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .read(true)
+            .open(&path)
+            .expect("create log");
+        let mut log = BoundedLog::new(file, 128).expect("bounded log");
+
+        log.write_all(&[b'a'; 100]).expect("write old output");
+        log.write_all(&[b'b'; 100]).expect("write new output");
+        log.sync_all().expect("sync log");
+
+        let retained = std::fs::read(path).expect("read retained log");
+        assert_eq!(retained.len(), 128);
+        assert!(retained.starts_with(LOG_TRUNCATED_MARKER));
+        assert!(
+            retained[LOG_TRUNCATED_MARKER.len()..]
+                .iter()
+                .all(|byte| *byte == b'b')
+        );
+    }
+
+    #[test]
+    fn bounded_log_caps_a_single_oversized_chunk() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("log");
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .read(true)
+            .open(&path)
+            .expect("create log");
+        let mut log = BoundedLog::new(file, 96).expect("bounded log");
+
+        log.write_all(&[b'x'; 4096]).expect("write large output");
+
+        let retained = std::fs::read(path).expect("read retained log");
+        assert_eq!(retained.len(), 96);
+        assert!(retained.starts_with(LOG_TRUNCATED_MARKER));
+        assert!(
+            retained[LOG_TRUNCATED_MARKER.len()..]
+                .iter()
+                .all(|byte| *byte == b'x')
+        );
     }
 }
