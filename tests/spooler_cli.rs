@@ -359,7 +359,7 @@ fn delivery_attempt_count(path: &Path) -> usize {
     fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
-        .filter(|line| *line == "notify")
+        .filter(|line| *line == "agent-bash-complete")
         .count()
 }
 
@@ -389,6 +389,10 @@ fn observing_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf
 
 fn observing_fake_agents_script() -> &'static str {
     r#"#!/bin/sh
+operation=${2:-}
+if [ "$operation" != "agent-bash-complete" ]; then
+    exit 0
+fi
 meta=
 rc=
 while [ "$#" -gt 0 ]; do
@@ -1279,13 +1283,15 @@ fn opencode_adapter_ordinary_command_completes_in_band_in_sync_mode() {
     assert_adapter_result_contains(&result, "adapter inline");
     let handle = adapter_result_handle(&result);
     assert_eq!(mode_text(&temp, handle), "sync");
-    let meta = read_meta(
-        &temp
-            .path()
-            .join("agent-bash")
-            .join(handle)
-            .join("meta.json"),
-    );
+    let meta_path = temp
+        .path()
+        .join("agent-bash")
+        .join(handle)
+        .join("meta.json");
+    let meta = wait_until(Duration::from_secs(6), || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["attempted"] == true).then_some(meta)
+    });
     assert_eq!(meta["delivery_mode"], "sync");
     assert!(meta["cancel_owner"]["pid"].is_number());
     assert_eq!(meta["owner_session_id"], "ses_adapter");
@@ -1293,8 +1299,9 @@ fn opencode_adapter_ordinary_command_completes_in_band_in_sync_mode() {
         meta["owner_invocation_uuid"],
         "11111111-1111-4111-8111-111111111111"
     );
-    assert_eq!(meta["delivery"]["attempted"], false);
-    assert_eq!(meta["delivery"]["skipped"], "sync_in_band");
+    assert_eq!(meta["delivery"]["attempted"], true);
+    assert_eq!(meta["delivery"]["exit_code"], 0);
+    assert!(meta["delivery"]["skipped"].is_null());
     let owner = read_meta(
         &temp
             .path()
@@ -1826,13 +1833,28 @@ fn delivery_seam_records_invocation_outcome() {
     assert_eq!(json["delivery_mode"], "async");
     assert_eq!(mode_text(&temp, handle), "async");
     let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
-    let delivered = wait_until(Duration::from_secs(2), || {
-        fs::read_to_string(&delivery_log).ok()
+    wait_until(Duration::from_secs(6), || {
+        (delivery_attempt_count(&delivery_log) == 1).then_some(())
     });
+    let delivered = fs::read_to_string(&delivery_log).expect("delivery log");
     let lines: Vec<_> = delivered.lines().map(str::to_string).collect();
     assert_eq!(
         lines,
         vec![
+            "notify".to_string(),
+            "agent-bash-register".to_string(),
+            "--handle".to_string(),
+            handle.to_string(),
+            "--delivery-mode".to_string(),
+            "async".to_string(),
+            "--state-dir".to_string(),
+            json["state_dir"].as_str().expect("state dir").to_string(),
+            "--meta".to_string(),
+            json["meta"].as_str().expect("meta").to_string(),
+            "--log".to_string(),
+            json["log"].as_str().expect("log").to_string(),
+            "--rc".to_string(),
+            json["rc"].as_str().expect("rc").to_string(),
             "notify".to_string(),
             "agent-bash-complete".to_string(),
             "--caller-ppid".to_string(),
@@ -1853,7 +1875,7 @@ fn delivery_seam_records_invocation_outcome() {
         ]
     );
     let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(2), || {
+    let meta = wait_until(Duration::from_secs(6), || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["attempted"] == true).then_some(meta)
     });
@@ -1863,7 +1885,7 @@ fn delivery_seam_records_invocation_outcome() {
 }
 
 #[test]
-fn sync_completion_stays_in_band_without_notifying() {
+fn sync_completion_triggers_its_inactive_completion_event() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
     let output = agent_bash(&temp)
@@ -1888,14 +1910,18 @@ fn sync_completion_stays_in_band_without_notifying() {
     assert!(status.contains("sync\n"), "{status}");
     assert_eq!(json["delivery_mode"], "sync");
     assert_eq!(mode_text(&temp, handle), "sync");
-    assert!(!delivery_log.exists());
-    let meta = wait_until(Duration::from_secs(2), || {
+    wait_until(Duration::from_secs(6), || {
+        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+    });
+    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    let meta = wait_until(Duration::from_secs(6), || {
         let meta = read_meta(&meta_path(&json));
-        (meta["delivery"]["skipped"] == "sync_in_band").then_some(meta)
+        (meta["delivery"]["attempted"] == true).then_some(meta)
     });
     assert_eq!(meta["delivery_mode"], "sync");
-    assert_eq!(meta["delivery"]["attempted"], false);
-    assert_eq!(meta["delivery"]["skipped"], "sync_in_band");
+    assert_eq!(meta["delivery"]["attempted"], true);
+    assert_eq!(meta["delivery"]["exit_code"], 0);
+    assert!(meta["delivery"]["skipped"].is_null());
 }
 
 #[test]
@@ -1930,8 +1956,14 @@ fn detach_after_sync_completion_notifies_once() {
     assert_eq!(second["transitioned"], false);
     assert_eq!(second["notification_attempted"], false);
     assert_eq!(mode_text(&temp, handle), "async");
+    wait_until(Duration::from_secs(6), || {
+        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+    });
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
-    let meta = read_meta(&meta_path(&json));
+    let meta = wait_until(Duration::from_secs(6), || {
+        let meta = read_meta(&meta_path(&json));
+        (meta["delivery"]["attempted"] == true).then_some(meta)
+    });
     assert_eq!(meta["delivery_mode"], "async");
     assert_eq!(meta["delivery"]["attempted"], true);
 }
@@ -1993,7 +2025,7 @@ fn concurrent_detach_and_completion_produce_one_notification() {
             .count(),
         1
     );
-    wait_until(Duration::from_secs(2), || {
+    wait_until(Duration::from_secs(6), || {
         (delivery_attempt_count(&delivery_log) == 1).then_some(())
     });
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
@@ -2017,13 +2049,16 @@ fn consumed_marker_before_completion_suppresses_async_delivery() {
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.contains("consumed\n"), "{final_status}");
     let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(2), || {
+    let meta = wait_until(Duration::from_secs(6), || {
         let meta = read_meta(&meta_path);
         delivery_metadata_observed(&meta).then_some(meta)
     });
-    assert!(!delivery_log.exists());
-    assert_eq!(meta["delivery"]["attempted"], false);
-    assert_eq!(meta["delivery"]["skipped"], "consumed_in_call");
+    let delivery = fs::read_to_string(&delivery_log).expect("event commands");
+    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert!(delivery.lines().any(|line| line == "--consumed"));
+    assert_eq!(meta["delivery"]["attempted"], true);
+    assert_eq!(meta["delivery"]["exit_code"], 0);
+    assert!(meta["delivery"]["skipped"].is_null());
 }
 
 #[test]
@@ -2050,14 +2085,20 @@ fn consumed_marker_during_delivery_grace_suppresses_async_delivery() {
         final_status.contains("consumed-after-rc\n"),
         "{final_status}"
     );
-    assert!(!delivery_log.exists());
+    wait_until(Duration::from_secs(6), || {
+        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+    });
+    let delivery = fs::read_to_string(&delivery_log).expect("event commands");
+    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert!(delivery.lines().any(|line| line == "--consumed"));
     let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(2), || {
+    let meta = wait_until(Duration::from_secs(6), || {
         let meta = read_meta(&meta_path);
         delivery_metadata_observed(&meta).then_some(meta)
     });
-    assert_eq!(meta["delivery"]["attempted"], false);
-    assert_eq!(meta["delivery"]["skipped"], "consumed_in_call");
+    assert_eq!(meta["delivery"]["attempted"], true);
+    assert_eq!(meta["delivery"]["exit_code"], 0);
+    assert!(meta["delivery"]["skipped"].is_null());
 }
 
 fn delivery_metadata_observed(meta: &Value) -> bool {
@@ -2294,8 +2335,8 @@ fn status_reconciles_conclusively_lost_supervisor_once_and_fails_closed() {
     );
     assert_eq!(
         fs::read_to_string(&delivery_log).expect("delivery log"),
-        "delivery\n",
-        "consumed markers must suppress duplicate async delivery"
+        "delivery\ndelivery\n",
+        "each completion must trigger its own durable event"
     );
     let consumed_meta = read_meta(
         &temp
@@ -2304,8 +2345,9 @@ fn status_reconciles_conclusively_lost_supervisor_once_and_fails_closed() {
             .join(consumed_handle)
             .join("meta.json"),
     );
-    assert_eq!(consumed_meta["delivery"]["attempted"], false);
-    assert_eq!(consumed_meta["delivery"]["skipped"], "consumed_in_call");
+    assert_eq!(consumed_meta["delivery"]["attempted"], true);
+    assert_eq!(consumed_meta["delivery"]["exit_code"], 0);
+    assert!(consumed_meta["delivery"]["skipped"].is_null());
 }
 
 #[test]
@@ -2361,7 +2403,7 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
     let notifications = fs::read_to_string(&delivery_log)
         .expect("delivery log")
         .lines()
-        .filter(|line| *line == "notify")
+        .filter(|line| *line == "agent-bash-complete")
         .count();
     assert_eq!(
         notifications, 1,

@@ -105,7 +105,7 @@ static void exec_agent_bash(int ready_write, int release_read, pid_t tracer_pid)
     _exit(127);
 }
 
-static pid_t start_agent_parent(int child_ready[2], int child_release[2], int parent_exit[2]) {
+static pid_t start_agent_parent(int child_ready[2], int child_release[2], int parent_exit[2], pid_t *parent_pid) {
     int child_pid_pipe[2];
     if (pipe2(child_pid_pipe, O_CLOEXEC) != 0) {
         helper_error("child-pid-pipe-failed\n");
@@ -143,6 +143,7 @@ static pid_t start_agent_parent(int child_ready[2], int child_release[2], int pa
     close(child_release[0]);
     close(parent_exit[0]);
     close(child_pid_pipe[1]);
+    *parent_pid = parent;
     pid_t child = -1;
     if (read(child_pid_pipe[0], &child, sizeof(child)) != (ssize_t)sizeof(child)) {
         helper_error("child-pid-read-failed\n");
@@ -181,7 +182,7 @@ static void continue_syscall(pid_t child) {
     }
 }
 
-static void trace_child_to_exit(pid_t child, int child_ready_read, int child_release_write, int parent_exit_write) {
+static void trace_child_to_exit(pid_t child, pid_t parent, int child_ready_read, int child_release_write, int parent_exit_write) {
     char ready = 0;
     if (read(child_ready_read, &ready, 1) != 1) {
         helper_error("ready-pipe-read-failed\n");
@@ -236,6 +237,15 @@ static void trace_child_to_exit(pid_t child, int child_ready_read, int child_rel
                             helper_error("parent-exit-write-failed\n");
                         }
                         close(parent_exit_write);
+                        int parent_status = 0;
+                        while (waitpid(parent, &parent_status, 0) < 0) {
+                            if (errno != EINTR) {
+                                helper_error("parent-wait-failed\n");
+                            }
+                        }
+                        if (!WIFEXITED(parent_status)) {
+                            helper_error("parent-exit-failed\n");
+                        }
                     } else if (getppid_seen == 1) {
                         reparented_ppid = value;
                     }
@@ -258,8 +268,9 @@ static void detached_monitor(void) {
     if (pipe2(child_ready, O_CLOEXEC) != 0 || pipe2(child_release, O_CLOEXEC) != 0 || pipe2(parent_exit, O_CLOEXEC) != 0) {
         helper_error("pipe-failed\n");
     }
-    pid_t child = start_agent_parent(child_ready, child_release, parent_exit);
-    trace_child_to_exit(child, child_ready[0], child_release[1], parent_exit[1]);
+    pid_t parent = -1;
+    pid_t child = start_agent_parent(child_ready, child_release, parent_exit, &parent);
+    trace_child_to_exit(child, parent, child_ready[0], child_release[1], parent_exit[1]);
     _exit(0);
 }
 
