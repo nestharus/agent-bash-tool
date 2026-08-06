@@ -229,6 +229,7 @@ fn run_command(
     )
     .with_owner_context(owner.session_id, owner.invocation_uuid);
     persist_initial_meta(&paths, &meta)?;
+    delivery::register(&paths, &meta).map_err(completion_event_registration_error)?;
 
     validate_guard(&guard)?;
     let config = supervisor_config(
@@ -422,6 +423,13 @@ fn initial_meta_create_error(err: io::Error) -> AppError {
     AppError::new(
         EX_CANTCREAT,
         format!("agent-bash: failed to create handle state: {err}"),
+    )
+}
+
+fn completion_event_registration_error(err: io::Error) -> AppError {
+    AppError::new(
+        EX_IOERR,
+        format!("agent-bash: failed to register completion event: {err}"),
     )
 }
 
