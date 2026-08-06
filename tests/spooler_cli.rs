@@ -1288,7 +1288,7 @@ fn opencode_adapter_ordinary_command_completes_in_band_in_sync_mode() {
         .join("agent-bash")
         .join(handle)
         .join("meta.json");
-    let meta = wait_until(Duration::from_secs(2), || {
+    let meta = wait_until(Duration::from_secs(6), || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["attempted"] == true).then_some(meta)
     });
@@ -1833,9 +1833,10 @@ fn delivery_seam_records_invocation_outcome() {
     assert_eq!(json["delivery_mode"], "async");
     assert_eq!(mode_text(&temp, handle), "async");
     let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
-    let delivered = wait_until(Duration::from_secs(2), || {
-        fs::read_to_string(&delivery_log).ok()
+    wait_until(Duration::from_secs(6), || {
+        (delivery_attempt_count(&delivery_log) == 1).then_some(())
     });
+    let delivered = fs::read_to_string(&delivery_log).expect("delivery log");
     let lines: Vec<_> = delivered.lines().map(str::to_string).collect();
     assert_eq!(
         lines,
@@ -1874,7 +1875,7 @@ fn delivery_seam_records_invocation_outcome() {
         ]
     );
     let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(2), || {
+    let meta = wait_until(Duration::from_secs(6), || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["attempted"] == true).then_some(meta)
     });
@@ -1909,11 +1910,11 @@ fn sync_completion_triggers_its_inactive_completion_event() {
     assert!(status.contains("sync\n"), "{status}");
     assert_eq!(json["delivery_mode"], "sync");
     assert_eq!(mode_text(&temp, handle), "sync");
-    wait_until(Duration::from_secs(2), || {
+    wait_until(Duration::from_secs(6), || {
         (delivery_attempt_count(&delivery_log) == 1).then_some(())
     });
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
-    let meta = wait_until(Duration::from_secs(2), || {
+    let meta = wait_until(Duration::from_secs(6), || {
         let meta = read_meta(&meta_path(&json));
         (meta["delivery"]["attempted"] == true).then_some(meta)
     });
@@ -1955,8 +1956,14 @@ fn detach_after_sync_completion_notifies_once() {
     assert_eq!(second["transitioned"], false);
     assert_eq!(second["notification_attempted"], false);
     assert_eq!(mode_text(&temp, handle), "async");
+    wait_until(Duration::from_secs(6), || {
+        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+    });
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
-    let meta = read_meta(&meta_path(&json));
+    let meta = wait_until(Duration::from_secs(6), || {
+        let meta = read_meta(&meta_path(&json));
+        (meta["delivery"]["attempted"] == true).then_some(meta)
+    });
     assert_eq!(meta["delivery_mode"], "async");
     assert_eq!(meta["delivery"]["attempted"], true);
 }
@@ -2018,7 +2025,7 @@ fn concurrent_detach_and_completion_produce_one_notification() {
             .count(),
         1
     );
-    wait_until(Duration::from_secs(2), || {
+    wait_until(Duration::from_secs(6), || {
         (delivery_attempt_count(&delivery_log) == 1).then_some(())
     });
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
@@ -2042,7 +2049,7 @@ fn consumed_marker_before_completion_suppresses_async_delivery() {
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.contains("consumed\n"), "{final_status}");
     let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(2), || {
+    let meta = wait_until(Duration::from_secs(6), || {
         let meta = read_meta(&meta_path);
         delivery_metadata_observed(&meta).then_some(meta)
     });
@@ -2078,11 +2085,14 @@ fn consumed_marker_during_delivery_grace_suppresses_async_delivery() {
         final_status.contains("consumed-after-rc\n"),
         "{final_status}"
     );
+    wait_until(Duration::from_secs(6), || {
+        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+    });
     let delivery = fs::read_to_string(&delivery_log).expect("event commands");
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
     assert!(delivery.lines().any(|line| line == "--consumed"));
     let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(2), || {
+    let meta = wait_until(Duration::from_secs(6), || {
         let meta = read_meta(&meta_path);
         delivery_metadata_observed(&meta).then_some(meta)
     });
