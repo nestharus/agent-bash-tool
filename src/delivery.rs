@@ -1,6 +1,8 @@
 use std::ffi::OsString;
+use std::io;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use std::os::unix::process::ExitStatusExt;
@@ -12,6 +14,8 @@ use crate::state::{self, CallerChainEntry, DeliveryMeta, DeliveryMode, Meta, Sta
 const CONSUMER_GRACE_MS_ENV: &str = "AGENT_BASH_CONSUMER_GRACE_MS";
 const MAX_CONSUMER_GRACE_MS: u64 = 10_000;
 const CONSUMER_GRACE_POLL_MS: u64 = 25;
+const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+const OWNER_LOOKUP_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Serialize)]
 pub(crate) struct DetachOutcome {
@@ -32,32 +36,75 @@ struct PidSessionResponse {
 pub(crate) fn resolve_owner_binding(
     caller_chain: &[CallerChainEntry],
     expected_invocation_uuid: &str,
-) -> Option<(String, String)> {
-    caller_chain
+) -> io::Result<Option<(String, String)>> {
+    for entry in caller_chain
         .iter()
         .filter(|entry| state::process_identity_is_live(entry))
-        .find_map(|entry| resolve_owner_for_pid(entry.pid, expected_invocation_uuid))
+    {
+        if let Some(owner) = resolve_owner_for_pid(entry.pid, expected_invocation_uuid)? {
+            return Ok(Some(owner));
+        }
+    }
+    Ok(None)
 }
 
 fn resolve_owner_for_pid(
     pid: libc::pid_t,
     expected_invocation_uuid: &str,
-) -> Option<(String, String)> {
-    let output = Command::new(delivery_binary())
+) -> io::Result<Option<(String, String)>> {
+    let mut child = Command::new(delivery_binary())
         .args(["session", "of-pid", &pid.to_string(), "--json"])
         .stdin(Stdio::null())
-        .output()
-        .ok()?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + OWNER_LOOKUP_TIMEOUT;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("agents session of-pid {pid} timed out"),
+            ));
+        }
+        thread::sleep(OWNER_LOOKUP_POLL);
+    }
+    let output = child.wait_with_output()?;
     if !output.status.success() {
-        return None;
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let fallback = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(io::Error::other(format!(
+            "agents session of-pid {pid} exited with {}{}",
+            output.status,
+            if !detail.is_empty() {
+                format!(": {detail}")
+            } else if !fallback.is_empty() {
+                format!(": {fallback}")
+            } else {
+                String::new()
+            }
+        )));
     }
-    let response: PidSessionResponse = serde_json::from_slice(&output.stdout).ok()?;
+    let response: PidSessionResponse = serde_json::from_slice(&output.stdout).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("agents session of-pid {pid} returned invalid JSON: {err}"),
+        )
+    })?;
     if !response.found || response.invocation_uuid.as_deref() != Some(expected_invocation_uuid) {
-        return None;
+        return Ok(None);
     }
-    let session_id = response.session_id.filter(|value| !value.is_empty())?;
-    let invocation_uuid = response.invocation_uuid?;
-    Some((session_id, invocation_uuid))
+    let Some(session_id) = response.session_id.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(invocation_uuid) = response.invocation_uuid else {
+        return Ok(None);
+    };
+    Ok(Some((session_id, invocation_uuid)))
 }
 
 pub(crate) fn register(paths: &StatePaths, meta: &Meta) -> std::io::Result<()> {

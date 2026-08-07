@@ -1045,6 +1045,7 @@ fn owner_exit_cancels_opted_in_workload_and_descendants() {
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
         .env("WORKLOAD_SCRIPT", workload_script)
         .env("CHILD_PID_PATH", &child_pid_path)
+        .env_remove("OULIPOLY_PARENT_INVOCATION")
         .env_remove("OULIPOLY_DATA_DIR")
         .output()
         .expect("owner launcher");
@@ -1961,6 +1962,11 @@ fn partial_explicit_owner_fails_closed_with_runner_detail() {
         !workload_marker.exists(),
         "workload launched after rejected registration"
     );
+    assert_eq!(
+        state_dir_count(&temp),
+        0,
+        "rejected registration leaked state"
+    );
 }
 
 #[test]
@@ -1995,6 +2001,11 @@ fn resolved_owner_must_match_parent_invocation_marker() {
     assert!(
         !workload_marker.exists(),
         "workload launched with mismatched resolved owner"
+    );
+    assert_eq!(
+        state_dir_count(&temp),
+        0,
+        "rejected registration leaked state"
     );
 }
 
