@@ -19,6 +19,7 @@ fn agent_bash(temp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("agent-bash").expect("agent-bash binary");
     cmd.env("XDG_STATE_HOME", temp.path())
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env_remove("OULIPOLY_PARENT_INVOCATION")
         .env_remove("OULIPOLY_DATA_DIR");
     cmd
 }
@@ -355,6 +356,42 @@ fn fake_agents_script() -> &'static str {
     "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\nexit 0\n"
 }
 
+fn owner_resolving_fake_agents(temp: &tempfile::TempDir) -> PathBuf {
+    let fake = temp.path().join("owner-resolving-fake-agents");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+if [ "${1:-}" = session ] && [ "${2:-}" = of-pid ]; then
+    printf '%s\n' '{"found":true,"invocation_uuid":"11111111-1111-4111-8111-111111111111","session_id":"ses_resolved"}'
+fi
+exit 0
+"#,
+    )
+    .expect("write owner-resolving fake");
+    set_executable(&fake);
+    fake
+}
+
+fn registration_rejecting_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join("registration-rejecting-fake-agents");
+    let resolver_log = temp.path().join("resolver-called");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+if [ "${1:-}" = session ] && [ "${2:-}" = of-pid ]; then
+    printf 'called\n' > "$AGENT_BASH_FAKE_RESOLVER_LOG"
+    printf '%s\n' '{"found":true,"invocation_uuid":"11111111-1111-4111-8111-111111111111","session_id":"ses_resolved"}'
+    exit 0
+fi
+printf '%s\n' '{"status":"notification_event_error","message":"meta.json owner_session_id and owner_invocation_uuid are both required"}'
+exit 74
+"#,
+    )
+    .expect("write registration-rejecting fake");
+    set_executable(&fake);
+    (fake, resolver_log)
+}
+
 fn delivery_attempt_count(path: &Path) -> usize {
     fs::read_to_string(path)
         .unwrap_or_default()
@@ -469,6 +506,22 @@ if (mode === "joint") {
   process.exit(0)
 }
 
+if (mode === "move-helper") {
+  const execution = mod.default.execute(
+    { command: `sleep 0.1; mv "$AGENT_BASH_BIN" "$AGENT_BASH_BIN.moved"; sleep 0.2` },
+    context,
+  ).then(
+    (result) => ({ kind: "result", result: typeof result === "string" ? result : String(result) }),
+    (error) => ({ kind: "error", result: String(error) }),
+  )
+  const outcome = await Promise.race([
+    execution,
+    Bun.sleep(2000).then(() => ({ kind: "timeout", result: "polling did not terminate" })),
+  ])
+  console.log(JSON.stringify(outcome))
+  process.exit(outcome.kind === "error" ? 0 : 1)
+}
+
 const args = mode === "poll"
   ? { handle: value }
   : mode === "async"
@@ -519,11 +572,20 @@ fn adapter_driver_command(
     handle: Option<&str>,
 ) -> StdCommand {
     let mut command = StdCommand::new(bun_bin_path());
+    let adapter_agent_bash = temp.path().join("adapter-agent-bash");
+    if !adapter_agent_bash.exists() {
+        fs::copy(
+            assert_cmd::cargo::cargo_bin("agent-bash"),
+            &adapter_agent_bash,
+        )
+        .expect("copy adapter agent-bash");
+        set_executable(&adapter_agent_bash);
+    }
     command
         .arg(driver)
         .arg(mode)
         .arg(adapter_module_path())
-        .env("AGENT_BASH_BIN", assert_cmd::cargo::cargo_bin("agent-bash"))
+        .env("AGENT_BASH_BIN", adapter_agent_bash)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
         .env("AGENT_BASH_TOOL_POLL_MS", "25")
         .env("XDG_STATE_HOME", temp.path())
@@ -1317,6 +1379,23 @@ fn opencode_adapter_ordinary_command_completes_in_band_in_sync_mode() {
 }
 
 #[test]
+fn opencode_adapter_polling_stops_when_helper_path_disappears() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let result = run_adapter_driver(&temp, &driver, "move-helper", None);
+
+    assert_eq!(result["kind"], "error");
+    assert!(
+        result["result"]
+            .as_str()
+            .is_some_and(|message| message.contains("ENOENT")),
+        "{result}"
+    );
+}
+
+#[test]
 fn opencode_adapter_standalone_sleep_does_not_create_spool_state() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1539,7 +1618,7 @@ fn rca_agent_bash_visibility_opencode_list_control_does_not_spool() {
     let driver = write_adapter_driver(&temp);
     let command = format!(
         "{} list --all --json",
-        assert_cmd::cargo::cargo_bin("agent-bash").display()
+        temp.path().join("adapter-agent-bash").display()
     );
 
     let configured_result = run_adapter_driver(&temp, &driver, "control", Some(&command));
@@ -1816,6 +1895,107 @@ fn rca_agent_bash_visibility_many_synthetic_entries_is_bounded() {
         "listing {ENTRY_COUNT} synthetic entries took {elapsed:?}, bound is {LIST_BOUND:?}"
     );
     eprintln!("listed {ENTRY_COUNT} synthetic entries in {elapsed:?}");
+}
+
+#[test]
+fn missing_explicit_owner_resolves_verified_parent_invocation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fake = owner_resolving_fake_agents(&temp);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+        .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"source":"opencode","id":"11111111-1111-4111-8111-111111111111"}"#,
+        )
+        .args(["run", "--", "bash", "-lc", "printf 'resolved owner\\n'"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let meta = read_meta(&meta_path(&json));
+
+    assert_eq!(meta["owner_session_id"], "ses_resolved");
+    assert_eq!(
+        meta["owner_invocation_uuid"],
+        "11111111-1111-4111-8111-111111111111"
+    );
+}
+
+#[test]
+fn partial_explicit_owner_fails_closed_with_runner_detail() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, resolver_log) = registration_rejecting_fake_agents(&temp);
+    let workload_marker = temp.path().join("workload-started");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+        .env("AGENT_BASH_FAKE_RESOLVER_LOG", &resolver_log)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_partial")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"source":"opencode","id":"11111111-1111-4111-8111-111111111111"}"#,
+        )
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            &format!("touch {}", workload_marker.display()),
+        ])
+        .output()
+        .expect("run");
+
+    assert_eq!(output.status.code(), Some(74));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("runner exited with 74: {\"status\":\"notification_event_error\"")
+            && stderr.contains("owner_session_id and owner_invocation_uuid are both required"),
+        "{stderr}"
+    );
+    assert!(
+        !resolver_log.exists(),
+        "partial owner must not use fallback resolution"
+    );
+    assert!(
+        !workload_marker.exists(),
+        "workload launched after rejected registration"
+    );
+}
+
+#[test]
+fn resolved_owner_must_match_parent_invocation_marker() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, resolver_log) = registration_rejecting_fake_agents(&temp);
+    let workload_marker = temp.path().join("workload-started");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+        .env("AGENT_BASH_FAKE_RESOLVER_LOG", &resolver_log)
+        .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"source":"opencode","id":"22222222-2222-4222-8222-222222222222"}"#,
+        )
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            &format!("touch {}", workload_marker.display()),
+        ])
+        .output()
+        .expect("run");
+
+    assert_eq!(output.status.code(), Some(74));
+    assert!(
+        resolver_log.exists(),
+        "verified PID lookup was not attempted"
+    );
+    assert!(
+        !workload_marker.exists(),
+        "workload launched with mismatched resolved owner"
+    );
 }
 
 #[test]

@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use std::os::unix::process::ExitStatusExt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::state::{self, DeliveryMeta, DeliveryMode, Meta, StatePaths};
+use crate::state::{self, CallerChainEntry, DeliveryMeta, DeliveryMode, Meta, StatePaths};
 
 const CONSUMER_GRACE_MS_ENV: &str = "AGENT_BASH_CONSUMER_GRACE_MS";
 const MAX_CONSUMER_GRACE_MS: u64 = 10_000;
@@ -22,8 +22,46 @@ pub(crate) struct DetachOutcome {
     notification_attempted: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct PidSessionResponse {
+    found: bool,
+    invocation_uuid: Option<String>,
+    session_id: Option<String>,
+}
+
+pub(crate) fn resolve_owner_binding(
+    caller_chain: &[CallerChainEntry],
+    expected_invocation_uuid: &str,
+) -> Option<(String, String)> {
+    caller_chain
+        .iter()
+        .filter(|entry| state::process_identity_is_live(entry))
+        .find_map(|entry| resolve_owner_for_pid(entry.pid, expected_invocation_uuid))
+}
+
+fn resolve_owner_for_pid(
+    pid: libc::pid_t,
+    expected_invocation_uuid: &str,
+) -> Option<(String, String)> {
+    let output = Command::new(delivery_binary())
+        .args(["session", "of-pid", &pid.to_string(), "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let response: PidSessionResponse = serde_json::from_slice(&output.stdout).ok()?;
+    if !response.found || response.invocation_uuid.as_deref() != Some(expected_invocation_uuid) {
+        return None;
+    }
+    let session_id = response.session_id.filter(|value| !value.is_empty())?;
+    let invocation_uuid = response.invocation_uuid?;
+    Some((session_id, invocation_uuid))
+}
+
 pub(crate) fn register(paths: &StatePaths, meta: &Meta) -> std::io::Result<()> {
-    run_required_runner_command(&register_request(meta, paths), "register completion event")
+    run_required_runner_command(&register_request(meta, paths))
 }
 
 pub(crate) fn complete(paths: &StatePaths, meta: &mut Meta) -> std::io::Result<()> {
@@ -44,10 +82,7 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
         return Ok(detach_outcome(&meta, false, false));
     }
 
-    run_required_runner_command(
-        &activate_request(&meta.handle),
-        "activate completion listener",
-    )?;
+    run_required_runner_command(&activate_request(&meta.handle))?;
     state::write_delivery_mode_atomic(paths, DeliveryMode::Async)?;
     meta.delivery_mode = DeliveryMode::Async;
     state::write_meta_atomic(paths, &meta)?;
@@ -232,17 +267,32 @@ fn run_notify_command(request: &NotifyRequest) -> std::io::Result<ExitStatus> {
         .status()
 }
 
-fn run_required_runner_command(request: &NotifyRequest, operation: &str) -> std::io::Result<()> {
-    let status = run_notify_command(request)?;
-    if status.success() {
+fn run_required_runner_command(request: &NotifyRequest) -> std::io::Result<()> {
+    let output = Command::new(&request.binary)
+        .args(&request.args)
+        .stdin(Stdio::null())
+        .output()?;
+    if output.status.success() {
         return Ok(());
     }
+    let detail = command_failure_detail(&output.stderr, &output.stdout);
     Err(std::io::Error::other(format!(
-        "failed to {operation}: runner exited with {}",
-        status
+        "runner exited with {}{}",
+        output
+            .status
             .code()
-            .map_or_else(|| "no exit code".to_string(), |code| code.to_string())
+            .map_or_else(|| "no exit code".to_string(), |code| code.to_string()),
+        detail
+            .as_deref()
+            .map_or_else(String::new, |detail| format!(": {detail}"))
     )))
+}
+
+fn command_failure_detail(stderr: &[u8], stdout: &[u8]) -> Option<String> {
+    [stderr, stdout].into_iter().find_map(|bytes| {
+        let detail = String::from_utf8_lossy(bytes).trim().to_string();
+        (!detail.is_empty()).then_some(detail)
+    })
 }
 
 fn delivery_meta_from_status(status: ExitStatus) -> DeliveryMeta {

@@ -22,6 +22,7 @@ const EX_CANTCREAT: i32 = 73;
 const EX_IOERR: i32 = 74;
 const OWNER_SESSION_ID_ENV: &str = "AGENT_BASH_OWNER_SESSION_ID";
 const OWNER_INVOCATION_UUID_ENV: &str = "AGENT_BASH_OWNER_INVOCATION_UUID";
+const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
 
 struct OwnerContext {
     session_id: Option<String>,
@@ -214,7 +215,7 @@ fn run_command(
     let cancel_owner = resolve_cancel_owner(&caller_chain, cancel_on_owner_exit, owner_pid)?;
     let cwd = current_directory().map_err(current_directory_error)?;
     let mode = run_mode(&ready_sentinel);
-    let owner = owner_context();
+    let owner = owner_context(&caller_chain);
     let meta = Meta::new(
         handle,
         guard.startup_ppid(),
@@ -400,11 +401,37 @@ fn run_mode(ready_sentinel: &Option<String>) -> &'static str {
     }
 }
 
-fn owner_context() -> OwnerContext {
-    OwnerContext {
+fn owner_context(caller_chain: &[CallerChainEntry]) -> OwnerContext {
+    let explicit = OwnerContext {
         session_id: nonempty_env(OWNER_SESSION_ID_ENV),
         invocation_uuid: nonempty_env(OWNER_INVOCATION_UUID_ENV),
+    };
+    if explicit.session_id.is_some() || explicit.invocation_uuid.is_some() {
+        return explicit;
     }
+
+    let Some(expected_invocation_uuid) = parent_invocation_uuid() else {
+        return explicit;
+    };
+    let Some((session_id, invocation_uuid)) =
+        delivery::resolve_owner_binding(caller_chain, &expected_invocation_uuid)
+    else {
+        return explicit;
+    };
+    OwnerContext {
+        session_id: Some(session_id),
+        invocation_uuid: Some(invocation_uuid),
+    }
+}
+
+fn parent_invocation_uuid() -> Option<String> {
+    let raw = nonempty_env(PARENT_INVOCATION_ENV)?;
+    let marker: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    marker
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn nonempty_env(name: &str) -> Option<String> {
