@@ -13,6 +13,7 @@ const AGENTS = process.env.AGENT_BASH_AGENT_RUNNER_BIN || `${process.env.HOME}/.
 const POLL_MS = Number(process.env.AGENT_BASH_TOOL_POLL_MS || 500)
 const CONSUMER_GRACE_MS = Number(process.env.AGENT_BASH_CONSUMER_GRACE_MS || Math.max(POLL_MS * 3, 1500))
 const MAX_FOREGROUND_SLEEP_MS = Number(process.env.AGENT_BASH_TOOL_MAX_FOREGROUND_SLEEP_MS || 300000)
+const PROCESS_TIMEOUT_MS = Number(process.env.AGENT_BASH_TOOL_PROCESS_TIMEOUT_MS || 10000)
 
 type DeliveryMode = "sync" | "async"
 type CompletionScope = "root" | "tree"
@@ -25,6 +26,12 @@ type RunDispatch = {
 type ShellCommand = {
   prefix: string
   body: string
+}
+
+type ProcessResult = {
+  exitCode: number
+  stdout: string
+  stderr: string
 }
 
 function ownerInvocationUuid(): string | undefined {
@@ -49,6 +56,48 @@ function runEnv(ownerSessionId?: string) {
   }
 }
 
+async function runProcess(argv: string[], ownerSessionId?: string, abort?: AbortSignal): Promise<ProcessResult> {
+  const child = Bun.spawn(argv, { env: runEnv(ownerSessionId), stdout: "pipe", stderr: "pipe" })
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  const stopped = new Promise<never>((_, reject) => {
+    const stop = (message: string) => {
+      child.kill()
+      reject(new Error(message))
+    }
+    timeout = setTimeout(() => stop(`subprocess timed out after ${PROCESS_TIMEOUT_MS}ms`), PROCESS_TIMEOUT_MS)
+    if (abort) {
+      if (abort.aborted) stop("subprocess aborted")
+      else abort.addEventListener("abort", () => stop("subprocess aborted"), { once: true })
+    }
+  })
+  try {
+    const completed = Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]).then(([exitCode, stdout, stderr]) => ({ exitCode, stdout, stderr }))
+    return await Promise.race([completed, stopped])
+  } finally {
+    if (timeout) clearTimeout(timeout)
+  }
+}
+
+function processFailure(operation: string, result: ProcessResult): Error {
+  const detail = result.stderr.trim() || result.stdout.trim()
+  return new Error(`${operation} failed with exit code ${result.exitCode}${detail ? `: ${detail}` : ""}`)
+}
+
+async function checkedProcessText(
+  argv: string[],
+  operation: string,
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+): Promise<string> {
+  const result = await runProcess(argv, ownerSessionId, abort)
+  if (result.exitCode !== 0) throw processFailure(operation, result)
+  return result.stdout.trim()
+}
+
 function stateRoot(): string | undefined {
   if (process.env.XDG_STATE_HOME) return join(process.env.XDG_STATE_HOME, "agent-bash")
   if (process.env.HOME) return join(process.env.HOME, ".local/state/agent-bash")
@@ -69,26 +118,39 @@ async function markConsumed(stateDir: string | undefined) {
   }
 }
 
-async function statusText(handle: string, headerOnly = false, ownerSessionId?: string): Promise<string> {
-  if (headerOnly) {
-    return (await Bun.$`${AGENT_BASH} status --tail-bytes 0 ${handle}`.env(runEnv(ownerSessionId)).nothrow().text()).trim()
+async function statusText(
+  handle: string,
+  headerOnly = false,
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+): Promise<string> {
+  const args = [AGENT_BASH, "status"]
+  if (headerOnly) args.push("--tail-bytes", "0")
+  args.push(handle)
+  const status = await checkedProcessText(args, "agent-bash status", ownerSessionId, abort)
+  const header = status.split("\n", 1)[0]
+  if (!/^(RUNNING|DONE rc=-?\d+|ERROR rc=-?\d+) handle=/.test(header) || !header.includes(`handle=${handle}`)) {
+    throw new Error(`agent-bash status returned invalid output: ${header || "<empty>"}`)
   }
-  return (await Bun.$`${AGENT_BASH} status ${handle}`.env(runEnv(ownerSessionId)).nothrow().text()).trim()
+  return status
 }
 
 async function terminalStatus(
   handle: string,
   stateDir: string | undefined,
   ownerSessionId?: string,
+  abort?: AbortSignal,
 ): Promise<string | undefined> {
-  const status = await statusText(handle, true, ownerSessionId)
+  const status = await statusText(handle, true, ownerSessionId, abort)
   if (!isTerminalStatus(status)) return undefined
   await markConsumed(stateDir)
-  return statusText(handle, false, ownerSessionId)
+  return statusText(handle, false, ownerSessionId, abort)
 }
 
-async function modeText(handle: string): Promise<string> {
-  return (await Bun.$`${AGENT_BASH} mode ${handle}`.env(runEnv()).nothrow().text()).trim()
+async function modeText(handle: string, ownerSessionId: string, abort?: AbortSignal): Promise<DeliveryMode> {
+  const mode = await checkedProcessText([AGENT_BASH, "mode", handle], "agent-bash mode", ownerSessionId, abort)
+  if (!validDeliveryMode(mode)) throw new Error(`agent-bash mode returned invalid output: ${mode || "<empty>"}`)
+  return mode
 }
 
 function isTerminalStatus(status: string): boolean {
@@ -153,22 +215,14 @@ function classifyListControl(command: string): ListControl | undefined {
   return { all, json }
 }
 
-async function executeListControl(control: ListControl, ownerSessionId: string): Promise<string> {
+async function executeListControl(control: ListControl, ownerSessionId: string, abort?: AbortSignal): Promise<string> {
   const argv = [AGENT_BASH, "list"]
   if (control.all) argv.push("--all")
   if (control.json) argv.push("--json")
 
-  const child = Bun.spawn(argv, { env: runEnv(ownerSessionId), stdout: "pipe", stderr: "pipe" })
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
-  if (exitCode !== 0) {
-    const detail = stderr.trim()
-    throw new Error(`agent-bash list failed with exit code ${exitCode}${detail ? `: ${detail}` : ""}`)
-  }
-  return stdout
+  const result = await runProcess(argv, ownerSessionId, abort)
+  if (result.exitCode !== 0) throw processFailure("agent-bash list", result)
+  return result.stdout
 }
 
 function parseRunDispatch(runOut: string): RunDispatch | undefined {
@@ -279,26 +333,32 @@ async function dispatchCommand(
   command = pinAgentRunnerBinary(command)
   if (isAgentBashRun(command)) {
     const explicitRun = commandWithDelivery(command, delivery, ownerLease)
-    return (await Bun.$`bash -lc ${explicitRun}`.env(runEnv(ownerSessionId)).nothrow().text()).trim()
+    return checkedProcessText(["bash", "-lc", explicitRun], "agent-bash dispatch", ownerSessionId)
   }
+  const args = [AGENT_BASH, "run"]
   if (!ownerLease) {
-    return (
-      await Bun.$`${AGENT_BASH} run --completion-scope ${completionScope} --delivery ${delivery} -- bash -lc ${command}`
-        .env(runEnv(ownerSessionId))
-        .nothrow()
-        .text()
-    ).trim()
+    args.push("--completion-scope", completionScope, "--delivery", delivery)
+  } else {
+    args.push(
+      "--cancel-on-owner-exit",
+      "--owner-pid",
+      String(process.pid),
+      "--completion-scope",
+      completionScope,
+      "--delivery",
+      delivery,
+    )
   }
-  return (
-    await Bun.$`${AGENT_BASH} run --cancel-on-owner-exit --owner-pid ${process.pid} --completion-scope ${completionScope} --delivery ${delivery} -- bash -lc ${command}`
-      .env(runEnv(ownerSessionId))
-      .nothrow()
-      .text()
-  ).trim()
+  args.push("--", "bash", "-lc", command)
+  return checkedProcessText(args, "agent-bash dispatch", ownerSessionId)
 }
 
 async function cancelResult(handle: string, ownerSessionId: string): Promise<string> {
-  const result = (await Bun.$`${AGENT_BASH} cancel ${handle}`.env(runEnv(ownerSessionId)).nothrow().text()).trim()
+  const result = await checkedProcessText(
+    [AGENT_BASH, "cancel", handle],
+    "agent-bash cancel",
+    ownerSessionId,
+  )
   return `Cancellation requested (handle=${handle}). ${result}`
 }
 
@@ -314,9 +374,9 @@ async function waitForSyncResult(
   })
   while (true) {
     if (abort.aborted) return cancelResult(handle, ownerSessionId)
-    const status = await terminalStatus(handle, stateDir, ownerSessionId)
+    const status = await terminalStatus(handle, stateDir, ownerSessionId, abort)
     if (status !== undefined) return status
-    if ((await modeText(handle)) === "async") return asyncDispatchResponse(handle)
+    if ((await modeText(handle, ownerSessionId, abort)) === "async") return asyncDispatchResponse(handle)
     await Promise.race([Bun.sleep(POLL_MS), aborted])
   }
 }
@@ -345,8 +405,8 @@ export default tool({
   async execute(args, context) {
     if (args.handle) {
       return (
-        (await terminalStatus(args.handle, stateDirForHandle(args.handle), context.sessionID)) ??
-        statusText(args.handle, false, context.sessionID)
+        (await terminalStatus(args.handle, stateDirForHandle(args.handle), context.sessionID, context.abort)) ??
+        statusText(args.handle, false, context.sessionID, context.abort)
       )
     }
     if (!commandProvided(args.command)) return missingCommandResponse()
@@ -355,7 +415,7 @@ export default tool({
     }
     const listControl = classifyListControl(args.command)
     if (listControl) {
-      return executeListControl(listControl, context.sessionID)
+      return executeListControl(listControl, context.sessionID, context.abort)
     }
 
     if (context.abort.aborted) return "Cancellation requested before dispatch."

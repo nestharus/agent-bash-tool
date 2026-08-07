@@ -6,6 +6,7 @@ mod guard;
 mod state;
 mod supervisor;
 
+use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -22,6 +23,7 @@ const EX_CANTCREAT: i32 = 73;
 const EX_IOERR: i32 = 74;
 const OWNER_SESSION_ID_ENV: &str = "AGENT_BASH_OWNER_SESSION_ID";
 const OWNER_INVOCATION_UUID_ENV: &str = "AGENT_BASH_OWNER_INVOCATION_UUID";
+const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
 
 struct OwnerContext {
     session_id: Option<String>,
@@ -207,14 +209,12 @@ fn run_command(
     reap_state_dirs_at_startup(&state_root);
     let handle = state::generate_handle().map_err(supervisor_bootstrap_error)?;
     let paths = state_paths(state_root, handle.clone());
-    create_run_state(&paths)?;
-    persist_delivery_mode(&paths, delivery_mode)?;
 
     let caller_chain = state::capture_caller_chain(guard.startup_ppid());
     let cancel_owner = resolve_cancel_owner(&caller_chain, cancel_on_owner_exit, owner_pid)?;
     let cwd = current_directory().map_err(current_directory_error)?;
     let mode = run_mode(&ready_sentinel);
-    let owner = owner_context();
+    let owner = owner_context(&caller_chain)?;
     let meta = Meta::new(
         handle,
         guard.startup_ppid(),
@@ -228,8 +228,13 @@ fn run_command(
         cancel_owner,
     )
     .with_owner_context(owner.session_id, owner.invocation_uuid);
+    create_run_state(&paths)?;
+    persist_delivery_mode(&paths, delivery_mode)?;
     persist_initial_meta(&paths, &meta)?;
-    delivery::register(&paths, &meta).map_err(completion_event_registration_error)?;
+    if let Err(err) = delivery::register(&paths, &meta) {
+        let _ = fs::remove_dir_all(&paths.state_dir);
+        return Err(completion_event_registration_error(err));
+    }
 
     validate_guard(&guard)?;
     let config = supervisor_config(
@@ -400,11 +405,45 @@ fn run_mode(ready_sentinel: &Option<String>) -> &'static str {
     }
 }
 
-fn owner_context() -> OwnerContext {
-    OwnerContext {
+fn owner_context(caller_chain: &[CallerChainEntry]) -> Result<OwnerContext, AppError> {
+    let explicit = OwnerContext {
         session_id: nonempty_env(OWNER_SESSION_ID_ENV),
         invocation_uuid: nonempty_env(OWNER_INVOCATION_UUID_ENV),
+    };
+    if explicit.session_id.is_some() || explicit.invocation_uuid.is_some() {
+        return Ok(explicit);
     }
+
+    let Some(expected_invocation_uuid) = parent_invocation_uuid() else {
+        return Ok(explicit);
+    };
+    let Some((session_id, invocation_uuid)) =
+        delivery::resolve_owner_binding(caller_chain, &expected_invocation_uuid)
+            .map_err(owner_resolution_error)?
+    else {
+        return Ok(explicit);
+    };
+    Ok(OwnerContext {
+        session_id: Some(session_id),
+        invocation_uuid: Some(invocation_uuid),
+    })
+}
+
+fn owner_resolution_error(err: io::Error) -> AppError {
+    AppError::new(
+        EX_IOERR,
+        format!("agent-bash: failed to resolve completion owner: {err}"),
+    )
+}
+
+fn parent_invocation_uuid() -> Option<String> {
+    let raw = nonempty_env(PARENT_INVOCATION_ENV)?;
+    let marker: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    marker
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn nonempty_env(name: &str) -> Option<String> {
