@@ -43,7 +43,25 @@ type LiveSessionResponse = {
   error?: string
 }
 
+class LiveSessionBindingTransportError extends Error {
+  constructor(message: string, readonly code?: string) {
+    super(message)
+  }
+}
+
 let liveSessionBinding: Promise<void> | undefined
+
+function clearLiveSessionBindingEnvironment() {
+  delete process.env.OULIPOLY_LIVE_SESSION_BIND_SOCKET
+  delete process.env.OULIPOLY_LIVE_SESSION_BIND_TOKEN
+}
+
+function liveSessionBindingTransportIsGone(error: unknown): boolean {
+  return (
+    error instanceof LiveSessionBindingTransportError &&
+    (error.code === "ENOENT" || error.code === "ECONNREFUSED")
+  )
+}
 
 function ownerInvocationUuid(): string | undefined {
   const raw = process.env.OULIPOLY_PARENT_INVOCATION
@@ -111,7 +129,10 @@ function reportLiveSession(
         finish(new Error(`live session binding returned invalid JSON: ${String(error)}`))
       }
     })
-    socket.on("error", (error) => finish(new Error(`live session binding failed: ${error.message}`)))
+    socket.on("error", (error) => {
+      const code = (error as Error & { code?: string }).code
+      finish(new LiveSessionBindingTransportError(`live session binding failed: ${error.message}`, code))
+    })
     socket.on("end", () => finish(new Error("live session binding closed without an acknowledgement")))
   })
 }
@@ -126,6 +147,10 @@ function ensureLiveSessionBinding(providerSessionId: string): Promise<void> | un
   }
   if (!liveSessionBinding) {
     liveSessionBinding = reportLiveSession(socketPath, token, invocationUuid, providerSessionId).catch((error) => {
+      if (liveSessionBindingTransportIsGone(error)) {
+        clearLiveSessionBindingEnvironment()
+        return
+      }
       liveSessionBinding = undefined
       throw error
     })
@@ -135,8 +160,12 @@ function ensureLiveSessionBinding(providerSessionId: string): Promise<void> | un
 
 function runEnv(ownerSessionId?: string) {
   const invocationUuid = ownerInvocationUuid()
+  const env = { ...process.env }
+  // The handshake capability is scoped to this adapter and is never a workload credential.
+  delete env.OULIPOLY_LIVE_SESSION_BIND_SOCKET
+  delete env.OULIPOLY_LIVE_SESSION_BIND_TOKEN
   return {
-    ...process.env,
+    ...env,
     AGENT_BASH_AGENT_RUNNER_BIN: AGENTS,
     AGENT_BASH_CONSUMER_GRACE_MS: String(CONSUMER_GRACE_MS),
     ...(ownerSessionId ? { AGENT_BASH_OWNER_SESSION_ID: ownerSessionId } : {}),
