@@ -1,7 +1,8 @@
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -506,6 +507,15 @@ if (mode === "joint") {
   process.exit(0)
 }
 
+if (mode === "parallel-live") {
+  const results = await Promise.all([
+    mod.default.execute({ command: "printf 'first live command\\n'" }, context),
+    mod.default.execute({ command: "printf 'second live command\\n'" }, context),
+  ])
+  console.log(JSON.stringify({ result: results.map(String).join("\n") }))
+  process.exit(0)
+}
+
 if (mode === "move-helper") {
   const execution = mod.default.execute(
     { command: `sleep 0.1; mv "$AGENT_BASH_BIN" "$AGENT_BASH_BIN.moved"; sleep 0.2` },
@@ -593,11 +603,58 @@ fn adapter_driver_command(
             "OULIPOLY_PARENT_INVOCATION",
             r#"{"source":"opencode","id":"11111111-1111-4111-8111-111111111111"}"#,
         )
+        .env_remove("OULIPOLY_LIVE_SESSION_BIND_SOCKET")
+        .env_remove("OULIPOLY_LIVE_SESSION_BIND_TOKEN")
         .env_remove("OULIPOLY_DATA_DIR");
     if let Some(handle) = handle {
         command.arg(handle);
     }
     command
+}
+
+fn run_adapter_driver_with_live_binding(
+    temp: &tempfile::TempDir,
+    driver: &Path,
+    mode: &str,
+) -> (Value, Value) {
+    let socket_path = temp.path().join("live-session.sock");
+    let state_root = temp.path().join("agent-bash");
+    let listener = UnixListener::bind(&socket_path).expect("bind live-session socket");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept live-session report");
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().expect("clone live-session stream"))
+            .read_line(&mut line)
+            .expect("read live-session report");
+        let report: Value =
+            serde_json::from_str(line.trim_end()).expect("live-session report JSON");
+        assert!(
+            !state_root.exists()
+                || fs::read_dir(&state_root)
+                    .expect("read pre-binding state root")
+                    .next()
+                    .is_none(),
+            "agent-bash dispatched before live-session acknowledgement"
+        );
+        writeln!(
+            stream,
+            "{}",
+            json!({ "ok": true, "session_id": "ses_adapter", "error": null })
+        )
+        .expect("write live-session response");
+        report
+    });
+    let mut command = adapter_driver_command(temp, driver, mode, None);
+    let output = command
+        .env("OULIPOLY_LIVE_SESSION_BIND_SOCKET", &socket_path)
+        .env("OULIPOLY_LIVE_SESSION_BIND_TOKEN", "fixture-token")
+        .output()
+        .expect("live-session adapter driver");
+    assert_command_success(&output);
+    (
+        parse_stdout_json(&output),
+        server.join().expect("join live-session server"),
+    )
 }
 
 fn bun_bin_path() -> PathBuf {
@@ -1333,6 +1390,25 @@ fn opencode_adapter_poll_marks_terminal_result_consumed_without_mutating_deliver
     assert_adapter_result_contains(&result, "adapter poll");
     assert_eq!(mode_text(&temp, handle), "async");
     assert!(state_dir_path(&json).join("consumed").exists());
+}
+
+#[test]
+fn opencode_adapter_binds_exact_live_session_once_before_parallel_dispatch() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let (result, report) = run_adapter_driver_with_live_binding(&temp, &driver, "parallel-live");
+
+    assert_adapter_result_contains(&result, "first live command");
+    assert_adapter_result_contains(&result, "second live command");
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["token"], "fixture-token");
+    assert_eq!(
+        report["invocation_uuid"],
+        "11111111-1111-4111-8111-111111111111"
+    );
+    assert_eq!(report["provider_session_id"], "ses_adapter");
 }
 
 #[test]

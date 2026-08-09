@@ -1,4 +1,5 @@
 import { tool } from "@opencode-ai/plugin"
+import { createConnection } from "node:net"
 import { join } from "node:path"
 
 /**
@@ -14,6 +15,8 @@ const POLL_MS = Number(process.env.AGENT_BASH_TOOL_POLL_MS || 500)
 const CONSUMER_GRACE_MS = Number(process.env.AGENT_BASH_CONSUMER_GRACE_MS || Math.max(POLL_MS * 3, 1500))
 const MAX_FOREGROUND_SLEEP_MS = Number(process.env.AGENT_BASH_TOOL_MAX_FOREGROUND_SLEEP_MS || 300000)
 const PROCESS_TIMEOUT_MS = Number(process.env.AGENT_BASH_TOOL_PROCESS_TIMEOUT_MS || 10000)
+const LIVE_SESSION_BIND_TIMEOUT_MS = 5000
+const MAX_LIVE_SESSION_RESPONSE_BYTES = 16 * 1024
 
 type DeliveryMode = "sync" | "async"
 type CompletionScope = "root" | "tree"
@@ -34,6 +37,14 @@ type ProcessResult = {
   stderr: string
 }
 
+type LiveSessionResponse = {
+  ok?: boolean
+  session_id?: string
+  error?: string
+}
+
+let liveSessionBinding: Promise<void> | undefined
+
 function ownerInvocationUuid(): string | undefined {
   const raw = process.env.OULIPOLY_PARENT_INVOCATION
   if (!raw) return undefined
@@ -43,6 +54,83 @@ function ownerInvocationUuid(): string | undefined {
   } catch {
     return undefined
   }
+}
+
+function reportLiveSession(
+  socketPath: string,
+  token: string,
+  invocationUuid: string,
+  providerSessionId: string,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ path: socketPath })
+    let responseBytes = ""
+    let settled = false
+    const timeout = setTimeout(
+      () => finish(new Error(`live session binding timed out after ${LIVE_SESSION_BIND_TIMEOUT_MS}ms`)),
+      LIVE_SESSION_BIND_TIMEOUT_MS,
+    )
+    const finish = (error?: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      socket.destroy()
+      if (error) reject(error)
+      else resolve()
+    }
+
+    socket.setEncoding("utf8")
+    socket.on("connect", () => {
+      socket.write(
+        `${JSON.stringify({
+          schema_version: 1,
+          token,
+          invocation_uuid: invocationUuid,
+          provider_session_id: providerSessionId,
+        })}\n`,
+      )
+    })
+    socket.on("data", (chunk: string) => {
+      responseBytes += chunk
+      if (Buffer.byteLength(responseBytes) > MAX_LIVE_SESSION_RESPONSE_BYTES) {
+        finish(new Error("live session binding response exceeded the size limit"))
+        return
+      }
+      const newline = responseBytes.indexOf("\n")
+      if (newline < 0) return
+      try {
+        const response = JSON.parse(responseBytes.slice(0, newline)) as LiveSessionResponse
+        if (response.ok !== true) {
+          finish(new Error(`live session binding was rejected: ${response.error || "unknown error"}`))
+        } else if (response.session_id !== providerSessionId) {
+          finish(new Error("live session binding acknowledged a different provider session"))
+        } else {
+          finish()
+        }
+      } catch (error) {
+        finish(new Error(`live session binding returned invalid JSON: ${String(error)}`))
+      }
+    })
+    socket.on("error", (error) => finish(new Error(`live session binding failed: ${error.message}`)))
+    socket.on("end", () => finish(new Error("live session binding closed without an acknowledgement")))
+  })
+}
+
+async function ensureLiveSessionBinding(providerSessionId: string): Promise<void> {
+  const socketPath = process.env.OULIPOLY_LIVE_SESSION_BIND_SOCKET
+  const token = process.env.OULIPOLY_LIVE_SESSION_BIND_TOKEN
+  if (!socketPath && !token) return
+  const invocationUuid = ownerInvocationUuid()
+  if (!socketPath || !token || !invocationUuid) {
+    throw new Error("live session binding environment is incomplete")
+  }
+  if (!liveSessionBinding) {
+    liveSessionBinding = reportLiveSession(socketPath, token, invocationUuid, providerSessionId).catch((error) => {
+      liveSessionBinding = undefined
+      throw error
+    })
+  }
+  await liveSessionBinding
 }
 
 function runEnv(ownerSessionId?: string) {
@@ -424,6 +512,7 @@ export default tool({
     if (delivery === "sync" && sleepMilliseconds !== undefined) {
       return runStandaloneSleep(sleepMilliseconds)
     }
+    await ensureLiveSessionBinding(context.sessionID)
     const runOut = await dispatchCommand(
       args.command,
       delivery,
