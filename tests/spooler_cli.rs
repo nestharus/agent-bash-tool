@@ -546,6 +546,8 @@ const args = mode === "poll"
         ? { command: `${process.env.AGENT_BASH_BIN} run -- agents --version` }
       : mode === "wrapper-env"
         ? { command: `XDG_STATE_HOME=${process.env.XDG_STATE_HOME} ${process.env.AGENT_BASH_BIN} run -- agents --version` }
+      : mode === "binding-env"
+        ? { command: "printf '%s|%s\\n' \"${OULIPOLY_LIVE_SESSION_BIND_SOCKET-unset}\" \"${OULIPOLY_LIVE_SESSION_BIND_TOKEN-unset}\"" }
       : mode === "agent-sync"
         ? { command: "agents --version", delivery: "sync" }
         : mode === "agent"
@@ -655,6 +657,24 @@ fn run_adapter_driver_with_live_binding(
         parse_stdout_json(&output),
         server.join().expect("join live-session server"),
     )
+}
+
+fn run_adapter_driver_with_stale_live_binding(
+    temp: &tempfile::TempDir,
+    driver: &Path,
+    mode: &str,
+) -> Value {
+    let mut command = adapter_driver_command(temp, driver, mode, None);
+    let output = command
+        .env(
+            "OULIPOLY_LIVE_SESSION_BIND_SOCKET",
+            temp.path().join("removed-live-session.sock"),
+        )
+        .env("OULIPOLY_LIVE_SESSION_BIND_TOKEN", "stale-fixture-token")
+        .output()
+        .expect("stale live-session adapter driver");
+    assert_command_success(&output);
+    parse_stdout_json(&output)
 }
 
 fn bun_bin_path() -> PathBuf {
@@ -1409,6 +1429,29 @@ fn opencode_adapter_binds_exact_live_session_once_before_parallel_dispatch() {
         "11111111-1111-4111-8111-111111111111"
     );
     assert_eq!(report["provider_session_id"], "ses_adapter");
+}
+
+#[test]
+fn opencode_adapter_does_not_propagate_consumed_live_binding_to_workloads() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let (result, report) = run_adapter_driver_with_live_binding(&temp, &driver, "binding-env");
+
+    assert_adapter_result_contains(&result, "unset|unset");
+    assert_eq!(report["provider_session_id"], "ses_adapter");
+}
+
+#[test]
+fn opencode_adapter_recovers_from_inherited_removed_live_binding() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let result = run_adapter_driver_with_stale_live_binding(&temp, &driver, "binding-env");
+
+    assert_adapter_result_contains(&result, "unset|unset");
 }
 
 #[test]
