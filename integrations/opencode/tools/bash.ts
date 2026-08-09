@@ -116,10 +116,10 @@ function reportLiveSession(
   })
 }
 
-async function ensureLiveSessionBinding(providerSessionId: string): Promise<void> {
+function ensureLiveSessionBinding(providerSessionId: string): Promise<void> | undefined {
   const socketPath = process.env.OULIPOLY_LIVE_SESSION_BIND_SOCKET
   const token = process.env.OULIPOLY_LIVE_SESSION_BIND_TOKEN
-  if (!socketPath && !token) return
+  if (!socketPath && !token) return undefined
   const invocationUuid = ownerInvocationUuid()
   if (!socketPath || !token || !invocationUuid) {
     throw new Error("live session binding environment is incomplete")
@@ -130,7 +130,7 @@ async function ensureLiveSessionBinding(providerSessionId: string): Promise<void
       throw error
     })
   }
-  await liveSessionBinding
+  return liveSessionBinding
 }
 
 function runEnv(ownerSessionId?: string) {
@@ -512,7 +512,8 @@ export default tool({
     if (delivery === "sync" && sleepMilliseconds !== undefined) {
       return runStandaloneSleep(sleepMilliseconds)
     }
-    await ensureLiveSessionBinding(context.sessionID)
+    const binding = ensureLiveSessionBinding(context.sessionID)
+    if (binding) await binding
     const runOut = await dispatchCommand(
       args.command,
       delivery,
