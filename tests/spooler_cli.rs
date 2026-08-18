@@ -363,6 +363,9 @@ fn owner_resolving_fake_agents(temp: &tempfile::TempDir) -> PathBuf {
         &fake,
         r#"#!/bin/sh
 if [ "${1:-}" = session ] && [ "${2:-}" = of-pid ]; then
+    if [ -n "${AGENT_BASH_FAKE_RESOLVER_DELAY:-}" ]; then
+        sleep "$AGENT_BASH_FAKE_RESOLVER_DELAY"
+    fi
     printf '{"found":true,"invocation_uuid":"11111111-1111-4111-8111-111111111111","session_id":"%s"}\n' "${AGENT_BASH_FAKE_RESOLVED_SESSION:-ses_resolved}"
 fi
 exit 0
@@ -1514,6 +1517,7 @@ fn opencode_adapter_initial_dispatch_uses_verified_parent_session() {
     let mut command = adapter_driver_command(&temp, &driver, "run", None);
     let output = command
         .env("AGENT_BASH_FAKE_RESOLVED_SESSION", "ses_parent")
+        .env("AGENT_BASH_FAKE_RESOLVER_DELAY", "2.2")
         .output()
         .expect("adapter driver");
     assert_command_success(&output);
