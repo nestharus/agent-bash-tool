@@ -14,7 +14,7 @@ use crate::state::{self, CallerChainEntry, DeliveryMeta, DeliveryMode, Meta, Sta
 const CONSUMER_GRACE_MS_ENV: &str = "AGENT_BASH_CONSUMER_GRACE_MS";
 const MAX_CONSUMER_GRACE_MS: u64 = 10_000;
 const CONSUMER_GRACE_POLL_MS: u64 = 25;
-const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
 const OWNER_LOOKUP_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Serialize)]
@@ -75,6 +75,12 @@ fn resolve_owner_for_pid(
     }
     let output = child.wait_with_output()?;
     if !output.status.success() {
+        if output.status.code() == Some(1)
+            && serde_json::from_slice::<PidSessionResponse>(&output.stdout)
+                .is_ok_and(|response| !response.found)
+        {
+            return Ok(None);
+        }
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let fallback = String::from_utf8_lossy(&output.stdout).trim().to_string();
         return Err(io::Error::other(format!(

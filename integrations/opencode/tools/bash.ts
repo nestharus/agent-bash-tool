@@ -491,9 +491,14 @@ async function waitForSyncResult(
   })
   while (true) {
     if (abort.aborted) return cancelResult(handle, ownerSessionId)
-    const status = await terminalStatus(handle, stateDir, ownerSessionId, abort)
-    if (status !== undefined) return status
-    if ((await modeText(handle, ownerSessionId, abort)) === "async") return asyncDispatchResponse(handle)
+    try {
+      const status = await terminalStatus(handle, stateDir, ownerSessionId, abort)
+      if (status !== undefined) return status
+      if ((await modeText(handle, ownerSessionId, abort)) === "async") return asyncDispatchResponse(handle)
+    } catch (error) {
+      if (abort.aborted) return cancelResult(handle, ownerSessionId)
+      throw error
+    }
     await Promise.race([Bun.sleep(POLL_MS), aborted])
   }
 }

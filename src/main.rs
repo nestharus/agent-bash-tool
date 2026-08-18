@@ -410,6 +410,19 @@ fn owner_context(caller_chain: &[CallerChainEntry]) -> Result<OwnerContext, AppE
         session_id: nonempty_env(OWNER_SESSION_ID_ENV),
         invocation_uuid: nonempty_env(OWNER_INVOCATION_UUID_ENV),
     };
+    if let (Some(explicit_invocation_uuid), Some(_)) = (
+        explicit.invocation_uuid.as_deref(),
+        explicit.session_id.as_deref(),
+    ) && parent_invocation_uuid().as_deref() == Some(explicit_invocation_uuid)
+        && let Some((session_id, invocation_uuid)) =
+            delivery::resolve_owner_binding(caller_chain, explicit_invocation_uuid)
+                .map_err(owner_resolution_error)?
+    {
+        return Ok(OwnerContext {
+            session_id: Some(session_id),
+            invocation_uuid: Some(invocation_uuid),
+        });
+    }
     if explicit.session_id.is_some() || explicit.invocation_uuid.is_some() {
         return Ok(explicit);
     }
