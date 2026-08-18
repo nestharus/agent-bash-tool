@@ -363,7 +363,7 @@ fn owner_resolving_fake_agents(temp: &tempfile::TempDir) -> PathBuf {
         &fake,
         r#"#!/bin/sh
 if [ "${1:-}" = session ] && [ "${2:-}" = of-pid ]; then
-    printf '%s\n' '{"found":true,"invocation_uuid":"11111111-1111-4111-8111-111111111111","session_id":"ses_resolved"}'
+    printf '{"found":true,"invocation_uuid":"11111111-1111-4111-8111-111111111111","session_id":"%s"}\n' "${AGENT_BASH_FAKE_RESOLVED_SESSION:-ses_resolved}"
 fi
 exit 0
 "#,
@@ -548,6 +548,8 @@ const args = mode === "poll"
         ? { command: `XDG_STATE_HOME=${process.env.XDG_STATE_HOME} ${process.env.AGENT_BASH_BIN} run -- agents --version` }
       : mode === "binding-env"
         ? { command: "printf '%s|%s\\n' \"${OULIPOLY_LIVE_SESSION_BIND_SOCKET-unset}\" \"${OULIPOLY_LIVE_SESSION_BIND_TOKEN-unset}\"" }
+      : mode === "inherited-env"
+        ? { command: "printf '%s|%s|%s\\n' \"$INHERITED_ENV_SENTINEL\" \"$OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY\" \"$OULIPOLY_PARENT_INVOCATION\"" }
       : mode === "agent-sync"
         ? { command: "agents --version", delivery: "sync" }
         : mode === "agent"
@@ -598,7 +600,11 @@ fn adapter_driver_command(
         .arg(mode)
         .arg(adapter_module_path())
         .env("AGENT_BASH_BIN", adapter_agent_bash)
-        .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env(
+            "AGENT_BASH_AGENT_RUNNER_BIN",
+            owner_resolving_fake_agents(temp),
+        )
+        .env("AGENT_BASH_FAKE_RESOLVED_SESSION", "ses_adapter")
         .env("AGENT_BASH_TOOL_POLL_MS", "25")
         .env("XDG_STATE_HOME", temp.path())
         .env(
@@ -947,6 +953,8 @@ exit "$rc"
         .env("AGENT_BASH_BIN", assert_cmd::cargo::cargo_bin("agent-bash"))
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
         .env("XDG_STATE_HOME", temp.path())
+        .env_remove("OULIPOLY_PARENT_INVOCATION")
+        .env_remove("OULIPOLY_DATA_DIR")
         .env("RUN_JSON", &run_json)
         .env("READY", &ready)
         .env("LIST_NOW", &list_now)
@@ -1499,6 +1507,57 @@ fn opencode_adapter_ordinary_command_completes_in_band_in_sync_mode() {
 }
 
 #[test]
+fn opencode_adapter_initial_dispatch_uses_verified_parent_session() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+    let mut command = adapter_driver_command(&temp, &driver, "run", None);
+    let output = command
+        .env("AGENT_BASH_FAKE_RESOLVED_SESSION", "ses_parent")
+        .output()
+        .expect("adapter driver");
+    assert_command_success(&output);
+    let result = parse_stdout_json(&output);
+    let handle = adapter_result_handle(&result);
+    let meta = read_meta(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(handle)
+            .join("meta.json"),
+    );
+
+    assert_eq!(meta["owner_session_id"], "ses_parent");
+    assert_eq!(
+        meta["owner_invocation_uuid"],
+        "11111111-1111-4111-8111-111111111111"
+    );
+}
+
+#[test]
+fn opencode_adapter_initial_dispatch_preserves_inherited_environment() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+    let mut command = adapter_driver_command(&temp, &driver, "inherited-env", None);
+    let output = command
+        .env("INHERITED_ENV_SENTINEL", "fixture-env")
+        .env(
+            "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
+            "fixture-authority",
+        )
+        .output()
+        .expect("adapter driver");
+    assert_command_success(&output);
+    let result = parse_stdout_json(&output);
+
+    assert_adapter_result_contains(
+        &result,
+        "fixture-env|fixture-authority|{\"source\":\"opencode\",\"id\":\"11111111-1111-4111-8111-111111111111\"}",
+    );
+}
+
+#[test]
 fn opencode_adapter_polling_stops_when_helper_path_disappears() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1625,11 +1684,9 @@ fn opencode_adapter_agent_dispatch_defaults_to_async() {
             .join("meta.json"),
     );
     assert!(
-        meta["argv"]
-            .as_array()
-            .expect("argv")
-            .iter()
-            .any(|arg| arg.as_str().is_some_and(|arg| arg.contains("/bin/true"))),
+        meta["argv"].as_array().expect("argv").iter().any(|arg| arg
+            .as_str()
+            .is_some_and(|arg| arg.contains("owner-resolving-fake-agents"))),
         "configured agent-runner binary was not pinned: {}",
         meta["argv"]
     );
