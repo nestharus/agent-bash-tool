@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -1053,153 +1054,162 @@ fn shell_list_json(temp: &tempfile::TempDir, all: bool) -> Vec<Value> {
     serde_json::from_slice(&output.stdout).expect("shell list JSON")
 }
 
-#[derive(Debug)]
-struct WorkloadGroupIdentity {
-    process: ProcIdentity,
-    boot_id: String,
-    pgid: libc::pid_t,
-}
-
 #[derive(Debug, Default, PartialEq, Eq)]
-struct ProcessGroupCleanup {
-    term_sent: bool,
-    kill_sent: bool,
+struct ProcessCleanup {
+    term_sent: usize,
+    kill_sent: usize,
 }
 
-fn kill_process_group(meta: &Value) -> ProcessGroupCleanup {
-    let Some(identity) = workload_group_identity(meta) else {
-        return ProcessGroupCleanup::default();
-    };
-    let term_sent = signal_owned_process_group(&identity, libc::SIGTERM);
-    if !term_sent {
-        return ProcessGroupCleanup::default();
+#[derive(Debug)]
+struct OwnedProcess {
+    pidfd: OwnedFd,
+}
+
+impl OwnedProcess {
+    fn capture(
+        identity: ProcIdentity,
+        boot_id: &str,
+        expected_parent: Option<libc::pid_t>,
+    ) -> Option<Self> {
+        if read_boot_id() != boot_id {
+            return None;
+        }
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0) };
+        if fd < 0 {
+            return None;
+        }
+        let pidfd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+        let (observed, parent) = proc_identity(identity.pid)?;
+        if observed != identity || expected_parent.is_some_and(|expected| parent != expected) {
+            return None;
+        }
+        Some(Self { pidfd })
     }
 
-    let deadline = Instant::now() + Duration::from_millis(100);
-    while Instant::now() < deadline {
-        if !workload_group_is_owned(&identity) {
-            return ProcessGroupCleanup {
-                term_sent,
-                kill_sent: false,
-            };
+    fn capture_current(pid: libc::pid_t, expected_parent: Option<libc::pid_t>) -> Option<Self> {
+        let (identity, parent) = proc_identity(pid)?;
+        if expected_parent.is_some_and(|expected| parent != expected) {
+            return None;
         }
+        Self::capture(identity, &read_boot_id(), expected_parent)
+    }
+
+    fn capture_workload(meta: &Value) -> Option<Self> {
+        Self::capture(
+            ProcIdentity {
+                pid: libc::pid_t::try_from(meta["workload_pid"].as_i64()?).ok()?,
+                starttime_ticks: meta["workload_pid_starttime_ticks"].as_u64()?,
+            },
+            meta["process_boot_id"].as_str()?,
+            None,
+        )
+    }
+
+    fn capture_supervisor(meta: &Value) -> Option<Self> {
+        Self::capture(
+            ProcIdentity {
+                pid: libc::pid_t::try_from(meta["supervisor_pid"].as_i64()?).ok()?,
+                starttime_ticks: meta["supervisor_pid_starttime_ticks"].as_u64()?,
+            },
+            meta["process_boot_id"].as_str()?,
+            None,
+        )
+    }
+
+    fn signal(&self, signal: libc::c_int) -> bool {
+        if self.exited() {
+            return false;
+        }
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            ) == 0
+        }
+    }
+
+    fn exited(&self) -> bool {
+        let mut pollfd = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        ready == 1 && pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0
+    }
+}
+
+fn terminate_owned_processes(processes: &[OwnedProcess]) -> ProcessCleanup {
+    let term_sent = processes
+        .iter()
+        .filter(|process| process.signal(libc::SIGTERM))
+        .count();
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline && processes.iter().any(|process| !process.exited()) {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    let kill_sent = signal_owned_process_group(&identity, libc::SIGKILL);
-    if kill_sent {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline && workload_group_is_owned(&identity) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+    let kill_sent = processes
+        .iter()
+        .filter(|process| process.signal(libc::SIGKILL))
+        .count();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && processes.iter().any(|process| !process.exited()) {
+        std::thread::sleep(Duration::from_millis(10));
     }
-    ProcessGroupCleanup {
+    ProcessCleanup {
         term_sent,
         kill_sent,
     }
 }
 
-fn workload_group_identity(meta: &Value) -> Option<WorkloadGroupIdentity> {
-    let pid = libc::pid_t::try_from(meta["workload_pid"].as_i64()?).ok()?;
-    let pgid = libc::pid_t::try_from(meta["workload_pgid"].as_i64()?).ok()?;
-    if pid <= 1 || pgid <= 1 {
-        return None;
-    }
-    Some(WorkloadGroupIdentity {
-        process: ProcIdentity {
-            pid,
-            starttime_ticks: meta["workload_pid_starttime_ticks"].as_u64()?,
-        },
-        boot_id: meta["process_boot_id"].as_str()?.to_string(),
-        pgid,
-    })
-}
-
-fn signal_owned_process_group(identity: &WorkloadGroupIdentity, signal: libc::c_int) -> bool {
-    workload_group_is_owned(identity) && unsafe { libc::kill(-identity.pgid, signal) == 0 }
-}
-
-fn workload_group_is_owned(identity: &WorkloadGroupIdentity) -> bool {
-    let boot_id_matches = fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .ok()
-        .is_some_and(|boot_id| boot_id.trim() == identity.boot_id);
-    let group_matches =
-        proc_group_identity(identity.process.pid).is_some_and(|(process, state, pgid)| {
-            process == identity.process && state != 'Z' && pgid == identity.pgid
-        });
-    boot_id_matches && group_matches
-}
-
-fn proc_group_identity(pid: libc::pid_t) -> Option<(ProcIdentity, char, libc::pid_t)> {
-    let contents = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let end_comm = contents.rfind(") ")?;
-    let fields: Vec<_> = contents[end_comm + 2..].split_whitespace().collect();
-    Some((
-        ProcIdentity {
-            pid,
-            starttime_ticks: fields.get(19)?.parse().ok()?,
-        },
-        fields.first()?.chars().next()?,
-        fields.get(2)?.parse().ok()?,
-    ))
-}
-
-fn workload_group_meta(identity: &ProcIdentity, pgid: libc::pid_t) -> Value {
-    json!({
-        "workload_pid": identity.pid,
-        "workload_pid_starttime_ticks": identity.starttime_ticks,
-        "process_boot_id": read_boot_id(),
-        "workload_pgid": pgid,
-    })
-}
-
 #[test]
-fn process_group_cleanup_rejects_mismatched_workload_identity() {
-    let mut workload = StdCommand::new("setsid")
-        .args(["sleep", "2"])
+fn process_cleanup_rejects_mismatched_workload_identity() {
+    let mut workload = StdCommand::new("sleep")
+        .arg("2")
         .spawn()
-        .expect("spawn isolated workload");
+        .expect("spawn workload");
     let pid = workload.id() as libc::pid_t;
-    let (mut identity, _) = proc_identity(pid).expect("workload identity");
-    identity.starttime_ticks += 1;
+    let (mut mismatched, _) = proc_identity(pid).expect("workload identity");
+    mismatched.starttime_ticks += 1;
 
-    let cleanup = kill_process_group(&workload_group_meta(&identity, pid));
+    let captured = OwnedProcess::capture(mismatched, &read_boot_id(), None);
     let remained_running = workload.try_wait().expect("workload status").is_none();
     if remained_running {
-        workload.kill().expect("kill isolated workload");
-        workload.wait().expect("reap isolated workload");
+        workload.kill().expect("kill workload");
+        workload.wait().expect("reap workload");
     }
 
-    assert_eq!(cleanup, ProcessGroupCleanup::default());
+    assert!(captured.is_none(), "mismatched identity was captured");
     assert!(remained_running, "mismatched identity was signaled");
 }
 
 #[test]
-fn process_group_cleanup_skips_escalation_after_termination() {
-    let mut workload = StdCommand::new("setsid")
-        .args(["sleep", "2"])
+fn process_cleanup_skips_escalation_after_termination() {
+    let mut workload = StdCommand::new("sleep")
+        .arg("2")
         .spawn()
-        .expect("spawn isolated workload");
-    let pid = workload.id() as libc::pid_t;
-    wait_until(Duration::from_secs(2), || {
-        (unsafe { libc::getpgid(pid) } == pid).then_some(())
-    });
-    let (identity, _) = proc_identity(pid).expect("workload identity");
+        .expect("spawn workload");
+    let process = OwnedProcess::capture_current(workload.id() as libc::pid_t, None)
+        .expect("capture workload");
 
-    let cleanup = kill_process_group(&workload_group_meta(&identity, pid));
-    workload.wait().expect("reap isolated workload");
+    let cleanup = terminate_owned_processes(&[process]);
+    workload.wait().expect("reap workload");
 
     assert_eq!(
         cleanup,
-        ProcessGroupCleanup {
-            term_sent: true,
-            kill_sent: false,
+        ProcessCleanup {
+            term_sent: 1,
+            kill_sent: 0,
         }
     );
 }
 
 #[test]
-fn process_group_cleanup_escalates_for_owned_group_and_descendant() {
+fn process_cleanup_escalates_for_owned_processes_and_reaps_descendant() {
     let temp = tempfile::tempdir().expect("tempdir");
     let child_pid_path = temp.path().join("cleanup-child.pid");
     let ready_path = temp.path().join("cleanup-ready");
@@ -1208,12 +1218,11 @@ fn process_group_cleanup_escalates_for_owned_group_and_descendant() {
         child_pid_path.display(),
         ready_path.display()
     );
-    let mut workload = StdCommand::new("setsid")
-        .args(["bash", "-c", &script])
+    let mut workload = StdCommand::new("bash")
+        .args(["-c", &script])
         .spawn()
-        .expect("spawn isolated workload group");
+        .expect("spawn workload tree");
     let pid = workload.id() as libc::pid_t;
-    let (identity, _) = proc_identity(pid).expect("workload identity");
     let child_pid = wait_until(Duration::from_secs(2), || {
         ready_path.exists().then(|| {
             fs::read_to_string(&child_pid_path)
@@ -1223,16 +1232,18 @@ fn process_group_cleanup_escalates_for_owned_group_and_descendant() {
                 .expect("numeric child pid")
         })
     });
+    let root = OwnedProcess::capture_current(pid, None).expect("capture workload root");
+    let child = OwnedProcess::capture_current(child_pid, Some(pid)).expect("capture child");
 
-    let cleanup = kill_process_group(&workload_group_meta(&identity, pid));
-    workload.wait().expect("reap isolated workload");
+    let cleanup = terminate_owned_processes(&[root, child]);
+    workload.wait().expect("reap workload root");
     wait_for_process_gone(child_pid);
 
     assert_eq!(
         cleanup,
-        ProcessGroupCleanup {
-            term_sent: true,
-            kill_sent: true,
+        ProcessCleanup {
+            term_sent: 2,
+            kill_sent: 2,
         }
     );
 }
@@ -1504,7 +1515,7 @@ fn ready_sentinel_reports_done_without_killing_workload() {
             "--",
             "bash",
             "-lc",
-            "echo boot; echo READY:123; while true; do sleep 1; done",
+            "echo boot; echo READY:123; exec sleep 60",
         ],
     );
     let json = parse_run_output(&output);
@@ -1524,7 +1535,10 @@ fn ready_sentinel_reports_done_without_killing_workload() {
     assert!(meta["workload_rc"].is_null());
     let workload_pid = meta["workload_pid"].as_i64().expect("workload pid");
     assert_process_alive(workload_pid as libc::pid_t);
-    kill_process_group(&meta);
+    let workload = OwnedProcess::capture_workload(&meta).expect("capture sentinel workload");
+    let cleanup = terminate_owned_processes(&[workload]);
+    assert_eq!(cleanup.term_sent, 1);
+    wait_for_process_gone(workload_pid as libc::pid_t);
 }
 
 #[test]
@@ -2987,11 +3001,13 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
     let child_pid_path = temp.path().join("retained-child-pid");
+    let allow_root_exit = temp.path().join("allow-root-exit");
 
     let mut cmd = agent_bash(&temp);
     cmd.env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
         .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
         .env("CHILD_PID_PATH", &child_pid_path)
+        .env("ALLOW_ROOT_EXIT", &allow_root_exit)
         .args([
             "run",
             "--delivery",
@@ -2999,25 +3015,39 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
             "--",
             "bash",
             "-lc",
-            "sleep 60 >/dev/null 2>&1 & printf '%s\\n' \"$!\" > \"$CHILD_PID_PATH\"",
+            "sleep 10 >/dev/null 2>&1 & child=$!; printf '%s\\n' \"$child\" > \"$CHILD_PID_PATH\"; for _ in {1..200}; do [ -e \"$ALLOW_ROOT_EXIT\" ] && exit 0; sleep 0.01; done; exit 1",
         ]);
     let output = cmd.output().expect("run");
     let json = parse_run_output(&output);
     let meta_path = meta_path(&json);
+    let initial_meta = wait_until(Duration::from_secs(2), || {
+        let meta = read_meta(&meta_path);
+        (meta["workload_pid"].is_number() && child_pid_path.exists()).then_some(meta)
+    });
+    let workload_pid = initial_meta["workload_pid"].as_i64().expect("workload pid") as libc::pid_t;
+    let child_pid = fs::read_to_string(&child_pid_path)
+        .expect("retained child pid")
+        .trim()
+        .parse::<libc::pid_t>()
+        .expect("numeric retained child pid");
+    let retained_child =
+        OwnedProcess::capture_current(child_pid, Some(workload_pid)).expect("capture child");
+    fs::write(&allow_root_exit, b"").expect("release workload root");
     let running_meta = wait_until(Duration::from_secs(3), || {
         let meta = read_meta(&meta_path);
-        (meta["workload_rc"] == 0 && child_pid_path.exists()).then_some(meta)
+        (meta["workload_rc"] == 0).then_some(meta)
     });
-    let supervisor_pid = running_meta["supervisor_pid"]
-        .as_i64()
-        .expect("supervisor pid") as libc::pid_t;
+    let supervisor =
+        OwnedProcess::capture_supervisor(&running_meta).expect("capture exact supervisor");
 
-    assert_eq!(unsafe { libc::kill(supervisor_pid, libc::SIGKILL) }, 0);
+    assert!(supervisor.signal(libc::SIGKILL));
     let deadline = Instant::now() + Duration::from_secs(3);
     while !delivery_log.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
-    kill_process_group(&running_meta);
+    let cleanup = terminate_owned_processes(&[retained_child]);
+    assert_eq!(cleanup.term_sent, 1);
+    wait_for_process_gone(child_pid);
 
     assert!(
         delivery_log.exists(),
