@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
@@ -973,24 +973,27 @@ impl Drop for OwnerScenario {
 }
 
 fn hand_off_child_reaping(child: Child) {
-    let pending = Arc::new(Mutex::new(Some(child)));
-    let delayed = Arc::clone(&pending);
-    let spawn = std::thread::Builder::new()
-        .name("owner-scenario-reaper".to_string())
-        .spawn(move || reap_pending_child(&delayed));
-    if spawn.is_err() {
-        reap_pending_child(&pending);
-    }
+    let _ = owner_scenario_reaper().send(child);
 }
 
-fn reap_pending_child(pending: &Mutex<Option<Child>>) {
-    let Some(mut child) = pending.lock().unwrap_or_else(|err| err.into_inner()).take() else {
-        return;
-    };
-    let _ = child.wait();
+fn owner_scenario_reaper() -> &'static mpsc::Sender<Child> {
+    static REAPER: OnceLock<mpsc::Sender<Child>> = OnceLock::new();
+    REAPER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<Child>();
+        std::thread::Builder::new()
+            .name("owner-scenario-reaper".to_string())
+            .spawn(move || {
+                for mut child in receiver {
+                    let _ = child.wait();
+                }
+            })
+            .expect("start owner scenario reaper");
+        sender
+    })
 }
 
-fn spawn_owner_scenario(temp: &tempfile::TempDir) -> OwnerScenario {
+fn spawn_owner_scenario(temp: &tempfile::TempDir, workload_seconds: &str) -> OwnerScenario {
+    let _ = owner_scenario_reaper();
     let run_json = temp.path().join("owner-run.json");
     let ready = temp.path().join("owner-ready");
     let list_now = temp.path().join("owner-list-now");
@@ -998,7 +1001,7 @@ fn spawn_owner_scenario(temp: &tempfile::TempDir) -> OwnerScenario {
     let list_caller_pid = temp.path().join("owner-list-caller-pid");
     let script = r#"
 set -eu
-"$AGENT_BASH_BIN" run -- bash -lc 'sleep 5' > "$RUN_JSON"
+"$AGENT_BASH_BIN" run -- sleep "$OWNER_WORKLOAD_SECONDS" > "$RUN_JSON"
 while [ ! -e "$LIST_NOW" ]; do : > "$READY"; sleep 0.01; done
 bash -c 'printf "%s\n" "$$" > "$LIST_CALLER_PID"; "$AGENT_BASH_BIN" list --json > "$OWNER_LIST"; rc=$?; exit "$rc"'
 rc=$?
@@ -1020,6 +1023,7 @@ exit "$rc"
         .env("LIST_NOW", &list_now)
         .env("OWNER_LIST", &owner_list)
         .env("LIST_CALLER_PID", &list_caller_pid)
+        .env("OWNER_WORKLOAD_SECONDS", workload_seconds)
         .spawn()
         .expect("spawn owner scenario");
     OwnerScenario {
@@ -1970,7 +1974,7 @@ fn rca_agent_bash_visibility_non_list_only_commands_still_spool() {
 fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
     // Verifies owner-tree visibility and unrelated-caller isolation at the real CLI/process seam.
     let temp = tempfile::tempdir().expect("tempdir");
-    let mut owner = spawn_owner_scenario(&temp);
+    let mut owner = spawn_owner_scenario(&temp, "5");
     wait_until(Duration::from_secs(3), || {
         owner.ready.exists().then_some(())
     });
@@ -2026,7 +2030,7 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
 #[test]
 fn owner_scenario_drop_terminates_and_reaps_polling_shell() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let owner = spawn_owner_scenario(&temp);
+    let owner = spawn_owner_scenario(&temp, "1");
     wait_until(Duration::from_secs(3), || {
         owner.ready.exists().then_some(())
     });
