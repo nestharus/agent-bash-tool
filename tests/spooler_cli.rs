@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
@@ -963,15 +964,30 @@ impl Drop for OwnerScenario {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Ok(None) | Err(_) => {
-                    // Keep exact-child ownership until a potentially delayed exit can be reaped.
-                    std::thread::spawn(move || {
-                        let _ = child.wait();
-                    });
+                    hand_off_child_reaping(child);
                     return;
                 }
             }
         }
     }
+}
+
+fn hand_off_child_reaping(child: Child) {
+    let pending = Arc::new(Mutex::new(Some(child)));
+    let delayed = Arc::clone(&pending);
+    let spawn = std::thread::Builder::new()
+        .name("owner-scenario-reaper".to_string())
+        .spawn(move || reap_pending_child(&delayed));
+    if spawn.is_err() {
+        reap_pending_child(&pending);
+    }
+}
+
+fn reap_pending_child(pending: &Mutex<Option<Child>>) {
+    let Some(mut child) = pending.lock().unwrap_or_else(|err| err.into_inner()).take() else {
+        return;
+    };
+    let _ = child.wait();
 }
 
 fn spawn_owner_scenario(temp: &tempfile::TempDir) -> OwnerScenario {
@@ -2017,10 +2033,6 @@ fn owner_scenario_drop_terminates_and_reaps_polling_shell() {
     let run_json: Value =
         serde_json::from_slice(&fs::read(&owner.run_json).expect("owner run JSON"))
             .expect("owner run JSON value");
-    let meta = wait_until(Duration::from_secs(2), || {
-        let meta = read_meta(&meta_path(&run_json));
-        meta["workload_pid"].is_number().then_some(meta)
-    });
     let owner_pid = owner.child_pid();
 
     drop(owner);
@@ -2029,7 +2041,6 @@ fn owner_scenario_drop_terminates_and_reaps_polling_shell() {
         proc_identity(owner_pid).is_none(),
         "owner polling shell was not reaped"
     );
-    kill_process_group(&meta);
     let handle = run_json["handle"].as_str().expect("handle");
     let _ = wait_for_terminal_status(&temp, handle);
 }
