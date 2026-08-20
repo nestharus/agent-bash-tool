@@ -3071,14 +3071,16 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
     let meta_path = meta_path(&json);
     let initial_meta = wait_until(Duration::from_secs(2), || {
         let meta = read_meta(&meta_path);
-        (meta["workload_pid"].is_number() && child_pid_path.exists()).then_some(meta)
+        meta["workload_pid"].is_number().then_some(meta)
     });
     let workload_pid = initial_meta["workload_pid"].as_i64().expect("workload pid") as libc::pid_t;
-    let child_pid = fs::read_to_string(&child_pid_path)
-        .expect("retained child pid")
-        .trim()
-        .parse::<libc::pid_t>()
-        .expect("numeric retained child pid");
+    let child_pid = wait_until(Duration::from_secs(2), || {
+        fs::read_to_string(&child_pid_path)
+            .ok()?
+            .trim()
+            .parse::<libc::pid_t>()
+            .ok()
+    });
     let retained_child =
         OwnedProcess::capture_current(child_pid, Some(workload_pid)).expect("capture child");
     fs::write(&allow_root_exit, b"").expect("release workload root");
