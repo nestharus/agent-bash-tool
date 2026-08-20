@@ -1087,6 +1087,12 @@ fn kill_process_group(meta: &Value) -> ProcessGroupCleanup {
     }
 
     let kill_sent = signal_owned_process_group(&identity, libc::SIGKILL);
+    if kill_sent {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && workload_group_is_owned(&identity) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     ProcessGroupCleanup {
         term_sent,
         kill_sent,
@@ -1150,7 +1156,7 @@ fn workload_group_meta(identity: &ProcIdentity, pgid: libc::pid_t) -> Value {
 #[test]
 fn process_group_cleanup_rejects_mismatched_workload_identity() {
     let mut workload = StdCommand::new("setsid")
-        .args(["sleep", "60"])
+        .args(["sleep", "2"])
         .spawn()
         .expect("spawn isolated workload");
     let pid = workload.id() as libc::pid_t;
@@ -1158,17 +1164,20 @@ fn process_group_cleanup_rejects_mismatched_workload_identity() {
     identity.starttime_ticks += 1;
 
     let cleanup = kill_process_group(&workload_group_meta(&identity, pid));
+    let remained_running = workload.try_wait().expect("workload status").is_none();
+    if remained_running {
+        workload.kill().expect("kill isolated workload");
+        workload.wait().expect("reap isolated workload");
+    }
 
     assert_eq!(cleanup, ProcessGroupCleanup::default());
-    assert!(workload.try_wait().expect("workload status").is_none());
-    workload.kill().expect("kill isolated workload");
-    workload.wait().expect("reap isolated workload");
+    assert!(remained_running, "mismatched identity was signaled");
 }
 
 #[test]
 fn process_group_cleanup_skips_escalation_after_termination() {
     let mut workload = StdCommand::new("setsid")
-        .args(["sleep", "60"])
+        .args(["sleep", "2"])
         .spawn()
         .expect("spawn isolated workload");
     let pid = workload.id() as libc::pid_t;
@@ -1178,6 +1187,7 @@ fn process_group_cleanup_skips_escalation_after_termination() {
     let (identity, _) = proc_identity(pid).expect("workload identity");
 
     let cleanup = kill_process_group(&workload_group_meta(&identity, pid));
+    workload.wait().expect("reap isolated workload");
 
     assert_eq!(
         cleanup,
@@ -1186,7 +1196,6 @@ fn process_group_cleanup_skips_escalation_after_termination() {
             kill_sent: false,
         }
     );
-    workload.wait().expect("reap isolated workload");
 }
 
 #[test]
@@ -1195,7 +1204,7 @@ fn process_group_cleanup_escalates_for_owned_group_and_descendant() {
     let child_pid_path = temp.path().join("cleanup-child.pid");
     let ready_path = temp.path().join("cleanup-ready");
     let script = format!(
-        "trap '' TERM; sleep 60 & echo $! > {}; : > {}; wait",
+        "trap '' TERM; sleep 2 & echo $! > {}; : > {}; wait",
         child_pid_path.display(),
         ready_path.display()
     );
@@ -1216,6 +1225,8 @@ fn process_group_cleanup_escalates_for_owned_group_and_descendant() {
     });
 
     let cleanup = kill_process_group(&workload_group_meta(&identity, pid));
+    workload.wait().expect("reap isolated workload");
+    wait_for_process_gone(child_pid);
 
     assert_eq!(
         cleanup,
@@ -1224,8 +1235,6 @@ fn process_group_cleanup_escalates_for_owned_group_and_descendant() {
             kill_sent: true,
         }
     );
-    workload.wait().expect("reap isolated workload");
-    wait_for_process_gone(child_pid);
 }
 
 #[test]
