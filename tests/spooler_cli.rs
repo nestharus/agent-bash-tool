@@ -1147,7 +1147,7 @@ fn terminate_owned_processes(processes: &[OwnedProcess]) -> ProcessCleanup {
         .iter()
         .filter(|process| process.signal(libc::SIGTERM))
         .count();
-    let deadline = Instant::now() + Duration::from_millis(100);
+    let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline && processes.iter().any(|process| !process.exited()) {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1166,25 +1166,55 @@ fn terminate_owned_processes(processes: &[OwnedProcess]) -> ProcessCleanup {
     }
 }
 
+fn terminate_workload_from_meta(meta: &Value) -> ProcessCleanup {
+    let Some(workload) = OwnedProcess::capture_workload(meta) else {
+        return ProcessCleanup::default();
+    };
+    terminate_owned_processes(&[workload])
+}
+
+fn workload_meta(identity: &ProcIdentity) -> Value {
+    json!({
+        "workload_pid": identity.pid,
+        "workload_pid_starttime_ticks": identity.starttime_ticks,
+        "process_boot_id": read_boot_id(),
+    })
+}
+
 #[test]
 fn process_cleanup_rejects_mismatched_workload_identity() {
-    let mut workload = StdCommand::new("sleep")
-        .arg("2")
+    let temp = tempfile::tempdir().expect("tempdir");
+    let ready = temp.path().join("mismatch-ready");
+    let check = temp.path().join("mismatch-check");
+    let acknowledged = temp.path().join("mismatch-acknowledged");
+    let signaled = temp.path().join("mismatch-signaled");
+    let mut workload = StdCommand::new("bash")
+        .args([
+            "-c",
+            "trap ': > \"$SIGNALED\"' TERM; : > \"$READY\"; for _ in {1..200}; do [ -e \"$CHECK\" ] && { : > \"$ACKNOWLEDGED\"; sleep 2; exit 0; }; sleep 0.01; done; exit 1",
+        ])
+        .env("READY", &ready)
+        .env("CHECK", &check)
+        .env("ACKNOWLEDGED", &acknowledged)
+        .env("SIGNALED", &signaled)
         .spawn()
         .expect("spawn workload");
+    wait_until(Duration::from_secs(2), || ready.exists().then_some(()));
     let pid = workload.id() as libc::pid_t;
     let (mut mismatched, _) = proc_identity(pid).expect("workload identity");
     mismatched.starttime_ticks += 1;
 
-    let captured = OwnedProcess::capture(mismatched, &read_boot_id(), None);
-    let remained_running = workload.try_wait().expect("workload status").is_none();
-    if remained_running {
-        workload.kill().expect("kill workload");
-        workload.wait().expect("reap workload");
-    }
+    let cleanup = terminate_workload_from_meta(&workload_meta(&mismatched));
+    fs::write(&check, b"").expect("release mismatch observation");
+    wait_until(Duration::from_secs(2), || {
+        acknowledged.exists().then_some(())
+    });
+    let signal_observed = signaled.exists();
+    workload.kill().expect("kill workload");
+    workload.wait().expect("reap workload");
 
-    assert!(captured.is_none(), "mismatched identity was captured");
-    assert!(remained_running, "mismatched identity was signaled");
+    assert_eq!(cleanup, ProcessCleanup::default());
+    assert!(!signal_observed, "mismatched identity was signaled");
 }
 
 #[test]
@@ -1209,17 +1239,17 @@ fn process_cleanup_skips_escalation_after_termination() {
 }
 
 #[test]
-fn process_cleanup_escalates_for_owned_processes_and_reaps_descendant() {
+fn process_cleanup_escalates_for_owned_group_members_and_reaps_descendant() {
     let temp = tempfile::tempdir().expect("tempdir");
     let child_pid_path = temp.path().join("cleanup-child.pid");
     let ready_path = temp.path().join("cleanup-ready");
     let script = format!(
-        "trap '' TERM; sleep 2 & echo $! > {}; : > {}; wait",
+        "trap '' TERM; sleep 5 & echo $! > {}; : > {}; wait",
         child_pid_path.display(),
         ready_path.display()
     );
-    let mut workload = StdCommand::new("bash")
-        .args(["-c", &script])
+    let mut workload = StdCommand::new("setsid")
+        .args(["bash", "-c", &script])
         .spawn()
         .expect("spawn workload tree");
     let pid = workload.id() as libc::pid_t;
@@ -1234,6 +1264,8 @@ fn process_cleanup_escalates_for_owned_processes_and_reaps_descendant() {
     });
     let root = OwnedProcess::capture_current(pid, None).expect("capture workload root");
     let child = OwnedProcess::capture_current(child_pid, Some(pid)).expect("capture child");
+    let root_group = unsafe { libc::getpgid(pid) };
+    let child_group = unsafe { libc::getpgid(child_pid) };
 
     let cleanup = terminate_owned_processes(&[root, child]);
     workload.wait().expect("reap workload root");
@@ -1246,6 +1278,8 @@ fn process_cleanup_escalates_for_owned_processes_and_reaps_descendant() {
             kill_sent: 2,
         }
     );
+    assert_eq!(root_group, pid, "workload root did not lead its group");
+    assert_eq!(child_group, pid, "descendant was not in the workload group");
 }
 
 #[test]
@@ -1506,39 +1540,54 @@ fn captured_log_is_bounded_and_retains_newest_output() {
 #[test]
 fn ready_sentinel_reports_done_without_killing_workload() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (output, _) = run_cmd(
-        &temp,
-        &[
+    let child_pid_path = temp.path().join("sentinel-child.pid");
+    let mut command = agent_bash(&temp);
+    command
+        .env("SENTINEL_CHILD_PID_PATH", &child_pid_path)
+        .args([
             "run",
             "--ready-sentinel",
             "READY:[0-9]+",
             "--",
             "bash",
             "-lc",
-            "echo boot; echo READY:123; exec sleep 60",
-        ],
-    );
+            "echo boot; echo READY:123; sleep 10 & echo $! > \"$SENTINEL_CHILD_PID_PATH\"; wait",
+        ]);
+    let output = command.output().expect("run sentinel workload");
     let json = parse_run_output(&output);
-    assert_eq!(json["mode"], "sentinel");
     let handle = json["handle"].as_str().expect("handle");
     let final_status = wait_for_status_prefix(
         &temp,
         handle,
         &format!("DONE rc=0 handle={handle} reason=ready-sentinel workload=running"),
     );
+    let meta = read_meta(&meta_path(&json));
+    let workload_pid = meta["workload_pid"].as_i64().expect("workload pid") as libc::pid_t;
+    let child_pid = wait_until(Duration::from_secs(2), || {
+        fs::read_to_string(&child_pid_path)
+            .ok()?
+            .trim()
+            .parse::<libc::pid_t>()
+            .ok()
+    });
+    let workload_alive = unsafe { libc::kill(workload_pid, 0) == 0 };
+    let workload = OwnedProcess::capture_workload(&meta).expect("capture sentinel workload");
+    let child =
+        OwnedProcess::capture_current(child_pid, Some(workload_pid)).expect("capture child");
+    let cleanup = terminate_owned_processes(&[workload, child]);
+    wait_for_process_gone(workload_pid);
+    wait_for_process_gone(child_pid);
+
+    assert_eq!(json["mode"], "sentinel");
     assert!(final_status.contains("boot\n"), "{final_status}");
     assert!(final_status.contains("READY:123\n"), "{final_status}");
-    let meta = read_meta(&meta_path(&json));
     assert_eq!(meta["completion_reason"], "ready-sentinel");
     assert_eq!(meta["rc"], 0);
     assert!(meta["ready_at_unix_ms"].is_number());
     assert!(meta["workload_rc"].is_null());
-    let workload_pid = meta["workload_pid"].as_i64().expect("workload pid");
-    assert_process_alive(workload_pid as libc::pid_t);
-    let workload = OwnedProcess::capture_workload(&meta).expect("capture sentinel workload");
-    let cleanup = terminate_owned_processes(&[workload]);
-    assert_eq!(cleanup.term_sent, 1);
-    wait_for_process_gone(workload_pid as libc::pid_t);
+    assert!(workload_alive, "sentinel workload was not running");
+    assert_eq!(cleanup.term_sent, 2);
+    assert_eq!(cleanup.kill_sent, 0);
 }
 
 #[test]
@@ -3040,15 +3089,16 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
     let supervisor =
         OwnedProcess::capture_supervisor(&running_meta).expect("capture exact supervisor");
 
-    assert!(supervisor.signal(libc::SIGKILL));
+    let supervisor_signaled = supervisor.signal(libc::SIGKILL);
     let deadline = Instant::now() + Duration::from_secs(3);
     while !delivery_log.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
     let cleanup = terminate_owned_processes(&[retained_child]);
-    assert_eq!(cleanup.term_sent, 1);
     wait_for_process_gone(child_pid);
 
+    assert!(supervisor_signaled, "exact supervisor signal failed");
+    assert_eq!(cleanup.term_sent, 1);
     assert!(
         delivery_log.exists(),
         "supervisor loss must deliver without a status poll"
