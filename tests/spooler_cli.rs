@@ -983,8 +983,7 @@ fn spawn_owner_scenario(temp: &tempfile::TempDir) -> OwnerScenario {
     let script = r#"
 set -eu
 "$AGENT_BASH_BIN" run -- bash -lc 'sleep 5' > "$RUN_JSON"
-: > "$READY"
-while [ ! -e "$LIST_NOW" ]; do sleep 0.01; done
+while [ ! -e "$LIST_NOW" ]; do : > "$READY"; sleep 0.01; done
 bash -c 'printf "%s\n" "$$" > "$LIST_CALLER_PID"; "$AGENT_BASH_BIN" list --json > "$OWNER_LIST"; rc=$?; exit "$rc"'
 rc=$?
 :
