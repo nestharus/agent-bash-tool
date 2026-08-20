@@ -128,15 +128,20 @@ pub(crate) fn complete(paths: &StatePaths, meta: &mut Meta) -> std::io::Result<(
 }
 
 pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
-    let _lock = state::lock_delivery(paths)?;
+    let delivery_lock = state::lock_delivery(paths)?;
     let mode = state::read_delivery_mode(paths)?;
     let mut meta = state::read_meta(paths)?;
     if mode == DeliveryMode::Async {
+        meta.delivery_mode = mode;
         return Ok(detach_outcome(&meta, false, false));
     }
 
     run_required_runner_command(&activate_request(&meta.handle))?;
     state::write_delivery_mode_atomic(paths, DeliveryMode::Async)?;
+    drop(delivery_lock);
+
+    let _completion_lock = state::lock_completion(paths)?;
+    let mut meta = state::read_meta(paths)?;
     meta.delivery_mode = DeliveryMode::Async;
     state::write_meta_atomic(paths, &meta)?;
 

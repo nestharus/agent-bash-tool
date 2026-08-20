@@ -472,10 +472,7 @@ pub(crate) fn create_cancel_request(paths: &StatePaths) -> io::Result<bool> {
         .mode(0o600)
         .open(&paths.cancel_requested)
     {
-        Ok(file) => {
-            file.sync_all()?;
-            Ok(true)
-        }
+        Ok(_) => Ok(true),
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
         Err(err) => Err(err),
     }

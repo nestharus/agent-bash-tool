@@ -359,6 +359,38 @@ fn fake_agents_script() -> &'static str {
     "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\nexit 0\n"
 }
 
+fn blocking_delivery_fake_agents(
+    temp: &tempfile::TempDir,
+) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+    let fake = temp.path().join("blocking-activate-fake-agents");
+    let activate_started = temp.path().join("activate-started");
+    let activate_release = temp.path().join("activate-release");
+    let complete_started = temp.path().join("complete-started");
+    let complete_release = temp.path().join("complete-release");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+if [ "${2:-}" = agent-bash-activate ]; then
+    : > "$AGENT_BASH_FAKE_ACTIVATE_STARTED"
+    while [ ! -e "$AGENT_BASH_FAKE_ACTIVATE_RELEASE" ]; do sleep 0.01; done
+elif [ "${2:-}" = agent-bash-complete ]; then
+    : > "$AGENT_BASH_FAKE_COMPLETE_STARTED"
+    while [ ! -e "$AGENT_BASH_FAKE_COMPLETE_RELEASE" ]; do sleep 0.01; done
+fi
+exit 0
+"#,
+    )
+    .expect("write blocking activation fake");
+    set_executable(&fake);
+    (
+        fake,
+        activate_started,
+        activate_release,
+        complete_started,
+        complete_release,
+    )
+}
+
 fn owner_resolving_fake_agents(temp: &tempfile::TempDir) -> PathBuf {
     let fake = temp.path().join("owner-resolving-fake-agents");
     fs::write(
@@ -2839,6 +2871,82 @@ fn concurrent_detach_and_completion_produce_one_notification() {
     });
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
     assert_eq!(mode_text(&temp, &handle), "async");
+}
+
+#[test]
+fn detach_does_not_rewrite_terminal_metadata_after_activation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, activate_started, activate_release, complete_started, complete_release) =
+        blocking_delivery_fake_agents(&temp);
+    let workload_release = temp.path().join("workload-release");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_ACTIVATE_STARTED", &activate_started)
+        .env("AGENT_BASH_FAKE_ACTIVATE_RELEASE", &activate_release)
+        .env("AGENT_BASH_FAKE_COMPLETE_STARTED", &complete_started)
+        .env("AGENT_BASH_FAKE_COMPLETE_RELEASE", &complete_release)
+        .env("WORKLOAD_RELEASE", &workload_release)
+        .args([
+            "run",
+            "--delivery",
+            "sync",
+            "--",
+            "bash",
+            "-lc",
+            "while [ ! -e \"$WORKLOAD_RELEASE\" ]; do sleep 0.01; done",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle").to_string();
+    let workload = wait_until(Duration::from_secs(2), || {
+        OwnedProcess::capture_workload(&read_meta(&meta_path(&json)))
+    });
+    let binary = assert_cmd::cargo::cargo_bin("agent-bash");
+    let state_root = temp.path().to_path_buf();
+    let detach_fake = fake.clone();
+    let detach_started = activate_started.clone();
+    let detach_release = activate_release.clone();
+    let detach_complete_started = complete_started.clone();
+    let detach_complete_release = complete_release.clone();
+    let detach_handle = handle.clone();
+    let detach = std::thread::spawn(move || {
+        StdCommand::new(binary)
+            .env("XDG_STATE_HOME", state_root)
+            .env("AGENT_BASH_AGENT_RUNNER_BIN", detach_fake)
+            .env("AGENT_BASH_FAKE_ACTIVATE_STARTED", detach_started)
+            .env("AGENT_BASH_FAKE_ACTIVATE_RELEASE", detach_release)
+            .env("AGENT_BASH_FAKE_COMPLETE_STARTED", detach_complete_started)
+            .env("AGENT_BASH_FAKE_COMPLETE_RELEASE", detach_complete_release)
+            .args(["detach", &detach_handle])
+            .output()
+            .expect("detach")
+    });
+    wait_until(Duration::from_secs(2), || {
+        activate_started.exists().then_some(())
+    });
+
+    fs::write(&workload_release, b"").expect("release workload");
+    wait_until(Duration::from_secs(2), || workload.exited().then_some(()));
+    wait_until(Duration::from_secs(2), || {
+        (read_meta(&meta_path(&json))["state"] == "DONE").then_some(())
+    });
+    fs::write(&activate_release, b"").expect("release activation");
+    wait_until(Duration::from_secs(2), || {
+        complete_started.exists().then_some(())
+    });
+    let state_during_delivery = read_meta(&meta_path(&json))["state"]
+        .as_str()
+        .expect("state")
+        .to_string();
+    fs::write(&complete_release, b"").expect("release completion");
+    let detach = detach.join().expect("detach thread");
+
+    assert_eq!(state_during_delivery, "DONE");
+    assert_command_success(&detach);
+    let status = wait_for_terminal_status(&temp, &handle);
+    assert!(status.starts_with("DONE rc=0"), "{status}");
+    assert_eq!(read_meta(&meta_path(&json))["state"], "DONE");
 }
 
 #[test]
