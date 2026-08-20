@@ -1002,6 +1002,8 @@ fn spawn_owner_scenario(temp: &tempfile::TempDir, workload_seconds: &str) -> Own
     let list_caller_pid = temp.path().join("owner-list-caller-pid");
     let script = r#"
 set -eu
+test -z "${AGENT_BASH_OWNER_SESSION_ID+x}"
+test -z "${AGENT_BASH_OWNER_INVOCATION_UUID+x}"
 "$AGENT_BASH_BIN" run -- sleep "$OWNER_WORKLOAD_SECONDS" > "$RUN_JSON"
 while [ ! -e "$LIST_NOW" ]; do : > "$READY"; sleep 0.01; done
 bash -c 'printf "%s\n" "$$" > "$LIST_CALLER_PID"; "$AGENT_BASH_BIN" list --json > "$OWNER_LIST"; rc=$?; exit "$rc"'
@@ -1039,7 +1041,11 @@ exit "$rc"
 
 fn shell_list_json(temp: &tempfile::TempDir, all: bool) -> Vec<Value> {
     let all_arg = if all { " --all" } else { "" };
-    let script = format!("\"$AGENT_BASH_BIN\" list{all_arg} --json; rc=$?; exit \"$rc\"");
+    let script = format!(
+        "test -z \"${{AGENT_BASH_OWNER_SESSION_ID+x}}\" && \
+         test -z \"${{AGENT_BASH_OWNER_INVOCATION_UUID+x}}\" && \
+         \"$AGENT_BASH_BIN\" list{all_arg} --json"
+    );
     let output = StdCommand::new("bash")
         .arg("-c")
         .arg(script)
@@ -2217,6 +2223,19 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
         serde_json::from_slice(&fs::read(&owner.run_json).expect("owner run JSON"))
             .expect("owner run JSON value");
     let handle = run_json["handle"].as_str().expect("handle").to_string();
+    let meta = read_meta(&meta_path(&run_json));
+    let owner_meta: Value = serde_json::from_slice(
+        &fs::read(Path::new(run_json["state_dir"].as_str().expect("state dir")).join("owner.json"))
+            .expect("owner metadata"),
+    )
+    .expect("owner metadata JSON");
+    assert!(meta["owner_session_id"].is_null(), "{meta}");
+    assert!(meta["owner_invocation_uuid"].is_null(), "{meta}");
+    assert!(owner_meta["owner_session_id"].is_null(), "{owner_meta}");
+    assert!(
+        owner_meta["owner_invocation_uuid"].is_null(),
+        "{owner_meta}"
+    );
     let active_status = status_text(&temp, &handle, false);
     let unrelated = shell_list_json(&temp, false);
     let all_access = shell_list_json(&temp, true);
