@@ -956,11 +956,20 @@ impl Drop for OwnerScenario {
         };
         let _ = child.kill();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if child.try_wait().ok().flatten().is_some() {
-                return;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) | Err(_) => {
+                    // Keep exact-child ownership until a potentially delayed exit can be reaped.
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    return;
+                }
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
