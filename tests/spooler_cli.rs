@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
+use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
@@ -931,7 +932,7 @@ fn wait_for_process_gone(pid: libc::pid_t) {
 }
 
 struct OwnerScenario {
-    child: Child,
+    child: Option<Child>,
     run_json: PathBuf,
     ready: PathBuf,
     list_now: PathBuf,
@@ -939,7 +940,60 @@ struct OwnerScenario {
     list_caller_pid: PathBuf,
 }
 
-fn spawn_owner_scenario(temp: &tempfile::TempDir) -> OwnerScenario {
+impl OwnerScenario {
+    fn child_pid(&self) -> libc::pid_t {
+        self.child.as_ref().expect("owner child").id() as libc::pid_t
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.take().expect("owner child").wait()
+    }
+}
+
+impl Drop for OwnerScenario {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = child.kill();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) | Err(_) => {
+                    hand_off_child_reaping(child);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn hand_off_child_reaping(child: Child) {
+    let _ = owner_scenario_reaper().send(child);
+}
+
+fn owner_scenario_reaper() -> &'static mpsc::Sender<Child> {
+    static REAPER: OnceLock<mpsc::Sender<Child>> = OnceLock::new();
+    REAPER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<Child>();
+        std::thread::Builder::new()
+            .name("owner-scenario-reaper".to_string())
+            .spawn(move || {
+                for mut child in receiver {
+                    let _ = child.wait();
+                }
+            })
+            .expect("start owner scenario reaper");
+        sender
+    })
+}
+
+fn spawn_owner_scenario(temp: &tempfile::TempDir, workload_seconds: &str) -> OwnerScenario {
+    let _ = owner_scenario_reaper();
     let run_json = temp.path().join("owner-run.json");
     let ready = temp.path().join("owner-ready");
     let list_now = temp.path().join("owner-list-now");
@@ -947,9 +1001,8 @@ fn spawn_owner_scenario(temp: &tempfile::TempDir) -> OwnerScenario {
     let list_caller_pid = temp.path().join("owner-list-caller-pid");
     let script = r#"
 set -eu
-"$AGENT_BASH_BIN" run -- bash -lc 'sleep 5' > "$RUN_JSON"
-: > "$READY"
-while [ ! -e "$LIST_NOW" ]; do sleep 0.01; done
+"$AGENT_BASH_BIN" run -- sleep "$OWNER_WORKLOAD_SECONDS" > "$RUN_JSON"
+while [ ! -e "$LIST_NOW" ]; do : > "$READY"; sleep 0.01; done
 bash -c 'printf "%s\n" "$$" > "$LIST_CALLER_PID"; "$AGENT_BASH_BIN" list --json > "$OWNER_LIST"; rc=$?; exit "$rc"'
 rc=$?
 :
@@ -970,10 +1023,11 @@ exit "$rc"
         .env("LIST_NOW", &list_now)
         .env("OWNER_LIST", &owner_list)
         .env("LIST_CALLER_PID", &list_caller_pid)
+        .env("OWNER_WORKLOAD_SECONDS", workload_seconds)
         .spawn()
         .expect("spawn owner scenario");
     OwnerScenario {
-        child,
+        child: Some(child),
         run_json,
         ready,
         list_now,
@@ -1920,7 +1974,7 @@ fn rca_agent_bash_visibility_non_list_only_commands_still_spool() {
 fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
     // Verifies owner-tree visibility and unrelated-caller isolation at the real CLI/process seam.
     let temp = tempfile::tempdir().expect("tempdir");
-    let mut owner = spawn_owner_scenario(&temp);
+    let mut owner = spawn_owner_scenario(&temp, "5");
     wait_until(Duration::from_secs(3), || {
         owner.ready.exists().then_some(())
     });
@@ -1933,7 +1987,7 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
     let all_access = shell_list_json(&temp, true);
 
     fs::write(&owner.list_now, b"").expect("release owner list");
-    let owner_status = owner.child.wait().expect("owner scenario");
+    let owner_status = owner.wait().expect("owner scenario");
     let owner_list: Vec<Value> =
         serde_json::from_slice(&fs::read(&owner.owner_list).expect("owner list"))
             .expect("owner list JSON");
@@ -1971,6 +2025,28 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
         "explicit --all did not expose workload {handle}: {all_access:?}"
     );
     assert!(final_status.contains("--- output ---"));
+}
+
+#[test]
+fn owner_scenario_drop_terminates_and_reaps_polling_shell() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let owner = spawn_owner_scenario(&temp, "1");
+    wait_until(Duration::from_secs(3), || {
+        owner.ready.exists().then_some(())
+    });
+    let run_json: Value =
+        serde_json::from_slice(&fs::read(&owner.run_json).expect("owner run JSON"))
+            .expect("owner run JSON value");
+    let owner_pid = owner.child_pid();
+
+    drop(owner);
+
+    assert!(
+        proc_identity(owner_pid).is_none(),
+        "owner polling shell was not reaped"
+    );
+    let handle = run_json["handle"].as_str().expect("handle");
+    let _ = wait_for_terminal_status(&temp, handle);
 }
 
 #[test]
