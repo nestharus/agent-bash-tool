@@ -1053,16 +1053,179 @@ fn shell_list_json(temp: &tempfile::TempDir, all: bool) -> Vec<Value> {
     serde_json::from_slice(&output.stdout).expect("shell list JSON")
 }
 
-fn kill_process_group(meta: &Value) {
-    if let Some(pgid) = meta["workload_pgid"].as_i64() {
-        unsafe {
-            libc::kill(-(pgid as libc::pid_t), libc::SIGTERM);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        unsafe {
-            libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
-        }
+#[derive(Debug)]
+struct WorkloadGroupIdentity {
+    process: ProcIdentity,
+    boot_id: String,
+    pgid: libc::pid_t,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProcessGroupCleanup {
+    term_sent: bool,
+    kill_sent: bool,
+}
+
+fn kill_process_group(meta: &Value) -> ProcessGroupCleanup {
+    let Some(identity) = workload_group_identity(meta) else {
+        return ProcessGroupCleanup::default();
+    };
+    let term_sent = signal_owned_process_group(&identity, libc::SIGTERM);
+    if !term_sent {
+        return ProcessGroupCleanup::default();
     }
+
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline {
+        if !workload_group_is_owned(&identity) {
+            return ProcessGroupCleanup {
+                term_sent,
+                kill_sent: false,
+            };
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let kill_sent = signal_owned_process_group(&identity, libc::SIGKILL);
+    ProcessGroupCleanup {
+        term_sent,
+        kill_sent,
+    }
+}
+
+fn workload_group_identity(meta: &Value) -> Option<WorkloadGroupIdentity> {
+    let pid = libc::pid_t::try_from(meta["workload_pid"].as_i64()?).ok()?;
+    let pgid = libc::pid_t::try_from(meta["workload_pgid"].as_i64()?).ok()?;
+    if pid <= 1 || pgid <= 1 {
+        return None;
+    }
+    Some(WorkloadGroupIdentity {
+        process: ProcIdentity {
+            pid,
+            starttime_ticks: meta["workload_pid_starttime_ticks"].as_u64()?,
+        },
+        boot_id: meta["process_boot_id"].as_str()?.to_string(),
+        pgid,
+    })
+}
+
+fn signal_owned_process_group(identity: &WorkloadGroupIdentity, signal: libc::c_int) -> bool {
+    workload_group_is_owned(identity) && unsafe { libc::kill(-identity.pgid, signal) == 0 }
+}
+
+fn workload_group_is_owned(identity: &WorkloadGroupIdentity) -> bool {
+    let boot_id_matches = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .is_some_and(|boot_id| boot_id.trim() == identity.boot_id);
+    let group_matches =
+        proc_group_identity(identity.process.pid).is_some_and(|(process, state, pgid)| {
+            process == identity.process && state != 'Z' && pgid == identity.pgid
+        });
+    boot_id_matches && group_matches
+}
+
+fn proc_group_identity(pid: libc::pid_t) -> Option<(ProcIdentity, char, libc::pid_t)> {
+    let contents = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end_comm = contents.rfind(") ")?;
+    let fields: Vec<_> = contents[end_comm + 2..].split_whitespace().collect();
+    Some((
+        ProcIdentity {
+            pid,
+            starttime_ticks: fields.get(19)?.parse().ok()?,
+        },
+        fields.first()?.chars().next()?,
+        fields.get(2)?.parse().ok()?,
+    ))
+}
+
+fn workload_group_meta(identity: &ProcIdentity, pgid: libc::pid_t) -> Value {
+    json!({
+        "workload_pid": identity.pid,
+        "workload_pid_starttime_ticks": identity.starttime_ticks,
+        "process_boot_id": read_boot_id(),
+        "workload_pgid": pgid,
+    })
+}
+
+#[test]
+fn process_group_cleanup_rejects_mismatched_workload_identity() {
+    let mut workload = StdCommand::new("setsid")
+        .args(["sleep", "60"])
+        .spawn()
+        .expect("spawn isolated workload");
+    let pid = workload.id() as libc::pid_t;
+    let (mut identity, _) = proc_identity(pid).expect("workload identity");
+    identity.starttime_ticks += 1;
+
+    let cleanup = kill_process_group(&workload_group_meta(&identity, pid));
+
+    assert_eq!(cleanup, ProcessGroupCleanup::default());
+    assert!(workload.try_wait().expect("workload status").is_none());
+    workload.kill().expect("kill isolated workload");
+    workload.wait().expect("reap isolated workload");
+}
+
+#[test]
+fn process_group_cleanup_skips_escalation_after_termination() {
+    let mut workload = StdCommand::new("setsid")
+        .args(["sleep", "60"])
+        .spawn()
+        .expect("spawn isolated workload");
+    let pid = workload.id() as libc::pid_t;
+    wait_until(Duration::from_secs(2), || {
+        (unsafe { libc::getpgid(pid) } == pid).then_some(())
+    });
+    let (identity, _) = proc_identity(pid).expect("workload identity");
+
+    let cleanup = kill_process_group(&workload_group_meta(&identity, pid));
+
+    assert_eq!(
+        cleanup,
+        ProcessGroupCleanup {
+            term_sent: true,
+            kill_sent: false,
+        }
+    );
+    workload.wait().expect("reap isolated workload");
+}
+
+#[test]
+fn process_group_cleanup_escalates_for_owned_group_and_descendant() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let child_pid_path = temp.path().join("cleanup-child.pid");
+    let ready_path = temp.path().join("cleanup-ready");
+    let script = format!(
+        "trap '' TERM; sleep 60 & echo $! > {}; : > {}; wait",
+        child_pid_path.display(),
+        ready_path.display()
+    );
+    let mut workload = StdCommand::new("setsid")
+        .args(["bash", "-c", &script])
+        .spawn()
+        .expect("spawn isolated workload group");
+    let pid = workload.id() as libc::pid_t;
+    let (identity, _) = proc_identity(pid).expect("workload identity");
+    let child_pid = wait_until(Duration::from_secs(2), || {
+        ready_path.exists().then(|| {
+            fs::read_to_string(&child_pid_path)
+                .expect("child pid")
+                .trim()
+                .parse::<libc::pid_t>()
+                .expect("numeric child pid")
+        })
+    });
+
+    let cleanup = kill_process_group(&workload_group_meta(&identity, pid));
+
+    assert_eq!(
+        cleanup,
+        ProcessGroupCleanup {
+            term_sent: true,
+            kill_sent: true,
+        }
+    );
+    workload.wait().expect("reap isolated workload");
+    wait_for_process_gone(child_pid);
 }
 
 #[test]
