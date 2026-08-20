@@ -931,12 +931,38 @@ fn wait_for_process_gone(pid: libc::pid_t) {
 }
 
 struct OwnerScenario {
-    child: Child,
+    child: Option<Child>,
     run_json: PathBuf,
     ready: PathBuf,
     list_now: PathBuf,
     owner_list: PathBuf,
     list_caller_pid: PathBuf,
+}
+
+impl OwnerScenario {
+    fn child_pid(&self) -> libc::pid_t {
+        self.child.as_ref().expect("owner child").id() as libc::pid_t
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.take().expect("owner child").wait()
+    }
+}
+
+impl Drop for OwnerScenario {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = child.kill();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 fn spawn_owner_scenario(temp: &tempfile::TempDir) -> OwnerScenario {
@@ -973,7 +999,7 @@ exit "$rc"
         .spawn()
         .expect("spawn owner scenario");
     OwnerScenario {
-        child,
+        child: Some(child),
         run_json,
         ready,
         list_now,
@@ -1933,7 +1959,7 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
     let all_access = shell_list_json(&temp, true);
 
     fs::write(&owner.list_now, b"").expect("release owner list");
-    let owner_status = owner.child.wait().expect("owner scenario");
+    let owner_status = owner.wait().expect("owner scenario");
     let owner_list: Vec<Value> =
         serde_json::from_slice(&fs::read(&owner.owner_list).expect("owner list"))
             .expect("owner list JSON");
@@ -1971,6 +1997,33 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
         "explicit --all did not expose workload {handle}: {all_access:?}"
     );
     assert!(final_status.contains("--- output ---"));
+}
+
+#[test]
+fn owner_scenario_drop_terminates_and_reaps_polling_shell() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let owner = spawn_owner_scenario(&temp);
+    wait_until(Duration::from_secs(3), || {
+        owner.ready.exists().then_some(())
+    });
+    let run_json: Value =
+        serde_json::from_slice(&fs::read(&owner.run_json).expect("owner run JSON"))
+            .expect("owner run JSON value");
+    let meta = wait_until(Duration::from_secs(2), || {
+        let meta = read_meta(&meta_path(&run_json));
+        meta["workload_pid"].is_number().then_some(meta)
+    });
+    let owner_pid = owner.child_pid();
+
+    drop(owner);
+
+    assert!(
+        proc_identity(owner_pid).is_none(),
+        "owner polling shell was not reaped"
+    );
+    kill_process_group(&meta);
+    let handle = run_json["handle"].as_str().expect("handle");
+    let _ = wait_for_terminal_status(&temp, handle);
 }
 
 #[test]
