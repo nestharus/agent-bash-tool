@@ -961,6 +961,8 @@ exit "$rc"
         .env("AGENT_BASH_BIN", assert_cmd::cargo::cargo_bin("agent-bash"))
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
         .env("XDG_STATE_HOME", temp.path())
+        .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
         .env_remove("OULIPOLY_PARENT_INVOCATION")
         .env_remove("OULIPOLY_DATA_DIR")
         .env("RUN_JSON", &run_json)
@@ -989,6 +991,8 @@ fn shell_list_json(temp: &tempfile::TempDir, all: bool) -> Vec<Value> {
         .env("AGENT_BASH_BIN", assert_cmd::cargo::cargo_bin("agent-bash"))
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
         .env("XDG_STATE_HOME", temp.path())
+        .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
         .output()
         .expect("shell list command");
     assert_command_success(&output);
