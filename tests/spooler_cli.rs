@@ -2936,16 +2936,19 @@ fn unavailable_registered_helper_is_retryable_after_restoration() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (helper, delivery_log) = fake_agents(&temp);
     let retained_helper = temp.path().join("retained-fake-agents");
+    let workload_started = temp.path().join("workload-started");
     let release = temp.path().join("release-workload");
+    let release_marker = ReleaseMarker::new(release.clone());
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env("WORKLOAD_STARTED", &workload_started)
         .env("RELEASE_WORKLOAD", &release)
         .args([
             "run",
             "--",
             "bash",
             "-lc",
-            "for _ in {1..800}; do [ -e \"$RELEASE_WORKLOAD\" ] && exit 0; sleep 0.01; done; exit 1",
+            "printf started > \"$WORKLOAD_STARTED\"; for _ in {1..800}; do [ -e \"$RELEASE_WORKLOAD\" ] && exit 0; sleep 0.01; done; exit 1",
         ])
         .output()
         .expect("run");
@@ -2953,8 +2956,11 @@ fn unavailable_registered_helper_is_retryable_after_restoration() {
     let handle = json["handle"].as_str().expect("handle");
     let meta_path = meta_path(&json);
 
+    wait_until(Duration::from_secs(6), || {
+        workload_started.exists().then_some(())
+    });
     fs::rename(&helper, &retained_helper).expect("make registered helper unavailable");
-    fs::write(&release, b"").expect("release workload");
+    release_marker.release();
     let failed = wait_until(Duration::from_secs(6), || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["error_code"] == "delivery_helper_unavailable").then_some(meta)
