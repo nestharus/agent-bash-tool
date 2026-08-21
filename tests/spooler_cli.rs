@@ -2803,27 +2803,61 @@ fn delivery_metadata_observed(meta: &Value) -> bool {
 #[test]
 fn consumed_marker_after_delivery_does_not_rewrite_delivery_meta() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let release_workload = temp.path().join("release-workload");
     let (fake, delivery_log) = fake_agents(&temp);
 
     let mut cmd = agent_bash(&temp);
     cmd.env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
         .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
-        .args(["run", "--", "bash", "-lc", "echo delivered"]);
+        .env("RELEASE_WORKLOAD", &release_workload)
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            "for _ in {1..800}; do [ -e \"$RELEASE_WORKLOAD\" ] && { echo delivered; exit 0; }; sleep 0.01; done; exit 1",
+        ]);
     let output = cmd.output().expect("run");
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
-    let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     let meta_path = meta_path(&json);
-    let before = wait_until(Duration::from_secs(2), || {
-        let meta = read_meta(&meta_path);
-        (meta["delivery"]["attempted"] == true).then_some(meta["delivery"].clone())
-    });
-    assert!(delivery_log.exists(), "delivery fixture should be invoked");
 
-    fs::write(state_dir_path(&json).join("consumed"), b"").expect("write consumed marker");
-    std::thread::sleep(Duration::from_millis(100));
-    let after = read_meta(&meta_path)["delivery"].clone();
-    assert_eq!(after, before);
+    fs::write(&release_workload, b"").expect("release workload");
+    let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+    wait_until(Duration::from_secs(6), || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["attempted"] == true).then_some(())
+    });
+
+    let state_dir = state_dir_path(&json);
+    let delivery_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state_dir.join("delivery.lock"))
+        .expect("open delivery lock");
+    wait_until(Duration::from_secs(6), || {
+        let result =
+            unsafe { libc::flock(delivery_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Some(());
+        }
+        let error = std::io::Error::last_os_error();
+        assert_eq!(error.raw_os_error(), Some(libc::EWOULDBLOCK), "{error}");
+        None
+    });
+
+    let before_meta = read_meta(&meta_path);
+    assert_eq!(before_meta["state"], "DONE");
+    assert_eq!(before_meta["rc"], 0);
+    let before_delivery = before_meta["delivery"].clone();
+    assert_eq!(before_delivery["attempted"], true);
+    assert_eq!(before_delivery["exit_code"], 0);
+    assert!(before_delivery["error"].is_null());
+    assert!(before_delivery["skipped"].is_null());
+
+    write_consumed_marker(&state_dir);
+    let after_delivery = read_meta(&meta_path)["delivery"].clone();
+    assert_eq!(after_delivery, before_delivery);
 }
 
 #[test]
