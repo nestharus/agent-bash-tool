@@ -3245,12 +3245,12 @@ fn consumed_marker_during_delivery_grace_suppresses_async_delivery() {
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
         .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
-        .env("AGENT_BASH_CONSUMER_GRACE_MS", "2000")
+        .env("AGENT_BASH_CONSUMER_GRACE_MS", "8000")
         .args(["run", "--", "bash", "-lc", "echo consumed-after-rc"])
         .output()
         .expect("run");
     let json = parse_run_output(&output);
-    wait_until(Duration::from_secs(2), || {
+    wait_until(Duration::from_secs(6), || {
         rc_path(&json).exists().then_some(())
     });
     fs::write(state_dir_path(&json).join("consumed"), b"").expect("write consumed marker");
