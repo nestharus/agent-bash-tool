@@ -359,6 +359,38 @@ fn fake_agents_script() -> &'static str {
     "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\nexit 0\n"
 }
 
+fn blocking_delivery_fake_agents(
+    temp: &tempfile::TempDir,
+) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+    let fake = temp.path().join("blocking-activate-fake-agents");
+    let activate_started = temp.path().join("activate-started");
+    let activate_release = temp.path().join("activate-release");
+    let complete_started = temp.path().join("complete-started");
+    let complete_release = temp.path().join("complete-release");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+if [ "${2:-}" = agent-bash-activate ]; then
+    : > "$AGENT_BASH_FAKE_ACTIVATE_STARTED"
+    while [ ! -e "$AGENT_BASH_FAKE_ACTIVATE_RELEASE" ]; do sleep 0.01; done
+elif [ "${2:-}" = agent-bash-complete ]; then
+    : > "$AGENT_BASH_FAKE_COMPLETE_STARTED"
+    while [ ! -e "$AGENT_BASH_FAKE_COMPLETE_RELEASE" ]; do sleep 0.01; done
+fi
+exit 0
+"#,
+    )
+    .expect("write blocking activation fake");
+    set_executable(&fake);
+    (
+        fake,
+        activate_started,
+        activate_release,
+        complete_started,
+        complete_release,
+    )
+}
+
 fn owner_resolving_fake_agents(temp: &tempfile::TempDir) -> PathBuf {
     let fake = temp.path().join("owner-resolving-fake-agents");
     fs::write(
@@ -1065,6 +1097,34 @@ struct OwnedProcess {
     pidfd: OwnedFd,
 }
 
+struct StoppedProcess<'a> {
+    process: &'a OwnedProcess,
+    resumed: bool,
+}
+
+impl<'a> StoppedProcess<'a> {
+    fn stop(process: &'a OwnedProcess) -> Self {
+        assert!(process.signal(libc::SIGSTOP), "stop owned process");
+        Self {
+            process,
+            resumed: false,
+        }
+    }
+
+    fn resume(&mut self) -> bool {
+        self.resumed = self.process.signal(libc::SIGCONT);
+        self.resumed
+    }
+}
+
+impl Drop for StoppedProcess<'_> {
+    fn drop(&mut self) {
+        if !self.resumed {
+            let _ = self.process.signal(libc::SIGCONT);
+        }
+    }
+}
+
 impl OwnedProcess {
     fn capture(
         identity: ProcIdentity,
@@ -1343,7 +1403,10 @@ fn run_returns_immediately_and_later_completes() {
 fn cancel_terminates_the_entire_adopted_process_tree() {
     let temp = tempfile::tempdir().expect("tempdir");
     let child_pid_path = temp.path().join("child.pid");
-    let script = format!("sleep 60 & echo $! > {}; wait", child_pid_path.display());
+    let script = format!(
+        "trap 'exit 0' TERM; sleep 60 & echo $! > {}; wait",
+        child_pid_path.display()
+    );
     let (output, _) = run_cmd(&temp, &["run", "--", "bash", "-lc", &script]);
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
@@ -1376,6 +1439,11 @@ fn cancel_terminates_the_entire_adopted_process_tree() {
         )),
         "{status}"
     );
+    let meta = read_meta(&meta_path);
+    assert_eq!(meta["rc"], 143);
+    assert_eq!(meta["signal"], libc::SIGTERM);
+    assert_eq!(meta["workload_rc"], 0);
+    assert!(meta["workload_signal"].is_null());
     wait_for_process_gone(workload_pid);
     wait_for_process_gone(child_pid);
 }
@@ -1401,7 +1469,10 @@ fn cancel_immediately_after_run_is_not_lost_during_supervisor_startup() {
 fn owner_exit_cancels_opted_in_workload_and_descendants() {
     let temp = tempfile::tempdir().expect("tempdir");
     let child_pid_path = temp.path().join("owner-child.pid");
-    let workload_script = format!("sleep 60 & echo $! > {}; wait", child_pid_path.display());
+    let workload_script = format!(
+        "trap 'exit 0' TERM; sleep 60 & echo $! > {}; wait",
+        child_pid_path.display()
+    );
     let binary = assert_cmd::cargo::cargo_bin("agent-bash");
     let launcher_script = format!(
         "\"{}\" run --cancel-on-owner-exit --owner-pid \"$BASHPID\" -- bash -lc \"$WORKLOAD_SCRIPT\"; rc=$?; for _ in {{1..250}}; do [ -s \"$CHILD_PID_PATH\" ] && break; sleep 0.02; done; exit $rc",
@@ -1439,8 +1510,83 @@ fn owner_exit_cancels_opted_in_workload_and_descendants() {
         status.starts_with(&format!("DONE rc=143 handle={handle} reason=owner-exit")),
         "{status}"
     );
+    let meta = read_meta(&meta_path);
+    assert_eq!(meta["rc"], 143);
+    assert_eq!(meta["signal"], libc::SIGTERM);
+    assert_eq!(meta["workload_rc"], 0);
+    assert!(meta["workload_signal"].is_null());
     wait_for_process_gone(workload_pid);
     wait_for_process_gone(child_pid);
+}
+
+#[test]
+fn explicit_cancel_wins_when_owner_exit_is_already_pollable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let run_json_path = temp.path().join("owner-race-run.json");
+    let owner_ready = temp.path().join("owner-race-ready");
+    let binary = assert_cmd::cargo::cargo_bin("agent-bash");
+    let launcher_script = format!(
+        "\"{}\" run --cancel-on-owner-exit --owner-pid \"$BASHPID\" -- sleep 60 > \"$RUN_JSON\"; : > \"$OWNER_READY\"; read -r _",
+        binary.display()
+    );
+    let mut owner = StdCommand::new("bash")
+        .args(["-c", &launcher_script])
+        .stdin(Stdio::piped())
+        .env("XDG_STATE_HOME", temp.path())
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env("RUN_JSON", &run_json_path)
+        .env("OWNER_READY", &owner_ready)
+        .env_remove("OULIPOLY_PARENT_INVOCATION")
+        .env_remove("OULIPOLY_DATA_DIR")
+        .spawn()
+        .expect("owner launcher");
+    wait_until(Duration::from_secs(2), || {
+        owner_ready.exists().then_some(())
+    });
+    let run_json: Value = serde_json::from_slice(&fs::read(&run_json_path).expect("run JSON"))
+        .expect("parse run JSON");
+    let handle = run_json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&run_json);
+    let supervisor_pid = wait_until(Duration::from_secs(2), || {
+        read_meta(&meta_path)["supervisor_pid"]
+            .as_i64()
+            .map(|pid| pid as libc::pid_t)
+    });
+
+    let supervisor =
+        OwnedProcess::capture_current(supervisor_pid, None).expect("capture supervisor process");
+    let mut stopped_supervisor = StoppedProcess::stop(&supervisor);
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel command");
+    owner
+        .stdin
+        .take()
+        .expect("owner stdin")
+        .write_all(b"release\n")
+        .expect("release owner");
+    let owner_status = owner.wait().expect("reap owner");
+    let continued = stopped_supervisor.resume();
+
+    assert!(continued, "continue supervisor");
+    assert!(owner_status.success(), "owner status: {owner_status:?}");
+    assert_command_success(&cancel);
+    assert_eq!(parse_stdout_json(&cancel)["requested"], true);
+    let status = wait_for_terminal_status(&temp, handle);
+    assert!(
+        status.starts_with(&format!(
+            "DONE rc=143 handle={handle} reason=cancel-request"
+        )),
+        "{status}"
+    );
+
+    let repeated = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("repeated cancel command");
+    assert_command_success(&repeated);
+    assert_eq!(parse_stdout_json(&repeated)["requested"], false);
 }
 
 #[test]
@@ -2725,6 +2871,82 @@ fn concurrent_detach_and_completion_produce_one_notification() {
     });
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
     assert_eq!(mode_text(&temp, &handle), "async");
+}
+
+#[test]
+fn detach_does_not_rewrite_terminal_metadata_after_activation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, activate_started, activate_release, complete_started, complete_release) =
+        blocking_delivery_fake_agents(&temp);
+    let workload_release = temp.path().join("workload-release");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_ACTIVATE_STARTED", &activate_started)
+        .env("AGENT_BASH_FAKE_ACTIVATE_RELEASE", &activate_release)
+        .env("AGENT_BASH_FAKE_COMPLETE_STARTED", &complete_started)
+        .env("AGENT_BASH_FAKE_COMPLETE_RELEASE", &complete_release)
+        .env("WORKLOAD_RELEASE", &workload_release)
+        .args([
+            "run",
+            "--delivery",
+            "sync",
+            "--",
+            "bash",
+            "-lc",
+            "while [ ! -e \"$WORKLOAD_RELEASE\" ]; do sleep 0.01; done",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle").to_string();
+    let workload = wait_until(Duration::from_secs(2), || {
+        OwnedProcess::capture_workload(&read_meta(&meta_path(&json)))
+    });
+    let binary = assert_cmd::cargo::cargo_bin("agent-bash");
+    let state_root = temp.path().to_path_buf();
+    let detach_fake = fake.clone();
+    let detach_started = activate_started.clone();
+    let detach_release = activate_release.clone();
+    let detach_complete_started = complete_started.clone();
+    let detach_complete_release = complete_release.clone();
+    let detach_handle = handle.clone();
+    let detach = std::thread::spawn(move || {
+        StdCommand::new(binary)
+            .env("XDG_STATE_HOME", state_root)
+            .env("AGENT_BASH_AGENT_RUNNER_BIN", detach_fake)
+            .env("AGENT_BASH_FAKE_ACTIVATE_STARTED", detach_started)
+            .env("AGENT_BASH_FAKE_ACTIVATE_RELEASE", detach_release)
+            .env("AGENT_BASH_FAKE_COMPLETE_STARTED", detach_complete_started)
+            .env("AGENT_BASH_FAKE_COMPLETE_RELEASE", detach_complete_release)
+            .args(["detach", &detach_handle])
+            .output()
+            .expect("detach")
+    });
+    wait_until(Duration::from_secs(2), || {
+        activate_started.exists().then_some(())
+    });
+
+    fs::write(&workload_release, b"").expect("release workload");
+    wait_until(Duration::from_secs(2), || workload.exited().then_some(()));
+    wait_until(Duration::from_secs(2), || {
+        (read_meta(&meta_path(&json))["state"] == "DONE").then_some(())
+    });
+    fs::write(&activate_release, b"").expect("release activation");
+    wait_until(Duration::from_secs(2), || {
+        complete_started.exists().then_some(())
+    });
+    let state_during_delivery = read_meta(&meta_path(&json))["state"]
+        .as_str()
+        .expect("state")
+        .to_string();
+    fs::write(&complete_release, b"").expect("release completion");
+    let detach = detach.join().expect("detach thread");
+
+    assert_eq!(state_during_delivery, "DONE");
+    assert_command_success(&detach);
+    let status = wait_for_terminal_status(&temp, &handle);
+    assert!(status.starts_with("DONE rc=0"), "{status}");
+    assert_eq!(read_meta(&meta_path(&json))["state"], "DONE");
 }
 
 #[test]

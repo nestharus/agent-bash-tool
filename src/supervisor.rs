@@ -60,35 +60,61 @@ pub(crate) fn fork_supervisor(config: SupervisorConfig) -> io::Result<()> {
 
 pub(crate) fn request_cancel(paths: &StatePaths) -> io::Result<bool> {
     let meta = wait_for_supervisor_metadata(paths)?;
-    let supervisor = meta
-        .supervisor_pid
-        .zip(meta.supervisor_pid_starttime_ticks)
-        .zip(meta.process_boot_id.as_deref());
-    let Some(((pid, starttime_ticks), boot_id)) = supervisor else {
+    if state::terminal(&meta) {
+        return Ok(false);
+    }
+    let Some(identity) = supervisor_identity(&meta) else {
         reconcile_lost_supervisor(paths)?;
         return Ok(false);
-    };
-    let identity = state::CallerChainEntry {
-        pid,
-        starttime_ticks,
-        boot_id: boot_id.to_string(),
     };
     if !state::process_identity_is_live(&identity) {
         reconcile_lost_supervisor(paths)?;
         return Ok(false);
     }
-    let rc = unsafe { libc::kill(pid, libc::SIGUSR1) };
+    let completion_lock = state::lock_completion(paths)?;
+    let current = state::read_meta(paths)?;
+    if state::terminal(&current) {
+        return Ok(false);
+    }
+    let Some(identity) = supervisor_identity(&current) else {
+        drop(completion_lock);
+        reconcile_lost_supervisor(paths)?;
+        return Ok(false);
+    };
+    if !state::process_identity_is_live(&identity) {
+        drop(completion_lock);
+        reconcile_lost_supervisor(paths)?;
+        return Ok(false);
+    }
+    let created = state::create_cancel_request(paths)?;
+    let rc = unsafe { libc::kill(identity.pid, libc::SIGUSR1) };
     if rc == 0 {
         Ok(true)
     } else {
         let err = io::Error::last_os_error();
+        if created {
+            state::remove_cancel_request(paths)?;
+        }
         if err.raw_os_error() == Some(libc::ESRCH) {
+            drop(completion_lock);
             reconcile_lost_supervisor(paths)?;
             Ok(false)
         } else {
             Err(err)
         }
     }
+}
+
+fn supervisor_identity(meta: &Meta) -> Option<state::CallerChainEntry> {
+    let ((pid, starttime_ticks), boot_id) = meta
+        .supervisor_pid
+        .zip(meta.supervisor_pid_starttime_ticks)
+        .zip(meta.process_boot_id.as_deref())?;
+    Some(state::CallerChainEntry {
+        pid,
+        starttime_ticks,
+        boot_id: boot_id.to_string(),
+    })
 }
 
 fn wait_for_supervisor_metadata(paths: &StatePaths) -> io::Result<Meta> {
@@ -1095,16 +1121,32 @@ impl EventLoop {
     }
 
     fn request_cancellation(&mut self, reason: &'static str) {
+        let reason = self.cancellation_reason(reason);
         if self.cancellation.is_none() {
             self.cancellation = Some(Cancellation {
                 reason,
                 started_at: Instant::now(),
             });
+        } else if reason == "cancel-request" {
+            self.cancellation.as_mut().expect("cancellation").reason = reason;
         }
         self.drive_cancellation();
     }
 
+    fn cancellation_reason(&self, fallback: &'static str) -> &'static str {
+        if fallback == "cancel-request" || self.paths.cancel_requested.exists() {
+            "cancel-request"
+        } else {
+            fallback
+        }
+    }
+
     fn drive_cancellation(&mut self) {
+        if self.paths.cancel_requested.exists()
+            && let Some(cancellation) = self.cancellation.as_mut()
+        {
+            cancellation.reason = "cancel-request";
+        }
         let Some(cancellation) = self.cancellation.as_mut() else {
             return;
         };
@@ -1290,11 +1332,24 @@ impl EventLoop {
         apply_supervisor_error_metadata(&mut self.meta, message);
     }
 
-    fn persist_completion_and_delivery(&mut self) -> io::Result<()> {
+    fn persist_completion(&mut self) -> io::Result<()> {
         state::write_meta_atomic(&self.paths, &self.meta)?;
-        delivery::complete(&self.paths, &mut self.meta)?;
         self.completion_recorded = true;
         Ok(())
+    }
+
+    fn deliver_completion(&mut self) -> io::Result<()> {
+        delivery::complete(&self.paths, &mut self.meta)
+    }
+
+    fn adopt_terminal_metadata(&mut self) -> io::Result<bool> {
+        let meta = state::read_meta(&self.paths)?;
+        if !state::terminal(&meta) {
+            return Ok(false);
+        }
+        self.meta = meta;
+        self.completion_recorded = true;
+        Ok(true)
     }
 
     fn output_closed(&self) -> bool {
@@ -1309,25 +1364,57 @@ impl EventLoop {
     }
 
     fn record_ready_sentinel(&mut self) -> io::Result<()> {
+        let completion_lock = state::lock_completion(&self.paths)?;
+        if self.adopt_terminal_metadata()? {
+            drop(completion_lock);
+            return self.deliver_completion();
+        }
+        if self.paths.cancel_requested.exists() {
+            drop(completion_lock);
+            self.request_cancellation("cancel-request");
+            return Ok(());
+        }
         let now = state::unix_ms();
         self.log.sync_all()?;
         state::write_rc_atomic(&self.paths, 0)?;
         self.apply_ready_sentinel_metadata(now);
-        self.persist_completion_and_delivery()
+        self.persist_completion()?;
+        drop(completion_lock);
+        self.deliver_completion()
     }
 
     fn record_exit_completion(&mut self, root_status: RootStatus, reason: &str) -> io::Result<()> {
+        let completion_lock = state::lock_completion(&self.paths)?;
+        if self.adopt_terminal_metadata()? {
+            drop(completion_lock);
+            return self.deliver_completion();
+        }
+        let reason = if self.paths.cancel_requested.exists() {
+            "cancel-request"
+        } else {
+            reason
+        };
+        let root_status = completion_root_status(root_status, reason);
         self.log.sync_all()?;
         state::write_rc_atomic(&self.paths, root_status.rc)?;
         self.apply_exit_completion_metadata(root_status, reason);
-        self.persist_completion_and_delivery()
+        self.persist_completion()?;
+        drop(completion_lock);
+        self.deliver_completion()
     }
 
     fn record_supervisor_error_in_loop(&mut self, message: String) -> io::Result<()> {
+        let completion_lock = state::lock_completion(&self.paths)?;
+        if self.adopt_terminal_metadata()? {
+            drop(completion_lock);
+            return self.deliver_completion();
+        }
         self.log.sync_all()?;
         state::write_rc_atomic(&self.paths, EX_SOFTWARE)?;
         self.apply_supervisor_error_metadata(message);
-        self.persist_completion_and_delivery()
+        self.persist_completion()?;
+        drop(completion_lock);
+        self.deliver_completion()
     }
 }
 
@@ -1478,6 +1565,17 @@ fn apply_exit_completion_metadata(meta: &mut Meta, root_status: RootStatus, reas
     meta.touch();
 }
 
+fn completion_root_status(root_status: RootStatus, reason: &str) -> RootStatus {
+    if matches!(reason, "cancel-request" | "owner-exit") {
+        RootStatus {
+            rc: signal_to_shell_rc(libc::SIGTERM),
+            signal: Some(libc::SIGTERM),
+        }
+    } else {
+        root_status
+    }
+}
+
 fn apply_supervisor_error_metadata(meta: &mut Meta, message: String) {
     meta.state = "ERROR".to_string();
     meta.completion_reason = Some("supervisor-error".to_string());
@@ -1517,10 +1615,19 @@ fn record_supervisor_error(
     message: String,
     log: Option<&mut BoundedLog>,
 ) -> io::Result<()> {
+    let completion_lock = state::lock_completion(paths)?;
+    let current = state::read_meta(paths)?;
+    if state::terminal(&current) {
+        *meta = current;
+        drop(completion_lock);
+        return delivery::complete(paths, meta);
+    }
     sync_optional_log(log)?;
     state::write_rc_atomic(paths, EX_SOFTWARE)?;
     apply_supervisor_error_metadata(meta, message);
-    persist_meta_with_delivery(paths, meta)
+    state::write_meta_atomic(paths, meta)?;
+    drop(completion_lock);
+    delivery::complete(paths, meta)
 }
 
 fn sync_optional_log(log: Option<&mut BoundedLog>) -> io::Result<()> {
@@ -1528,11 +1635,6 @@ fn sync_optional_log(log: Option<&mut BoundedLog>) -> io::Result<()> {
         return Ok(());
     };
     log.sync_all()
-}
-
-fn persist_meta_with_delivery(paths: &StatePaths, meta: &mut Meta) -> io::Result<()> {
-    state::write_meta_atomic(paths, meta)?;
-    delivery::complete(paths, meta)
 }
 
 pub(crate) fn reconcile_lost_supervisor(paths: &StatePaths) -> io::Result<Meta> {
@@ -1545,8 +1647,10 @@ pub(crate) fn reconcile_lost_supervisor_without_delivery(paths: &StatePaths) -> 
 
 fn reconcile_lost_supervisor_with_delivery(paths: &StatePaths, deliver: bool) -> io::Result<Meta> {
     let _lock = state::lock_reconciliation(paths)?;
+    let completion_lock = state::lock_completion(paths)?;
     let mut meta = state::read_meta(paths)?;
     if state::terminal(&meta) {
+        drop(completion_lock);
         if deliver {
             delivery::complete(paths, &mut meta)?;
         }
@@ -1559,7 +1663,9 @@ fn reconcile_lost_supervisor_with_delivery(paths: &StatePaths, deliver: bool) ->
     state::write_rc_atomic(paths, EX_SOFTWARE)?;
     apply_lost_supervisor_metadata(&mut meta);
     if deliver {
-        persist_meta_with_delivery(paths, &mut meta)?;
+        state::write_meta_atomic(paths, &meta)?;
+        drop(completion_lock);
+        delivery::complete(paths, &mut meta)?;
     } else {
         state::write_meta_atomic(paths, &meta)?;
     }

@@ -31,6 +31,8 @@ pub(crate) struct StatePaths {
     pub(crate) consumed: PathBuf,
     pub(crate) delivery_mode: PathBuf,
     pub(crate) delivery_lock: PathBuf,
+    pub(crate) cancel_requested: PathBuf,
+    pub(crate) completion_lock: PathBuf,
     pub(crate) reconciliation_lock: PathBuf,
 }
 
@@ -47,6 +49,8 @@ impl StatePaths {
             consumed: state_dir.join("consumed"),
             delivery_mode: state_dir.join("delivery-mode"),
             delivery_lock: state_dir.join("delivery.lock"),
+            cancel_requested: state_dir.join("cancel-requested"),
+            completion_lock: state_dir.join("completion.lock"),
             reconciliation_lock: state_dir.join("reconciliation.lock"),
             state_dir,
         }
@@ -446,6 +450,40 @@ pub(crate) fn lock_delivery(paths: &StatePaths) -> io::Result<File> {
         .open(&paths.delivery_lock)?;
     lock_file_exclusive(&file)?;
     Ok(file)
+}
+
+pub(crate) fn lock_completion(paths: &StatePaths) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&paths.completion_lock)?;
+    lock_file_exclusive(&file)?;
+    Ok(file)
+}
+
+pub(crate) fn create_cancel_request(paths: &StatePaths) -> io::Result<bool> {
+    match OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&paths.cancel_requested)
+    {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn remove_cancel_request(paths: &StatePaths) -> io::Result<()> {
+    match fs::remove_file(&paths.cancel_requested) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn lock_file_exclusive(file: &File) -> io::Result<()> {
