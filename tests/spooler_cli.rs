@@ -352,15 +352,12 @@ fn write_delivery_helper_provenance(state_dir: &Path, helper: &Path) {
         "size": metadata.size(),
         "modified_seconds": metadata.mtime(),
         "modified_nanoseconds": metadata.mtime_nsec(),
-        "changed_seconds": metadata.ctime(),
-        "changed_nanoseconds": metadata.ctime_nsec(),
         "mode": metadata.mode(),
     });
-    fs::write(
-        state_dir.join("delivery-helper.json"),
-        serde_json::to_vec_pretty(&provenance).expect("delivery helper provenance JSON"),
-    )
-    .expect("write delivery helper provenance");
+    let meta_path = state_dir.join("meta.json");
+    let mut meta = read_meta(&meta_path);
+    meta["delivery_helper"] = provenance;
+    fs::write(&meta_path, format_seeded_meta(&meta)).expect("write delivery helper provenance");
 }
 
 fn fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
@@ -951,7 +948,7 @@ fn status_with_observing_delivery(
     rc_snapshot: &Path,
 ) -> Output {
     let state_dir = temp.path().join("agent-bash").join(handle);
-    if !state_dir.join("delivery-helper.json").exists() {
+    if read_meta(&state_dir.join("meta.json"))["delivery_helper"].is_null() {
         write_delivery_helper_provenance(&state_dir, fake);
     }
     let mut cmd = agent_bash(temp);

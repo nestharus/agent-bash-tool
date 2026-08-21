@@ -215,6 +215,8 @@ fn run_command(
     let cwd = current_directory().map_err(current_directory_error)?;
     let mode = run_mode(&ready_sentinel);
     let owner = owner_context(&caller_chain)?;
+    let registration =
+        delivery::prepare_registration().map_err(completion_event_registration_error)?;
     let meta = Meta::new(
         handle,
         guard.startup_ppid(),
@@ -227,15 +229,12 @@ fn run_command(
         caller_chain,
         cancel_owner,
     )
-    .with_owner_context(owner.session_id, owner.invocation_uuid);
+    .with_owner_context(owner.session_id, owner.invocation_uuid)
+    .with_delivery_helper(registration.provenance());
     create_run_state(&paths)?;
     persist_delivery_mode(&paths, delivery_mode)?;
-    if let Err(err) = delivery::prepare_registration(&paths) {
-        let _ = fs::remove_dir_all(&paths.state_dir);
-        return Err(completion_event_registration_error(err));
-    }
     persist_initial_meta(&paths, &meta)?;
-    if let Err(err) = delivery::register(&paths, &meta) {
+    if let Err(err) = delivery::register(&paths, &meta, registration) {
         let _ = fs::remove_dir_all(&paths.state_dir);
         return Err(completion_event_registration_error(err));
     }

@@ -30,7 +30,6 @@ pub(crate) struct StatePaths {
     pub(crate) owner: PathBuf,
     pub(crate) consumed: PathBuf,
     pub(crate) delivery_mode: PathBuf,
-    pub(crate) delivery_helper: PathBuf,
     pub(crate) delivery_lock: PathBuf,
     pub(crate) cancel_requested: PathBuf,
     pub(crate) completion_lock: PathBuf,
@@ -49,7 +48,6 @@ impl StatePaths {
             owner: state_dir.join("owner.json"),
             consumed: state_dir.join("consumed"),
             delivery_mode: state_dir.join("delivery-mode"),
-            delivery_helper: state_dir.join("delivery-helper.json"),
             delivery_lock: state_dir.join("delivery.lock"),
             cancel_requested: state_dir.join("cancel-requested"),
             completion_lock: state_dir.join("completion.lock"),
@@ -85,6 +83,18 @@ impl DeliveryMode {
             )),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DeliveryHelperProvenance {
+    pub(crate) schema_version: u8,
+    pub(crate) path: String,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) size: u64,
+    pub(crate) modified_seconds: i64,
+    pub(crate) modified_nanoseconds: i64,
+    pub(crate) mode: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +185,8 @@ pub(crate) struct Meta {
     pub(crate) mode: String,
     #[serde(default)]
     pub(crate) delivery_mode: DeliveryMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) delivery_helper: Option<DeliveryHelperProvenance>,
     pub(crate) ready_sentinel: Option<String>,
     pub(crate) ready_at_unix_ms: Option<u64>,
     pub(crate) completed_at_unix_ms: Option<u64>,
@@ -226,6 +238,7 @@ impl Meta {
             cwd: cwd.display().to_string(),
             mode: mode.to_string(),
             delivery_mode,
+            delivery_helper: None,
             ready_sentinel,
             ready_at_unix_ms: None,
             completed_at_unix_ms: None,
@@ -250,6 +263,11 @@ impl Meta {
     ) -> Self {
         self.owner_session_id = session_id;
         self.owner_invocation_uuid = invocation_uuid;
+        self
+    }
+
+    pub(crate) fn with_delivery_helper(mut self, helper: DeliveryHelperProvenance) -> Self {
+        self.delivery_helper = Some(helper);
         self
     }
 }
@@ -779,14 +797,6 @@ pub(crate) fn read_delivery_mode(paths: &StatePaths) -> io::Result<DeliveryMode>
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(DeliveryMode::Async),
         Err(err) => Err(err),
     }
-}
-
-pub(crate) fn write_delivery_helper_atomic(paths: &StatePaths, bytes: &[u8]) -> io::Result<()> {
-    atomic_write(&paths.delivery_helper, bytes)
-}
-
-pub(crate) fn read_delivery_helper(paths: &StatePaths) -> io::Result<Vec<u8>> {
-    read_file_bytes(&paths.delivery_helper)
 }
 
 pub(crate) fn read_meta(paths: &StatePaths) -> io::Result<Meta> {

@@ -16,7 +16,9 @@ use std::os::unix::process::ExitStatusExt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::{self, CallerChainEntry, DeliveryMeta, DeliveryMode, Meta, StatePaths};
+use crate::state::{
+    self, CallerChainEntry, DeliveryHelperProvenance, DeliveryMeta, DeliveryMode, Meta, StatePaths,
+};
 
 const CONSUMER_GRACE_MS_ENV: &str = "AGENT_BASH_CONSUMER_GRACE_MS";
 const MAX_CONSUMER_GRACE_MS: u64 = 10_000;
@@ -28,24 +30,20 @@ const DELIVERY_HELPER_UNAVAILABLE: &str = "delivery_helper_unavailable";
 const DELIVERY_HELPER_INVALID: &str = "delivery_helper_provenance_invalid";
 const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
 
-#[derive(Debug, Serialize, Deserialize)]
-struct DeliveryHelperProvenance {
-    schema_version: u8,
-    path: String,
-    device: u64,
-    inode: u64,
-    size: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
-    mode: u32,
-}
-
 #[derive(Debug)]
 struct DeliveryHelper {
     provenance: DeliveryHelperProvenance,
     executable: File,
+}
+
+pub(crate) struct DeliveryRegistration {
+    helper: DeliveryHelper,
+}
+
+impl DeliveryRegistration {
+    pub(crate) fn provenance(&self) -> DeliveryHelperProvenance {
+        self.helper.provenance.clone()
+    }
 }
 
 #[derive(Debug)]
@@ -172,31 +170,26 @@ impl DeliveryHelper {
         })
     }
 
-    fn from_persisted(paths: &StatePaths) -> Result<Self, DeliveryHelperError> {
-        let bytes = state::read_delivery_helper(paths).map_err(|err| {
+    fn from_provenance(
+        provenance: Option<&DeliveryHelperProvenance>,
+        handle: &str,
+    ) -> Result<Self, DeliveryHelperError> {
+        let provenance = provenance.ok_or_else(|| {
             DeliveryHelperError::unavailable(format!(
-                "cannot read registered delivery helper for {}: {err}",
-                paths.handle
+                "registered delivery helper provenance is missing for {handle}"
             ))
         })?;
-        let provenance: DeliveryHelperProvenance =
-            serde_json::from_slice(&bytes).map_err(|err| {
-                DeliveryHelperError::invalid(format!(
-                    "registered delivery helper for {} is malformed: {err}",
-                    paths.handle
-                ))
-            })?;
         if provenance.schema_version != DELIVERY_HELPER_SCHEMA_VERSION {
             return Err(DeliveryHelperError::invalid(format!(
                 "registered delivery helper for {} has unsupported schema version {}",
-                paths.handle, provenance.schema_version
+                handle, provenance.schema_version
             )));
         }
         let path = PathBuf::from(&provenance.path);
         if !path.is_absolute() {
             return Err(DeliveryHelperError::invalid(format!(
                 "registered delivery helper path for {} is not absolute",
-                paths.handle
+                handle
             )));
         }
         let executable = open_delivery_helper(&path).map_err(|err| {
@@ -204,13 +197,13 @@ impl DeliveryHelper {
                 DeliveryHelperError::unavailable(format!(
                     "registered delivery helper {} for {} is unavailable: {err}",
                     path.display(),
-                    paths.handle
+                    handle
                 ))
             } else {
                 DeliveryHelperError::changed(format!(
                     "registered delivery helper {} for {} cannot be opened safely: {err}",
                     path.display(),
-                    paths.handle
+                    handle
                 ))
             }
         })?;
@@ -218,29 +211,22 @@ impl DeliveryHelper {
             DeliveryHelperError::unavailable(format!(
                 "cannot inspect registered delivery helper {} for {}: {err}",
                 path.display(),
-                paths.handle
+                handle
             ))
         })?;
-        validate_delivery_helper_metadata(&path, &metadata).map_err(|detail| {
-            DeliveryHelperError::changed(format!("{detail} for {}", paths.handle))
-        })?;
-        if !provenance_matches(&provenance, &metadata) {
+        validate_delivery_helper_metadata(&path, &metadata)
+            .map_err(|detail| DeliveryHelperError::changed(format!("{detail} for {handle}")))?;
+        if !provenance_matches(provenance, &metadata) {
             return Err(DeliveryHelperError::changed(format!(
                 "registered delivery helper identity changed for {} at {}",
-                paths.handle,
+                handle,
                 path.display()
             )));
         }
         Ok(Self {
-            provenance,
+            provenance: provenance.clone(),
             executable,
         })
-    }
-
-    fn persist(&self, paths: &StatePaths) -> io::Result<()> {
-        let mut bytes = serde_json::to_vec_pretty(&self.provenance).map_err(io::Error::other)?;
-        bytes.push(b'\n');
-        state::write_delivery_helper_atomic(paths, &bytes)
     }
 
     fn command(&self) -> Command {
@@ -302,8 +288,6 @@ fn provenance_from_metadata(path: String, metadata: &Metadata) -> DeliveryHelper
         size: metadata.size(),
         modified_seconds: metadata.mtime(),
         modified_nanoseconds: metadata.mtime_nsec(),
-        changed_seconds: metadata.ctime(),
-        changed_nanoseconds: metadata.ctime_nsec(),
         mode: metadata.mode(),
     }
 }
@@ -314,8 +298,6 @@ fn provenance_matches(provenance: &DeliveryHelperProvenance, metadata: &Metadata
         && provenance.size == metadata.size()
         && provenance.modified_seconds == metadata.mtime()
         && provenance.modified_nanoseconds == metadata.mtime_nsec()
-        && provenance.changed_seconds == metadata.ctime()
-        && provenance.changed_nanoseconds == metadata.ctime_nsec()
         && provenance.mode == metadata.mode()
 }
 
@@ -417,14 +399,17 @@ fn resolve_owner_for_pid(
     Ok(Some((session_id, invocation_uuid)))
 }
 
-pub(crate) fn prepare_registration(paths: &StatePaths) -> io::Result<()> {
+pub(crate) fn prepare_registration() -> io::Result<DeliveryRegistration> {
     let helper = DeliveryHelper::from_environment().map_err(io::Error::other)?;
-    helper.persist(paths)
+    Ok(DeliveryRegistration { helper })
 }
 
-pub(crate) fn register(paths: &StatePaths, meta: &Meta) -> std::io::Result<()> {
-    let helper = DeliveryHelper::from_persisted(paths).map_err(io::Error::other)?;
-    run_required_runner_command(&register_request(meta, paths, helper))
+pub(crate) fn register(
+    paths: &StatePaths,
+    meta: &Meta,
+    registration: DeliveryRegistration,
+) -> std::io::Result<()> {
+    run_required_runner_command(&register_request(meta, paths, registration.helper))
 }
 
 pub(crate) fn complete(paths: &StatePaths, meta: &mut Meta) -> std::io::Result<()> {
@@ -446,7 +431,7 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
         return Ok(detach_outcome(&meta, false, false));
     }
 
-    let request = activate_request(paths, &meta.handle).map_err(io::Error::other)?;
+    let request = activate_request(&meta, &meta.handle).map_err(io::Error::other)?;
     run_required_runner_command(&request)?;
     state::write_delivery_mode_atomic(paths, DeliveryMode::Async)?;
     drop(delivery_lock);
@@ -474,6 +459,7 @@ fn completion_delivery(
         paths,
         consumed_before_delivery(paths),
         mode,
+        meta.delivery_helper.as_ref(),
     )
 }
 
@@ -493,8 +479,9 @@ fn trigger(
     paths: &StatePaths,
     consumed: bool,
     _mode: DeliveryMode,
+    provenance: Option<&DeliveryHelperProvenance>,
 ) -> DeliveryMeta {
-    let request = match trigger_request(caller_ppid, handle, paths, consumed) {
+    let request = match trigger_request(caller_ppid, handle, paths, consumed, provenance) {
         Ok(request) => request,
         Err(err) => return delivery_meta_from_helper_error(err),
     };
@@ -547,12 +534,9 @@ fn register_request(meta: &Meta, paths: &StatePaths, helper: DeliveryHelper) -> 
     }
 }
 
-fn activate_request(
-    paths: &StatePaths,
-    handle: &str,
-) -> Result<NotifyRequest, DeliveryHelperError> {
+fn activate_request(meta: &Meta, handle: &str) -> Result<NotifyRequest, DeliveryHelperError> {
     Ok(NotifyRequest {
-        helper: DeliveryHelper::from_persisted(paths)?,
+        helper: DeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), &meta.handle)?,
         args: activate_args(handle),
     })
 }
@@ -562,9 +546,10 @@ fn trigger_request(
     handle: &str,
     paths: &StatePaths,
     consumed: bool,
+    provenance: Option<&DeliveryHelperProvenance>,
 ) -> Result<NotifyRequest, DeliveryHelperError> {
     Ok(NotifyRequest {
-        helper: DeliveryHelper::from_persisted(paths)?,
+        helper: DeliveryHelper::from_provenance(provenance, handle)?,
         args: trigger_args(caller_ppid, handle, paths, consumed),
     })
 }
@@ -728,8 +713,6 @@ mod tests {
     #[test]
     fn changed_registered_helper_is_rejected_before_execution() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let paths = StatePaths::new(temp.path().join("state"), "ab_helper_change".to_string());
-        state::create_handle_state(&paths).expect("create state");
         let helper_path = temp.path().join("helper");
         fs::write(&helper_path, "#!/bin/sh\nexit 0\n").expect("write helper");
         let mut permissions = fs::metadata(&helper_path)
@@ -738,7 +721,7 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&helper_path, permissions).expect("make helper executable");
         let helper = DeliveryHelper::from_configured_path(&helper_path).expect("resolve helper");
-        helper.persist(&paths).expect("persist helper provenance");
+        let provenance = helper.provenance;
 
         let retained = temp.path().join("retained-helper");
         fs::rename(&helper_path, &retained).expect("retain original helper");
@@ -749,7 +732,8 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&helper_path, permissions).expect("make replacement executable");
 
-        let err = DeliveryHelper::from_persisted(&paths).expect_err("replacement must fail closed");
+        let err = DeliveryHelper::from_provenance(Some(&provenance), "ab_helper_change")
+            .expect_err("replacement must fail closed");
         assert_eq!(err.code, DELIVERY_HELPER_CHANGED);
     }
 }
