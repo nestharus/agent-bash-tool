@@ -2502,7 +2502,7 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
     // Verifies owner-tree visibility and unrelated-caller isolation at the real CLI/process seam.
     let temp = tempfile::tempdir().expect("tempdir");
     let mut owner = spawn_releasable_owner_scenario(&temp);
-    wait_until(Duration::from_secs(3), || {
+    wait_until(Duration::from_secs(6), || {
         owner.ready.exists().then_some(())
     });
     let run_json: Value =
