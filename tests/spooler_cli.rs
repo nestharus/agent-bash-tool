@@ -1011,6 +1011,7 @@ struct OwnerScenario {
     list_now: PathBuf,
     owner_list: PathBuf,
     list_caller_pid: PathBuf,
+    workload_release: PathBuf,
 }
 
 impl OwnerScenario {
@@ -1066,17 +1067,34 @@ fn owner_scenario_reaper() -> &'static mpsc::Sender<Child> {
 }
 
 fn spawn_owner_scenario(temp: &tempfile::TempDir, workload_seconds: &str) -> OwnerScenario {
+    spawn_owner_scenario_with_release(temp, workload_seconds, false)
+}
+
+fn spawn_releasable_owner_scenario(temp: &tempfile::TempDir) -> OwnerScenario {
+    spawn_owner_scenario_with_release(temp, "0", true)
+}
+
+fn spawn_owner_scenario_with_release(
+    temp: &tempfile::TempDir,
+    workload_seconds: &str,
+    releasable: bool,
+) -> OwnerScenario {
     let _ = owner_scenario_reaper();
     let run_json = temp.path().join("owner-run.json");
     let ready = temp.path().join("owner-ready");
     let list_now = temp.path().join("owner-list-now");
     let owner_list = temp.path().join("owner-list.json");
     let list_caller_pid = temp.path().join("owner-list-caller-pid");
+    let workload_release = temp.path().join("owner-workload-release");
     let script = r#"
 set -eu
 test -z "${AGENT_BASH_OWNER_SESSION_ID+x}"
 test -z "${AGENT_BASH_OWNER_INVOCATION_UUID+x}"
-"$AGENT_BASH_BIN" run -- sleep "$OWNER_WORKLOAD_SECONDS" > "$RUN_JSON"
+if [ "$OWNER_WORKLOAD_RELEASABLE" = 1 ]; then
+    "$AGENT_BASH_BIN" run -- bash -lc 'for _ in {1..800}; do [ -e "$OWNER_WORKLOAD_RELEASE" ] && exit 0; sleep 0.01; done; exit 1' > "$RUN_JSON"
+else
+    "$AGENT_BASH_BIN" run -- sleep "$OWNER_WORKLOAD_SECONDS" > "$RUN_JSON"
+fi
 while [ ! -e "$LIST_NOW" ]; do : > "$READY"; sleep 0.01; done
 bash -c 'printf "%s\n" "$$" > "$LIST_CALLER_PID"; "$AGENT_BASH_BIN" list --json > "$OWNER_LIST"; rc=$?; exit "$rc"'
 rc=$?
@@ -1099,6 +1117,11 @@ exit "$rc"
         .env("OWNER_LIST", &owner_list)
         .env("LIST_CALLER_PID", &list_caller_pid)
         .env("OWNER_WORKLOAD_SECONDS", workload_seconds)
+        .env(
+            "OWNER_WORKLOAD_RELEASABLE",
+            if releasable { "1" } else { "0" },
+        )
+        .env("OWNER_WORKLOAD_RELEASE", &workload_release)
         .spawn()
         .expect("spawn owner scenario");
     OwnerScenario {
@@ -1108,6 +1131,7 @@ exit "$rc"
         list_now,
         owner_list,
         list_caller_pid,
+        workload_release,
     }
 }
 
@@ -2404,7 +2428,7 @@ fn rca_agent_bash_visibility_non_list_only_commands_still_spool() {
 fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
     // Verifies owner-tree visibility and unrelated-caller isolation at the real CLI/process seam.
     let temp = tempfile::tempdir().expect("tempdir");
-    let mut owner = spawn_owner_scenario(&temp, "5");
+    let mut owner = spawn_releasable_owner_scenario(&temp);
     wait_until(Duration::from_secs(3), || {
         owner.ready.exists().then_some(())
     });
@@ -2440,6 +2464,7 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
         .trim()
         .parse()
         .expect("numeric list caller pid");
+    fs::write(&owner.workload_release, b"").expect("release owner workload");
     let final_status =
         wait_for_status_prefix(&temp, &handle, &format!("DONE rc=0 handle={handle}"));
 
