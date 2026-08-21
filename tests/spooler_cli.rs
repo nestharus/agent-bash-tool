@@ -613,7 +613,10 @@ if (mode === "move-helper") {
 const args = mode === "poll"
   ? { handle: value }
   : mode === "async"
-    ? { command: "sleep 1; printf 'adapter async\\n'", delivery: "async" }
+    ? {
+        command: `printf started > "$ADAPTER_ASYNC_STARTED"; attempts=0; while [ "$attempts" -lt 800 ]; do if [ -e "$ADAPTER_ASYNC_RELEASE" ]; then printf 'adapter async\\n'; exit 0; fi; attempts=$((attempts + 1)); sleep 0.01; done; exit 1`,
+        delivery: "async",
+      }
     : mode === "sleep"
       ? { command: "sleep 0.05" }
     : mode === "abort"
@@ -684,6 +687,14 @@ fn adapter_driver_command(
         )
         .env("AGENT_BASH_FAKE_RESOLVED_SESSION", "ses_adapter")
         .env("AGENT_BASH_TOOL_POLL_MS", "25")
+        .env(
+            "ADAPTER_ASYNC_STARTED",
+            temp.path().join("adapter-async-started"),
+        )
+        .env(
+            "ADAPTER_ASYNC_RELEASE",
+            temp.path().join("adapter-async-release"),
+        )
         .env("XDG_STATE_HOME", temp.path())
         .env(
             "OULIPOLY_PARENT_INVOCATION",
@@ -1002,6 +1013,26 @@ fn wait_for_process_gone(pid: libc::pid_t) {
     wait_until(Duration::from_secs(6), || {
         proc_identity(pid).is_none().then_some(())
     });
+}
+
+struct ReleaseMarker(Option<PathBuf>);
+
+impl ReleaseMarker {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn release(mut self) {
+        fs::write(self.0.take().expect("release marker path"), b"").expect("write release marker");
+    }
+}
+
+impl Drop for ReleaseMarker {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::write(path, b"");
+        }
+    }
 }
 
 struct OwnerScenario {
@@ -1849,22 +1880,38 @@ fn tree_capture_waits_for_setsid_detached_grandchild_via_subreaper() {
 fn root_completion_does_not_wait_for_setsid_detached_grandchild() {
     let temp = tempfile::tempdir().expect("tempdir");
     let marker = temp.path().join("root-completion-grandchild-marker");
-    let script =
-        "(setsid sh -c 'sleep 2; printf grandchild > \"$MARKER\"' >/dev/null 2>&1 &) ; exit 0";
+    let ready = temp.path().join("root-completion-grandchild-ready");
+    let release = temp.path().join("root-completion-grandchild-release");
+    let release_marker = ReleaseMarker::new(release.clone());
+    let script = r#"(setsid bash -lc '
+        printf ready > "$GRANDCHILD_READY"
+        for _ in {1..800}; do
+            if [ -e "$GRANDCHILD_RELEASE" ]; then
+                printf grandchild > "$MARKER"
+                exit 0
+            fi
+            sleep 0.01
+        done
+        exit 1
+    ' >/dev/null 2>&1 &) ; exit 0"#;
     let mut cmd = agent_bash(&temp);
-    cmd.env("MARKER", &marker).args([
-        "run",
-        "--completion-scope",
-        "root",
-        "--",
-        "bash",
-        "-lc",
-        script,
-    ]);
+    cmd.env("MARKER", &marker)
+        .env("GRANDCHILD_READY", &ready)
+        .env("GRANDCHILD_RELEASE", &release)
+        .args([
+            "run",
+            "--completion-scope",
+            "root",
+            "--",
+            "bash",
+            "-lc",
+            script,
+        ]);
     let output = cmd.output().expect("run");
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
 
+    wait_until(Duration::from_secs(2), || ready.exists().then_some(()));
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.starts_with(&format!("DONE rc=0 handle={handle}")));
     assert!(
@@ -1872,6 +1919,7 @@ fn root_completion_does_not_wait_for_setsid_detached_grandchild() {
         "root completion waited for the detached grandchild"
     );
 
+    release_marker.release();
     wait_until(Duration::from_secs(5), || marker.exists().then_some(()));
 }
 
@@ -2149,14 +2197,17 @@ fn opencode_adapter_explicit_async_returns_handle_immediately() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
-    let start = Instant::now();
+    let started = temp.path().join("adapter-async-started");
+    let release = temp.path().join("adapter-async-release");
+    let release_marker = ReleaseMarker::new(release);
 
     let result = run_adapter_driver(&temp, &driver, "async", None);
 
-    assert!(start.elapsed() < Duration::from_secs(1));
+    wait_until(Duration::from_secs(2), || started.exists().then_some(()));
     assert_adapter_result_contains(&result, "Running asynchronously");
     let handle = adapter_result_handle(&result);
     assert_eq!(mode_text(&temp, handle), "async");
+    release_marker.release();
     let status = wait_for_terminal_status(&temp, handle);
     assert!(
         status.starts_with(&format!("DONE rc=0 handle={handle}")),
