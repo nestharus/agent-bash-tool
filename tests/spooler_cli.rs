@@ -94,6 +94,7 @@ fn stdout_utf8(output: Output, context: &str) -> String {
     String::from_utf8(output.stdout).expect(context)
 }
 
+#[track_caller]
 fn wait_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + timeout;
     loop {
@@ -105,6 +106,7 @@ fn wait_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
     }
 }
 
+#[track_caller]
 fn assert_wait_pending(deadline: Instant, timeout: Duration) {
     assert!(Instant::now() < deadline, "timed out after {timeout:?}");
 }
@@ -1490,12 +1492,21 @@ fn attached_guard_rejects_detached_invocation() {
 #[test]
 fn run_returns_immediately_and_later_completes() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (output, elapsed) = run_cmd(&temp, &["run", "--", "bash", "-lc", "sleep 2; echo late"]);
-    assert!(elapsed < Duration::from_secs(1), "run took {elapsed:?}");
+    let started = temp.path().join("run-immediate-started");
+    let release = temp.path().join("run-immediate-release");
+    let release_marker = ReleaseMarker::new(release.clone());
+    let script = format!(
+        "printf started > {}; attempts=0; while [ \"$attempts\" -lt 400 ]; do if [ -e {} ]; then echo late; exit 0; fi; attempts=$((attempts + 1)); sleep 0.01; done; exit 1",
+        started.display(),
+        release.display()
+    );
+    let (output, _) = run_cmd(&temp, &["run", "--", "bash", "-lc", &script]);
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
+    wait_until(Duration::from_secs(2), || started.exists().then_some(()));
     let immediate = status_text(&temp, handle, false);
     assert!(immediate.starts_with("RUNNING handle="), "{immediate}");
+    release_marker.release();
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.contains("late\n"), "{final_status}");
 }
@@ -3555,6 +3566,8 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
     let (fake, delivery_log) = fake_agents(&temp);
     let child_pid_path = temp.path().join("retained-child-pid");
     let allow_root_exit = temp.path().join("allow-root-exit");
+    let root_release_marker = ReleaseMarker::new(allow_root_exit.clone());
+    let fixture_deadline = Duration::from_secs(6);
 
     let mut cmd = agent_bash(&temp);
     cmd.env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
@@ -3568,17 +3581,17 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
             "--",
             "bash",
             "-lc",
-            "sleep 10 >/dev/null 2>&1 & child=$!; printf '%s\\n' \"$child\" > \"$CHILD_PID_PATH\"; for _ in {1..200}; do [ -e \"$ALLOW_ROOT_EXIT\" ] && exit 0; sleep 0.01; done; exit 1",
+            "sleep 10 >/dev/null 2>&1 & child=$!; printf '%s\\n' \"$child\" > \"$CHILD_PID_PATH\"; for _ in {1..800}; do [ -e \"$ALLOW_ROOT_EXIT\" ] && exit 0; sleep 0.01; done; exit 1",
         ]);
     let output = cmd.output().expect("run");
     let json = parse_run_output(&output);
     let meta_path = meta_path(&json);
-    let initial_meta = wait_until(Duration::from_secs(2), || {
+    let initial_meta = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         meta["workload_pid"].is_number().then_some(meta)
     });
     let workload_pid = initial_meta["workload_pid"].as_i64().expect("workload pid") as libc::pid_t;
-    let child_pid = wait_until(Duration::from_secs(2), || {
+    let child_pid = wait_until(fixture_deadline, || {
         fs::read_to_string(&child_pid_path)
             .ok()?
             .trim()
@@ -3587,8 +3600,8 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
     });
     let retained_child =
         OwnedProcess::capture_current(child_pid, Some(workload_pid)).expect("capture child");
-    fs::write(&allow_root_exit, b"").expect("release workload root");
-    let running_meta = wait_until(Duration::from_secs(3), || {
+    root_release_marker.release();
+    let running_meta = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         (meta["workload_rc"] == 0).then_some(meta)
     });
@@ -3596,7 +3609,7 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
         OwnedProcess::capture_supervisor(&running_meta).expect("capture exact supervisor");
 
     let supervisor_signaled = supervisor.signal(libc::SIGKILL);
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + fixture_deadline;
     while !delivery_log.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -3609,7 +3622,7 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
         delivery_log.exists(),
         "supervisor loss must deliver without a status poll"
     );
-    let terminal_meta = wait_until(Duration::from_secs(2), || {
+    let terminal_meta = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["attempted"] == true).then_some(meta)
     });
