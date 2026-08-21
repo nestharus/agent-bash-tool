@@ -389,12 +389,13 @@ fn shell_quote(path: &Path) -> String {
 
 fn blocking_delivery_fake_agents(
     temp: &tempfile::TempDir,
-) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
     let fake = temp.path().join("blocking-activate-fake-agents");
     let activate_started = temp.path().join("activate-started");
     let activate_release = temp.path().join("activate-release");
     let complete_started = temp.path().join("complete-started");
     let complete_release = temp.path().join("complete-release");
+    let complete_finished = temp.path().join("complete-finished");
     fs::write(
         &fake,
         r#"#!/bin/sh
@@ -403,7 +404,13 @@ if [ "${2:-}" = agent-bash-activate ]; then
     while [ ! -e "$AGENT_BASH_FAKE_ACTIVATE_RELEASE" ]; do sleep 0.01; done
 elif [ "${2:-}" = agent-bash-complete ]; then
     : > "$AGENT_BASH_FAKE_COMPLETE_STARTED"
-    while [ ! -e "$AGENT_BASH_FAKE_COMPLETE_RELEASE" ]; do sleep 0.01; done
+    attempts=0
+    while [ ! -e "$AGENT_BASH_FAKE_COMPLETE_RELEASE" ] && [ "$attempts" -lt 800 ]; do
+        attempts=$((attempts + 1))
+        sleep 0.01
+    done
+    [ -e "$AGENT_BASH_FAKE_COMPLETE_RELEASE" ] || exit 1
+    : > "$AGENT_BASH_FAKE_COMPLETE_FINISHED"
 fi
 exit 0
 "#,
@@ -416,6 +423,7 @@ exit 0
         activate_release,
         complete_started,
         complete_release,
+        complete_finished,
     )
 }
 
@@ -3025,8 +3033,14 @@ fn concurrent_detach_and_completion_produce_one_notification() {
 #[test]
 fn detach_does_not_rewrite_terminal_metadata_after_activation() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (fake, activate_started, activate_release, complete_started, complete_release) =
-        blocking_delivery_fake_agents(&temp);
+    let (
+        fake,
+        activate_started,
+        activate_release,
+        complete_started,
+        complete_release,
+        complete_finished,
+    ) = blocking_delivery_fake_agents(&temp);
     let workload_release = temp.path().join("workload-release");
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
@@ -3034,6 +3048,7 @@ fn detach_does_not_rewrite_terminal_metadata_after_activation() {
         .env("AGENT_BASH_FAKE_ACTIVATE_RELEASE", &activate_release)
         .env("AGENT_BASH_FAKE_COMPLETE_STARTED", &complete_started)
         .env("AGENT_BASH_FAKE_COMPLETE_RELEASE", &complete_release)
+        .env("AGENT_BASH_FAKE_COMPLETE_FINISHED", &complete_finished)
         .env("WORKLOAD_RELEASE", &workload_release)
         .args([
             "run",
@@ -3058,6 +3073,7 @@ fn detach_does_not_rewrite_terminal_metadata_after_activation() {
     let detach_release = activate_release.clone();
     let detach_complete_started = complete_started.clone();
     let detach_complete_release = complete_release.clone();
+    let detach_complete_finished = complete_finished.clone();
     let detach_handle = handle.clone();
     let detach = std::thread::spawn(move || {
         StdCommand::new(binary)
@@ -3067,6 +3083,10 @@ fn detach_does_not_rewrite_terminal_metadata_after_activation() {
             .env("AGENT_BASH_FAKE_ACTIVATE_RELEASE", detach_release)
             .env("AGENT_BASH_FAKE_COMPLETE_STARTED", detach_complete_started)
             .env("AGENT_BASH_FAKE_COMPLETE_RELEASE", detach_complete_release)
+            .env(
+                "AGENT_BASH_FAKE_COMPLETE_FINISHED",
+                detach_complete_finished,
+            )
             .args(["detach", &detach_handle])
             .output()
             .expect("detach")
@@ -3089,6 +3109,9 @@ fn detach_does_not_rewrite_terminal_metadata_after_activation() {
         .expect("state")
         .to_string();
     fs::write(&complete_release, b"").expect("release completion");
+    wait_until(Duration::from_secs(2), || {
+        complete_finished.exists().then_some(())
+    });
     let detach = detach.join().expect("detach thread");
 
     assert_eq!(state_during_delivery, "DONE");
