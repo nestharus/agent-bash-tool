@@ -2392,6 +2392,14 @@ fn opencode_adapter_abort_signal_cancels_sync_workload() {
 
     assert_adapter_result_contains(&result, "Cancellation requested");
     let handle = adapter_result_handle(&result);
+    let state_dir = temp.path().join("agent-bash").join(handle);
+    let meta = read_meta(&state_dir.join("meta.json"));
+    assert!(
+        adapter_result_text(&result).contains(r#""requested":true"#),
+        "{}\nmeta={meta}\naccepted_cancel={}",
+        adapter_result_text(&result),
+        state_dir.join("cancel-requested").exists()
+    );
     let status = wait_for_terminal_status(&temp, handle);
     assert!(status.contains("reason=cancel-request"), "{status}");
 }

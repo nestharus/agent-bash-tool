@@ -16,6 +16,7 @@ const ONE_MIB: usize = 1024 * 1024;
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 const OWNER_POLL: Duration = Duration::from_millis(250);
+const SUPERVISOR_METADATA_WAIT: Duration = Duration::from_secs(5);
 const SUPERVISOR_RECOVERY_POLL: Duration = Duration::from_millis(100);
 const LOG_MAX_BYTES_ENV: &str = "AGENT_BASH_LOG_MAX_BYTES";
 const DEFAULT_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -120,7 +121,7 @@ fn supervisor_identity(meta: &Meta) -> Option<state::CallerChainEntry> {
 }
 
 fn wait_for_supervisor_metadata(paths: &StatePaths) -> io::Result<Meta> {
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + SUPERVISOR_METADATA_WAIT;
     loop {
         let meta = state::read_meta(paths)?;
         if meta.supervisor_pid.is_some() || state::terminal(&meta) || Instant::now() >= deadline {
@@ -279,6 +280,7 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
             return EX_SOFTWARE;
         }
     };
+    persist_supervisor_meta_best_effort(&config.paths, &meta);
 
     let cgroup_setup = cgroup::setup(&meta.handle);
     apply_cgroup_setup_meta(&mut meta, cgroup_setup.meta.clone());
