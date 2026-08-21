@@ -1,11 +1,11 @@
 use std::env;
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt;
-use std::fs::{self, File, Metadata};
-use std::io;
+use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use std::os::unix::process::ExitStatusExt;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::state::{
     self, CallerChainEntry, DeliveryHelperProvenance, DeliveryMeta, DeliveryMode, Meta, StatePaths,
@@ -25,10 +26,13 @@ const MAX_CONSUMER_GRACE_MS: u64 = 10_000;
 const CONSUMER_GRACE_POLL_MS: u64 = 25;
 const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
 const OWNER_LOOKUP_POLL: Duration = Duration::from_millis(10);
-const DELIVERY_HELPER_SCHEMA_VERSION: u8 = 1;
+const DELIVERY_HELPER_SCHEMA_VERSION: u8 = 2;
+const DELIVERY_HELPER_CACHE_DIR: &str = ".delivery-helpers";
+const DELIVERY_HELPER_LEGACY_UNSUPPORTED: &str = "delivery_helper_legacy_unsupported";
 const DELIVERY_HELPER_UNAVAILABLE: &str = "delivery_helper_unavailable";
 const DELIVERY_HELPER_INVALID: &str = "delivery_helper_provenance_invalid";
 const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
+const DELIVERY_ATTEMPT_IN_PROGRESS: &str = "delivery_attempt_in_progress";
 
 #[derive(Debug)]
 struct DeliveryHelper {
@@ -44,12 +48,18 @@ impl DeliveryRegistration {
     pub(crate) fn provenance(&self) -> DeliveryHelperProvenance {
         self.helper.provenance.clone()
     }
+
+    pub(crate) fn pin_to_handle(self, paths: &StatePaths) -> io::Result<Self> {
+        let helper = self.helper.pin_to_handle(paths).map_err(io::Error::other)?;
+        Ok(Self { helper })
+    }
 }
 
 #[derive(Debug)]
 struct DeliveryHelperError {
     code: &'static str,
     detail: String,
+    retryable: bool,
 }
 
 impl DeliveryHelperError {
@@ -57,6 +67,7 @@ impl DeliveryHelperError {
         Self {
             code: DELIVERY_HELPER_UNAVAILABLE,
             detail: detail.into(),
+            retryable: true,
         }
     }
 
@@ -64,6 +75,7 @@ impl DeliveryHelperError {
         Self {
             code: DELIVERY_HELPER_INVALID,
             detail: detail.into(),
+            retryable: false,
         }
     }
 
@@ -71,6 +83,15 @@ impl DeliveryHelperError {
         Self {
             code: DELIVERY_HELPER_CHANGED,
             detail: detail.into(),
+            retryable: true,
+        }
+    }
+
+    fn legacy(detail: impl Into<String>) -> Self {
+        Self {
+            code: DELIVERY_HELPER_LEGACY_UNSUPPORTED,
+            detail: detail.into(),
+            retryable: false,
         }
     }
 }
@@ -151,45 +172,131 @@ impl DeliveryHelper {
         let path_text = path.to_str().ok_or_else(|| {
             DeliveryHelperError::invalid("delivery helper path is not valid UTF-8")
         })?;
-        let executable = open_delivery_helper(path).map_err(|err| {
+        let source = open_delivery_helper(path).map_err(|err| {
             DeliveryHelperError::unavailable(format!(
                 "cannot open delivery helper {}: {err}",
                 path.display()
             ))
         })?;
-        let metadata = executable.metadata().map_err(|err| {
+        let metadata = source.metadata().map_err(|err| {
             DeliveryHelperError::unavailable(format!(
                 "cannot inspect delivery helper {}: {err}",
                 path.display()
             ))
         })?;
         validate_delivery_helper_metadata(path, &metadata).map_err(DeliveryHelperError::invalid)?;
+        let (executable, sha256) = sealed_execution_image(&source).map_err(|err| {
+            DeliveryHelperError::unavailable(format!(
+                "cannot snapshot delivery helper {}: {err}",
+                path.display()
+            ))
+        })?;
         Ok(Self {
-            provenance: provenance_from_metadata(path_text.to_string(), &metadata),
+            provenance: provenance_from_metadata(path_text.to_string(), &metadata, sha256),
             executable,
+        })
+    }
+
+    fn pin_to_handle(self, paths: &StatePaths) -> Result<Self, DeliveryHelperError> {
+        let cache_dir = paths.root.join(DELIVERY_HELPER_CACHE_DIR);
+        create_helper_cache_dir(&cache_dir).map_err(|err| {
+            DeliveryHelperError::unavailable(format!(
+                "cannot create delivery helper cache {}: {err}",
+                cache_dir.display()
+            ))
+        })?;
+        let cache_lock = lock_helper_cache(&cache_dir).map_err(|err| {
+            DeliveryHelperError::unavailable(format!(
+                "cannot lock delivery helper cache {}: {err}",
+                cache_dir.display()
+            ))
+        })?;
+        let cached = cache_dir.join(&self.provenance.sha256);
+        install_cached_helper(
+            &cached,
+            &self.executable,
+            &self.provenance.sha256,
+            &paths.handle,
+        )
+        .map_err(|err| {
+            DeliveryHelperError::unavailable(format!(
+                "cannot cache delivery helper for {}: {err}",
+                paths.handle
+            ))
+        })?;
+        fs::hard_link(&cached, &paths.delivery_helper).map_err(|err| {
+            DeliveryHelperError::unavailable(format!(
+                "cannot pin delivery helper for {}: {err}",
+                paths.handle
+            ))
+        })?;
+        cleanup_unreferenced_helper_snapshots(&cache_dir);
+        File::open(&paths.state_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|err| {
+                DeliveryHelperError::unavailable(format!(
+                    "cannot persist delivery helper binding for {}: {err}",
+                    paths.handle
+                ))
+            })?;
+        drop(cache_lock);
+        let snapshot_path = fs::canonicalize(&paths.delivery_helper).map_err(|err| {
+            DeliveryHelperError::unavailable(format!(
+                "cannot resolve pinned delivery helper for {}: {err}",
+                paths.handle
+            ))
+        })?;
+        let metadata = fs::metadata(&snapshot_path).map_err(|err| {
+            DeliveryHelperError::unavailable(format!(
+                "cannot inspect pinned delivery helper for {}: {err}",
+                paths.handle
+            ))
+        })?;
+        let provenance = provenance_from_metadata(
+            snapshot_path.to_string_lossy().into_owned(),
+            &metadata,
+            self.provenance.sha256,
+        );
+        Ok(Self {
+            provenance,
+            executable: self.executable,
         })
     }
 
     fn from_provenance(
         provenance: Option<&DeliveryHelperProvenance>,
-        handle: &str,
+        paths: &StatePaths,
     ) -> Result<Self, DeliveryHelperError> {
         let provenance = provenance.ok_or_else(|| {
-            DeliveryHelperError::unavailable(format!(
-                "registered delivery helper provenance is missing for {handle}"
+            DeliveryHelperError::legacy(format!(
+                "registered delivery helper snapshot is missing for {}",
+                paths.handle
             ))
         })?;
         if provenance.schema_version != DELIVERY_HELPER_SCHEMA_VERSION {
-            return Err(DeliveryHelperError::invalid(format!(
+            return Err(DeliveryHelperError::legacy(format!(
                 "registered delivery helper for {} has unsupported schema version {}",
-                handle, provenance.schema_version
+                paths.handle, provenance.schema_version
             )));
         }
         let path = PathBuf::from(&provenance.path);
         if !path.is_absolute() {
             return Err(DeliveryHelperError::invalid(format!(
                 "registered delivery helper path for {} is not absolute",
-                handle
+                paths.handle
+            )));
+        }
+        let expected_parent = fs::canonicalize(&paths.state_dir).map_err(|err| {
+            DeliveryHelperError::unavailable(format!(
+                "registered delivery helper state for {} is unavailable: {err}",
+                paths.handle
+            ))
+        })?;
+        let expected_path = expected_parent.join("delivery-helper");
+        if path != expected_path {
+            return Err(DeliveryHelperError::changed(format!(
+                "registered delivery helper binding changed for {}",
+                paths.handle
             )));
         }
         let executable = open_delivery_helper(&path).map_err(|err| {
@@ -197,13 +304,13 @@ impl DeliveryHelper {
                 DeliveryHelperError::unavailable(format!(
                     "registered delivery helper {} for {} is unavailable: {err}",
                     path.display(),
-                    handle
+                    paths.handle
                 ))
             } else {
                 DeliveryHelperError::changed(format!(
                     "registered delivery helper {} for {} cannot be opened safely: {err}",
                     path.display(),
-                    handle
+                    paths.handle
                 ))
             }
         })?;
@@ -211,16 +318,29 @@ impl DeliveryHelper {
             DeliveryHelperError::unavailable(format!(
                 "cannot inspect registered delivery helper {} for {}: {err}",
                 path.display(),
-                handle
+                paths.handle
             ))
         })?;
-        validate_delivery_helper_metadata(&path, &metadata)
-            .map_err(|detail| DeliveryHelperError::changed(format!("{detail} for {handle}")))?;
+        validate_delivery_helper_metadata(&path, &metadata).map_err(|detail| {
+            DeliveryHelperError::changed(format!("{detail} for {}", paths.handle))
+        })?;
         if !provenance_matches(provenance, &metadata) {
             return Err(DeliveryHelperError::changed(format!(
                 "registered delivery helper identity changed for {} at {}",
-                handle,
+                paths.handle,
                 path.display()
+            )));
+        }
+        let (executable, sha256) = sealed_execution_image(&executable).map_err(|err| {
+            DeliveryHelperError::unavailable(format!(
+                "cannot load registered delivery helper for {}: {err}",
+                paths.handle
+            ))
+        })?;
+        if sha256 != provenance.sha256 {
+            return Err(DeliveryHelperError::changed(format!(
+                "registered delivery helper contents changed for {}",
+                paths.handle
             )));
         }
         Ok(Self {
@@ -254,7 +374,7 @@ fn open_delivery_helper(path: &Path) -> io::Result<File> {
     let fd = unsafe {
         libc::open(
             path.as_ptr(),
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -279,7 +399,11 @@ fn validate_delivery_helper_metadata(path: &Path, metadata: &Metadata) -> Result
     Ok(())
 }
 
-fn provenance_from_metadata(path: String, metadata: &Metadata) -> DeliveryHelperProvenance {
+fn provenance_from_metadata(
+    path: String,
+    metadata: &Metadata,
+    sha256: String,
+) -> DeliveryHelperProvenance {
     DeliveryHelperProvenance {
         schema_version: DELIVERY_HELPER_SCHEMA_VERSION,
         path,
@@ -289,6 +413,135 @@ fn provenance_from_metadata(path: String, metadata: &Metadata) -> DeliveryHelper
         modified_seconds: metadata.mtime(),
         modified_nanoseconds: metadata.mtime_nsec(),
         mode: metadata.mode(),
+        sha256,
+    }
+}
+
+fn sealed_execution_image(source: &File) -> io::Result<(File, String)> {
+    let name = CString::new("agent-bash-delivery-helper").expect("static memfd name");
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            name.as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut image = unsafe { File::from_raw_fd(i32::try_from(fd).map_err(io::Error::other)?) };
+    let mut reader = source.try_clone()?;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        image.write_all(&buffer[..read])?;
+    }
+    image.set_permissions(fs::Permissions::from_mode(0o500))?;
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if unsafe { libc::fcntl(image.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    image.seek(SeekFrom::Start(0))?;
+    Ok((image, format!("{:x}", digest.finalize())))
+}
+
+fn create_helper_cache_dir(path: &Path) -> io::Result<()> {
+    match DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn cleanup_unreferenced_helper_snapshots(cache_dir: &Path) {
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok).take(128) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_file() && metadata.nlink() == 1 {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn lock_helper_cache(cache_dir: &Path) -> io::Result<File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(cache_dir.join("cache.lock"))?;
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(lock);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+fn install_cached_helper(
+    cached: &Path,
+    image: &File,
+    expected_sha256: &str,
+    handle: &str,
+) -> io::Result<()> {
+    if cached.exists() {
+        return validate_cached_helper(cached, expected_sha256);
+    }
+    let temp = cached.with_file_name(format!(".{}.{}.tmp", expected_sha256, handle));
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o500)
+        .open(&temp)?;
+    let mut input = image.try_clone()?;
+    input.seek(SeekFrom::Start(0))?;
+    io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    drop(output);
+    match fs::hard_link(&temp, cached) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            let _ = fs::remove_file(&temp);
+            return Err(err);
+        }
+    }
+    fs::remove_file(&temp)?;
+    validate_cached_helper(cached, expected_sha256)
+}
+
+fn validate_cached_helper(path: &Path, expected_sha256: &str) -> io::Result<()> {
+    let file = open_delivery_helper(path)?;
+    let metadata = file.metadata()?;
+    validate_delivery_helper_metadata(path, &metadata)
+        .map_err(|detail| io::Error::new(io::ErrorKind::InvalidData, detail))?;
+    let (_, observed_sha256) = sealed_execution_image(&file)?;
+    if observed_sha256 == expected_sha256 {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cached delivery helper digest mismatch",
+        ))
     }
 }
 
@@ -414,53 +667,91 @@ pub(crate) fn register(
 
 pub(crate) fn complete(paths: &StatePaths, meta: &mut Meta) -> std::io::Result<()> {
     let _lock = state::lock_delivery(paths)?;
-    let persisted = state::read_meta(paths)?;
+    let mut persisted = state::read_meta(paths)?;
     let mode = state::read_delivery_mode(paths)?;
-    meta.delivery_mode = mode;
-    meta.delivery = completion_delivery(mode, &persisted.delivery, meta, paths);
-    meta.touch();
-    state::write_meta_atomic(paths, meta)
+    persisted.delivery_mode = mode;
+    if persisted.delivery.attempted
+        || persisted.delivery.skipped.is_some()
+        || (persisted.delivery.error_code.is_some() && persisted.delivery.retryable != Some(true))
+    {
+        *meta = persisted;
+        return Ok(());
+    }
+    let retry_count = persisted
+        .delivery
+        .retry_count
+        .saturating_add(u8::from(persisted.delivery.retryable == Some(true)));
+    let request = match trigger_request(
+        persisted.caller_ppid,
+        &persisted.handle,
+        paths,
+        consumed_before_delivery(paths),
+        persisted.delivery_helper.as_ref(),
+    ) {
+        Ok(request) => request,
+        Err(err) => {
+            persisted.delivery = delivery_meta_from_helper_error(err, retry_count);
+            persisted.touch();
+            state::write_meta_atomic(paths, &persisted)?;
+            *meta = persisted;
+            return Ok(());
+        }
+    };
+    persisted.delivery = delivery_attempt_started_meta();
+    persisted.touch();
+    state::write_meta_atomic(paths, &persisted)?;
+    persisted.delivery = match run_notify_command(&request) {
+        Ok(status) => delivery_meta_from_status(status),
+        Err(err) => delivery_meta_from_error(err),
+    };
+    persisted.touch();
+    state::write_meta_atomic(paths, &persisted)?;
+    *meta = persisted;
+    Ok(())
 }
 
 pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
     let delivery_lock = state::lock_delivery(paths)?;
     let mode = state::read_delivery_mode(paths)?;
-    let mut meta = state::read_meta(paths)?;
     if mode == DeliveryMode::Async {
-        meta.delivery_mode = mode;
+        let meta = repair_delivery_mode_mirror(paths)?;
+        drop(delivery_lock);
         return Ok(detach_outcome(&meta, false, false));
     }
 
-    let request = activate_request(&meta, &meta.handle).map_err(io::Error::other)?;
-    run_required_runner_command(&request)?;
-    state::write_delivery_mode_atomic(paths, DeliveryMode::Async)?;
+    let meta = state::read_meta(paths)?;
+    let request = activate_request(&meta, paths).map_err(io::Error::other)?;
+    let claimed = state::record_activation_attempt(paths)?;
+    if let Err(err) = state::write_delivery_mode_atomic(paths, DeliveryMode::Async) {
+        if claimed {
+            let _ = state::rollback_activation_attempt(paths);
+        }
+        return Err(err);
+    }
+    let result = if claimed {
+        run_required_runner_command(&request)
+    } else {
+        Ok(())
+    };
+    let meta = repair_delivery_mode_mirror(paths)?;
     drop(delivery_lock);
-
-    let _completion_lock = state::lock_completion(paths)?;
-    let mut meta = state::read_meta(paths)?;
-    meta.delivery_mode = DeliveryMode::Async;
-    state::write_meta_atomic(paths, &meta)?;
-
-    Ok(detach_outcome(&meta, true, state::terminal(&meta)))
+    result?;
+    Ok(detach_outcome(
+        &meta,
+        true,
+        claimed && state::terminal(&meta),
+    ))
 }
 
-fn completion_delivery(
-    mode: DeliveryMode,
-    persisted: &DeliveryMeta,
-    meta: &Meta,
-    paths: &StatePaths,
-) -> DeliveryMeta {
-    if persisted.attempted && persisted.exit_code == Some(0) {
-        return persisted.clone();
+fn repair_delivery_mode_mirror(paths: &StatePaths) -> io::Result<Meta> {
+    let _completion_lock = state::lock_completion(paths)?;
+    let mut meta = state::read_meta(paths)?;
+    if meta.delivery_mode != DeliveryMode::Async {
+        meta.delivery_mode = DeliveryMode::Async;
+        meta.touch();
+        state::write_meta_atomic(paths, &meta)?;
     }
-    trigger(
-        meta.caller_ppid,
-        &meta.handle,
-        paths,
-        consumed_before_delivery(paths),
-        mode,
-        meta.delivery_helper.as_ref(),
-    )
+    Ok(meta)
 }
 
 fn detach_outcome(meta: &Meta, transitioned: bool, notification_attempted: bool) -> DetachOutcome {
@@ -470,24 +761,6 @@ fn detach_outcome(meta: &Meta, transitioned: bool, notification_attempted: bool)
         state: meta.state.clone(),
         transitioned,
         notification_attempted,
-    }
-}
-
-fn trigger(
-    caller_ppid: libc::pid_t,
-    handle: &str,
-    paths: &StatePaths,
-    consumed: bool,
-    _mode: DeliveryMode,
-    provenance: Option<&DeliveryHelperProvenance>,
-) -> DeliveryMeta {
-    let request = match trigger_request(caller_ppid, handle, paths, consumed, provenance) {
-        Ok(request) => request,
-        Err(err) => return delivery_meta_from_helper_error(err),
-    };
-    match run_notify_command(&request) {
-        Ok(status) => delivery_meta_from_status(status),
-        Err(err) => delivery_meta_from_error(err),
     }
 }
 
@@ -534,10 +807,10 @@ fn register_request(meta: &Meta, paths: &StatePaths, helper: DeliveryHelper) -> 
     }
 }
 
-fn activate_request(meta: &Meta, handle: &str) -> Result<NotifyRequest, DeliveryHelperError> {
+fn activate_request(meta: &Meta, paths: &StatePaths) -> Result<NotifyRequest, DeliveryHelperError> {
     Ok(NotifyRequest {
-        helper: DeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), &meta.handle)?,
-        args: activate_args(handle),
+        helper: DeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)?,
+        args: activate_args(&meta.handle),
     })
 }
 
@@ -549,7 +822,7 @@ fn trigger_request(
     provenance: Option<&DeliveryHelperProvenance>,
 ) -> Result<NotifyRequest, DeliveryHelperError> {
     Ok(NotifyRequest {
-        helper: DeliveryHelper::from_provenance(provenance, handle)?,
+        helper: DeliveryHelper::from_provenance(provenance, paths)?,
         args: trigger_args(caller_ppid, handle, paths, consumed),
     })
 }
@@ -671,13 +944,14 @@ fn delivery_meta_from_error(err: std::io::Error) -> DeliveryMeta {
     meta
 }
 
-fn delivery_meta_from_helper_error(err: DeliveryHelperError) -> DeliveryMeta {
+fn delivery_meta_from_helper_error(err: DeliveryHelperError, retry_count: u8) -> DeliveryMeta {
     DeliveryMeta {
         attempted: false,
         exit_code: None,
         error: Some(err.to_string()),
         error_code: Some(err.code.to_string()),
-        retryable: Some(true),
+        retryable: Some(err.retryable && retry_count == 0),
+        retry_count,
         skipped: None,
     }
 }
@@ -689,12 +963,33 @@ fn attempted_delivery_meta() -> DeliveryMeta {
         error: None,
         error_code: None,
         retryable: None,
+        retry_count: 0,
+        skipped: None,
+    }
+}
+
+fn delivery_attempt_started_meta() -> DeliveryMeta {
+    DeliveryMeta {
+        attempted: true,
+        exit_code: None,
+        error: Some(
+            "delivery helper outcome is unknown until the admitted attempt exits".to_string(),
+        ),
+        error_code: Some(DELIVERY_ATTEMPT_IN_PROGRESS.to_string()),
+        retryable: Some(false),
+        retry_count: 0,
         skipped: None,
     }
 }
 
 pub(crate) fn delivery_needs_retry(meta: &Meta) -> bool {
-    state::terminal(meta) && meta.delivery.retryable == Some(true)
+    state::terminal(meta) && !meta.delivery.attempted && meta.delivery.retryable == Some(true)
+}
+
+pub(crate) fn delivery_attempt_in_progress(meta: &Meta) -> bool {
+    state::terminal(meta)
+        && meta.delivery.attempted
+        && meta.delivery.error_code.as_deref() == Some(DELIVERY_ATTEMPT_IN_PROGRESS)
 }
 
 fn delivery_signal_error(status: ExitStatus) -> String {
@@ -707,6 +1002,7 @@ fn delivery_signal_error(status: ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
 
@@ -720,9 +1016,6 @@ mod tests {
             .permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&helper_path, permissions).expect("make helper executable");
-        let helper = DeliveryHelper::from_configured_path(&helper_path).expect("resolve helper");
-        let provenance = helper.provenance;
-
         let retained = temp.path().join("retained-helper");
         fs::rename(&helper_path, &retained).expect("retain original helper");
         fs::write(&helper_path, "#!/bin/sh\nexit 99\n").expect("write replacement helper");
@@ -732,8 +1025,44 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&helper_path, permissions).expect("make replacement executable");
 
-        let err = DeliveryHelper::from_provenance(Some(&provenance), "ab_helper_change")
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_helper_change".to_string());
+        state::create_handle_state(&paths).expect("create state");
+        fs::hard_link(&retained, &paths.delivery_helper).expect("pin retained helper");
+        let snapshot = fs::canonicalize(&paths.delivery_helper).expect("snapshot path");
+        let snapshot_metadata = fs::metadata(&snapshot).expect("snapshot metadata");
+        let (_, sha256) = sealed_execution_image(&File::open(&snapshot).expect("open snapshot"))
+            .expect("snapshot digest");
+        let provenance = provenance_from_metadata(
+            snapshot.to_string_lossy().into_owned(),
+            &snapshot_metadata,
+            sha256,
+        );
+        let mut permissions = fs::metadata(&paths.delivery_helper)
+            .expect("snapshot metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&paths.delivery_helper, permissions).expect("make snapshot writable");
+        fs::write(&paths.delivery_helper, "#!/bin/sh\nexit 9\n").expect("change snapshot");
+        let mut permissions = fs::metadata(&paths.delivery_helper)
+            .expect("changed snapshot metadata")
+            .permissions();
+        permissions.set_mode(provenance.mode & 0o7777);
+        fs::set_permissions(&paths.delivery_helper, permissions).expect("restore snapshot mode");
+        let modified = UNIX_EPOCH
+            + Duration::new(
+                u64::try_from(provenance.modified_seconds).expect("nonnegative mtime"),
+                u32::try_from(provenance.modified_nanoseconds).expect("mtime nanos"),
+            );
+        File::options()
+            .write(true)
+            .open(&paths.delivery_helper)
+            .expect("open changed snapshot")
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .expect("restore snapshot mtime");
+
+        let err = DeliveryHelper::from_provenance(Some(&provenance), &paths)
             .expect_err("replacement must fail closed");
         assert_eq!(err.code, DELIVERY_HELPER_CHANGED);
+        assert!(err.detail.contains("contents changed"), "{}", err.detail);
     }
 }

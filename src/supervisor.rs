@@ -86,14 +86,16 @@ pub(crate) fn request_cancel(paths: &StatePaths) -> io::Result<bool> {
         reconcile_lost_supervisor(paths)?;
         return Ok(false);
     }
-    let created = state::create_cancel_request(paths)?;
+    // The marker is prepared before SIGUSR1 so the supervisor can observe the
+    // accepted handoff as soon as it handles the signal. A failed signal rolls it back.
+    let prepared = state::prepare_explicit_cancel_acceptance(paths)?;
     let rc = unsafe { libc::kill(identity.pid, libc::SIGUSR1) };
     if rc == 0 {
         Ok(true)
     } else {
         let err = io::Error::last_os_error();
-        if created {
-            state::remove_cancel_request(paths)?;
+        if prepared {
+            state::rollback_explicit_cancel_acceptance(paths)?;
         }
         if err.raw_os_error() == Some(libc::ESRCH) {
             drop(completion_lock);
@@ -133,6 +135,16 @@ unsafe fn daemonization_child(config: SupervisorConfig) -> ! {
     if unsafe { libc::setsid() } < 0 {
         unsafe { libc::_exit(EX_SOFTWARE) };
     }
+    if let Err(err) = set_subreaper() {
+        let mut meta = config.meta.clone();
+        let _ = record_supervisor_error(
+            &config.paths,
+            &mut meta,
+            subreaper_failed_message(err),
+            None,
+        );
+        unsafe { libc::_exit(EX_SOFTWARE) };
+    }
     let guardian_paths = config.paths.clone();
     match unsafe { libc::fork() } {
         -1 => unsafe { libc::_exit(EX_SOFTWARE) },
@@ -156,13 +168,47 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
         return 0;
     }
 
+    let mut recovered_cancel_started = None;
     loop {
+        let accepted_cancel = explicit_cancel_accepted(paths);
+        if accepted_cancel {
+            let started_at = recovered_cancel_started.get_or_insert_with(Instant::now);
+            let signal = if started_at.elapsed() >= CANCEL_GRACE {
+                libc::SIGKILL
+            } else {
+                libc::SIGTERM
+            };
+            signal_descendants(current_pid(), signal);
+        }
+        let adopted_tree_empty = reap_adopted_children();
+        if accepted_cancel && !adopted_tree_empty {
+            std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+            continue;
+        }
         match reconcile_lost_supervisor(paths) {
             Ok(meta) if state::terminal(&meta) => return 0,
             Ok(meta) if !state::running_exit_mode(&meta) => return 0,
             Ok(_) => std::thread::sleep(SUPERVISOR_RECOVERY_POLL),
             Err(_) => return EX_SOFTWARE,
         }
+    }
+}
+
+fn reap_adopted_children() -> bool {
+    loop {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if waited > 0 {
+            continue;
+        }
+        if waited == 0 {
+            return false;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return err.raw_os_error() == Some(libc::ECHILD);
     }
 }
 
@@ -981,13 +1027,13 @@ fn poll_entries(loop_state: &EventLoop) -> Vec<PollEntry> {
     push_optional_poll_entry(&mut entries, loop_state.stdout_fd, PollKey::Stdout);
     push_optional_poll_entry(&mut entries, loop_state.stderr_fd, PollKey::Stderr);
     push_optional_poll_entry(&mut entries, loop_state.exec_err_fd, PollKey::ExecErr);
+    push_optional_poll_entry(&mut entries, loop_state.owner_pidfd, PollKey::OwnerPidfd);
     entries.push(poll_entry(
         loop_state.sigchld.fd,
         libc::POLLIN,
         PollKey::Sigchld,
     ));
     push_optional_poll_entry(&mut entries, loop_state.root_pidfd, PollKey::Pidfd);
-    push_optional_poll_entry(&mut entries, loop_state.owner_pidfd, PollKey::OwnerPidfd);
     push_optional_poll_entry(&mut entries, cgroup_inotify_fd(loop_state), PollKey::Cgroup);
     entries
 }
@@ -1134,7 +1180,7 @@ impl EventLoop {
     }
 
     fn cancellation_reason(&self, fallback: &'static str) -> &'static str {
-        if fallback == "cancel-request" || self.paths.cancel_requested.exists() {
+        if fallback == "cancel-request" || explicit_cancel_accepted(&self.paths) {
             "cancel-request"
         } else {
             fallback
@@ -1142,7 +1188,7 @@ impl EventLoop {
     }
 
     fn drive_cancellation(&mut self) {
-        if self.paths.cancel_requested.exists()
+        if explicit_cancel_accepted(&self.paths)
             && let Some(cancellation) = self.cancellation.as_mut()
         {
             cancellation.reason = "cancel-request";
@@ -1320,38 +1366,6 @@ impl EventLoop {
         }
     }
 
-    fn apply_ready_sentinel_metadata(&mut self, now: u64) {
-        apply_ready_sentinel_metadata(&mut self.meta, now);
-    }
-
-    fn apply_exit_completion_metadata(&mut self, root_status: RootStatus, reason: &str) {
-        apply_exit_completion_metadata(&mut self.meta, root_status, reason);
-    }
-
-    fn apply_supervisor_error_metadata(&mut self, message: String) {
-        apply_supervisor_error_metadata(&mut self.meta, message);
-    }
-
-    fn persist_completion(&mut self) -> io::Result<()> {
-        state::write_meta_atomic(&self.paths, &self.meta)?;
-        self.completion_recorded = true;
-        Ok(())
-    }
-
-    fn deliver_completion(&mut self) -> io::Result<()> {
-        delivery::complete(&self.paths, &mut self.meta)
-    }
-
-    fn adopt_terminal_metadata(&mut self) -> io::Result<bool> {
-        let meta = state::read_meta(&self.paths)?;
-        if !state::terminal(&meta) {
-            return Ok(false);
-        }
-        self.meta = meta;
-        self.completion_recorded = true;
-        Ok(true)
-    }
-
     fn output_closed(&self) -> bool {
         self.stdout_fd.is_none() && self.stderr_fd.is_none() && self.exec_err_fd.is_none()
     }
@@ -1364,57 +1378,46 @@ impl EventLoop {
     }
 
     fn record_ready_sentinel(&mut self) -> io::Result<()> {
-        let completion_lock = state::lock_completion(&self.paths)?;
-        if self.adopt_terminal_metadata()? {
-            drop(completion_lock);
-            return self.deliver_completion();
+        match publish_terminal(
+            &self.paths,
+            &mut self.meta,
+            Some(&mut self.log),
+            TerminalProposal::ReadySentinel(state::unix_ms()),
+            true,
+        )? {
+            TerminalPublishResult::Published => self.completion_recorded = true,
+            TerminalPublishResult::DeferredForAcceptedCancel => {
+                self.request_cancellation("cancel-request");
+            }
         }
-        if self.paths.cancel_requested.exists() {
-            drop(completion_lock);
-            self.request_cancellation("cancel-request");
-            return Ok(());
-        }
-        let now = state::unix_ms();
-        self.log.sync_all()?;
-        state::write_rc_atomic(&self.paths, 0)?;
-        self.apply_ready_sentinel_metadata(now);
-        self.persist_completion()?;
-        drop(completion_lock);
-        self.deliver_completion()
+        Ok(())
     }
 
     fn record_exit_completion(&mut self, root_status: RootStatus, reason: &str) -> io::Result<()> {
-        let completion_lock = state::lock_completion(&self.paths)?;
-        if self.adopt_terminal_metadata()? {
-            drop(completion_lock);
-            return self.deliver_completion();
-        }
-        let reason = if self.paths.cancel_requested.exists() {
-            "cancel-request"
-        } else {
-            reason
-        };
-        let root_status = completion_root_status(root_status, reason);
-        self.log.sync_all()?;
-        state::write_rc_atomic(&self.paths, root_status.rc)?;
-        self.apply_exit_completion_metadata(root_status, reason);
-        self.persist_completion()?;
-        drop(completion_lock);
-        self.deliver_completion()
+        publish_terminal(
+            &self.paths,
+            &mut self.meta,
+            Some(&mut self.log),
+            TerminalProposal::Exit {
+                root_status,
+                reason: reason.to_string(),
+            },
+            true,
+        )?;
+        self.completion_recorded = true;
+        Ok(())
     }
 
     fn record_supervisor_error_in_loop(&mut self, message: String) -> io::Result<()> {
-        let completion_lock = state::lock_completion(&self.paths)?;
-        if self.adopt_terminal_metadata()? {
-            drop(completion_lock);
-            return self.deliver_completion();
-        }
-        self.log.sync_all()?;
-        state::write_rc_atomic(&self.paths, EX_SOFTWARE)?;
-        self.apply_supervisor_error_metadata(message);
-        self.persist_completion()?;
-        drop(completion_lock);
-        self.deliver_completion()
+        publish_terminal(
+            &self.paths,
+            &mut self.meta,
+            Some(&mut self.log),
+            TerminalProposal::SupervisorError(message),
+            true,
+        )?;
+        self.completion_recorded = true;
+        Ok(())
     }
 }
 
@@ -1585,6 +1588,18 @@ fn apply_supervisor_error_metadata(meta: &mut Meta, message: String) {
     meta.touch();
 }
 
+fn apply_explicit_cancel_metadata(meta: &mut Meta) {
+    let status = completion_root_status(
+        RootStatus {
+            rc: EX_SOFTWARE,
+            signal: None,
+        },
+        "cancel-request",
+    );
+    apply_exit_completion_metadata(meta, status, "cancel-request");
+    meta.error = None;
+}
+
 fn status_to_root_status(status: i32) -> RootStatus {
     if libc::WIFEXITED(status) {
         RootStatus {
@@ -1615,19 +1630,14 @@ fn record_supervisor_error(
     message: String,
     log: Option<&mut BoundedLog>,
 ) -> io::Result<()> {
-    let completion_lock = state::lock_completion(paths)?;
-    let current = state::read_meta(paths)?;
-    if state::terminal(&current) {
-        *meta = current;
-        drop(completion_lock);
-        return delivery::complete(paths, meta);
-    }
-    sync_optional_log(log)?;
-    state::write_rc_atomic(paths, EX_SOFTWARE)?;
-    apply_supervisor_error_metadata(meta, message);
-    state::write_meta_atomic(paths, meta)?;
-    drop(completion_lock);
-    delivery::complete(paths, meta)
+    publish_terminal(
+        paths,
+        meta,
+        log,
+        TerminalProposal::SupervisorError(message),
+        true,
+    )?;
+    Ok(())
 }
 
 fn sync_optional_log(log: Option<&mut BoundedLog>) -> io::Result<()> {
@@ -1647,10 +1657,8 @@ pub(crate) fn reconcile_lost_supervisor_without_delivery(paths: &StatePaths) -> 
 
 fn reconcile_lost_supervisor_with_delivery(paths: &StatePaths, deliver: bool) -> io::Result<Meta> {
     let _lock = state::lock_reconciliation(paths)?;
-    let completion_lock = state::lock_completion(paths)?;
     let mut meta = state::read_meta(paths)?;
     if state::terminal(&meta) {
-        drop(completion_lock);
         if deliver {
             delivery::complete(paths, &mut meta)?;
         }
@@ -1659,16 +1667,13 @@ fn reconcile_lost_supervisor_with_delivery(paths: &StatePaths, deliver: bool) ->
     if !state::exact_supervisor_and_workload_are_gone(&meta) {
         return Ok(meta);
     }
-
-    state::write_rc_atomic(paths, EX_SOFTWARE)?;
-    apply_lost_supervisor_metadata(&mut meta);
-    if deliver {
-        state::write_meta_atomic(paths, &meta)?;
-        drop(completion_lock);
-        delivery::complete(paths, &mut meta)?;
-    } else {
-        state::write_meta_atomic(paths, &meta)?;
-    }
+    publish_terminal(
+        paths,
+        &mut meta,
+        None,
+        TerminalProposal::SupervisorLost,
+        deliver,
+    )?;
     Ok(meta)
 }
 
@@ -1680,6 +1685,74 @@ fn apply_lost_supervisor_metadata(meta: &mut Meta) {
     meta.completed_at_unix_ms = Some(state::unix_ms());
     meta.error = Some("supervisor and workload process identities are gone".to_string());
     meta.touch();
+}
+
+enum TerminalProposal {
+    ReadySentinel(u64),
+    Exit {
+        root_status: RootStatus,
+        reason: String,
+    },
+    SupervisorError(String),
+    SupervisorLost,
+}
+
+enum TerminalPublishResult {
+    Published,
+    DeferredForAcceptedCancel,
+}
+
+fn publish_terminal(
+    paths: &StatePaths,
+    meta: &mut Meta,
+    log: Option<&mut BoundedLog>,
+    proposal: TerminalProposal,
+    deliver: bool,
+) -> io::Result<TerminalPublishResult> {
+    let completion_lock = state::lock_completion(paths)?;
+    let current = state::read_meta(paths)?;
+    if state::terminal(&current) {
+        *meta = current;
+        drop(completion_lock);
+        if deliver {
+            delivery::complete(paths, meta)?;
+        }
+        return Ok(TerminalPublishResult::Published);
+    }
+    if matches!(proposal, TerminalProposal::ReadySentinel(_)) && explicit_cancel_accepted(paths) {
+        drop(completion_lock);
+        return Ok(TerminalPublishResult::DeferredForAcceptedCancel);
+    }
+    sync_optional_log(log)?;
+    if explicit_cancel_accepted(paths) {
+        apply_explicit_cancel_metadata(meta);
+    } else {
+        match proposal {
+            TerminalProposal::ReadySentinel(now) => apply_ready_sentinel_metadata(meta, now),
+            TerminalProposal::Exit {
+                root_status,
+                reason,
+            } => {
+                let root_status = completion_root_status(root_status, &reason);
+                apply_exit_completion_metadata(meta, root_status, &reason);
+            }
+            TerminalProposal::SupervisorError(message) => {
+                apply_supervisor_error_metadata(meta, message);
+            }
+            TerminalProposal::SupervisorLost => apply_lost_supervisor_metadata(meta),
+        }
+    }
+    state::write_rc_atomic(paths, meta.rc.unwrap_or(EX_SOFTWARE))?;
+    state::write_meta_atomic(paths, meta)?;
+    drop(completion_lock);
+    if deliver {
+        delivery::complete(paths, meta)?;
+    }
+    Ok(TerminalPublishResult::Published)
+}
+
+fn explicit_cancel_accepted(paths: &StatePaths) -> bool {
+    paths.accepted_cancel.exists()
 }
 
 impl Drop for EventLoop {

@@ -15,7 +15,6 @@ const DEFAULT_STATE_TTL_SECS: u64 = 48 * 60 * 60;
 const DEFAULT_REAP_MAX_DIRS: usize = 128;
 const DEFAULT_REAP_MAX_SCAN: usize = 4096;
 const DEFAULT_REAP_SHARDS: usize = 16;
-const PENDING_DELIVERY_GRACE_MULTIPLIER: u64 = 7;
 const REAP_SHARD_CURSOR_FILE: &str = ".reap-shard";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -30,8 +29,10 @@ pub(crate) struct StatePaths {
     pub(crate) owner: PathBuf,
     pub(crate) consumed: PathBuf,
     pub(crate) delivery_mode: PathBuf,
+    pub(crate) delivery_helper: PathBuf,
+    pub(crate) activation_attempted: PathBuf,
     pub(crate) delivery_lock: PathBuf,
-    pub(crate) cancel_requested: PathBuf,
+    pub(crate) accepted_cancel: PathBuf,
     pub(crate) completion_lock: PathBuf,
     pub(crate) reconciliation_lock: PathBuf,
 }
@@ -48,8 +49,10 @@ impl StatePaths {
             owner: state_dir.join("owner.json"),
             consumed: state_dir.join("consumed"),
             delivery_mode: state_dir.join("delivery-mode"),
+            delivery_helper: state_dir.join("delivery-helper"),
+            activation_attempted: state_dir.join("activation-attempted"),
             delivery_lock: state_dir.join("delivery.lock"),
-            cancel_requested: state_dir.join("cancel-requested"),
+            accepted_cancel: state_dir.join("cancel-requested"),
             completion_lock: state_dir.join("completion.lock"),
             reconciliation_lock: state_dir.join("reconciliation.lock"),
             state_dir,
@@ -95,6 +98,8 @@ pub(crate) struct DeliveryHelperProvenance {
     pub(crate) modified_seconds: i64,
     pub(crate) modified_nanoseconds: i64,
     pub(crate) mode: u32,
+    #[serde(default)]
+    pub(crate) sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,8 +133,14 @@ pub(crate) struct DeliveryMeta {
     pub(crate) error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retryable: Option<bool>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) retry_count: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) skipped: Option<String>,
+}
+
+fn is_zero(value: &u8) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -488,23 +499,59 @@ pub(crate) fn lock_completion(paths: &StatePaths) -> io::Result<File> {
     Ok(file)
 }
 
-pub(crate) fn create_cancel_request(paths: &StatePaths) -> io::Result<bool> {
+pub(crate) fn prepare_explicit_cancel_acceptance(paths: &StatePaths) -> io::Result<bool> {
     match OpenOptions::new()
         .create_new(true)
         .write(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .mode(0o600)
-        .open(&paths.cancel_requested)
+        .open(&paths.accepted_cancel)
     {
-        Ok(_) => Ok(true),
+        Ok(file) => {
+            if let Err(err) = file
+                .sync_all()
+                .and_then(|()| File::open(&paths.state_dir)?.sync_all())
+            {
+                drop(file);
+                let _ = fs::remove_file(&paths.accepted_cancel);
+                return Err(err);
+            }
+            Ok(true)
+        }
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
         Err(err) => Err(err),
     }
 }
 
-pub(crate) fn remove_cancel_request(paths: &StatePaths) -> io::Result<()> {
-    match fs::remove_file(&paths.cancel_requested) {
-        Ok(()) => Ok(()),
+pub(crate) fn rollback_explicit_cancel_acceptance(paths: &StatePaths) -> io::Result<()> {
+    match fs::remove_file(&paths.accepted_cancel) {
+        Ok(()) => File::open(&paths.state_dir)?.sync_all(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn record_activation_attempt(paths: &StatePaths) -> io::Result<bool> {
+    match OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&paths.activation_attempted)
+    {
+        Ok(file) => {
+            file.sync_all()?;
+            File::open(&paths.state_dir)?.sync_all()?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn rollback_activation_attempt(paths: &StatePaths) -> io::Result<()> {
+    match fs::remove_file(&paths.activation_attempted) {
+        Ok(()) => File::open(&paths.state_dir)?.sync_all(),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
@@ -546,13 +593,6 @@ impl ReapConfig {
 
     fn ttl_ms(self) -> u64 {
         secs_to_ms(self.ttl_secs)
-    }
-
-    fn pending_delivery_moot_ms(self) -> u64 {
-        secs_to_ms(
-            self.ttl_secs
-                .saturating_mul(PENDING_DELIVERY_GRACE_MULTIPLIER),
-        )
     }
 }
 
@@ -659,15 +699,9 @@ fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig, boot_id: &str
         return false;
     }
     if meta_is_reap_terminal(&meta, boot_id) {
-        return delivery_is_settled(paths, &meta) || age_ms >= config.pending_delivery_moot_ms();
+        return true;
     }
     meta.state == "RUNNING" && meta_processes_are_gone_or_reused(&meta, boot_id)
-}
-
-fn delivery_is_settled(paths: &StatePaths, meta: &Meta) -> bool {
-    paths.consumed.exists()
-        || (meta.delivery.attempted && meta.delivery.exit_code == Some(0))
-        || meta.delivery.skipped.as_deref() == Some("sync_in_band")
 }
 
 fn meta_is_reap_terminal(meta: &Meta, boot_id: &str) -> bool {
@@ -1336,19 +1370,19 @@ mod tests {
     }
 
     #[test]
-    fn reaper_keeps_pending_undelivered_state_dir_until_moot() {
+    fn reaper_removes_pending_undelivered_state_at_ttl() {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_pending", "DONE", now - 20_000, false);
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
 
-        assert_eq!(stats.reaped, 0);
-        assert!(paths.state_dir.exists());
+        assert_eq!(stats.reaped, 1);
+        assert!(!paths.state_dir.exists());
     }
 
     #[test]
-    fn reaper_keeps_retryable_failed_delivery_until_moot() {
+    fn reaper_removes_retryable_failed_delivery_at_ttl() {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_retryable", "DONE", now - 20_000, false);
@@ -1357,12 +1391,13 @@ mod tests {
         meta.delivery.error = Some("registered delivery helper is unavailable".to_string());
         meta.delivery.error_code = Some("delivery_helper_unavailable".to_string());
         meta.delivery.retryable = Some(true);
+        meta.delivery.retry_count = 0;
         write_meta_atomic(&paths, &meta).expect("write retryable delivery metadata");
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
 
-        assert_eq!(stats.reaped, 0);
-        assert!(paths.state_dir.exists());
+        assert_eq!(stats.reaped, 1);
+        assert!(!paths.state_dir.exists());
     }
 
     #[test]

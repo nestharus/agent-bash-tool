@@ -104,6 +104,12 @@ supervisor loss is conclusive, record `supervisor-lost`, and run any pending asy
 persisted root exit code remains diagnostic evidence; supervisor loss is still `ERROR rc=70`
 because full process-tree completion can no longer be proven.
 
+The guardian becomes a subreaper before it forks the supervisor. If explicit cancellation was
+accepted before abnormal supervisor exit, the durable `cancel-requested` handoff transfers that
+obligation to the guardian. It adopts and terminates the remaining workload tree, then the shared
+terminal-publication operation records `cancel-request`, status 143, instead of `supervisor-lost`.
+Every non-sentinel terminal producer uses that same precedence decision.
+
 ### Completion detection — three modes
 - **tree exit mode (default):** wake on root process death with `pidfd_open` + `poll`, and finish
   only after the subreaper has reaped all descendants (`waitpid` → `ECHILD`). Optional cgroup-v2
@@ -135,6 +141,27 @@ session to rediscover its handles after the adapter process and caller PID chang
 use this pair as a delivery fallback only after confirming that the invocation belongs to the same
 provider session.
 
+Registration resolves the configured helper once, reads it into a sealed executable image, and
+stores its SHA-256 identity. The image is installed once per content digest under the account-private
+state root and hard-linked as `delivery-helper` inside each dependent handle. Later activation,
+completion, status recovery, and guardian recovery accept only that handle-local path, verify its
+metadata and digest, copy it into a sealed in-memory image, and execute the sealed bytes. Replacing
+or editing the configured source path after registration cannot change an in-flight handle.
+
+The helper cache lock serializes cache installation, per-handle linking, and removal of cache entries
+with no remaining handle links. This keeps one physical snapshot per live helper version rather than
+one full executable copy per handle.
+
+The state root is a Unix-account trust boundary. Mode `0700` excludes other accounts, while
+same-account workloads and observers are trusted not to rewrite another handle's state or helper
+cache. The observer-isolation guarantee means a later process cannot substitute its environment or
+configured helper path; it is not a sandbox between hostile processes sharing one Unix identity.
+
+Helper provenance schema 2 is the activation boundary for this convention. A deployment owner must
+drain handles created by older binaries before rollout. Records with missing or older provenance are
+deliberately retired: later activation or completion fails closed with
+`delivery_helper_legacy_unsupported` and does not fall back to the observer's helper.
+
 ### Durable delivery mode and atomic detach
 Each handle stores its canonical delivery mode in `delivery-mode`; `meta.json.delivery_mode` mirrors
 that value for observability. Missing mode files are interpreted as `async` for handles created by
@@ -149,7 +176,21 @@ persisted before that decision so detach can safely observe a completion that wo
   the terminal handle and notifies.
 - If detach observes terminal state before completion's delivery step, detach notifies and records
   the attempt; completion reloads that record and does not notify again.
-- Repeated detach calls observe `async` and are no-ops.
+- Repeated detach calls observe `async` and are no-ops. If a caller died between the canonical mode
+  write and the `meta.json` mirror, the retry repairs the mirror without repeating activation.
+
+Before activation, detach creates `activation-attempted` and persists canonical `async` mode. Before
+completion, the delivery record is persisted with `attempted=true` and
+`error_code="delivery_attempt_in_progress"`. These are write-ahead transfer claims: once present, a
+successor never hands the same one-shot obligation to the helper again, including after a nonzero
+exit or unknown caller-death outcome. Failures that occur while resolving the pinned helper are
+recorded with `attempted=false` and may be retried because no helper process received the operation.
+This chooses at-most-once invocation over retrying an ambiguous external effect.
+
+The spooler's closed state machine ends at the admitted helper invocation and its observed process
+exit. Agent-runner owns mailbox publication, transaction boundaries, and any downstream idempotency.
+Accordingly, “at most once” in this repository means one admitted `agent-bash-activate` or
+`agent-bash-complete` helper invocation; it does not claim an uninspected end-to-end mailbox theorem.
 
 Before asynchronous notification, the supervisor checks the best-effort `consumed` marker. If
 `AGENT_BASH_CONSUMER_GRACE_MS` is nonzero, it waits up to that bounded interval (clamped to ten
@@ -162,6 +203,13 @@ roots are scanned incrementally. In addition to settled terminal handles, the re
 expired `ERROR` handle or `RUNNING` handle whose exact supervisor and workload identities are both
 conclusively gone or reused. Missing or unreadable process identity evidence fails closed and keeps
 the state directory.
+
+All terminal handles use the configured state TTL. Retryable pre-invocation helper failures do not
+receive a multiplied retention window, so failed delivery does not create a sevenfold retained-state
+population. Each status observer may perform at most one helper-resolution retry for the handle it
+observes, and `retry_count` bounds each handle to one observer-triggered retry in total. The delivery
+lock serializes concurrently admitted observers; the first persists either an attempt claim or a
+closed retry result, and later observers cannot repeat it.
 
 ## agent-runner additions
 

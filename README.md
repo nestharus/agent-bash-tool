@@ -16,8 +16,8 @@ completion returns synchronously in-band or asynchronously through the agent mai
   Headless asynchronous work is not leased to the caller process, so it survives that normal turn
   exit. Interactive PTY callers retain the explicit foreground option and owner-exit cancellation.
 - **Atomic detach.** `detach <handle>` converts a running synchronous call to asynchronous delivery.
-  Completion and detach serialize on a per-handle lock, so either race ordering emits at most one
-  mailbox notification.
+  Completion and detach serialize on a per-handle lock and durably claim an external helper attempt
+  before launching it, so successor processes do not repeat an uncertain completion or activation.
 - **Attached-required.** The tool must be invoked as an attached subprocess (so it can anchor the
   process tree). A detached invocation is rejected immediately.
 - **Explicit completion scope.** Tree scope remains the CLI default and waits for every orphaned
@@ -27,7 +27,8 @@ completion returns synchronously in-band or asynchronously through the agent mai
   agents. Delegated cgroup v2 remains an optional live-set enhancement.
 - **Supervisor-loss recovery.** A detached guardian waits on the exact supervisor child. If the
   supervisor exits abnormally, the guardian reconciles durable process identity and terminal state
-  and performs pending asynchronous delivery without requiring a caller to poll `status`.
+  and performs pending asynchronous delivery without requiring a caller to poll `status`. The
+  guardian also adopts the workload tree and finishes any already-accepted explicit cancellation.
 - **Owner-scoped cancellation.** Integrations can opt into an exact PID/start-time/boot-ID lease
   with `run --cancel-on-owner-exit --owner-pid <pid>`. `cancel <handle>`, an owner exit, or an
   OpenCode tool abort terminates the complete adopted process tree, escalating to `SIGKILL` after
@@ -37,10 +38,18 @@ completion returns synchronously in-band or asynchronously through the agent mai
 - **Async delivery via agent-runner.** For asynchronous completion the spooler asks agent-runner
   whose session the caller is and hands over the result; agent-runner wakes (headless: `resume`) or
   forwards (PTY). Synchronous completion never enters that mailbox.
+- **Pinned delivery helper.** Registration snapshots the selected helper into a content-addressed,
+  account-private cache and hard-links that exact version into the handle. A normal helper upgrade
+  therefore cannot substitute or strand operations for handles already in flight.
 
 The spooler is **general and provider-agnostic** — it knows nothing about agents or sessions and
 talks to agent-runner only over its CLI. See [`docs/DESIGN.md`](docs/DESIGN.md) for the full
 architecture, layering, and the agent-runner-side mailbox.
+
+The spooler guarantees at most one admitted helper invocation per handle operation. Agent-runner is
+the authority for mailbox transactions and deduplication after accepting that invocation. State
+directories and the helper cache are protected between Unix accounts, not between mutually
+untrusted processes running as the same account.
 
 ## Build
 
