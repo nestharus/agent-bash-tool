@@ -624,7 +624,7 @@ const args = mode === "poll"
     : mode === "abort"
       ? { command: "sleep 60; printf 'adapter abort failed\\n'" }
       : mode === "detachable"
-        ? { command: "sleep 2; printf 'adapter detached\\n'" }
+        ? { command: `printf started > "$ADAPTER_DETACHABLE_STARTED"; attempts=0; while [ "$attempts" -lt 800 ]; do if [ -e "$ADAPTER_DETACHABLE_RELEASE" ]; then printf 'adapter detached\\n'; exit 0; fi; attempts=$((attempts + 1)); sleep 0.01; done; exit 1` }
       : mode === "wrapper"
         ? { command: `${process.env.AGENT_BASH_BIN} run -- agents --version` }
       : mode === "wrapper-env"
@@ -696,6 +696,14 @@ fn adapter_driver_command(
         .env(
             "ADAPTER_ASYNC_RELEASE",
             temp.path().join("adapter-async-release"),
+        )
+        .env(
+            "ADAPTER_DETACHABLE_STARTED",
+            temp.path().join("adapter-detachable-started"),
+        )
+        .env(
+            "ADAPTER_DETACHABLE_RELEASE",
+            temp.path().join("adapter-detachable-release"),
         )
         .env("XDG_STATE_HOME", temp.path())
         .env(
@@ -1636,6 +1644,7 @@ fn explicit_cancel_wins_when_owner_exit_is_already_pollable() {
     let temp = tempfile::tempdir().expect("tempdir");
     let run_json_path = temp.path().join("owner-race-run.json");
     let owner_ready = temp.path().join("owner-race-ready");
+    let fixture_deadline = Duration::from_secs(6);
     let binary = assert_cmd::cargo::cargo_bin("agent-bash");
     let launcher_script = format!(
         "\"{}\" run --cancel-on-owner-exit --owner-pid \"$BASHPID\" -- sleep 60 > \"$RUN_JSON\"; : > \"$OWNER_READY\"; read -r _",
@@ -1652,14 +1661,12 @@ fn explicit_cancel_wins_when_owner_exit_is_already_pollable() {
         .env_remove("OULIPOLY_DATA_DIR")
         .spawn()
         .expect("owner launcher");
-    wait_until(Duration::from_secs(2), || {
-        owner_ready.exists().then_some(())
-    });
+    wait_until(fixture_deadline, || owner_ready.exists().then_some(()));
     let run_json: Value = serde_json::from_slice(&fs::read(&run_json_path).expect("run JSON"))
         .expect("parse run JSON");
     let handle = run_json["handle"].as_str().expect("handle");
     let meta_path = meta_path(&run_json);
-    let supervisor_pid = wait_until(Duration::from_secs(2), || {
+    let supervisor_pid = wait_until(fixture_deadline, || {
         read_meta(&meta_path)["supervisor_pid"]
             .as_i64()
             .map(|pid| pid as libc::pid_t)
@@ -1799,9 +1806,12 @@ fn captured_log_is_bounded_and_retains_newest_output() {
 fn ready_sentinel_reports_done_without_killing_workload() {
     let temp = tempfile::tempdir().expect("tempdir");
     let child_pid_path = temp.path().join("sentinel-child.pid");
+    let workload_release = temp.path().join("sentinel-workload-release");
+    let release_marker = ReleaseMarker::new(workload_release.clone());
     let mut command = agent_bash(&temp);
     command
         .env("SENTINEL_CHILD_PID_PATH", &child_pid_path)
+        .env("SENTINEL_WORKLOAD_RELEASE", &workload_release)
         .args([
             "run",
             "--ready-sentinel",
@@ -1809,7 +1819,7 @@ fn ready_sentinel_reports_done_without_killing_workload() {
             "--",
             "bash",
             "-lc",
-            "echo boot; echo READY:123; sleep 10 & echo $! > \"$SENTINEL_CHILD_PID_PATH\"; wait",
+            "echo boot; echo READY:123; bash -lc 'attempts=0; while [ \"$attempts\" -lt 2000 ]; do [ -e \"$SENTINEL_WORKLOAD_RELEASE\" ] && exit 0; attempts=$((attempts + 1)); sleep 0.01; done; exit 1' & echo $! > \"$SENTINEL_CHILD_PID_PATH\"; wait",
         ]);
     let output = command.output().expect("run sentinel workload");
     let json = parse_run_output(&output);
@@ -1821,7 +1831,7 @@ fn ready_sentinel_reports_done_without_killing_workload() {
     );
     let meta = read_meta(&meta_path(&json));
     let workload_pid = meta["workload_pid"].as_i64().expect("workload pid") as libc::pid_t;
-    let child_pid = wait_until(Duration::from_secs(2), || {
+    let child_pid = wait_until(Duration::from_secs(6), || {
         fs::read_to_string(&child_pid_path)
             .ok()?
             .trim()
@@ -1829,12 +1839,7 @@ fn ready_sentinel_reports_done_without_killing_workload() {
             .ok()
     });
     let workload_alive = unsafe { libc::kill(workload_pid, 0) == 0 };
-    let workload = OwnedProcess::capture_workload(&meta).expect("capture sentinel workload");
-    let child =
-        OwnedProcess::capture_current(child_pid, Some(workload_pid)).expect("capture child");
-    let cleanup = terminate_owned_processes(&[workload, child]);
-    wait_for_process_gone(workload_pid);
-    wait_for_process_gone(child_pid);
+    let child_alive = unsafe { libc::kill(child_pid, 0) == 0 };
 
     assert_eq!(json["mode"], "sentinel");
     assert!(final_status.contains("boot\n"), "{final_status}");
@@ -1844,8 +1849,11 @@ fn ready_sentinel_reports_done_without_killing_workload() {
     assert!(meta["ready_at_unix_ms"].is_number());
     assert!(meta["workload_rc"].is_null());
     assert!(workload_alive, "sentinel workload was not running");
-    assert_eq!(cleanup.term_sent, 2);
-    assert_eq!(cleanup.kill_sent, 0);
+    assert!(child_alive, "sentinel child was not running");
+
+    release_marker.release();
+    wait_for_process_gone(workload_pid);
+    wait_for_process_gone(child_pid);
 }
 
 #[test]
@@ -2336,12 +2344,16 @@ fn opencode_adapter_sync_wait_returns_when_handle_is_detached() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
+    let started = temp.path().join("adapter-detachable-started");
+    let release = temp.path().join("adapter-detachable-release");
+    let release_marker = ReleaseMarker::new(release);
     let mut adapter = adapter_driver_command(&temp, &driver, "detachable", None)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn adapter driver");
-    let handle = wait_until(Duration::from_secs(2), || initialized_state_handle(&temp));
+    let handle = wait_until(Duration::from_secs(6), || initialized_state_handle(&temp));
+    wait_until(Duration::from_secs(6), || started.exists().then_some(()));
     assert_eq!(mode_text(&temp, &handle), "sync");
 
     let detach = agent_bash(&temp)
@@ -2350,18 +2362,17 @@ fn opencode_adapter_sync_wait_returns_when_handle_is_detached() {
         .expect("detach command");
     assert_command_success(&detach);
     assert_eq!(parse_stdout_json(&detach)["transitioned"], true);
-    let detached_at = Instant::now();
     let stdout = adapter.stdout.take().expect("adapter stdout");
     let line = BufReader::new(stdout)
         .lines()
         .next()
         .expect("adapter result line")
         .expect("adapter result");
-    assert!(detached_at.elapsed() < Duration::from_secs(1));
     let result: Value = serde_json::from_str(&line).expect("adapter result json");
 
     assert_adapter_result_contains(&result, "Running asynchronously");
     assert_eq!(adapter_result_handle(&result), handle);
+    release_marker.release();
     let final_status = wait_for_terminal_status(&temp, &handle);
     assert!(
         final_status.starts_with(&format!("DONE rc=0 handle={handle}")),
