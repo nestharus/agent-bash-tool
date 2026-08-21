@@ -30,6 +30,7 @@ pub(crate) struct StatePaths {
     pub(crate) owner: PathBuf,
     pub(crate) consumed: PathBuf,
     pub(crate) delivery_mode: PathBuf,
+    pub(crate) delivery_helper: PathBuf,
     pub(crate) delivery_lock: PathBuf,
     pub(crate) cancel_requested: PathBuf,
     pub(crate) completion_lock: PathBuf,
@@ -48,6 +49,7 @@ impl StatePaths {
             owner: state_dir.join("owner.json"),
             consumed: state_dir.join("consumed"),
             delivery_mode: state_dir.join("delivery-mode"),
+            delivery_helper: state_dir.join("delivery-helper.json"),
             delivery_lock: state_dir.join("delivery.lock"),
             cancel_requested: state_dir.join("cancel-requested"),
             completion_lock: state_dir.join("completion.lock"),
@@ -112,6 +114,10 @@ pub(crate) struct DeliveryMeta {
     pub(crate) attempted: bool,
     pub(crate) exit_code: Option<i32>,
     pub(crate) error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retryable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) skipped: Option<String>,
 }
@@ -642,7 +648,7 @@ fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig, boot_id: &str
 
 fn delivery_is_settled(paths: &StatePaths, meta: &Meta) -> bool {
     paths.consumed.exists()
-        || meta.delivery.attempted
+        || (meta.delivery.attempted && meta.delivery.exit_code == Some(0))
         || meta.delivery.skipped.as_deref() == Some("sync_in_band")
 }
 
@@ -773,6 +779,14 @@ pub(crate) fn read_delivery_mode(paths: &StatePaths) -> io::Result<DeliveryMode>
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(DeliveryMode::Async),
         Err(err) => Err(err),
     }
+}
+
+pub(crate) fn write_delivery_helper_atomic(paths: &StatePaths, bytes: &[u8]) -> io::Result<()> {
+    atomic_write(&paths.delivery_helper, bytes)
+}
+
+pub(crate) fn read_delivery_helper(paths: &StatePaths) -> io::Result<Vec<u8>> {
+    read_file_bytes(&paths.delivery_helper)
 }
 
 pub(crate) fn read_meta(paths: &StatePaths) -> io::Result<Meta> {
@@ -1316,6 +1330,24 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_pending", "DONE", now - 20_000, false);
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 0);
+        assert!(paths.state_dir.exists());
+    }
+
+    #[test]
+    fn reaper_keeps_retryable_failed_delivery_until_moot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_retryable", "DONE", now - 20_000, false);
+        let mut meta = read_meta(&paths).expect("read meta");
+        meta.delivery.attempted = false;
+        meta.delivery.error = Some("registered delivery helper is unavailable".to_string());
+        meta.delivery.error_code = Some("delivery_helper_unavailable".to_string());
+        meta.delivery.retryable = Some(true);
+        write_meta_atomic(&paths, &meta).expect("write retryable delivery metadata");
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
 

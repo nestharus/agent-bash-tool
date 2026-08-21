@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
@@ -341,22 +341,53 @@ fn write_consumed_marker(state_dir: &Path) {
     fs::write(state_dir.join("consumed"), b"").expect("write consumed");
 }
 
+fn write_delivery_helper_provenance(state_dir: &Path, helper: &Path) {
+    let helper = fs::canonicalize(helper).expect("canonical helper");
+    let metadata = fs::metadata(&helper).expect("helper metadata");
+    let provenance = json!({
+        "schema_version": 1,
+        "path": helper.to_str().expect("UTF-8 helper path"),
+        "device": metadata.dev(),
+        "inode": metadata.ino(),
+        "size": metadata.size(),
+        "modified_seconds": metadata.mtime(),
+        "modified_nanoseconds": metadata.mtime_nsec(),
+        "changed_seconds": metadata.ctime(),
+        "changed_nanoseconds": metadata.ctime_nsec(),
+        "mode": metadata.mode(),
+    });
+    fs::write(
+        state_dir.join("delivery-helper.json"),
+        serde_json::to_vec_pretty(&provenance).expect("delivery helper provenance JSON"),
+    )
+    .expect("write delivery helper provenance");
+}
+
 fn fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
-    let (fake, delivery_log) = fake_agents_paths(temp);
-    fs::write(&fake, fake_agents_script()).expect("write fake");
+    named_fake_agents(temp, "fake-agents", "delivery.log")
+}
+
+fn named_fake_agents(
+    temp: &tempfile::TempDir,
+    helper_name: &str,
+    log_name: &str,
+) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join(helper_name);
+    let delivery_log = temp.path().join(log_name);
+    fs::write(&fake, fake_agents_script(&delivery_log)).expect("write fake");
     set_executable(&fake);
     (fake, delivery_log)
 }
 
-fn fake_agents_paths(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
-    (
-        temp.path().join("fake-agents"),
-        temp.path().join("delivery.log"),
+fn fake_agents_script(delivery_log: &Path) -> String {
+    format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nexit 0\n",
+        shell_quote(delivery_log)
     )
 }
 
-fn fake_agents_script() -> &'static str {
-    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\nexit 0\n"
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
 fn blocking_delivery_fake_agents(
@@ -919,6 +950,10 @@ fn status_with_observing_delivery(
     meta_snapshot: &Path,
     rc_snapshot: &Path,
 ) -> Output {
+    let state_dir = temp.path().join("agent-bash").join(handle);
+    if !state_dir.join("delivery-helper.json").exists() {
+        write_delivery_helper_provenance(&state_dir, fake);
+    }
     let mut cmd = agent_bash(temp);
     cmd.env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
         .env("AGENT_BASH_FAKE_DELIVERY_LOG", delivery_log)
@@ -2236,8 +2271,11 @@ fn opencode_adapter_sync_wait_returns_when_handle_is_detached() {
 
     assert_adapter_result_contains(&result, "Running asynchronously");
     assert_eq!(adapter_result_handle(&result), handle);
-    let final_status =
-        wait_for_status_prefix(&temp, &handle, &format!("DONE rc=0 handle={handle}"));
+    let final_status = wait_for_terminal_status(&temp, &handle);
+    assert!(
+        final_status.starts_with(&format!("DONE rc=0 handle={handle}")),
+        "{final_status}"
+    );
     assert!(
         final_status.contains("adapter detached\n"),
         "{final_status}"
@@ -2742,6 +2780,101 @@ fn delivery_seam_records_invocation_outcome() {
     assert_eq!(meta["delivery"]["attempted"], true);
     assert_eq!(meta["delivery"]["exit_code"], 0);
     assert!(meta["delivery"]["skipped"].is_null());
+}
+
+#[test]
+fn observer_cannot_substitute_registered_delivery_helper() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (helper_a, log_a) = named_fake_agents(&temp, "helper-a", "helper-a.log");
+    let (helper_b, log_b) = named_fake_agents(&temp, "helper-b", "helper-b.log");
+    let release = temp.path().join("release-workload");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper_a)
+        .env("RELEASE_WORKLOAD", &release)
+        .args([
+            "run",
+            "--delivery",
+            "sync",
+            "--",
+            "bash",
+            "-lc",
+            "for _ in {1..800}; do [ -e \"$RELEASE_WORKLOAD\" ] && exit 0; sleep 0.01; done; exit 1",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+
+    let detach = detach_with_fake(&temp, handle, &helper_b, &log_b);
+    assert_command_success(&detach);
+    fs::write(&release, b"").expect("release workload");
+    let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+    wait_until(Duration::from_secs(6), || {
+        (delivery_attempt_count(&log_a) == 1).then_some(())
+    });
+
+    let helper_a_operations = fs::read_to_string(&log_a).expect("helper A log");
+    assert!(
+        helper_a_operations
+            .lines()
+            .any(|line| line == "agent-bash-activate"),
+        "registered helper did not receive detach activation: {helper_a_operations}"
+    );
+    assert_eq!(delivery_attempt_count(&log_a), 1);
+    assert!(
+        !log_b.exists(),
+        "observer helper received registered-handle operations: {}",
+        fs::read_to_string(&log_b).unwrap_or_default()
+    );
+}
+
+#[test]
+fn unavailable_registered_helper_is_retryable_after_restoration() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (helper, delivery_log) = fake_agents(&temp);
+    let retained_helper = temp.path().join("retained-fake-agents");
+    let release = temp.path().join("release-workload");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env("RELEASE_WORKLOAD", &release)
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            "for _ in {1..800}; do [ -e \"$RELEASE_WORKLOAD\" ] && exit 0; sleep 0.01; done; exit 1",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+
+    fs::rename(&helper, &retained_helper).expect("make registered helper unavailable");
+    fs::write(&release, b"").expect("release workload");
+    let failed = wait_until(Duration::from_secs(6), || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["error_code"] == "delivery_helper_unavailable").then_some(meta)
+    });
+    assert_eq!(failed["delivery"]["attempted"], false);
+    assert_eq!(failed["delivery"]["retryable"], true);
+    assert!(failed["delivery"]["exit_code"].is_null());
+
+    fs::rename(&retained_helper, &helper).expect("restore registered helper identity");
+    let status = status_text(&temp, handle, true);
+    assert!(
+        status.starts_with(&format!("DONE rc=0 handle={handle}")),
+        "{status}"
+    );
+    let delivered = wait_until(Duration::from_secs(6), || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["exit_code"] == 0).then_some(meta)
+    });
+    assert_eq!(delivered["delivery"]["attempted"], true);
+    assert!(delivered["delivery"]["error"].is_null());
+    assert!(delivered["delivery"]["error_code"].is_null());
+    assert!(delivered["delivery"]["retryable"].is_null());
+    assert_eq!(delivery_attempt_count(&delivery_log), 1);
 }
 
 #[test]

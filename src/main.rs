@@ -230,6 +230,10 @@ fn run_command(
     .with_owner_context(owner.session_id, owner.invocation_uuid);
     create_run_state(&paths)?;
     persist_delivery_mode(&paths, delivery_mode)?;
+    if let Err(err) = delivery::prepare_registration(&paths) {
+        let _ = fs::remove_dir_all(&paths.state_dir);
+        return Err(completion_event_registration_error(err));
+    }
     persist_initial_meta(&paths, &meta)?;
     if let Err(err) = delivery::register(&paths, &meta) {
         let _ = fs::remove_dir_all(&paths.state_dir);
@@ -563,7 +567,12 @@ fn status_command(handle: String, tail_bytes: u64, full: bool) -> Result<(), App
 }
 
 fn reconcile_status_meta(paths: &StatePaths, handle: &str) -> Result<Meta, AppError> {
-    let meta = read_meta_for_handle(paths, handle)?;
+    let mut meta = read_meta_for_handle(paths, handle)?;
+    if delivery::delivery_needs_retry(&meta) {
+        delivery::complete(paths, &mut meta)
+            .map_err(|err| status_reconciliation_error(handle, err))?;
+        return Ok(meta);
+    }
     if !state::running_exit_mode(&meta) {
         return Ok(meta);
     }
