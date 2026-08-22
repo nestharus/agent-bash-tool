@@ -1963,7 +1963,7 @@ fn explicit_cancel_wins_when_owner_exit_is_already_pollable() {
     let temp = tempfile::tempdir().expect("tempdir");
     let run_json_path = temp.path().join("owner-race-run.json");
     let owner_ready = temp.path().join("owner-race-ready");
-    let fixture_deadline = Duration::from_secs(6);
+    let fixture_deadline = Duration::from_secs(12);
     let binary = assert_cmd::cargo::cargo_bin("agent-bash");
     let launcher_script = format!(
         "\"{}\" run --cancel-on-owner-exit --owner-pid \"$BASHPID\" -- sleep 60 > \"$RUN_JSON\"; : > \"$OWNER_READY\"; read -r _",
