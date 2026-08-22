@@ -29,9 +29,10 @@ completion returns synchronously in-band or asynchronously through the agent mai
   supervisor exits abnormally, the guardian reconciles durable process identity and terminal state
   and performs pending asynchronous delivery without requiring a caller to poll `status`. Bulk
   `list` may publish that terminal state for an accurate projection without executing a helper;
-  pending delivery stays owned by the guardian, while targeted `status` may claim it first under the
-  same delivery lock. The guardian also adopts the workload tree and finishes any already-accepted
-  explicit cancellation.
+  it leaves delivery unclaimed in that reconciliation. The guardian normally claims the pending
+  delivery, while targeted owner `status` may claim it first under the same delivery lock and wait
+  for the helper outcome. Cross-owner `status` is read-only. The guardian also adopts the workload
+  tree and finishes any already-accepted explicit cancellation.
 - **Owner-scoped cancellation.** Integrations can opt into an exact PID/start-time/boot-ID lease
   with `run --cancel-on-owner-exit --owner-pid <pid>`. `cancel <handle>`, an owner exit, or an
   OpenCode tool abort terminates the complete adopted process tree, escalating to `SIGKILL` after

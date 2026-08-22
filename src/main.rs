@@ -77,7 +77,7 @@ enum Command {
     Cancel { handle: String },
     /// Print the current completion delivery mode for a handle.
     Mode { handle: String },
-    /// Non-blocking status of a spooled job: RUNNING, or DONE rc=<n> + captured output.
+    /// Status of a spooled job. Owner calls may reconcile terminal state and delivery first.
     Status {
         /// Print this many trailing log bytes. Defaults to 65536.
         #[arg(long, conflicts_with = "full")]

@@ -124,9 +124,10 @@ pre-admission failure.
 
 Owner-authorized `status` and bulk `list` share the lost-supervisor terminal transition but not the
 immediate notification role. A targeted owner `status` reconciliation owns pending completion
-delivery in its current process. An owner-scoped bulk `list` may publish the same terminal state for
-an accurate projection, but it never executes a helper as an incidental enumeration side effect; it
-leaves delivery unattempted for the independent per-handle guardian. Cross-owner status and
+delivery in its current process and synchronously waits for the local delivery owner and helper
+outcome. An owner-scoped bulk `list` may publish the same terminal state for an accurate projection,
+but it never executes a helper as an incidental enumeration side effect; its disposition is
+`LeaveUnclaimedByThisReconciliation`. Cross-owner status and
 `list --all` remain observational and do not reconcile state. The guardian re-enters reconciliation,
 observes the terminal record, and claims pending delivery. A later targeted owner `status` may claim
 it first. Both paths use the same `delivery.lock`, pinned helper, and write-ahead attempt record, so
@@ -146,10 +147,13 @@ only that list does not claim delivery, then exercise the targeted-status handof
   *We never assume a workload will exit.*
 
 ### Output / handle
-`run` prints a handle (JSON) immediately. `status <handle>` is non-blocking: `RUNNING`, or
-`DONE rc=<n>` + captured output. This generalizes the current `agents-bg{,-poll}` tmux helpers
-into an event-driven, cgroup-tracked tool. The supervisor's poll of the PID is **harness-code
-polling (cheap, no LLM tokens)** — not the LLM self-polling that is forbidden.
+`run` prints a handle (JSON) immediately. `status <handle>` reports `RUNNING`, or `DONE rc=<n>` plus
+captured output. Cross-owner status is a point-in-time read. Owner status is also a progress
+operation: it may publish conclusively lost-supervisor terminal state or claim pending completion
+delivery, and therefore may wait for the bounded helper subprocess. This generalizes the current
+`agents-bg{,-poll}` tmux helpers into an event-driven, cgroup-tracked tool. The supervisor's poll of
+the PID is **harness-code polling (cheap, no LLM tokens)** — not the LLM self-polling that is
+forbidden.
 
 Handle observation and handle control are separate authorities. Default list visibility and
 control use the same recorded owner-session or exact caller-chain predicate. `list --all` and a

@@ -1675,7 +1675,7 @@ pub(crate) fn reconcile_lost_supervisor(paths: &StatePaths) -> io::Result<Meta> 
 pub(crate) fn reconcile_lost_supervisor_for_list(paths: &StatePaths) -> io::Result<Meta> {
     reconcile_lost_supervisor_with_delivery(
         paths,
-        CompletionDeliveryDisposition::LeavePendingForPerHandleGuardian,
+        CompletionDeliveryDisposition::LeaveUnclaimedByThisReconciliation,
         false,
     )
 }
@@ -1694,7 +1694,7 @@ fn reconcile_lost_supervisor_after_guardian(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CompletionDeliveryDisposition {
     ClaimInThisReconciliation,
-    LeavePendingForPerHandleGuardian,
+    LeaveUnclaimedByThisReconciliation,
 }
 
 fn reconcile_lost_supervisor_with_delivery(
