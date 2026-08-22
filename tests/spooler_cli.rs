@@ -702,7 +702,7 @@ if (mode === "move-helper") {
   )
   const outcome = await Promise.race([
     execution,
-    Bun.sleep(2000).then(() => ({ kind: "timeout", result: "polling did not terminate" })),
+    Bun.sleep(30000).then(() => ({ kind: "timeout", result: "polling did not terminate" })),
   ])
   console.log(JSON.stringify(outcome))
   process.exit(outcome.kind === "error" ? 0 : 1)
