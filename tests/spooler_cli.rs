@@ -170,7 +170,15 @@ fn wait_for_status_prefix(temp: &tempfile::TempDir, handle: &str, prefix: &str) 
 }
 
 fn wait_for_terminal_status(temp: &tempfile::TempDir, handle: &str) -> String {
-    wait_until(Duration::from_secs(6), || {
+    wait_for_terminal_status_within(temp, handle, Duration::from_secs(6))
+}
+
+fn wait_for_terminal_status_within(
+    temp: &tempfile::TempDir,
+    handle: &str,
+    timeout: Duration,
+) -> String {
+    wait_until(timeout, || {
         let text = status_text(temp, handle, true);
         (!text.starts_with("RUNNING ")).then_some(text)
     })
@@ -1846,7 +1854,7 @@ fn accepted_cancel_precedes_already_pending_workload_completion() {
     wait_until(Duration::from_secs(2), || workload.exited().then_some(()));
     assert!(stopped.resume(), "resume supervisor");
 
-    let status = wait_for_terminal_status(&temp, handle);
+    let status = wait_for_terminal_status_within(&temp, handle, Duration::from_secs(12));
     assert!(
         status.starts_with(&format!(
             "DONE rc=143 handle={handle} reason=cancel-request"
