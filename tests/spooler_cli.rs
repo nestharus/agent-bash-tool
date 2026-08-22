@@ -3670,9 +3670,19 @@ fn observer_cannot_substitute_registered_delivery_helper() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (helper_a, log_a) = named_fake_agents(&temp, "helper-a", "helper-a.log");
     let (helper_b, log_b) = named_fake_agents(&temp, "helper-b", "helper-b.log");
+    fs::write(
+        &helper_a,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nprintf 'route=%s operation=%s\\n' \"${{AGENT_BASH_FAKE_ROUTE-unset}}\" \"${{2:-}}\" >> {}\nexit 0\n",
+            shell_quote(&log_a),
+            shell_quote(&log_a)
+        ),
+    )
+    .expect("write environment-observing helper");
     let release = temp.path().join("release-workload");
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper_a)
+        .env("AGENT_BASH_FAKE_ROUTE", "registered")
         .env("RELEASE_WORKLOAD", &release)
         .args([
             "run",
@@ -3688,7 +3698,13 @@ fn observer_cannot_substitute_registered_delivery_helper() {
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
 
-    let detach = detach_with_fake(&temp, handle, &helper_b, &log_b);
+    let detach = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper_b)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &log_b)
+        .env("AGENT_BASH_FAKE_ROUTE", "later-caller")
+        .args(["detach", handle])
+        .output()
+        .expect("detach command");
     assert_command_success(&detach);
     fs::write(&release, b"").expect("release workload");
     let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
@@ -3704,6 +3720,18 @@ fn observer_cannot_substitute_registered_delivery_helper() {
         "registered helper did not receive detach activation: {helper_a_operations}"
     );
     assert_eq!(delivery_attempt_count(&log_a), 1);
+    assert!(
+        helper_a_operations
+            .lines()
+            .any(|line| line == "route=registered operation=agent-bash-activate"),
+        "registered helper environment did not receive detach activation: {helper_a_operations}"
+    );
+    assert!(
+        !helper_a_operations
+            .lines()
+            .any(|line| line.starts_with("route=later-caller ")),
+        "observer environment changed the registered helper context: {helper_a_operations}"
+    );
     assert!(
         !log_b.exists(),
         "observer helper received registered-handle operations: {}",
