@@ -3300,12 +3300,13 @@ fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
     wait_until(fixture_deadline, || {
         (delivery_attempt_count(&delivery_log) == 1).then_some(())
     });
-    let interrupted = wait_until(fixture_deadline, || {
+    let delivered = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
-        (meta["delivery"]["error_code"] == "delivery_attempt_in_progress").then_some(meta)
+        (meta["delivery"]["exit_code"] == 0).then_some(meta)
     });
-    assert_eq!(interrupted["delivery"]["attempted"], true);
-    assert_eq!(interrupted["delivery"]["retryable"], false);
+    assert_eq!(delivered["delivery"]["attempted"], true);
+    assert!(delivered["delivery"]["retryable"].is_null());
+    assert!(delivered["delivery"]["error"].is_null());
 
     for _ in 0..4 {
         let status = status_text(&temp, handle, true);
@@ -3499,6 +3500,7 @@ fn legacy_helperless_handles_fail_closed_without_retry() {
 #[test]
 fn caller_death_after_activation_handoff_does_not_repeat_or_split_detach() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = Duration::from_secs(30);
     let (fake, delivery_log) = parent_killing_fake_agents(&temp, "agent-bash-activate");
     let release = temp.path().join("detach-crash-release");
     let release_marker = ReleaseMarker::new(release.clone());
@@ -3526,8 +3528,13 @@ fn caller_death_after_activation_handoff_does_not_repeat_or_split_detach() {
         .output()
         .expect("interrupted detach");
     assert!(!interrupted.status.success());
-    wait_until(Duration::from_secs(6), || {
+    wait_until(fixture_deadline, || {
         (operation_count(&delivery_log, "agent-bash-activate") == 1).then_some(())
+    });
+    wait_until(fixture_deadline, || {
+        (mode_text(&temp, handle) == "async"
+            && read_meta(&meta_path(&json))["delivery_mode"] == "async")
+            .then_some(())
     });
 
     let repeated = agent_bash(&temp)
