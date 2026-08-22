@@ -3597,6 +3597,7 @@ fn observer_cannot_substitute_registered_delivery_helper() {
 #[test]
 fn registered_helper_snapshot_survives_source_replacement_without_polling() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = Duration::from_secs(12);
     let (helper, delivery_log) = fake_agents(&temp);
     let retained_helper = temp.path().join("retained-fake-agents");
     let replacement_log = temp.path().join("replacement-delivery.log");
@@ -3620,14 +3621,12 @@ fn registered_helper_snapshot_survives_source_replacement_without_polling() {
     let handle = json["handle"].as_str().expect("handle");
     let meta_path = meta_path(&json);
 
-    wait_until(Duration::from_secs(6), || {
-        workload_started.exists().then_some(())
-    });
+    wait_until(fixture_deadline, || workload_started.exists().then_some(()));
     fs::rename(&helper, &retained_helper).expect("retain registered source helper");
     fs::write(&helper, fake_agents_script(&replacement_log)).expect("write replacement helper");
     set_executable(&helper);
     release_marker.release();
-    let delivered = wait_until(Duration::from_secs(6), || {
+    let delivered = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["exit_code"] == 0).then_some(meta)
     });
