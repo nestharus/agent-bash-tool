@@ -1400,7 +1400,7 @@ impl EventLoop {
             &mut self.meta,
             Some(&mut self.log),
             TerminalProposal::ReadySentinel(state::unix_ms()),
-            true,
+            CompletionDeliveryDisposition::ClaimInThisReconciliation,
         )? {
             TerminalPublishResult::Published => self.completion_recorded = true,
             TerminalPublishResult::DeferredForAcceptedCancel => {
@@ -1419,7 +1419,7 @@ impl EventLoop {
                 root_status,
                 reason: reason.to_string(),
             },
-            true,
+            CompletionDeliveryDisposition::ClaimInThisReconciliation,
         )?;
         self.completion_recorded = true;
         Ok(())
@@ -1431,7 +1431,7 @@ impl EventLoop {
             &mut self.meta,
             Some(&mut self.log),
             TerminalProposal::SupervisorError(message),
-            true,
+            CompletionDeliveryDisposition::ClaimInThisReconciliation,
         )?;
         self.completion_recorded = true;
         Ok(())
@@ -1652,7 +1652,7 @@ fn record_supervisor_error(
         meta,
         log,
         TerminalProposal::SupervisorError(message),
-        true,
+        CompletionDeliveryDisposition::ClaimInThisReconciliation,
     )?;
     Ok(())
 }
@@ -1665,40 +1665,47 @@ fn sync_optional_log(log: Option<&mut BoundedLog>) -> io::Result<()> {
 }
 
 pub(crate) fn reconcile_lost_supervisor(paths: &StatePaths) -> io::Result<Meta> {
-    reconcile_lost_supervisor_with_owner(paths, CompletionDeliveryOwner::Reconciler, false)
+    reconcile_lost_supervisor_with_delivery(
+        paths,
+        CompletionDeliveryDisposition::ClaimInThisReconciliation,
+        false,
+    )
 }
 
 pub(crate) fn reconcile_lost_supervisor_for_list(paths: &StatePaths) -> io::Result<Meta> {
-    reconcile_lost_supervisor_with_owner(paths, CompletionDeliveryOwner::PerHandleGuardian, false)
+    reconcile_lost_supervisor_with_delivery(
+        paths,
+        CompletionDeliveryDisposition::LeavePendingForPerHandleGuardian,
+        false,
+    )
 }
 
 fn reconcile_lost_supervisor_after_guardian(
     paths: &StatePaths,
     accepted_cancel_tree_empty: bool,
 ) -> io::Result<Meta> {
-    reconcile_lost_supervisor_with_owner(
+    reconcile_lost_supervisor_with_delivery(
         paths,
-        CompletionDeliveryOwner::Reconciler,
+        CompletionDeliveryDisposition::ClaimInThisReconciliation,
         accepted_cancel_tree_empty,
     )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CompletionDeliveryOwner {
-    Reconciler,
-    PerHandleGuardian,
+enum CompletionDeliveryDisposition {
+    ClaimInThisReconciliation,
+    LeavePendingForPerHandleGuardian,
 }
 
-fn reconcile_lost_supervisor_with_owner(
+fn reconcile_lost_supervisor_with_delivery(
     paths: &StatePaths,
-    delivery_owner: CompletionDeliveryOwner,
+    delivery_disposition: CompletionDeliveryDisposition,
     accepted_cancel_tree_empty: bool,
 ) -> io::Result<Meta> {
-    let deliver = delivery_owner == CompletionDeliveryOwner::Reconciler;
     let _lock = state::lock_reconciliation(paths)?;
     let mut meta = state::read_meta(paths)?;
     if state::terminal(&meta) {
-        if deliver {
+        if delivery_disposition == CompletionDeliveryDisposition::ClaimInThisReconciliation {
             delivery::reconcile_completion_delivery(paths, &mut meta)?;
         }
         return Ok(meta);
@@ -1714,7 +1721,7 @@ fn reconcile_lost_supervisor_with_owner(
         &mut meta,
         None,
         TerminalProposal::SupervisorLost,
-        deliver,
+        delivery_disposition,
     )?;
     Ok(meta)
 }
@@ -1749,14 +1756,14 @@ fn publish_terminal(
     meta: &mut Meta,
     log: Option<&mut BoundedLog>,
     proposal: TerminalProposal,
-    deliver: bool,
+    delivery_disposition: CompletionDeliveryDisposition,
 ) -> io::Result<TerminalPublishResult> {
     let completion_lock = state::lock_completion(paths)?;
     let current = state::read_meta(paths)?;
     if state::terminal(&current) {
         *meta = current;
         drop(completion_lock);
-        if deliver {
+        if delivery_disposition == CompletionDeliveryDisposition::ClaimInThisReconciliation {
             delivery::reconcile_completion_delivery(paths, meta)?;
         }
         return Ok(TerminalPublishResult::Published);
@@ -1787,7 +1794,7 @@ fn publish_terminal(
     state::write_rc_atomic(paths, meta.rc.unwrap_or(EX_SOFTWARE))?;
     state::write_meta_atomic(paths, meta)?;
     drop(completion_lock);
-    if deliver {
+    if delivery_disposition == CompletionDeliveryDisposition::ClaimInThisReconciliation {
         delivery::reconcile_completion_delivery(paths, meta)?;
     }
     Ok(TerminalPublishResult::Published)
