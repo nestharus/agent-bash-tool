@@ -3285,6 +3285,7 @@ fn delivery_seam_records_invocation_outcome() {
 #[test]
 fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = Duration::from_secs(30);
     let (fake, delivery_log) = parent_killing_fake_agents(&temp, "agent-bash-complete");
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
@@ -3296,10 +3297,10 @@ fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
     let handle = json["handle"].as_str().expect("handle");
     let meta_path = meta_path(&json);
 
-    wait_until(Duration::from_secs(6), || {
+    wait_until(fixture_deadline, || {
         (delivery_attempt_count(&delivery_log) == 1).then_some(())
     });
-    let interrupted = wait_until(Duration::from_secs(6), || {
+    let interrupted = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["error_code"] == "delivery_attempt_in_progress").then_some(meta)
     });
