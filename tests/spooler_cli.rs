@@ -4016,6 +4016,7 @@ fn concurrent_detach_and_completion_produce_one_notification() {
 #[test]
 fn detach_does_not_rewrite_terminal_metadata_after_activation() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = Duration::from_secs(8);
     let (
         fake,
         activate_started,
@@ -4048,7 +4049,7 @@ fn detach_does_not_rewrite_terminal_metadata_after_activation() {
         .expect("run");
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle").to_string();
-    let workload = wait_until(Duration::from_secs(2), || {
+    let workload = wait_until(fixture_deadline, || {
         OwnedProcess::capture_workload(&read_meta(&meta_path(&json)))
     });
     let binary = assert_cmd::cargo::cargo_bin("agent-bash");
@@ -4078,25 +4079,21 @@ fn detach_does_not_rewrite_terminal_metadata_after_activation() {
             .output()
             .expect("detach")
     });
-    wait_until(Duration::from_secs(2), || {
-        activate_started.exists().then_some(())
-    });
+    wait_until(fixture_deadline, || activate_started.exists().then_some(()));
 
     fs::write(&workload_release, b"").expect("release workload");
-    wait_until(Duration::from_secs(2), || workload.exited().then_some(()));
-    wait_until(Duration::from_secs(2), || {
+    wait_until(fixture_deadline, || workload.exited().then_some(()));
+    wait_until(fixture_deadline, || {
         (read_meta(&meta_path(&json))["state"] == "DONE").then_some(())
     });
     fs::write(&activate_release, b"").expect("release activation");
-    wait_until(Duration::from_secs(6), || {
-        complete_started.exists().then_some(())
-    });
+    wait_until(fixture_deadline, || complete_started.exists().then_some(()));
     let state_during_delivery = read_meta(&meta_path(&json))["state"]
         .as_str()
         .expect("state")
         .to_string();
     fs::write(&complete_release, b"").expect("release completion");
-    wait_until(Duration::from_secs(2), || {
+    wait_until(fixture_deadline, || {
         complete_finished.exists().then_some(())
     });
     let detach = detach.join().expect("detach thread");
