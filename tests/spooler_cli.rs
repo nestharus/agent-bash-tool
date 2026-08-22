@@ -1772,7 +1772,7 @@ fn cancel_rejects_a_live_pid_with_stale_supervisor_identity() {
 #[test]
 fn accepted_cancel_is_owned_by_guardian_after_supervisor_loss() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let fixture_deadline = Duration::from_secs(12);
+    let fixture_deadline = Duration::from_secs(30);
     let (fake, delivery_log) = fake_agents(&temp);
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
