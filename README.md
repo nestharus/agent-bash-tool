@@ -52,7 +52,8 @@ completion returns synchronously in-band or asynchronously through the agent mai
   Additional non-secret variables must be named at registration in
   `AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST`; their values become durable handle provenance. A normal
   helper upgrade or later caller environment therefore cannot substitute or strand operations for
-  handles already in flight.
+  handles already in flight. Registration-only authority and helper-selection controls are removed
+  before the workload starts.
 
 The spooler is **general and provider-agnostic** — it knows nothing about agents or sessions and
 talks to agent-runner only over its CLI. See [`docs/DESIGN.md`](docs/DESIGN.md) for the full

@@ -31,6 +31,11 @@ type ShellCommand = {
   body: string
 }
 
+const RESERVED_SPOOLER_ASSIGNMENTS = new Set([
+  "AGENT_BASH_AGENT_RUNNER_BIN",
+  "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
+])
+
 type ProcessResult = {
   exitCode: number
   stdout: string
@@ -378,7 +383,8 @@ function splitShellCommand(command: string): ShellCommand {
   while (true) {
     const matched = body.match(assignment)?.[0]
     if (!matched) break
-    environmentPrefix += matched
+    const name = matched.slice(0, matched.indexOf("="))
+    if (!RESERVED_SPOOLER_ASSIGNMENTS.has(name)) environmentPrefix += matched
     body = body.slice(matched.length)
   }
   return { prefix: leadingWhitespace + environmentPrefix, body }

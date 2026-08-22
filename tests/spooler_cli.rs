@@ -745,7 +745,9 @@ const args = mode === "poll"
       : mode === "binding-env"
         ? { command: "printf '%s|%s\\n' \"${OULIPOLY_LIVE_SESSION_BIND_SOCKET-unset}\" \"${OULIPOLY_LIVE_SESSION_BIND_TOKEN-unset}\"" }
       : mode === "inherited-env"
-        ? { command: "printf '%s|%s|%s\\n' \"$INHERITED_ENV_SENTINEL\" \"$OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY\" \"$OULIPOLY_PARENT_INVOCATION\"" }
+        ? { command: "printf '%s|%s|%s|%s\\n' \"$INHERITED_ENV_SENTINEL\" \"${OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY-unset}\" \"${AGENT_BASH_AGENT_RUNNER_BIN-unset}\" \"$OULIPOLY_PARENT_INVOCATION\"" }
+      : mode === "reserved-helper-prefix"
+        ? { command: `AGENT_BASH_AGENT_RUNNER_BIN=${process.env.RESERVED_HELPER_OVERRIDE} ${process.env.AGENT_BASH_BIN} run -- true` }
       : mode === "agent-sync"
         ? { command: "agents --version", delivery: "sync" }
         : mode === "agent"
@@ -2505,7 +2507,27 @@ fn opencode_adapter_initial_dispatch_preserves_inherited_environment() {
 
     assert_adapter_result_contains(
         &result,
-        "fixture-env|fixture-authority|{\"source\":\"opencode\",\"id\":\"11111111-1111-4111-8111-111111111111\"}",
+        "fixture-env|unset|unset|{\"source\":\"opencode\",\"id\":\"11111111-1111-4111-8111-111111111111\"}",
+    );
+}
+
+#[test]
+fn opencode_adapter_rejects_command_local_registration_helper_override() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+    let (override_helper, override_log) =
+        named_fake_agents(&temp, "override-agents", "override-delivery.log");
+    let output = adapter_driver_command(&temp, &driver, "reserved-helper-prefix", None)
+        .env("RESERVED_HELPER_OVERRIDE", override_helper)
+        .output()
+        .expect("adapter driver");
+
+    assert_command_success(&output);
+    assert!(
+        !override_log.exists(),
+        "command-local helper override was invoked: {}",
+        fs::read_to_string(&override_log).unwrap_or_default()
     );
 }
 

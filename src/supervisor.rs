@@ -771,6 +771,8 @@ fn argv_pointers(c_argv: &[CString]) -> Vec<*const libc::c_char> {
 
 fn exec_workload(pointers: &[*const libc::c_char]) {
     unsafe {
+        libc::unsetenv(c"OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY".as_ptr());
+        libc::unsetenv(c"AGENT_BASH_AGENT_RUNNER_BIN".as_ptr());
         libc::execvp(pointers[0], pointers.as_ptr());
     }
 }

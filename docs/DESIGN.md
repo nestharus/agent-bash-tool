@@ -195,9 +195,11 @@ user, `PATH`, temporary-directory, and XDG/agent-runner data paths) plus non-sec
 by `AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST` at registration. The explicit values are durable
 provenance and must not contain credentials. The caller-bound completion-registration authority is
 the sole transient exception: it is injected only into the immediate registration invocation and
-is neither persisted nor replayed. A later detach, status, supervisor, or guardian process therefore
-cannot alter interpreter lookup, the agent-runner data namespace, or an explicitly declared helper
-input through its own environment.
+is neither persisted, replayed, nor inherited by the workload. The helper-selection override is also
+removed before workload execution, and the OpenCode adapter ignores command-local assignments to
+either reserved control. A later workload, detach, status, supervisor, or guardian process therefore
+cannot retain the registration capability or alter interpreter lookup, the agent-runner data
+namespace, or an explicitly declared helper input through its own environment.
 
 The helper cache lock serializes cache installation, per-handle linking, and removal of cache entries
 with no remaining handle links. Warm-cache content validation occurs before the lock; the critical
