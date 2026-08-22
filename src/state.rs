@@ -500,21 +500,34 @@ pub(crate) fn lock_completion(paths: &StatePaths) -> io::Result<File> {
 }
 
 pub(crate) fn record_explicit_cancel_acceptance(paths: &StatePaths) -> io::Result<bool> {
+    record_durable_create_once_marker(&paths.accepted_cancel, &paths.state_dir)
+}
+
+pub(crate) fn record_activation_attempt(paths: &StatePaths) -> io::Result<bool> {
+    record_durable_create_once_marker(&paths.activation_attempted, &paths.state_dir)
+}
+
+fn record_durable_create_once_marker(marker: &Path, directory: &Path) -> io::Result<bool> {
+    let directory = File::open(directory)?;
     match OpenOptions::new()
         .create_new(true)
         .write(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .mode(0o600)
-        .open(&paths.accepted_cancel)
+        .open(marker)
     {
         Ok(file) => {
-            if let Err(err) = file
-                .sync_all()
-                .and_then(|()| File::open(&paths.state_dir)?.sync_all())
-            {
+            if let Err(publication_error) = file.sync_all().and_then(|()| directory.sync_all()) {
                 drop(file);
-                let _ = fs::remove_file(&paths.accepted_cancel);
-                return Err(err);
+                if let Err(rollback_error) = rollback_created_marker(marker, &directory) {
+                    return Err(io::Error::new(
+                        publication_error.kind(),
+                        format!(
+                            "failed to publish durable marker: {publication_error}; rollback failed: {rollback_error}"
+                        ),
+                    ));
+                }
+                return Err(publication_error);
             }
             Ok(true)
         }
@@ -523,27 +536,14 @@ pub(crate) fn record_explicit_cancel_acceptance(paths: &StatePaths) -> io::Resul
     }
 }
 
-pub(crate) fn record_activation_attempt(paths: &StatePaths) -> io::Result<bool> {
-    match OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .mode(0o600)
-        .open(&paths.activation_attempted)
-    {
-        Ok(file) => {
-            file.sync_all()?;
-            File::open(&paths.state_dir)?.sync_all()?;
-            Ok(true)
-        }
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(err) => Err(err),
-    }
+pub(crate) fn rollback_activation_attempt(paths: &StatePaths) -> io::Result<()> {
+    let directory = File::open(&paths.state_dir)?;
+    rollback_created_marker(&paths.activation_attempted, &directory)
 }
 
-pub(crate) fn rollback_activation_attempt(paths: &StatePaths) -> io::Result<()> {
-    match fs::remove_file(&paths.activation_attempted) {
-        Ok(()) => File::open(&paths.state_dir)?.sync_all(),
+fn rollback_created_marker(marker: &Path, directory: &File) -> io::Result<()> {
+    match fs::remove_file(marker) {
+        Ok(()) => directory.sync_all(),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
@@ -1293,6 +1293,22 @@ mod tests {
             read_delivery_mode(&paths).expect("sync mode"),
             DeliveryMode::Sync
         );
+    }
+
+    #[test]
+    fn durable_create_once_markers_share_publication_and_rollback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_test".to_string());
+        create_handle_state(&paths).expect("create state");
+
+        assert!(record_explicit_cancel_acceptance(&paths).expect("record cancellation"));
+        assert!(!record_explicit_cancel_acceptance(&paths).expect("repeat cancellation"));
+        assert!(record_activation_attempt(&paths).expect("record activation"));
+        assert!(!record_activation_attempt(&paths).expect("repeat activation"));
+
+        rollback_activation_attempt(&paths).expect("rollback activation");
+        assert!(!paths.activation_attempted.exists());
+        assert!(record_activation_attempt(&paths).expect("retry activation"));
     }
 
     #[test]

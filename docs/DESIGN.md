@@ -115,6 +115,13 @@ operation then records `cancel-request`, status 143, instead of `supervisor-lost
 an accepted cancel continues to require both exact identities and fails closed when either is
 missing. Every non-sentinel terminal producer uses that same precedence decision.
 
+`cancel-requested` and `activation-attempted` use one state-layer durable create-once marker
+primitive. It opens the state directory before marker creation, syncs the created file and directory,
+and removes plus directory-syncs the marker if either publication sync fails. A failed publication
+therefore does not become an accepted cancellation or consumed activation claim on a later call.
+The activation lifecycle may also invoke the same durable rollback after a conclusive downstream
+pre-admission failure.
+
 Owner-authorized `status` and bulk `list` share the lost-supervisor terminal transition but not the
 immediate notification role. A targeted owner `status` reconciliation owns pending completion
 delivery in its current process. An owner-scoped bulk `list` may publish the same terminal state for
