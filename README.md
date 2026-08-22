@@ -32,7 +32,9 @@ completion returns synchronously in-band or asynchronously through the agent mai
 - **Owner-scoped cancellation.** Integrations can opt into an exact PID/start-time/boot-ID lease
   with `run --cancel-on-owner-exit --owner-pid <pid>`. `cancel <handle>`, an owner exit, or an
   OpenCode tool abort terminates the complete adopted process tree, escalating to `SIGKILL` after
-  a bounded grace period. Direct CLI runs remain detached unless they explicitly request a lease.
+  a bounded grace period. A direct cancel is accepted when its durable marker is synchronized;
+  signaling only wakes the supervisor, which also observes the marker independently. Direct CLI
+  runs remain detached unless they explicitly request a lease.
 - **Completion: root, tree, or sentinel.** Finite jobs use an explicit process boundary;
   never-exiting servers report ready on a stdout marker. Nothing is assumed to exit.
 - **Async delivery via agent-runner.** For asynchronous completion the spooler asks agent-runner
@@ -46,10 +48,13 @@ The spooler is **general and provider-agnostic** — it knows nothing about agen
 talks to agent-runner only over its CLI. See [`docs/DESIGN.md`](docs/DESIGN.md) for the full
 architecture, layering, and the agent-runner-side mailbox.
 
-The spooler guarantees at most one admitted helper invocation per handle operation. Agent-runner is
-the authority for mailbox transactions and deduplication after accepting that invocation. State
-directories and the helper cache are protected between Unix accounts, not between mutually
-untrusted processes running as the same account.
+The spooler transfers each helper operation to a local delivery owner before persisting its
+write-ahead claim and guarantees at most one admitted helper invocation per handle operation.
+Conclusive process-launch failures remain pre-admission and get one bounded retry. Agent-runner is
+the authority for mailbox transactions and deduplication after accepting an invocation. The helper
+is an opaque, trusted same-account extension; its internal mailbox effects are outside this
+repository's state machine. State directories and the helper cache are protected between Unix
+accounts, not between mutually untrusted processes running as the same account.
 
 ## Build
 

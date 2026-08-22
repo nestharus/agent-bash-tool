@@ -205,25 +205,33 @@ impl DeliveryHelper {
                 cache_dir.display()
             ))
         })?;
+        let cached = cache_dir.join(&self.provenance.sha256);
+        let validated_cache = validate_cached_helper(&cached, &self.provenance.sha256).ok();
         let cache_lock = lock_helper_cache(&cache_dir).map_err(|err| {
             DeliveryHelperError::unavailable(format!(
                 "cannot lock delivery helper cache {}: {err}",
                 cache_dir.display()
             ))
         })?;
-        let cached = cache_dir.join(&self.provenance.sha256);
-        install_cached_helper(
-            &cached,
-            &self.executable,
-            &self.provenance.sha256,
-            &paths.handle,
-        )
-        .map_err(|err| {
-            DeliveryHelperError::unavailable(format!(
-                "cannot cache delivery helper for {}: {err}",
-                paths.handle
-            ))
-        })?;
+        let cache_unchanged = validated_cache.as_ref().is_some_and(|validated| {
+            fs::metadata(&cached)
+                .map(|current| same_file_version(validated, &current))
+                .unwrap_or(false)
+        });
+        if !cache_unchanged {
+            install_cached_helper(
+                &cached,
+                &self.executable,
+                &self.provenance.sha256,
+                &paths.handle,
+            )
+            .map_err(|err| {
+                DeliveryHelperError::unavailable(format!(
+                    "cannot cache delivery helper for {}: {err}",
+                    paths.handle
+                ))
+            })?;
+        }
         fs::hard_link(&cached, &paths.delivery_helper).map_err(|err| {
             DeliveryHelperError::unavailable(format!(
                 "cannot pin delivery helper for {}: {err}",
@@ -504,7 +512,7 @@ fn install_cached_helper(
     handle: &str,
 ) -> io::Result<()> {
     if cached.exists() {
-        return validate_cached_helper(cached, expected_sha256);
+        return validate_cached_helper(cached, expected_sha256).map(|_| ());
     }
     let temp = cached.with_file_name(format!(".{}.{}.tmp", expected_sha256, handle));
     let mut output = OpenOptions::new()
@@ -526,23 +534,32 @@ fn install_cached_helper(
         }
     }
     fs::remove_file(&temp)?;
-    validate_cached_helper(cached, expected_sha256)
+    validate_cached_helper(cached, expected_sha256).map(|_| ())
 }
 
-fn validate_cached_helper(path: &Path, expected_sha256: &str) -> io::Result<()> {
+fn validate_cached_helper(path: &Path, expected_sha256: &str) -> io::Result<Metadata> {
     let file = open_delivery_helper(path)?;
     let metadata = file.metadata()?;
     validate_delivery_helper_metadata(path, &metadata)
         .map_err(|detail| io::Error::new(io::ErrorKind::InvalidData, detail))?;
     let (_, observed_sha256) = sealed_execution_image(&file)?;
     if observed_sha256 == expected_sha256 {
-        Ok(())
+        Ok(metadata)
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "cached delivery helper digest mismatch",
         ))
     }
+}
+
+fn same_file_version(left: &Metadata, right: &Metadata) -> bool {
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.size() == right.size()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.mode() == right.mode()
 }
 
 fn provenance_matches(provenance: &DeliveryHelperProvenance, metadata: &Metadata) -> bool {
@@ -665,7 +682,10 @@ pub(crate) fn register(
     run_required_runner_command(&register_request(meta, paths, registration.helper))
 }
 
-pub(crate) fn complete(paths: &StatePaths, meta: &mut Meta) -> std::io::Result<()> {
+pub(crate) fn reconcile_completion_delivery(
+    paths: &StatePaths,
+    meta: &mut Meta,
+) -> std::io::Result<()> {
     let _lock = state::lock_delivery(paths)?;
     let mut persisted = state::read_meta(paths)?;
     let mode = state::read_delivery_mode(paths)?;
@@ -697,16 +717,32 @@ pub(crate) fn complete(paths: &StatePaths, meta: &mut Meta) -> std::io::Result<(
             return Ok(());
         }
     };
-    persisted.delivery = delivery_attempt_started_meta();
-    persisted.touch();
-    state::write_meta_atomic(paths, &persisted)?;
-    persisted.delivery = match run_notify_command(&request) {
-        Ok(status) => delivery_meta_from_status(status),
-        Err(err) => delivery_meta_from_error(err),
-    };
-    persisted.touch();
-    state::write_meta_atomic(paths, &persisted)?;
-    *meta = persisted;
+    let owner_result = run_delivery_owner(|| {
+        persisted.delivery = delivery_attempt_started_meta();
+        persisted.touch();
+        state::write_meta_atomic(paths, &persisted)?;
+        persisted.delivery = match run_notify_command(&request) {
+            Ok(status) => delivery_meta_from_status(status),
+            Err(NotifyCommandError::NotStarted(err)) => {
+                delivery_meta_from_launch_error(err, retry_count)
+            }
+            Err(NotifyCommandError::Admitted(err)) => delivery_meta_from_error(err),
+        };
+        persisted.touch();
+        state::write_meta_atomic(paths, &persisted)
+    });
+    let mut observed = state::read_meta(paths)?;
+    if let Err(err) = owner_result {
+        if !observed.delivery.attempted && observed.delivery.error_code.is_none() {
+            observed.delivery = delivery_meta_from_owner_launch_error(err, retry_count);
+            observed.touch();
+            state::write_meta_atomic(paths, &observed)?;
+        } else {
+            *meta = observed;
+            return Err(err);
+        }
+    }
+    *meta = observed;
     Ok(())
 }
 
@@ -714,40 +750,84 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
     let delivery_lock = state::lock_delivery(paths)?;
     let mode = state::read_delivery_mode(paths)?;
     if mode == DeliveryMode::Async {
-        let meta = repair_delivery_mode_mirror(paths)?;
+        let meta = repair_delivery_mode_mirror(paths, DeliveryMode::Async)?;
         drop(delivery_lock);
         return Ok(detach_outcome(&meta, false, false));
     }
 
     let meta = state::read_meta(paths)?;
     let request = activate_request(&meta, paths).map_err(io::Error::other)?;
-    let claimed = state::record_activation_attempt(paths)?;
-    if let Err(err) = state::write_delivery_mode_atomic(paths, DeliveryMode::Async) {
-        if claimed {
-            let _ = state::rollback_activation_attempt(paths);
+    run_delivery_owner(|| {
+        let claimed = state::record_activation_attempt(paths)?;
+        if let Err(err) = state::write_delivery_mode_atomic(paths, DeliveryMode::Async) {
+            if claimed {
+                let _ = state::rollback_activation_attempt(paths);
+            }
+            return Err(err);
         }
-        return Err(err);
-    }
-    let result = if claimed {
-        run_required_runner_command(&request)
-    } else {
-        Ok(())
-    };
-    let meta = repair_delivery_mode_mirror(paths)?;
+        let result = if claimed {
+            run_required_runner_command_detailed(&request)
+        } else {
+            Ok(())
+        };
+        match result {
+            Err(NotifyCommandError::NotStarted(err)) => {
+                state::rollback_activation_attempt(paths)?;
+                state::write_delivery_mode_atomic(paths, DeliveryMode::Sync)?;
+                repair_delivery_mode_mirror(paths, DeliveryMode::Sync)?;
+                Err(err)
+            }
+            Err(NotifyCommandError::Admitted(err)) => {
+                repair_delivery_mode_mirror(paths, DeliveryMode::Async)?;
+                Err(err)
+            }
+            Ok(()) => {
+                repair_delivery_mode_mirror(paths, DeliveryMode::Async)?;
+                Ok(())
+            }
+        }
+    })?;
+    let meta = state::read_meta(paths)?;
     drop(delivery_lock);
-    result?;
-    Ok(detach_outcome(
-        &meta,
-        true,
-        claimed && state::terminal(&meta),
-    ))
+    Ok(detach_outcome(&meta, true, state::terminal(&meta)))
 }
 
-fn repair_delivery_mode_mirror(paths: &StatePaths) -> io::Result<Meta> {
+fn run_delivery_owner(operation: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if pid == 0 {
+        let code = if operation().is_ok() { 0 } else { 70 };
+        unsafe { libc::_exit(code) };
+    }
+    wait_for_delivery_owner(pid)
+}
+
+fn wait_for_delivery_owner(pid: libc::pid_t) -> io::Result<()> {
+    loop {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if waited == pid {
+            if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                return Ok(());
+            }
+            return Err(io::Error::other("delivery owner failed"));
+        }
+        if waited < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+}
+
+fn repair_delivery_mode_mirror(paths: &StatePaths, mode: DeliveryMode) -> io::Result<Meta> {
     let _completion_lock = state::lock_completion(paths)?;
     let mut meta = state::read_meta(paths)?;
-    if meta.delivery_mode != DeliveryMode::Async {
-        meta.delivery_mode = DeliveryMode::Async;
+    if meta.delivery_mode != mode {
+        meta.delivery_mode = mode;
         meta.touch();
         state::write_meta_atomic(paths, &meta)?;
     }
@@ -887,37 +967,64 @@ fn path_arg(path: &Path) -> OsString {
     path.as_os_str().to_os_string()
 }
 
-fn run_notify_command(request: &NotifyRequest) -> std::io::Result<ExitStatus> {
-    request
+enum NotifyCommandError {
+    NotStarted(io::Error),
+    Admitted(io::Error),
+}
+
+impl NotifyCommandError {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::NotStarted(err) | Self::Admitted(err) => err,
+        }
+    }
+}
+
+fn run_notify_command(request: &NotifyRequest) -> Result<ExitStatus, NotifyCommandError> {
+    let mut child = request
         .helper
         .command()
         .args(&request.args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
+        .map_err(NotifyCommandError::NotStarted)?;
+    child.wait().map_err(NotifyCommandError::Admitted)
 }
 
 fn run_required_runner_command(request: &NotifyRequest) -> std::io::Result<()> {
-    let output = request
+    run_required_runner_command_detailed(request).map_err(NotifyCommandError::into_io_error)
+}
+
+fn run_required_runner_command_detailed(request: &NotifyRequest) -> Result<(), NotifyCommandError> {
+    let child = request
         .helper
         .command()
         .args(&request.args)
         .stdin(Stdio::null())
-        .output()?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(NotifyCommandError::NotStarted)?;
+    let output = child
+        .wait_with_output()
+        .map_err(NotifyCommandError::Admitted)?;
     if output.status.success() {
         return Ok(());
     }
     let detail = command_failure_detail(&output.stderr, &output.stdout);
-    Err(std::io::Error::other(format!(
-        "runner exited with {}{}",
-        output
-            .status
-            .code()
-            .map_or_else(|| "no exit code".to_string(), |code| code.to_string()),
-        detail
-            .as_deref()
-            .map_or_else(String::new, |detail| format!(": {detail}"))
+    Err(NotifyCommandError::Admitted(std::io::Error::other(
+        format!(
+            "runner exited with {}{}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "no exit code".to_string(), |code| code.to_string()),
+            detail
+                .as_deref()
+                .map_or_else(String::new, |detail| format!(": {detail}"))
+        ),
     )))
 }
 
@@ -942,6 +1049,30 @@ fn delivery_meta_from_error(err: std::io::Error) -> DeliveryMeta {
     let mut meta = attempted_delivery_meta();
     meta.error = Some(err.to_string());
     meta
+}
+
+fn delivery_meta_from_launch_error(err: io::Error, retry_count: u8) -> DeliveryMeta {
+    DeliveryMeta {
+        attempted: false,
+        exit_code: None,
+        error: Some(err.to_string()),
+        error_code: Some("delivery_helper_launch_failed".to_string()),
+        retryable: Some(retry_count == 0),
+        retry_count,
+        skipped: None,
+    }
+}
+
+fn delivery_meta_from_owner_launch_error(err: io::Error, retry_count: u8) -> DeliveryMeta {
+    DeliveryMeta {
+        attempted: false,
+        exit_code: None,
+        error: Some(err.to_string()),
+        error_code: Some("delivery_owner_launch_failed".to_string()),
+        retryable: Some(retry_count == 0),
+        retry_count,
+        skipped: None,
+    }
 }
 
 fn delivery_meta_from_helper_error(err: DeliveryHelperError, retry_count: u8) -> DeliveryMeta {

@@ -87,23 +87,22 @@ pub(crate) fn request_cancel(paths: &StatePaths) -> io::Result<bool> {
         reconcile_lost_supervisor(paths)?;
         return Ok(false);
     }
-    // The marker is prepared before SIGUSR1 so the supervisor can observe the
-    // accepted handoff as soon as it handles the signal. A failed signal rolls it back.
-    let prepared = state::prepare_explicit_cancel_acceptance(paths)?;
+    // Durability is the acceptance boundary. SIGUSR1 only wakes the supervisor;
+    // it also polls the marker so requester death cannot abandon the request.
+    state::record_explicit_cancel_acceptance(paths)?;
     let rc = unsafe { libc::kill(identity.pid, libc::SIGUSR1) };
     if rc == 0 {
         Ok(true)
     } else {
         let err = io::Error::last_os_error();
-        if prepared {
-            state::rollback_explicit_cancel_acceptance(paths)?;
-        }
         if err.raw_os_error() == Some(libc::ESRCH) {
             drop(completion_lock);
             reconcile_lost_supervisor(paths)?;
-            Ok(false)
+            Ok(true)
         } else {
-            Err(err)
+            // The accepted marker remains authoritative even when the wake-up
+            // signal fails; the live supervisor polls it.
+            Ok(true)
         }
     }
 }
@@ -186,7 +185,8 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
             std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
             continue;
         }
-        match reconcile_lost_supervisor(paths) {
+        match reconcile_lost_supervisor_after_guardian(paths, accepted_cancel && adopted_tree_empty)
+        {
             Ok(meta) if state::terminal(&meta) => return 0,
             Ok(meta) if !state::running_exit_mode(&meta) => return 0,
             Ok(_) => std::thread::sleep(SUPERVISOR_RECOVERY_POLL),
@@ -1010,6 +1010,7 @@ struct PollEntry {
 
 fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
     loop {
+        loop_state.check_explicit_cancel();
         loop_state.check_polled_owner();
         loop_state.drive_cancellation();
         loop_state.maybe_finish()?;
@@ -1146,7 +1147,15 @@ impl EventLoop {
         } else if self.meta.cancel_owner.is_some() && self.owner_pidfd.is_none() {
             Some(OWNER_POLL)
         } else {
-            None
+            // The accepted marker is the durable cancellation handoff. Polling
+            // covers requester death before its best-effort wake-up signal.
+            Some(OWNER_POLL)
+        }
+    }
+
+    fn check_explicit_cancel(&mut self) {
+        if explicit_cancel_accepted(&self.paths) {
+            self.request_cancellation("cancel-request");
         }
     }
 
@@ -1650,23 +1659,37 @@ fn sync_optional_log(log: Option<&mut BoundedLog>) -> io::Result<()> {
 }
 
 pub(crate) fn reconcile_lost_supervisor(paths: &StatePaths) -> io::Result<Meta> {
-    reconcile_lost_supervisor_with_delivery(paths, true)
+    reconcile_lost_supervisor_with_delivery(paths, true, false)
 }
 
 pub(crate) fn reconcile_lost_supervisor_without_delivery(paths: &StatePaths) -> io::Result<Meta> {
-    reconcile_lost_supervisor_with_delivery(paths, false)
+    reconcile_lost_supervisor_with_delivery(paths, false, false)
 }
 
-fn reconcile_lost_supervisor_with_delivery(paths: &StatePaths, deliver: bool) -> io::Result<Meta> {
+fn reconcile_lost_supervisor_after_guardian(
+    paths: &StatePaths,
+    accepted_cancel_tree_empty: bool,
+) -> io::Result<Meta> {
+    reconcile_lost_supervisor_with_delivery(paths, true, accepted_cancel_tree_empty)
+}
+
+fn reconcile_lost_supervisor_with_delivery(
+    paths: &StatePaths,
+    deliver: bool,
+    accepted_cancel_tree_empty: bool,
+) -> io::Result<Meta> {
     let _lock = state::lock_reconciliation(paths)?;
     let mut meta = state::read_meta(paths)?;
     if state::terminal(&meta) {
         if deliver {
-            delivery::complete(paths, &mut meta)?;
+            delivery::reconcile_completion_delivery(paths, &mut meta)?;
         }
         return Ok(meta);
     }
-    if !state::exact_supervisor_and_workload_are_gone(&meta) {
+    let guardian_settled_cancel = accepted_cancel_tree_empty
+        && explicit_cancel_accepted(paths)
+        && state::exact_supervisor_is_gone(&meta);
+    if !guardian_settled_cancel && !state::exact_supervisor_and_workload_are_gone(&meta) {
         return Ok(meta);
     }
     publish_terminal(
@@ -1717,7 +1740,7 @@ fn publish_terminal(
         *meta = current;
         drop(completion_lock);
         if deliver {
-            delivery::complete(paths, meta)?;
+            delivery::reconcile_completion_delivery(paths, meta)?;
         }
         return Ok(TerminalPublishResult::Published);
     }
@@ -1748,7 +1771,7 @@ fn publish_terminal(
     state::write_meta_atomic(paths, meta)?;
     drop(completion_lock);
     if deliver {
-        delivery::complete(paths, meta)?;
+        delivery::reconcile_completion_delivery(paths, meta)?;
     }
     Ok(TerminalPublishResult::Published)
 }
@@ -1794,6 +1817,54 @@ mod tests {
     #[test]
     fn signal_to_shell_rc_maps_signal() {
         assert_eq!(signal_to_shell_rc(15), 143);
+    }
+
+    #[test]
+    fn guardian_settles_accepted_startup_cancel_without_workload_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let handle = "ab_guardian_startup_cancel".to_string();
+        let paths = StatePaths::new(temp.path().join("agent-bash"), handle.clone());
+        state::create_handle_state(&paths).expect("create state");
+        state::create_log(&paths).expect("create log");
+        state::write_delivery_mode_atomic(&paths, state::DeliveryMode::Sync)
+            .expect("write delivery mode");
+        let mut supervisor = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn supervisor identity");
+        let supervisor_pid = supervisor.id() as libc::pid_t;
+        let supervisor_starttime =
+            state::process_starttime_ticks(supervisor_pid).expect("supervisor start time");
+        let mut meta = Meta::new(
+            handle,
+            unsafe { libc::getpid() },
+            unsafe { libc::getpid() },
+            vec!["true".to_string()],
+            std::path::PathBuf::from("/tmp"),
+            "exit",
+            state::DeliveryMode::Sync,
+            None,
+            Vec::new(),
+            None,
+        );
+        meta.supervisor_pid = Some(supervisor_pid);
+        meta.supervisor_pid_starttime_ticks = Some(supervisor_starttime);
+        meta.process_boot_id = Some(state::current_boot_id());
+        state::write_meta_atomic(&paths, &meta).expect("write running meta");
+        state::record_explicit_cancel_acceptance(&paths).expect("accept cancel");
+        supervisor.kill().expect("kill supervisor identity");
+        supervisor.wait().expect("reap supervisor identity");
+
+        let terminal = reconcile_lost_supervisor_after_guardian(&paths, true)
+            .expect("guardian reconciliation");
+
+        assert_eq!(terminal.state, "DONE");
+        assert_eq!(
+            terminal.completion_reason.as_deref(),
+            Some("cancel-request")
+        );
+        assert_eq!(terminal.rc, Some(143));
+        assert!(state::terminal(&terminal));
     }
 
     #[test]

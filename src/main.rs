@@ -575,7 +575,7 @@ fn status_command(handle: String, tail_bytes: u64, full: bool) -> Result<(), App
 fn reconcile_status_meta(paths: &StatePaths, handle: &str) -> Result<Meta, AppError> {
     let mut meta = read_meta_for_handle(paths, handle)?;
     if delivery::delivery_needs_retry(&meta) || delivery::delivery_attempt_in_progress(&meta) {
-        delivery::complete(paths, &mut meta)
+        delivery::reconcile_completion_delivery(paths, &mut meta)
             .map_err(|err| status_reconciliation_error(handle, err))?;
         return Ok(meta);
     }

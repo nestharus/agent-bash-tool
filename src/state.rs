@@ -499,7 +499,7 @@ pub(crate) fn lock_completion(paths: &StatePaths) -> io::Result<File> {
     Ok(file)
 }
 
-pub(crate) fn prepare_explicit_cancel_acceptance(paths: &StatePaths) -> io::Result<bool> {
+pub(crate) fn record_explicit_cancel_acceptance(paths: &StatePaths) -> io::Result<bool> {
     match OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -519,14 +519,6 @@ pub(crate) fn prepare_explicit_cancel_acceptance(paths: &StatePaths) -> io::Resu
             Ok(true)
         }
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(err) => Err(err),
-    }
-}
-
-pub(crate) fn rollback_explicit_cancel_acceptance(paths: &StatePaths) -> io::Result<()> {
-    match fs::remove_file(&paths.accepted_cancel) {
-        Ok(()) => File::open(&paths.state_dir)?.sync_all(),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
 }
@@ -1031,6 +1023,25 @@ pub(crate) fn exact_supervisor_and_workload_are_gone(meta: &Meta) -> bool {
         inspect_process_identity(
             meta.workload_pid,
             meta.workload_pid_starttime_ticks,
+            meta.process_boot_id.as_deref(),
+            &current_boot_id,
+        ),
+        ProcessIdentityEvidence::Gone
+    )
+}
+
+pub(crate) fn exact_supervisor_is_gone(meta: &Meta) -> bool {
+    if !running_exit_mode(meta) {
+        return false;
+    }
+    let current_boot_id = read_boot_id();
+    if current_boot_id.is_empty() {
+        return false;
+    }
+    matches!(
+        inspect_process_identity(
+            meta.supervisor_pid,
+            meta.supervisor_pid_starttime_ticks,
             meta.process_boot_id.as_deref(),
             &current_boot_id,
         ),

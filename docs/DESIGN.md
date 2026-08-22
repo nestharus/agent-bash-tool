@@ -105,10 +105,15 @@ persisted root exit code remains diagnostic evidence; supervisor loss is still `
 because full process-tree completion can no longer be proven.
 
 The guardian becomes a subreaper before it forks the supervisor. If explicit cancellation was
-accepted before abnormal supervisor exit, the durable `cancel-requested` handoff transfers that
-obligation to the guardian. It adopts and terminates the remaining workload tree, then the shared
-terminal-publication operation records `cancel-request`, status 143, instead of `supervisor-lost`.
-Every non-sentinel terminal producer uses that same precedence decision.
+accepted before abnormal supervisor exit, the synchronized `cancel-requested` marker is the
+durable handoff and transfers that obligation to the guardian. `SIGUSR1` is only a low-latency
+wake-up; the supervisor also observes the marker on its bounded poll, so requester death cannot
+abandon an accepted request. The guardian adopts and terminates the remaining workload tree. Once
+it has authoritatively observed an empty adopted tree, it can settle an accepted startup cancel
+even when the supervisor died before publishing workload identity. The shared terminal-publication
+operation then records `cancel-request`, status 143, instead of `supervisor-lost`. Recovery without
+an accepted cancel continues to require both exact identities and fails closed when either is
+missing. Every non-sentinel terminal producer uses that same precedence decision.
 
 ### Completion detection — three modes
 - **tree exit mode (default):** wake on root process death with `pidfd_open` + `poll`, and finish
@@ -149,17 +154,25 @@ metadata and digest, copy it into a sealed in-memory image, and execute the seal
 or editing the configured source path after registration cannot change an in-flight handle.
 
 The helper cache lock serializes cache installation, per-handle linking, and removal of cache entries
-with no remaining handle links. This keeps one physical snapshot per live helper version rather than
-one full executable copy per handle.
+with no remaining handle links. Warm-cache content validation occurs before the lock; the critical
+section rechecks the validated file identity before linking it. This keeps one physical snapshot per
+live helper version rather than one full executable copy per handle without serializing full-image
+hashing. The declared normal parallel admission point is eight same-account registrations sharing
+one warm helper digest, bounded to eight seconds in the integration contract; the test records the
+effective helper size and elapsed admission time.
 
 The state root is a Unix-account trust boundary. Mode `0700` excludes other accounts, while
 same-account workloads and observers are trusted not to rewrite another handle's state or helper
 cache. The observer-isolation guarantee means a later process cannot substitute its environment or
 configured helper path; it is not a sandbox between hostile processes sharing one Unix identity.
+The selected helper is an opaque trusted extension at this boundary. Its operation handlers may
+maintain downstream state, but this repository claims only pinned byte identity, invocation
+admission, and the observed helper-process outcome, not closure over arbitrary helper internals.
 
 Helper provenance schema 2 is the activation boundary for this convention. A deployment owner must
-drain handles created by older binaries before rollout. Records with missing or older provenance are
-deliberately retired: later activation or completion fails closed with
+drain handles created by older binaries before rollout. Draining includes explicitly terminating or
+otherwise settling never-ending old-schema handles; rollout must not wait on them indefinitely.
+Records with missing or older provenance are deliberately retired: later activation or completion fails closed with
 `delivery_helper_legacy_unsupported` and does not fall back to the observer's helper.
 
 ### Durable delivery mode and atomic detach
@@ -179,13 +192,16 @@ persisted before that decision so detach can safely observe a completion that wo
 - Repeated detach calls observe `async` and are no-ops. If a caller died between the canonical mode
   write and the `meta.json` mirror, the retry repairs the mirror without repeating activation.
 
-Before activation, detach creates `activation-attempted` and persists canonical `async` mode. Before
-completion, the delivery record is persisted with `attempted=true` and
-`error_code="delivery_attempt_in_progress"`. These are write-ahead transfer claims: once present, a
-successor never hands the same one-shot obligation to the helper again, including after a nonzero
-exit or unknown caller-death outcome. Failures that occur while resolving the pinned helper are
-recorded with `attempted=false` and may be retried because no helper process received the operation.
-This chooses at-most-once invocation over retrying an ambiguous external effect.
+Detach and completion first fork a local delivery owner while retaining `delivery.lock`. That owner
+persists `activation-attempted` plus canonical `async` mode, or `attempted=true` plus
+`error_code="delivery_attempt_in_progress"`, immediately before it launches the helper. The owner
+retains the lock and persists the observed outcome even if the initiating CLI or supervisor dies.
+These are write-ahead transfer claims: once present, a successor never hands the same one-shot
+obligation to the helper again, including after a nonzero exit or unknown admitted outcome.
+Conclusive helper-resolution, fork, spawn, or pre-exec failures remain `attempted=false`; detach
+restores sync mode, while completion records a typed result and permits one bounded retry because no
+helper process received the operation. This chooses at-most-once invocation after admission without
+discarding a provably pre-admission obligation.
 
 The spooler's closed state machine ends at the admitted helper invocation and its observed process
 exit. Agent-runner owns mailbox publication, transaction boundaries, and any downstream idempotency.
