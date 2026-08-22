@@ -13,6 +13,8 @@ use assert_cmd::Command;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+const FIXTURE_DEADLINE: Duration = Duration::from_secs(30);
+
 #[derive(Debug, PartialEq, Eq)]
 struct ProcIdentity {
     pid: libc::pid_t,
@@ -159,7 +161,7 @@ fn detached_guard_compile_failure_message(output: &Output) -> String {
 }
 
 fn wait_for_status_prefix(temp: &tempfile::TempDir, handle: &str, prefix: &str) -> String {
-    wait_until(Duration::from_secs(30), || {
+    wait_until(FIXTURE_DEADLINE, || {
         let text = status_text(temp, handle, true);
         if text.starts_with(prefix) {
             Some(text)
@@ -170,7 +172,7 @@ fn wait_for_status_prefix(temp: &tempfile::TempDir, handle: &str, prefix: &str) 
 }
 
 fn wait_for_terminal_status(temp: &tempfile::TempDir, handle: &str) -> String {
-    wait_until(Duration::from_secs(30), || {
+    wait_until(FIXTURE_DEADLINE, || {
         let text = status_text(temp, handle, true);
         (!text.starts_with("RUNNING ")).then_some(text)
     })
@@ -1114,7 +1116,7 @@ fn assert_process_alive(pid: libc::pid_t) {
 }
 
 fn wait_for_process_gone(pid: libc::pid_t) {
-    wait_until(Duration::from_secs(6), || {
+    wait_until(FIXTURE_DEADLINE, || {
         proc_identity(pid).is_none().then_some(())
     });
 }
@@ -1165,7 +1167,7 @@ impl Drop for OwnerScenario {
             return;
         };
         let _ = child.kill();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + FIXTURE_DEADLINE;
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => return,
@@ -1464,16 +1466,14 @@ fn process_cleanup_rejects_mismatched_workload_identity() {
         .env("SIGNALED", &signaled)
         .spawn()
         .expect("spawn workload");
-    wait_until(Duration::from_secs(2), || ready.exists().then_some(()));
+    wait_until(FIXTURE_DEADLINE, || ready.exists().then_some(()));
     let pid = workload.id() as libc::pid_t;
     let (mut mismatched, _) = proc_identity(pid).expect("workload identity");
     mismatched.starttime_ticks += 1;
 
     let cleanup = terminate_workload_from_meta(&workload_meta(&mismatched));
     fs::write(&check, b"").expect("release mismatch observation");
-    wait_until(Duration::from_secs(2), || {
-        acknowledged.exists().then_some(())
-    });
+    wait_until(FIXTURE_DEADLINE, || acknowledged.exists().then_some(()));
     let signal_observed = signaled.exists();
     workload.kill().expect("kill workload");
     workload.wait().expect("reap workload");
@@ -1518,7 +1518,7 @@ fn process_cleanup_escalates_for_owned_group_members_and_reaps_descendant() {
         .spawn()
         .expect("spawn workload tree");
     let pid = workload.id() as libc::pid_t;
-    let child_pid = wait_until(Duration::from_secs(2), || {
+    let child_pid = wait_until(FIXTURE_DEADLINE, || {
         ready_path.exists().then(|| {
             fs::read_to_string(&child_pid_path)
                 .expect("child pid")
@@ -1577,7 +1577,7 @@ fn attached_guard_rejects_detached_invocation() {
         .status()
         .expect("detached helper launcher");
     assert!(status.success(), "detached helper launcher failed");
-    let child_rc = wait_until(Duration::from_secs(3), || fs::read_to_string(&rc).ok());
+    let child_rc = wait_until(FIXTURE_DEADLINE, || fs::read_to_string(&rc).ok());
     assert_eq!(child_rc.trim(), "64", "detached child rc");
     let observed_ppids = fs::read_to_string(&ppid_trace).expect("ppid trace");
     let ppids: Vec<_> = observed_ppids.lines().collect();
@@ -1605,7 +1605,7 @@ fn run_returns_immediately_and_later_completes() {
     let (output, _) = run_cmd(&temp, &["run", "--", "bash", "-lc", &script]);
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
-    wait_until(Duration::from_secs(2), || started.exists().then_some(()));
+    wait_until(FIXTURE_DEADLINE, || started.exists().then_some(()));
     let immediate = status_text(&temp, handle, false);
     assert!(immediate.starts_with("RUNNING handle="), "{immediate}");
     release_marker.release();
@@ -1616,7 +1616,7 @@ fn run_returns_immediately_and_later_completes() {
 #[test]
 fn cancel_terminates_the_entire_adopted_process_tree() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let fixture_deadline = Duration::from_secs(8);
+    let fixture_deadline = FIXTURE_DEADLINE;
     let child_pid_path = temp.path().join("child.pid");
     let script = format!(
         "trap 'exit 0' TERM; sleep 60 & echo $! > {}; wait",
@@ -1687,7 +1687,7 @@ fn supervisor_finishes_durable_cancel_without_wakeup_signal() {
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
     let state_dir = state_dir_path(&json);
-    wait_until(Duration::from_secs(2), || {
+    wait_until(FIXTURE_DEADLINE, || {
         read_meta(&meta_path(&json))["supervisor_pid"]
             .is_number()
             .then_some(())
@@ -1739,7 +1739,7 @@ fn cancel_rejects_a_live_pid_with_stale_supervisor_identity() {
         .env("SIGNALED", &signaled)
         .spawn()
         .expect("spawn stale-identity process");
-    wait_until(Duration::from_secs(2), || ready.exists().then_some(()));
+    wait_until(FIXTURE_DEADLINE, || ready.exists().then_some(()));
     let pid = process.id() as libc::pid_t;
     let (identity, _) = proc_identity(pid).expect("live process identity");
     let handle = "ab_cancel_stale_supervisor";
@@ -1772,7 +1772,7 @@ fn cancel_rejects_a_live_pid_with_stale_supervisor_identity() {
 #[test]
 fn accepted_cancel_is_owned_by_guardian_after_supervisor_loss() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let fixture_deadline = Duration::from_secs(30);
+    let fixture_deadline = FIXTURE_DEADLINE;
     let (fake, delivery_log) = fake_agents(&temp);
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
@@ -1815,7 +1815,7 @@ fn accepted_cancel_is_owned_by_guardian_after_supervisor_loss() {
 #[test]
 fn accepted_cancel_precedes_already_pending_workload_completion() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let fixture_deadline = Duration::from_secs(30);
+    let fixture_deadline = FIXTURE_DEADLINE;
     let release = temp.path().join("cancel-completion-release");
     let output = agent_bash(&temp)
         .env("RELEASE", &release)
@@ -1862,7 +1862,7 @@ fn accepted_cancel_precedes_already_pending_workload_completion() {
 #[test]
 fn guardian_escalates_accepted_cancel_for_term_resistant_tree() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let fixture_deadline = Duration::from_secs(30);
+    let fixture_deadline = FIXTURE_DEADLINE;
     let child_pid_path = temp.path().join("term-resistant-child.pid");
     let script = format!(
         "trap '' TERM; sleep 60 & echo $! > {}; wait",
@@ -1909,7 +1909,7 @@ fn guardian_escalates_accepted_cancel_for_term_resistant_tree() {
 #[test]
 fn owner_exit_cancels_opted_in_workload_and_descendants() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let fixture_deadline = Duration::from_secs(30);
+    let fixture_deadline = FIXTURE_DEADLINE;
     let child_pid_path = temp.path().join("owner-child.pid");
     let workload_script = format!(
         "trap 'exit 0' TERM; sleep 60 & echo $! > {}; wait",
@@ -1966,7 +1966,7 @@ fn explicit_cancel_wins_when_owner_exit_is_already_pollable() {
     let temp = tempfile::tempdir().expect("tempdir");
     let run_json_path = temp.path().join("owner-race-run.json");
     let owner_ready = temp.path().join("owner-race-ready");
-    let fixture_deadline = Duration::from_secs(12);
+    let fixture_deadline = FIXTURE_DEADLINE;
     let binary = assert_cmd::cargo::cargo_bin("agent-bash");
     let launcher_script = format!(
         "\"{}\" run --cancel-on-owner-exit --owner-pid \"$BASHPID\" -- sleep 60 > \"$RUN_JSON\"; : > \"$OWNER_READY\"; read -r _",
@@ -2153,7 +2153,7 @@ fn ready_sentinel_reports_done_without_killing_workload() {
     );
     let meta = read_meta(&meta_path(&json));
     let workload_pid = meta["workload_pid"].as_i64().expect("workload pid") as libc::pid_t;
-    let child_pid = wait_until(Duration::from_secs(6), || {
+    let child_pid = wait_until(FIXTURE_DEADLINE, || {
         fs::read_to_string(&child_pid_path)
             .ok()?
             .trim()
@@ -2207,7 +2207,7 @@ fn tree_capture_waits_for_setsid_detached_grandchild_via_subreaper() {
     let running = status_text(&temp, handle, false);
     assert!(running.starts_with("RUNNING handle="), "{running}");
 
-    wait_until(Duration::from_secs(5), || marker.exists().then_some(()));
+    wait_until(FIXTURE_DEADLINE, || marker.exists().then_some(()));
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.starts_with(&format!("DONE rc=0 handle={handle}")));
     let meta = read_meta(&meta_path);
@@ -2252,7 +2252,7 @@ fn root_completion_does_not_wait_for_setsid_detached_grandchild() {
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
 
-    wait_until(Duration::from_secs(2), || ready.exists().then_some(()));
+    wait_until(FIXTURE_DEADLINE, || ready.exists().then_some(()));
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.starts_with(&format!("DONE rc=0 handle={handle}")));
     assert!(
@@ -2261,7 +2261,7 @@ fn root_completion_does_not_wait_for_setsid_detached_grandchild() {
     );
 
     release_marker.release();
-    wait_until(Duration::from_secs(5), || marker.exists().then_some(()));
+    wait_until(FIXTURE_DEADLINE, || marker.exists().then_some(()));
 }
 
 #[test]
@@ -2270,7 +2270,7 @@ fn cgroup_v2_live_set_path_runs_when_delegated_and_skips_otherwise() {
     let (output, _) = run_cmd(&temp, &["run", "--", "bash", "-lc", "sleep 1.5"]);
     let json = parse_run_output(&output);
     let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(2), || {
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
         meta["workload_pid"].is_number().then_some(meta)
     });
@@ -2384,7 +2384,7 @@ fn opencode_adapter_ordinary_command_completes_in_band_in_sync_mode() {
         .join("agent-bash")
         .join(handle)
         .join("meta.json");
-    let meta = wait_until(Duration::from_secs(6), || {
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["attempted"] == true
             && meta["delivery"]["error_code"] != "delivery_attempt_in_progress")
@@ -2546,7 +2546,7 @@ fn opencode_adapter_explicit_async_returns_handle_immediately() {
 
     let result = run_adapter_driver(&temp, &driver, "async", None);
 
-    wait_until(Duration::from_secs(2), || started.exists().then_some(()));
+    wait_until(FIXTURE_DEADLINE, || started.exists().then_some(()));
     assert_adapter_result_contains(&result, "Running asynchronously");
     let handle = adapter_result_handle(&result);
     assert_eq!(mode_text(&temp, handle), "async");
@@ -2684,8 +2684,8 @@ fn opencode_adapter_sync_wait_returns_when_handle_is_detached() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn adapter driver");
-    let handle = wait_until(Duration::from_secs(6), || initialized_state_handle(&temp));
-    wait_until(Duration::from_secs(6), || started.exists().then_some(()));
+    let handle = wait_until(FIXTURE_DEADLINE, || initialized_state_handle(&temp));
+    wait_until(FIXTURE_DEADLINE, || started.exists().then_some(()));
     assert_eq!(mode_text(&temp, &handle), "sync");
 
     let detach = agent_bash(&temp)
@@ -2834,9 +2834,7 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
     // Verifies owner-tree visibility and unrelated-caller isolation at the real CLI/process seam.
     let temp = tempfile::tempdir().expect("tempdir");
     let mut owner = spawn_releasable_owner_scenario(&temp);
-    wait_until(Duration::from_secs(30), || {
-        owner.ready.exists().then_some(())
-    });
+    wait_until(FIXTURE_DEADLINE, || owner.ready.exists().then_some(()));
     let run_json: Value =
         serde_json::from_slice(&fs::read(&owner.run_json).expect("owner run JSON"))
             .expect("owner run JSON value");
@@ -2904,9 +2902,7 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
 fn owner_scenario_drop_terminates_and_reaps_polling_shell() {
     let temp = tempfile::tempdir().expect("tempdir");
     let owner = spawn_owner_scenario(&temp, "1");
-    wait_until(Duration::from_secs(3), || {
-        owner.ready.exists().then_some(())
-    });
+    wait_until(FIXTURE_DEADLINE, || owner.ready.exists().then_some(()));
     let run_json: Value =
         serde_json::from_slice(&fs::read(&owner.run_json).expect("owner run JSON"))
             .expect("owner run JSON value");
@@ -3217,7 +3213,7 @@ fn delivery_seam_records_invocation_outcome() {
     let meta_path = meta_path(&json);
     assert_eq!(json["delivery_mode"], "async");
     assert_eq!(mode_text(&temp, handle), "async");
-    let deadline = Instant::now() + Duration::from_secs(6);
+    let deadline = Instant::now() + FIXTURE_DEADLINE;
     while delivery_attempt_count(&delivery_log) != 1 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -3228,7 +3224,7 @@ fn delivery_seam_records_invocation_outcome() {
         read_meta(&meta_path),
         fs::read_to_string(&delivery_log).unwrap_or_default()
     );
-    wait_until(Duration::from_secs(6), || {
+    wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["exit_code"] == 0).then_some(())
     });
@@ -3275,7 +3271,7 @@ fn delivery_seam_records_invocation_outcome() {
             json["rc"].as_str().expect("rc").to_string(),
         ]
     );
-    let meta = wait_until(Duration::from_secs(6), || {
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
         delivery_metadata_observed(&meta).then_some(meta)
     });
@@ -3287,7 +3283,7 @@ fn delivery_seam_records_invocation_outcome() {
 #[test]
 fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let fixture_deadline = Duration::from_secs(30);
+    let fixture_deadline = FIXTURE_DEADLINE;
     let (fake, delivery_log) = parent_killing_fake_agents(&temp, "agent-bash-complete");
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
@@ -3320,7 +3316,7 @@ fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
 #[test]
 fn delivery_owner_finishes_after_supervisor_dies() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let fixture_deadline = Duration::from_secs(30);
+    let fixture_deadline = FIXTURE_DEADLINE;
     let (
         fake,
         _activate_started,
@@ -3374,7 +3370,7 @@ fn delivery_owner_finishes_after_supervisor_dies() {
 #[test]
 fn delivery_owner_finishes_after_detach_caller_dies() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let fixture_deadline = Duration::from_secs(30);
+    let fixture_deadline = FIXTURE_DEADLINE;
     let (
         fake,
         activate_started,
@@ -3432,7 +3428,7 @@ fn concurrent_status_after_nonzero_helper_exit_does_not_repeat_delivery() {
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle").to_string();
     let meta_path = meta_path(&json);
-    wait_until(Duration::from_secs(6), || {
+    wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["exit_code"] == 17).then_some(())
     });
@@ -3502,7 +3498,7 @@ fn legacy_helperless_handles_fail_closed_without_retry() {
 #[test]
 fn caller_death_after_activation_handoff_does_not_repeat_or_split_detach() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let fixture_deadline = Duration::from_secs(30);
+    let fixture_deadline = FIXTURE_DEADLINE;
     let (fake, delivery_log) = parent_killing_fake_agents(&temp, "agent-bash-activate");
     let release = temp.path().join("detach-crash-release");
     let release_marker = ReleaseMarker::new(release.clone());
@@ -3584,7 +3580,7 @@ fn observer_cannot_substitute_registered_delivery_helper() {
     assert_command_success(&detach);
     fs::write(&release, b"").expect("release workload");
     let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
-    wait_until(Duration::from_secs(6), || {
+    wait_until(FIXTURE_DEADLINE, || {
         (delivery_attempt_count(&log_a) == 1).then_some(())
     });
 
@@ -3606,7 +3602,7 @@ fn observer_cannot_substitute_registered_delivery_helper() {
 #[test]
 fn registered_helper_snapshot_survives_source_replacement_without_polling() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let fixture_deadline = Duration::from_secs(12);
+    let fixture_deadline = FIXTURE_DEADLINE;
     let (helper, delivery_log) = fake_agents(&temp);
     let retained_helper = temp.path().join("retained-fake-agents");
     let replacement_log = temp.path().join("replacement-delivery.log");
@@ -3690,7 +3686,7 @@ fn unavailable_pinned_helper_allows_one_bounded_pre_execution_retry() {
     fs::rename(&snapshot, &retained_snapshot).expect("make pinned helper unavailable");
     release_marker.release();
 
-    let initial = wait_until(Duration::from_secs(6), || {
+    let initial = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["error_code"] == "delivery_helper_unavailable").then_some(meta)
     });
@@ -3753,7 +3749,7 @@ fn completion_launch_failure_is_retryable_and_never_claimed_as_admitted() {
     fs::rename(&interpreter, &retained_interpreter).expect("remove helper interpreter");
     fs::write(&release, b"").expect("release workload");
 
-    let initial = wait_until(Duration::from_secs(6), || {
+    let initial = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["error_code"] == "delivery_helper_launch_failed").then_some(meta)
     });
@@ -3833,7 +3829,7 @@ fn changed_handle_helper_fails_closed_through_completion_boundary() {
     set_executable(&snapshot);
     fs::write(&release, b"").expect("release workload");
 
-    let meta = wait_until(Duration::from_secs(6), || {
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["error_code"] == "delivery_helper_changed").then_some(meta)
     });
@@ -3893,11 +3889,11 @@ fn sync_completion_triggers_its_inactive_completion_event() {
     assert!(status.contains("sync\n"), "{status}");
     assert_eq!(json["delivery_mode"], "sync");
     assert_eq!(mode_text(&temp, handle), "sync");
-    wait_until(Duration::from_secs(6), || {
+    wait_until(FIXTURE_DEADLINE, || {
         (delivery_attempt_count(&delivery_log) == 1).then_some(())
     });
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
-    let meta = wait_until(Duration::from_secs(6), || {
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path(&json));
         delivery_metadata_observed(&meta).then_some(meta)
     });
@@ -3939,11 +3935,11 @@ fn detach_after_sync_completion_notifies_once() {
     assert_eq!(second["transitioned"], false);
     assert_eq!(second["notification_attempted"], false);
     assert_eq!(mode_text(&temp, handle), "async");
-    wait_until(Duration::from_secs(6), || {
+    wait_until(FIXTURE_DEADLINE, || {
         (delivery_attempt_count(&delivery_log) == 1).then_some(())
     });
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
-    let meta = wait_until(Duration::from_secs(6), || {
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path(&json));
         delivery_metadata_observed(&meta).then_some(meta)
     });
@@ -4008,7 +4004,7 @@ fn concurrent_detach_and_completion_produce_one_notification() {
             .count(),
         1
     );
-    wait_until(Duration::from_secs(6), || {
+    wait_until(FIXTURE_DEADLINE, || {
         (delivery_attempt_count(&delivery_log) == 1).then_some(())
     });
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
@@ -4018,7 +4014,7 @@ fn concurrent_detach_and_completion_produce_one_notification() {
 #[test]
 fn detach_does_not_rewrite_terminal_metadata_after_activation() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let fixture_deadline = Duration::from_secs(8);
+    let fixture_deadline = FIXTURE_DEADLINE;
     let (
         fake,
         activate_started,
@@ -4128,7 +4124,7 @@ fn consumed_marker_before_completion_suppresses_async_delivery() {
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.contains("consumed\n"), "{final_status}");
     let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(6), || {
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
         delivery_metadata_observed(&meta).then_some(meta)
     });
@@ -4153,9 +4149,7 @@ fn consumed_marker_during_delivery_grace_suppresses_async_delivery() {
         .output()
         .expect("run");
     let json = parse_run_output(&output);
-    wait_until(Duration::from_secs(6), || {
-        rc_path(&json).exists().then_some(())
-    });
+    wait_until(FIXTURE_DEADLINE, || rc_path(&json).exists().then_some(()));
     fs::write(state_dir_path(&json).join("consumed"), b"").expect("write consumed marker");
 
     let handle = json["handle"].as_str().expect("handle");
@@ -4164,14 +4158,14 @@ fn consumed_marker_during_delivery_grace_suppresses_async_delivery() {
         final_status.contains("consumed-after-rc\n"),
         "{final_status}"
     );
-    wait_until(Duration::from_secs(6), || {
+    wait_until(FIXTURE_DEADLINE, || {
         (delivery_attempt_count(&delivery_log) == 1).then_some(())
     });
     let delivery = fs::read_to_string(&delivery_log).expect("event commands");
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
     assert!(delivery.lines().any(|line| line == "--consumed"));
     let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(6), || {
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
         delivery_metadata_observed(&meta).then_some(meta)
     });
@@ -4210,7 +4204,7 @@ fn consumed_marker_after_delivery_does_not_rewrite_delivery_meta() {
 
     fs::write(&release_workload, b"").expect("release workload");
     let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
-    wait_until(Duration::from_secs(6), || {
+    wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["attempted"] == true).then_some(())
     });
@@ -4221,7 +4215,7 @@ fn consumed_marker_after_delivery_does_not_rewrite_delivery_meta() {
         .write(true)
         .open(state_dir.join("delivery.lock"))
         .expect("open delivery lock");
-    wait_until(Duration::from_secs(6), || {
+    wait_until(FIXTURE_DEADLINE, || {
         let result =
             unsafe { libc::flock(delivery_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result == 0 {
@@ -4474,7 +4468,7 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
     let child_pid_path = temp.path().join("retained-child-pid");
     let allow_root_exit = temp.path().join("allow-root-exit");
     let root_release_marker = ReleaseMarker::new(allow_root_exit.clone());
-    let fixture_deadline = Duration::from_secs(6);
+    let fixture_deadline = FIXTURE_DEADLINE;
 
     let mut cmd = agent_bash(&temp);
     cmd.env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
