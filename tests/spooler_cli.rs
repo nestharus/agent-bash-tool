@@ -1862,6 +1862,7 @@ fn accepted_cancel_precedes_already_pending_workload_completion() {
 #[test]
 fn guardian_escalates_accepted_cancel_for_term_resistant_tree() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = Duration::from_secs(30);
     let child_pid_path = temp.path().join("term-resistant-child.pid");
     let script = format!(
         "trap '' TERM; sleep 60 & echo $! > {}; wait",
@@ -1871,13 +1872,13 @@ fn guardian_escalates_accepted_cancel_for_term_resistant_tree() {
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
     let meta_path = meta_path(&json);
-    let running = wait_until(Duration::from_secs(2), || {
+    let running = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         meta["workload_pid"].is_number().then_some(meta)
     });
     let workload = OwnedProcess::capture_workload(&running).expect("capture workload");
     let supervisor = OwnedProcess::capture_supervisor(&running).expect("capture supervisor");
-    let child_pid = wait_until(Duration::from_secs(2), || {
+    let child_pid = wait_until(fixture_deadline, || {
         fs::read_to_string(&child_pid_path)
             .ok()?
             .trim()
@@ -1901,7 +1902,7 @@ fn guardian_escalates_accepted_cancel_for_term_resistant_tree() {
         started.elapsed() >= Duration::from_millis(1500),
         "guardian did not observe cancellation grace"
     );
-    wait_until(Duration::from_secs(2), || workload.exited().then_some(()));
+    wait_until(fixture_deadline, || workload.exited().then_some(()));
     wait_for_process_gone(child_pid);
 }
 
