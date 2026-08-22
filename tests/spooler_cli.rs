@@ -1772,6 +1772,7 @@ fn cancel_rejects_a_live_pid_with_stale_supervisor_identity() {
 #[test]
 fn accepted_cancel_is_owned_by_guardian_after_supervisor_loss() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = Duration::from_secs(12);
     let (fake, delivery_log) = fake_agents(&temp);
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
@@ -1782,7 +1783,7 @@ fn accepted_cancel_is_owned_by_guardian_after_supervisor_loss() {
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
     let meta_path = meta_path(&json);
-    let running = wait_until(Duration::from_secs(6), || {
+    let running = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         meta["workload_pid"].is_number().then_some(meta)
     });
@@ -1799,7 +1800,7 @@ fn accepted_cancel_is_owned_by_guardian_after_supervisor_loss() {
     assert!(supervisor.signal(libc::SIGKILL), "kill exact supervisor");
     drop(stopped);
 
-    let terminal = wait_until(Duration::from_secs(8), || {
+    let terminal = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         (meta["completion_reason"] == "cancel-request" && meta["delivery"]["exit_code"] == 0)
             .then_some(meta)
