@@ -173,7 +173,12 @@ function runEnv(ownerSessionId?: string) {
   }
 }
 
-async function runProcess(argv: string[], ownerSessionId?: string, abort?: AbortSignal): Promise<ProcessResult> {
+async function runProcess(
+  argv: string[],
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+  operation = "subprocess",
+): Promise<ProcessResult> {
   const child = Bun.spawn(argv, { env: runEnv(ownerSessionId), stdout: "pipe", stderr: "pipe" })
   let timeout: ReturnType<typeof setTimeout> | undefined
   const stopped = new Promise<never>((_, reject) => {
@@ -181,7 +186,7 @@ async function runProcess(argv: string[], ownerSessionId?: string, abort?: Abort
       child.kill()
       reject(new Error(message))
     }
-    timeout = setTimeout(() => stop(`subprocess timed out after ${PROCESS_TIMEOUT_MS}ms`), PROCESS_TIMEOUT_MS)
+    timeout = setTimeout(() => stop(`${operation} timed out after ${PROCESS_TIMEOUT_MS}ms`), PROCESS_TIMEOUT_MS)
     if (abort) {
       if (abort.aborted) stop("subprocess aborted")
       else abort.addEventListener("abort", () => stop("subprocess aborted"), { once: true })
@@ -210,7 +215,7 @@ async function checkedProcessText(
   ownerSessionId?: string,
   abort?: AbortSignal,
 ): Promise<string> {
-  const result = await runProcess(argv, ownerSessionId, abort)
+  const result = await runProcess(argv, ownerSessionId, abort, operation)
   if (result.exitCode !== 0) throw processFailure(operation, result)
   return result.stdout.trim()
 }
@@ -337,7 +342,7 @@ async function executeListControl(control: ListControl, ownerSessionId: string, 
   if (control.all) argv.push("--all")
   if (control.json) argv.push("--json")
 
-  const result = await runProcess(argv, ownerSessionId, abort)
+  const result = await runProcess(argv, ownerSessionId, abort, "agent-bash list")
   if (result.exitCode !== 0) throw processFailure("agent-bash list", result)
   return result.stdout
 }
