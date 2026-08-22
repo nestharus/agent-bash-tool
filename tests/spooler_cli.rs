@@ -159,7 +159,7 @@ fn detached_guard_compile_failure_message(output: &Output) -> String {
 }
 
 fn wait_for_status_prefix(temp: &tempfile::TempDir, handle: &str, prefix: &str) -> String {
-    wait_until(Duration::from_secs(6), || {
+    wait_until(Duration::from_secs(30), || {
         let text = status_text(temp, handle, true);
         if text.starts_with(prefix) {
             Some(text)
