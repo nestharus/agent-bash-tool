@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -127,7 +128,34 @@ impl OwnerMeta {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) const DELIVERY_ATTEMPT_IN_PROGRESS: &str = "delivery_attempt_in_progress";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DeliveryLifecycle {
+    Unclaimed,
+    ProvisionalTransfer,
+    RetryablePreAdmissionFailure,
+    ClosedPreAdmissionFailure,
+    AdmittedOutcome,
+    Skipped,
+    Invalid,
+}
+
+impl DeliveryLifecycle {
+    pub(crate) fn permits_attempt(self) -> bool {
+        matches!(self, Self::Unclaimed | Self::RetryablePreAdmissionFailure)
+    }
+
+    pub(crate) fn needs_progress(self) -> bool {
+        matches!(
+            self,
+            Self::Unclaimed | Self::ProvisionalTransfer | Self::RetryablePreAdmissionFailure
+        )
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 pub(crate) struct DeliveryMeta {
     pub(crate) attempted: bool,
     pub(crate) exit_code: Option<i32>,
@@ -142,8 +170,54 @@ pub(crate) struct DeliveryMeta {
     pub(crate) skipped: Option<String>,
 }
 
-fn is_zero(value: &u8) -> bool {
-    *value == 0
+impl DeliveryMeta {
+    pub(crate) fn lifecycle(&self) -> DeliveryLifecycle {
+        if self.skipped.is_some() {
+            return if !self.attempted && self.error_code.is_none() {
+                DeliveryLifecycle::Skipped
+            } else {
+                DeliveryLifecycle::Invalid
+            };
+        }
+        if self.attempted {
+            return if self.error_code.as_deref() == Some(DELIVERY_ATTEMPT_IN_PROGRESS) {
+                DeliveryLifecycle::ProvisionalTransfer
+            } else {
+                DeliveryLifecycle::AdmittedOutcome
+            };
+        }
+        match (self.error_code.is_some(), self.retryable) {
+            (false, _) => DeliveryLifecycle::Unclaimed,
+            (true, Some(true)) => DeliveryLifecycle::RetryablePreAdmissionFailure,
+            (true, _) => DeliveryLifecycle::ClosedPreAdmissionFailure,
+        }
+    }
+}
+
+impl Serialize for DeliveryMeta {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("DeliveryMeta", 9)?;
+        state.serialize_field("attempted", &self.attempted)?;
+        state.serialize_field("exit_code", &self.exit_code)?;
+        state.serialize_field("error", &self.error)?;
+        if let Some(error_code) = &self.error_code {
+            state.serialize_field("error_code", error_code)?;
+        }
+        if let Some(retryable) = self.retryable {
+            state.serialize_field("retryable", &retryable)?;
+        }
+        if self.retry_count != 0 {
+            state.serialize_field("retry_count", &self.retry_count)?;
+        }
+        if let Some(skipped) = &self.skipped {
+            state.serialize_field("skipped", skipped)?;
+        }
+        state.serialize_field("lifecycle", &self.lifecycle())?;
+        state.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1112,6 +1186,45 @@ fn parse_proc_stat(contents: &str) -> Option<ProcStat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_lifecycle_classifies_existing_metadata_protocol() {
+        let mut delivery = DeliveryMeta::default();
+        assert_eq!(delivery.lifecycle(), DeliveryLifecycle::Unclaimed);
+
+        delivery.error_code = Some("delivery_helper_launch_failed".to_string());
+        delivery.retryable = Some(true);
+        assert_eq!(
+            delivery.lifecycle(),
+            DeliveryLifecycle::RetryablePreAdmissionFailure
+        );
+        delivery.retryable = Some(false);
+        assert_eq!(
+            delivery.lifecycle(),
+            DeliveryLifecycle::ClosedPreAdmissionFailure
+        );
+
+        delivery = DeliveryMeta {
+            attempted: true,
+            error_code: Some(DELIVERY_ATTEMPT_IN_PROGRESS.to_string()),
+            ..DeliveryMeta::default()
+        };
+        assert_eq!(delivery.lifecycle(), DeliveryLifecycle::ProvisionalTransfer);
+        delivery.error_code = None;
+        assert_eq!(delivery.lifecycle(), DeliveryLifecycle::AdmittedOutcome);
+
+        delivery = DeliveryMeta {
+            skipped: Some("sync_in_band".to_string()),
+            ..DeliveryMeta::default()
+        };
+        assert_eq!(delivery.lifecycle(), DeliveryLifecycle::Skipped);
+        assert_eq!(
+            serde_json::to_value(&delivery).expect("serialize delivery")["lifecycle"],
+            "skipped"
+        );
+        delivery.attempted = true;
+        assert_eq!(delivery.lifecycle(), DeliveryLifecycle::Invalid);
+    }
 
     fn test_reap_config(now_unix_ms: u64, ttl_secs: u64, max_dirs: usize) -> ReapConfig {
         ReapConfig {

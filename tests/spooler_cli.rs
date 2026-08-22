@@ -2427,9 +2427,7 @@ fn opencode_adapter_ordinary_command_completes_in_band_in_sync_mode() {
         .join("meta.json");
     let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
-        (meta["delivery"]["attempted"] == true
-            && meta["delivery"]["error_code"] != "delivery_attempt_in_progress")
-            .then_some(meta)
+        delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     assert_eq!(meta["delivery_mode"], "sync");
     assert!(meta["cancel_owner"]["pid"].is_number());
@@ -3368,7 +3366,7 @@ fn delivery_seam_records_invocation_outcome() {
     );
     let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
-        delivery_metadata_observed(&meta).then_some(meta)
+        delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     assert_eq!(meta["delivery"]["attempted"], true);
     assert_eq!(meta["delivery"]["exit_code"], 0);
@@ -4116,7 +4114,7 @@ fn sync_completion_triggers_its_inactive_completion_event() {
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
     let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path(&json));
-        delivery_metadata_observed(&meta).then_some(meta)
+        delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     assert_eq!(meta["delivery_mode"], "sync");
     assert_eq!(meta["delivery"]["attempted"], true);
@@ -4162,7 +4160,7 @@ fn detach_after_sync_completion_notifies_once() {
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
     let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path(&json));
-        delivery_metadata_observed(&meta).then_some(meta)
+        delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     assert_eq!(meta["delivery_mode"], "async");
     assert_eq!(meta["delivery"]["attempted"], true);
@@ -4364,7 +4362,7 @@ fn consumed_marker_before_completion_suppresses_async_delivery() {
     let meta_path = meta_path(&json);
     let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
-        delivery_metadata_observed(&meta).then_some(meta)
+        delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     let delivery = fs::read_to_string(&delivery_log).expect("event commands");
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
@@ -4405,17 +4403,18 @@ fn consumed_marker_during_delivery_grace_suppresses_async_delivery() {
     let meta_path = meta_path(&json);
     let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
-        delivery_metadata_observed(&meta).then_some(meta)
+        delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     assert_eq!(meta["delivery"]["attempted"], true);
     assert_eq!(meta["delivery"]["exit_code"], 0);
     assert!(meta["delivery"]["skipped"].is_null());
 }
 
-fn delivery_metadata_observed(meta: &Value) -> bool {
-    (meta["delivery"]["attempted"] == true
-        && meta["delivery"]["error_code"] != "delivery_attempt_in_progress")
-        || meta["delivery"]["skipped"].is_string()
+fn delivery_lifecycle_is_closed(meta: &Value) -> bool {
+    matches!(
+        meta["delivery"]["lifecycle"].as_str(),
+        Some("admitted_outcome" | "skipped")
+    )
 }
 
 #[test]
@@ -4444,7 +4443,11 @@ fn consumed_marker_after_delivery_does_not_rewrite_delivery_meta() {
     let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
-        (meta["delivery"]["attempted"] == true).then_some(())
+        matches!(
+            meta["delivery"]["lifecycle"].as_str(),
+            Some("provisional_transfer" | "admitted_outcome")
+        )
+        .then_some(())
     });
 
     let state_dir = state_dir_path(&json);
@@ -4468,6 +4471,7 @@ fn consumed_marker_after_delivery_does_not_rewrite_delivery_meta() {
     assert_eq!(before_meta["state"], "DONE");
     assert_eq!(before_meta["rc"], 0);
     let before_delivery = before_meta["delivery"].clone();
+    assert_eq!(before_delivery["lifecycle"], "admitted_outcome");
     assert_eq!(before_delivery["attempted"], true);
     assert_eq!(before_delivery["exit_code"], 0);
     assert!(before_delivery["error"].is_null());
@@ -4766,7 +4770,7 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
     );
     let terminal_meta = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
-        delivery_metadata_observed(&meta).then_some(meta)
+        delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     assert_eq!(terminal_meta["state"], "ERROR");
     assert_eq!(terminal_meta["completion_reason"], "supervisor-lost");

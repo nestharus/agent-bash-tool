@@ -249,6 +249,12 @@ restores sync mode, while completion records a typed result and permits one boun
 helper process received the operation. This chooses at-most-once invocation after admission without
 discarding a provably pre-admission obligation.
 
+`DeliveryMeta::lifecycle` is the source-level and serialized classifier for that protocol. It reports
+`unclaimed`, `provisional_transfer`, `retryable_pre_admission_failure`,
+`closed_pre_admission_failure`, `admitted_outcome`, `skipped`, or `invalid` from the existing metadata
+fields. Reconciliation and status progress decisions consume this classifier rather than independently
+decoding field combinations; the original fields remain present for detailed outcome diagnostics.
+
 The spooler's closed state machine ends at the admitted helper invocation and its observed process
 exit. Agent-runner owns mailbox publication, transaction boundaries, and any downstream idempotency.
 Accordingly, “at most once” in this repository means one admitted `agent-bash-activate` or

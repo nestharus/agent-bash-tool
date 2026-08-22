@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::state::{
-    self, CallerChainEntry, DeliveryHelperProvenance, DeliveryMeta, DeliveryMode, Meta, StatePaths,
+    self, CallerChainEntry, DeliveryHelperProvenance, DeliveryLifecycle, DeliveryMeta,
+    DeliveryMode, Meta, StatePaths,
 };
 
 const CONSUMER_GRACE_MS_ENV: &str = "AGENT_BASH_CONSUMER_GRACE_MS";
@@ -54,7 +55,6 @@ const DELIVERY_HELPER_LEGACY_UNSUPPORTED: &str = "delivery_helper_legacy_unsuppo
 const DELIVERY_HELPER_UNAVAILABLE: &str = "delivery_helper_unavailable";
 const DELIVERY_HELPER_INVALID: &str = "delivery_helper_provenance_invalid";
 const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
-const DELIVERY_ATTEMPT_IN_PROGRESS: &str = "delivery_attempt_in_progress";
 
 #[derive(Debug)]
 struct DeliveryHelper {
@@ -835,17 +835,14 @@ pub(crate) fn reconcile_completion_delivery(
     let mut persisted = state::read_meta(paths)?;
     let mode = state::read_delivery_mode(paths)?;
     persisted.delivery_mode = mode;
-    if persisted.delivery.attempted
-        || persisted.delivery.skipped.is_some()
-        || (persisted.delivery.error_code.is_some() && persisted.delivery.retryable != Some(true))
-    {
+    let lifecycle = persisted.delivery.lifecycle();
+    if !lifecycle.permits_attempt() {
         *meta = persisted;
         return Ok(());
     }
-    let retry_count = persisted
-        .delivery
-        .retry_count
-        .saturating_add(u8::from(persisted.delivery.retryable == Some(true)));
+    let retry_count = persisted.delivery.retry_count.saturating_add(u8::from(
+        lifecycle == DeliveryLifecycle::RetryablePreAdmissionFailure,
+    ));
     let request = match trigger_request(
         persisted.caller_ppid,
         &persisted.handle,
@@ -863,7 +860,7 @@ pub(crate) fn reconcile_completion_delivery(
         }
     };
     let owner_result = run_delivery_owner_holding_lock(&delivery_lock, || {
-        persisted.delivery = delivery_attempt_started_meta();
+        persisted.delivery = provisional_delivery_transfer_meta();
         persisted.touch();
         state::write_meta_atomic(paths, &persisted)?;
         persisted.delivery = match run_notify_command(&request) {
@@ -878,7 +875,7 @@ pub(crate) fn reconcile_completion_delivery(
     });
     let mut observed = state::read_meta(paths)?;
     if let Err(err) = owner_result {
-        if !observed.delivery.attempted && observed.delivery.error_code.is_none() {
+        if observed.delivery.lifecycle() == DeliveryLifecycle::Unclaimed {
             observed.delivery = delivery_meta_from_owner_launch_error(err, retry_count);
             observed.touch();
             state::write_meta_atomic(paths, &observed)?;
@@ -1198,7 +1195,7 @@ fn command_failure_detail(stderr: &[u8], stdout: &[u8]) -> Option<String> {
 }
 
 fn delivery_meta_from_status(status: ExitStatus) -> DeliveryMeta {
-    let mut meta = attempted_delivery_meta();
+    let mut meta = admitted_delivery_meta();
     if let Some(code) = status.code() {
         meta.exit_code = Some(code);
         return meta;
@@ -1208,7 +1205,7 @@ fn delivery_meta_from_status(status: ExitStatus) -> DeliveryMeta {
 }
 
 fn delivery_meta_from_error(err: std::io::Error) -> DeliveryMeta {
-    let mut meta = attempted_delivery_meta();
+    let mut meta = admitted_delivery_meta();
     meta.error = Some(err.to_string());
     meta
 }
@@ -1249,7 +1246,7 @@ fn delivery_meta_from_helper_error(err: DeliveryHelperError, retry_count: u8) ->
     }
 }
 
-fn attempted_delivery_meta() -> DeliveryMeta {
+fn admitted_delivery_meta() -> DeliveryMeta {
     DeliveryMeta {
         attempted: true,
         exit_code: None,
@@ -1261,14 +1258,14 @@ fn attempted_delivery_meta() -> DeliveryMeta {
     }
 }
 
-fn delivery_attempt_started_meta() -> DeliveryMeta {
+fn provisional_delivery_transfer_meta() -> DeliveryMeta {
     DeliveryMeta {
         attempted: true,
         exit_code: None,
         error: Some(
             "delivery helper outcome is unknown until the admitted attempt exits".to_string(),
         ),
-        error_code: Some(DELIVERY_ATTEMPT_IN_PROGRESS.to_string()),
+        error_code: Some(state::DELIVERY_ATTEMPT_IN_PROGRESS.to_string()),
         retryable: Some(false),
         retry_count: 0,
         skipped: None,
@@ -1276,12 +1273,7 @@ fn delivery_attempt_started_meta() -> DeliveryMeta {
 }
 
 pub(crate) fn completion_delivery_pending(meta: &Meta) -> bool {
-    state::terminal(meta)
-        && ((meta.delivery.attempted
-            && meta.delivery.error_code.as_deref() == Some(DELIVERY_ATTEMPT_IN_PROGRESS))
-            || (!meta.delivery.attempted
-                && meta.delivery.skipped.is_none()
-                && (meta.delivery.error_code.is_none() || meta.delivery.retryable == Some(true))))
+    state::terminal(meta) && meta.delivery.lifecycle().needs_progress()
 }
 
 fn delivery_signal_error(status: ExitStatus) -> String {
