@@ -115,16 +115,17 @@ operation then records `cancel-request`, status 143, instead of `supervisor-lost
 an accepted cancel continues to require both exact identities and fails closed when either is
 missing. Every non-sentinel terminal producer uses that same precedence decision.
 
-`status` and bulk `list` share the lost-supervisor terminal transition but not the immediate
-notification role. A targeted `status` reconciliation owns pending completion delivery in its
-current process. Bulk `list` may publish the same terminal state for an accurate projection, but it
-never executes a helper as an incidental enumeration side effect; it leaves delivery unattempted
-for the independent per-handle guardian. The guardian then re-enters reconciliation, observes the
-terminal record, and claims pending delivery. A later targeted `status` may claim it first. Both
-paths use the same `delivery.lock`, pinned helper, and write-ahead attempt record, so this handoff
-changes the delivery owner without permitting a repeated attempt. Every valid run creates the
-guardian before the supervisor; synthetic list fixtures without a guardian validate only that list
-does not claim delivery, then exercise the targeted-status handoff separately.
+Owner-authorized `status` and bulk `list` share the lost-supervisor terminal transition but not the
+immediate notification role. A targeted owner `status` reconciliation owns pending completion
+delivery in its current process. An owner-scoped bulk `list` may publish the same terminal state for
+an accurate projection, but it never executes a helper as an incidental enumeration side effect; it
+leaves delivery unattempted for the independent per-handle guardian. Cross-owner status and
+`list --all` remain observational and do not reconcile state. The guardian re-enters reconciliation,
+observes the terminal record, and claims pending delivery. A later targeted owner `status` may claim
+it first. Both paths use the same `delivery.lock`, pinned helper, and write-ahead attempt record, so
+this handoff changes the delivery owner without permitting a repeated attempt. Every valid run
+creates the guardian before the supervisor; synthetic list fixtures without a guardian validate
+only that list does not claim delivery, then exercise the targeted-status handoff separately.
 
 ### Completion detection — three modes
 - **tree exit mode (default):** wake on root process death with `pidfd_open` + `poll`, and finish
@@ -143,6 +144,14 @@ does not claim delivery, then exercise the targeted-status handoff separately.
 into an event-driven, cgroup-tracked tool. The supervisor's poll of the PID is **harness-code
 polling (cheap, no LLM tokens)** — not the LLM self-polling that is forbidden.
 
+Handle observation and handle control are separate authorities. Default list visibility and
+control use the same recorded owner-session or exact caller-chain predicate. `list --all` and a
+cross-owner `status` may observe account-local handles, but they cannot publish recovery state,
+claim delivery, cancel work, or change delivery mode. Cancel and detach fail with `EX_NOPERM` for
+non-owners. Guardian recovery remains independent of any observing caller and is the automatic
+cleanup/progress path after the originating process disappears. No unauthenticated cross-owner
+operator override is exposed by this CLI.
+
 ### Delivery resolution metadata
 At launch, while the caller is still alive and `/proc` is readable, the spooler records
 `caller_ppid` and a nearest-first `caller_chain` in `meta.json`. Each chain element contains
@@ -155,7 +164,9 @@ The OpenCode adapter also supplies its provider session ID and parent invocation
 records these as optional fields in `meta.json` and in a separate `owner.json`, allowing a resumed
 session to rediscover its handles after the adapter process and caller PID change. Agent-runner may
 use this pair as a delivery fallback only after confirming that the invocation belongs to the same
-provider session.
+provider session. The recorded session ID also restores that session's control authority for
+cancel, detach, and status reconciliation after its caller PID changes. Handles without session
+metadata use the nearest exact PID/start-time/boot-ID caller-chain entry as their control anchor.
 
 Registration resolves the configured helper once, reads it into a sealed executable image, and
 stores its SHA-256 identity. The image is installed once per content digest under the account-private
@@ -176,6 +187,9 @@ The state root is a Unix-account trust boundary. Mode `0700` excludes other acco
 same-account workloads and observers are trusted not to rewrite another handle's state or helper
 cache. The observer-isolation guarantee means a later process cannot substitute its environment or
 configured helper path; it is not a sandbox between hostile processes sharing one Unix identity.
+The owner check prevents accidental cross-session control within that account, but is not claimed
+as authentication against a hostile same-UID process. A future cross-owner operator action requires
+a separately authenticated broker or OS identity; `list --all` deliberately does not confer it.
 The selected helper is an opaque trusted extension at this boundary. Its operation handlers may
 maintain downstream state, but this repository claims only pinned byte identity, invocation
 admission, and the observed helper-process outcome, not closure over arbitrary helper internals.
@@ -233,10 +247,11 @@ the state directory.
 
 All terminal handles use the configured state TTL. Retryable pre-invocation helper failures do not
 receive a multiplied retention window, so failed delivery does not create a sevenfold retained-state
-population. Each status observer may perform at most one helper-resolution retry for the handle it
-observes, and `retry_count` bounds each handle to one observer-triggered retry in total. The delivery
-lock serializes concurrently admitted observers; the first persists either an attempt claim or a
-closed retry result, and later observers cannot repeat it.
+population. Each owner-authorized status observer may perform at most one helper-resolution retry
+for the handle it observes; cross-owner status is read-only. `retry_count` bounds each handle to one
+observer-triggered retry in total. The delivery lock serializes concurrently admitted owner
+observers; the first persists either an attempt claim or a closed retry result, and later observers
+cannot repeat it.
 
 ## agent-runner additions
 

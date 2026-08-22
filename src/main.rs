@@ -21,6 +21,7 @@ const EX_NOINPUT: i32 = 66;
 const EX_SOFTWARE: i32 = 70;
 const EX_CANTCREAT: i32 = 73;
 const EX_IOERR: i32 = 74;
+const EX_NOPERM: i32 = 77;
 const OWNER_SESSION_ID_ENV: &str = "AGENT_BASH_OWNER_SESSION_ID";
 const OWNER_INVOCATION_UUID_ENV: &str = "AGENT_BASH_OWNER_INVOCATION_UUID";
 const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
@@ -28,6 +29,11 @@ const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
 struct OwnerContext {
     session_id: Option<String>,
     invocation_uuid: Option<String>,
+}
+
+struct CallerAuthority {
+    caller_chain: Vec<CallerChainEntry>,
+    owner_session_id: Option<String>,
 }
 
 #[derive(Parser)]
@@ -167,20 +173,20 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
             owner_pid,
             argv,
         ),
-        Command::Detach { handle } => detach_command(handle),
-        Command::Cancel { handle } => cancel_command(handle),
+        Command::Detach { handle } => detach_command(handle, caller_authority(&guard)),
+        Command::Cancel { handle } => cancel_command(handle, caller_authority(&guard)),
         Command::Mode { handle } => mode_command(handle),
         Command::Status {
             tail_bytes,
             full,
             handle,
-        } => status_command(handle, tail_bytes.unwrap_or(65_536), full),
-        Command::List { all, json } => list_command(
-            guard.startup_ppid(),
-            nonempty_env(OWNER_SESSION_ID_ENV),
-            all,
-            json,
+        } => status_command(
+            handle,
+            tail_bytes.unwrap_or(65_536),
+            full,
+            caller_authority(&guard),
         ),
+        Command::List { all, json } => list_command(caller_authority(&guard), all, json),
     }
 }
 
@@ -288,8 +294,9 @@ fn resolve_cancel_owner(
         })
 }
 
-fn cancel_command(handle: String) -> Result<(), AppError> {
+fn cancel_command(handle: String, caller: CallerAuthority) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
+    require_control_authority(&paths, &handle, &caller)?;
     let requested =
         supervisor::request_cancel(&paths).map_err(|err| cancel_request_error(&handle, err))?;
     serde_json::to_writer(
@@ -521,8 +528,9 @@ fn run_output(
     RunOutput::new(paths, caller_ppid, mode, delivery_mode, ready_sentinel)
 }
 
-fn detach_command(handle: String) -> Result<(), AppError> {
+fn detach_command(handle: String, caller: CallerAuthority) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
+    require_control_authority(&paths, &handle, &caller)?;
     let outcome = delivery::detach(&paths).map_err(|err| delivery_mode_error(&handle, err))?;
     serde_json::to_writer(io::stdout(), &outcome).map_err(json_write_error)?;
     io::stdout().write_all(b"\n").map_err(json_write_error)
@@ -552,9 +560,19 @@ fn json_write_error(err: impl std::fmt::Display) -> AppError {
     AppError::new(EX_IOERR, format!("agent-bash: failed to write JSON: {err}"))
 }
 
-fn status_command(handle: String, tail_bytes: u64, full: bool) -> Result<(), AppError> {
+fn status_command(
+    handle: String,
+    tail_bytes: u64,
+    full: bool,
+    caller: CallerAuthority,
+) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
-    let meta = reconcile_status_meta(&paths, &handle)?;
+    let meta = read_meta_for_handle(&paths, &handle)?;
+    let meta = if caller_controls_handle(&meta, &paths, &caller) {
+        reconcile_status_meta(&paths, &handle, meta)?
+    } else {
+        meta
+    };
 
     let rc_from_file = if rc_file_exists(&paths) {
         Some(read_rc_for_handle(&paths, &handle)?)
@@ -572,8 +590,11 @@ fn status_command(handle: String, tail_bytes: u64, full: bool) -> Result<(), App
     Ok(())
 }
 
-fn reconcile_status_meta(paths: &StatePaths, handle: &str) -> Result<Meta, AppError> {
-    let mut meta = read_meta_for_handle(paths, handle)?;
+fn reconcile_status_meta(
+    paths: &StatePaths,
+    handle: &str,
+    mut meta: Meta,
+) -> Result<Meta, AppError> {
     if delivery::completion_delivery_pending(&meta) {
         delivery::reconcile_completion_delivery(paths, &mut meta)
             .map_err(|err| status_reconciliation_error(handle, err))?;
@@ -790,19 +811,14 @@ fn read_open_status_log(mut file: std::fs::File) -> io::Result<Vec<u8>> {
     Ok(output)
 }
 
-fn list_command(
-    caller_ppid: libc::pid_t,
-    owner_session_id: Option<String>,
-    all: bool,
-    json: bool,
-) -> Result<(), AppError> {
+fn list_command(caller: CallerAuthority, all: bool, json: bool) -> Result<(), AppError> {
     let root = load_state_root().map_err(state_root_unavailable)?;
-    let caller_chain = if all {
-        Vec::new()
-    } else {
-        state::capture_caller_chain(caller_ppid)
-    };
-    let mut summaries = list_summaries(&root, &caller_chain, owner_session_id.as_deref(), all)?;
+    let mut summaries = list_summaries(
+        &root,
+        &caller.caller_chain,
+        caller.owner_session_id.as_deref(),
+        all,
+    )?;
     sort_summaries(&mut summaries);
     emit_list_summaries(&summaries, json)?;
     Ok(())
@@ -866,7 +882,13 @@ fn list_summary_for_entry(
         return None;
     }
     let paths = paths_for_entry(root, &entry);
-    let meta = reconcile_list_meta(&paths, read_entry_meta(&paths)?)?;
+    let meta = read_entry_meta(&paths)?;
+    let owned = handle_owned_by(&meta, &paths, caller_chain, owner_session_id);
+    let meta = if owned {
+        reconcile_list_meta(&paths, meta)?
+    } else {
+        meta
+    };
     if !include_list_meta(&meta, &paths, caller_chain, owner_session_id, all) {
         return None;
     }
@@ -900,12 +922,20 @@ fn include_list_meta(
     owner_session_id: Option<&str>,
     all: bool,
 ) -> bool {
-    if all {
-        return true;
-    }
-    if owner_session_matches(meta, paths, owner_session_id) {
-        return true;
-    }
+    all || handle_owned_by(meta, paths, caller_chain, owner_session_id)
+}
+
+fn handle_owned_by(
+    meta: &Meta,
+    paths: &StatePaths,
+    caller_chain: &[state::CallerChainEntry],
+    owner_session_id: Option<&str>,
+) -> bool {
+    owner_session_matches(meta, paths, owner_session_id)
+        || caller_chain_owns_handle(meta, caller_chain)
+}
+
+fn caller_chain_owns_handle(meta: &Meta, caller_chain: &[state::CallerChainEntry]) -> bool {
     let Some(anchor) = meta.caller_chain.first() else {
         return false;
     };
@@ -917,6 +947,37 @@ fn include_list_meta(
             && entry.starttime_ticks == anchor.starttime_ticks
             && entry.boot_id == anchor.boot_id
     })
+}
+
+fn caller_authority(guard: &AttachedGuard) -> CallerAuthority {
+    CallerAuthority {
+        caller_chain: state::capture_caller_chain(guard.startup_ppid()),
+        owner_session_id: nonempty_env(OWNER_SESSION_ID_ENV),
+    }
+}
+
+fn caller_controls_handle(meta: &Meta, paths: &StatePaths, caller: &CallerAuthority) -> bool {
+    handle_owned_by(
+        meta,
+        paths,
+        &caller.caller_chain,
+        caller.owner_session_id.as_deref(),
+    )
+}
+
+fn require_control_authority(
+    paths: &StatePaths,
+    handle: &str,
+    caller: &CallerAuthority,
+) -> Result<(), AppError> {
+    let meta = read_meta_for_handle(paths, handle)?;
+    if caller_controls_handle(&meta, paths, caller) {
+        return Ok(());
+    }
+    Err(AppError::new(
+        EX_NOPERM,
+        format!("agent-bash: caller does not own handle {handle}"),
+    ))
 }
 
 fn owner_session_matches(meta: &Meta, paths: &StatePaths, owner_session_id: Option<&str>) -> bool {

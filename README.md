@@ -37,7 +37,9 @@ completion returns synchronously in-band or asynchronously through the agent mai
   OpenCode tool abort terminates the complete adopted process tree, escalating to `SIGKILL` after
   a bounded grace period. A direct cancel is accepted when its durable marker is synchronized;
   signaling only wakes the supervisor, which also observes the marker independently. Direct CLI
-  runs remain detached unless they explicitly request a lease.
+  runs remain detached unless they explicitly request a lease. Direct cancel and detach require
+  the handle's recorded session or exact caller-tree ownership; `list --all` is observation, not a
+  grant of control authority.
 - **Completion: root, tree, or sentinel.** Finite jobs use an explicit process boundary;
   never-exiting servers report ready on a stdout marker. Nothing is assumed to exit.
 - **Async delivery via agent-runner.** For asynchronous completion the spooler asks agent-runner
@@ -57,7 +59,9 @@ Conclusive process-launch failures remain pre-admission and get one bounded retr
 the authority for mailbox transactions and deduplication after accepting an invocation. The helper
 is an opaque, trusted same-account extension; its internal mailbox effects are outside this
 repository's state machine. State directories and the helper cache are protected between Unix
-accounts, not between mutually untrusted processes running as the same account.
+accounts, not between mutually untrusted processes running as the same account. Within that trust
+boundary, the CLI still enforces recorded handle ownership before a caller may cancel, detach, or
+spend a status-triggered delivery retry.
 
 ## Build
 

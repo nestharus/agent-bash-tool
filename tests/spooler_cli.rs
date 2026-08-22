@@ -222,6 +222,7 @@ fn seed_done_state_dir(
 }
 
 fn done_state_meta(handle: &str, updated_at_unix_ms: u64) -> Value {
+    let (caller_identity, _) = proc_identity(unsafe { libc::getpid() }).expect("caller identity");
     json!({
         "schema_version": 1,
         "handle": handle,
@@ -230,7 +231,7 @@ fn done_state_meta(handle: &str, updated_at_unix_ms: u64) -> Value {
         "state": "DONE",
         "completion_reason": "exit",
         "caller_ppid": unsafe { libc::getpid() },
-        "caller_chain": [],
+        "caller_chain": [exact_identity(&caller_identity)],
         "launcher_pid": unsafe { libc::getpid() },
         "supervisor_pid": null,
         "workload_pid": null,
@@ -1010,6 +1011,7 @@ fn seed_running_state_dir(
 ) -> Value {
     let state_dir = temp.path().join("agent-bash").join(handle);
     fs::create_dir_all(&state_dir).expect("state dir");
+    let (caller_identity, _) = proc_identity(unsafe { libc::getpid() }).expect("caller identity");
     let meta = json!({
         "schema_version": 1,
         "handle": handle,
@@ -1018,7 +1020,7 @@ fn seed_running_state_dir(
         "state": "RUNNING",
         "completion_reason": null,
         "caller_ppid": unsafe { libc::getpid() },
-        "caller_chain": [],
+        "caller_chain": [exact_identity(&caller_identity)],
         "launcher_pid": unsafe { libc::getpid() },
         "supervisor_pid": supervisor_identity.as_ref().and_then(|value| value["pid"].as_i64()),
         "supervisor_pid_starttime_ticks": supervisor_identity
@@ -1229,7 +1231,7 @@ set -eu
 test -z "${AGENT_BASH_OWNER_SESSION_ID+x}"
 test -z "${AGENT_BASH_OWNER_INVOCATION_UUID+x}"
 if [ "$OWNER_WORKLOAD_RELEASABLE" = 1 ]; then
-    "$AGENT_BASH_BIN" run -- bash -lc 'for _ in {1..800}; do [ -e "$OWNER_WORKLOAD_RELEASE" ] && exit 0; sleep 0.01; done; exit 1' > "$RUN_JSON"
+    "$AGENT_BASH_BIN" run --delivery sync -- bash -lc 'for _ in {1..800}; do [ -e "$OWNER_WORKLOAD_RELEASE" ] && exit 0; sleep 0.01; done; exit 1' > "$RUN_JSON"
 else
     "$AGENT_BASH_BIN" run -- sleep "$OWNER_WORKLOAD_SECONDS" > "$RUN_JSON"
 fi
@@ -1709,7 +1711,12 @@ fn supervisor_finishes_durable_cancel_without_wakeup_signal() {
 fn cancel_without_a_live_exact_supervisor_is_an_idempotent_noop() {
     let temp = tempfile::tempdir().expect("tempdir");
     let handle = "ab_cancel_missing_supervisor";
-    let meta = active_state_meta(handle, unsafe { libc::getpid() }, json!([]));
+    let (caller_identity, _) = proc_identity(unsafe { libc::getpid() }).expect("caller identity");
+    let meta = active_state_meta(
+        handle,
+        unsafe { libc::getpid() },
+        json!([exact_identity(&caller_identity)]),
+    );
     seed_active_state_dir(&temp, handle, &meta);
 
     for _ in 0..2 {
@@ -1744,7 +1751,12 @@ fn cancel_rejects_a_live_pid_with_stale_supervisor_identity() {
     let pid = process.id() as libc::pid_t;
     let (identity, _) = proc_identity(pid).expect("live process identity");
     let handle = "ab_cancel_stale_supervisor";
-    let mut meta = active_state_meta(handle, unsafe { libc::getpid() }, json!([]));
+    let (caller_identity, _) = proc_identity(unsafe { libc::getpid() }).expect("caller identity");
+    let mut meta = active_state_meta(
+        handle,
+        unsafe { libc::getpid() },
+        json!([exact_identity(&caller_identity)]),
+    );
     meta["supervisor_pid"] = json!(pid);
     meta["supervisor_pid_starttime_ticks"] = json!(identity.starttime_ticks + 1);
     meta["process_boot_id"] = json!(read_boot_id());
@@ -2510,6 +2522,8 @@ fn list_adopts_handle_owned_by_resumed_session_after_caller_pid_changes() {
     let meta_path = state_dir.join("meta.json");
     let mut meta = read_meta(&meta_path);
     meta["caller_ppid"] = json!(i32::MAX);
+    meta["caller_chain"] = json!([]);
+    meta["delivery"]["retryable"] = json!(true);
     fs::write(&meta_path, format_seeded_meta(&meta)).expect("write resumed owner meta");
     fs::write(
         state_dir.join("owner.json"),
@@ -2534,6 +2548,30 @@ fn list_adopts_handle_owned_by_resumed_session_after_caller_pid_changes() {
         .expect("other list");
     assert_command_success(&other);
     assert_eq!(parse_stdout_json(&other), json!([]));
+
+    let unrelated_status = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_other")
+        .args(["status", "--full", "ab_resumed_owner"])
+        .output()
+        .expect("unrelated status");
+    assert_command_success(&unrelated_status);
+    let unchanged = read_meta(&meta_path);
+    assert_eq!(unchanged["delivery"]["attempted"], false);
+    assert!(unchanged["delivery"]["error_code"].is_null());
+    assert_eq!(unchanged["delivery"]["retryable"], true);
+
+    let owner_status = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_resumed")
+        .args(["status", "--full", "ab_resumed_owner"])
+        .output()
+        .expect("owner status");
+    assert_command_success(&owner_status);
+    let reconciled = read_meta(&meta_path);
+    assert_eq!(
+        reconciled["delivery"]["error_code"],
+        "delivery_helper_legacy_unsupported"
+    );
+    assert_eq!(reconciled["delivery"]["retryable"], false);
 }
 
 #[test]
@@ -2690,6 +2728,7 @@ fn opencode_adapter_sync_wait_returns_when_handle_is_detached() {
     assert_eq!(mode_text(&temp, &handle), "sync");
 
     let detach = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_adapter")
         .args(["detach", &handle])
         .output()
         .expect("detach command");
@@ -2856,6 +2895,14 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
     let active_status = status_text(&temp, &handle, false);
     let unrelated = shell_list_json(&temp, false);
     let all_access = shell_list_json(&temp, true);
+    let unrelated_cancel = agent_bash(&temp)
+        .args(["cancel", &handle])
+        .output()
+        .expect("unrelated cancel");
+    let unrelated_detach = agent_bash(&temp)
+        .args(["detach", &handle])
+        .output()
+        .expect("unrelated detach");
 
     fs::write(&owner.list_now, b"").expect("release owner list");
     let owner_status = owner.wait().expect("owner scenario");
@@ -2896,6 +2943,25 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
         all_access.iter().any(|entry| entry["handle"] == handle),
         "explicit --all did not expose workload {handle}: {all_access:?}"
     );
+    assert_eq!(unrelated_cancel.status.code(), Some(77));
+    assert!(
+        String::from_utf8_lossy(&unrelated_cancel.stderr).contains("caller does not own handle"),
+        "{}",
+        command_failure_message(&unrelated_cancel)
+    );
+    assert_eq!(unrelated_detach.status.code(), Some(77));
+    assert!(
+        String::from_utf8_lossy(&unrelated_detach.stderr).contains("caller does not own handle"),
+        "{}",
+        command_failure_message(&unrelated_detach)
+    );
+    assert!(
+        !Path::new(run_json["state_dir"].as_str().expect("state dir"))
+            .join("cancel-requested")
+            .exists(),
+        "unrelated cancellation created the durable acceptance marker"
+    );
+    assert_eq!(mode_text(&temp, &handle), "sync");
     assert!(final_status.contains("--- output ---"));
 }
 
