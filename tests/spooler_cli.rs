@@ -488,7 +488,7 @@ fn parent_killing_fake_agents(
     fs::write(
         &fake,
         format!(
-            "#!/bin/sh\noperation=${{2:-}}\nif [ \"$operation\" = {} ]; then\n  printf '%s\\n' \"$operation\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\n  kill -KILL \"$PPID\"\nfi\nexit 0\n",
+            "#!/bin/sh\noperation=${{2:-}}\nif [ \"$operation\" = {} ]; then\n  printf '%s\\n' \"$operation\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\n  caller_pid=$(ps -o ppid= -p \"$PPID\")\n  kill -KILL \"$caller_pid\"\nfi\nexit 0\n",
             shell_quote(Path::new(killed_operation))
         ),
     )
