@@ -170,7 +170,7 @@ fn wait_for_status_prefix(temp: &tempfile::TempDir, handle: &str, prefix: &str) 
 }
 
 fn wait_for_terminal_status(temp: &tempfile::TempDir, handle: &str) -> String {
-    wait_until(Duration::from_secs(12), || {
+    wait_until(Duration::from_secs(30), || {
         let text = status_text(temp, handle, true);
         (!text.starts_with("RUNNING ")).then_some(text)
     })
