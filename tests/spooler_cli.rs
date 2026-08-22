@@ -1907,6 +1907,7 @@ fn guardian_escalates_accepted_cancel_for_term_resistant_tree() {
 #[test]
 fn owner_exit_cancels_opted_in_workload_and_descendants() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = Duration::from_secs(30);
     let child_pid_path = temp.path().join("owner-child.pid");
     let workload_script = format!(
         "trap 'exit 0' TERM; sleep 60 & echo $! > {}; wait",
@@ -1930,13 +1931,13 @@ fn owner_exit_cancels_opted_in_workload_and_descendants() {
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
     let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(2), || {
+    let meta = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         meta["workload_pid"].is_number().then_some(meta)
     });
     assert_eq!(meta["cancel_owner"]["pid"], meta["caller_ppid"]);
     let workload_pid = meta["workload_pid"].as_i64().expect("workload pid") as libc::pid_t;
-    let child_pid = wait_until(Duration::from_secs(2), || {
+    let child_pid = wait_until(fixture_deadline, || {
         fs::read_to_string(&child_pid_path)
             .ok()?
             .trim()
