@@ -186,6 +186,16 @@ completion, status recovery, and guardian recovery accept only that handle-local
 metadata and digest, copy it into a sealed in-memory image, and execute the sealed bytes. Replacing
 or editing the configured source path after registration cannot change an in-flight handle.
 
+Registration also pins the helper's execution environment. Helper commands clear the initiating
+process's ambient environment, run from `/`, and restore only a bounded baseline (`HOME`, locale,
+user, `PATH`, temporary-directory, and XDG/agent-runner data paths) plus non-secret variables named
+by `AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST` at registration. The explicit values are durable
+provenance and must not contain credentials. The caller-bound completion-registration authority is
+the sole transient exception: it is injected only into the immediate registration invocation and
+is neither persisted nor replayed. A later detach, status, supervisor, or guardian process therefore
+cannot alter interpreter lookup, the agent-runner data namespace, or an explicitly declared helper
+input through its own environment.
+
 The helper cache lock serializes cache installation, per-handle linking, and removal of cache entries
 with no remaining handle links. Warm-cache content validation occurs before the lock; the critical
 section rechecks the validated file identity before linking it. This keeps one physical snapshot per
@@ -205,7 +215,7 @@ The selected helper is an opaque trusted extension at this boundary. Its operati
 maintain downstream state, but this repository claims only pinned byte identity, invocation
 admission, and the observed helper-process outcome, not closure over arbitrary helper internals.
 
-Helper provenance schema 2 is the activation boundary for this convention. A deployment owner must
+Helper provenance schema 3 is the activation boundary for this convention. A deployment owner must
 drain handles created by older binaries before rollout. Draining includes explicitly terminating or
 otherwise settling never-ending old-schema handles; rollout must not wait on them indefinitely.
 Records with missing or older provenance are deliberately retired: later activation or completion fails closed with

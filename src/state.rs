@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -100,6 +101,8 @@ pub(crate) struct DeliveryHelperProvenance {
     pub(crate) mode: u32,
     #[serde(default)]
     pub(crate) sha256: String,
+    #[serde(default)]
+    pub(crate) environment: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

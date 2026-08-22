@@ -47,8 +47,12 @@ completion returns synchronously in-band or asynchronously through the agent mai
   whose session the caller is and hands over the result; agent-runner wakes (headless: `resume`) or
   forwards (PTY). Synchronous completion never enters that mailbox.
 - **Pinned delivery helper.** Registration snapshots the selected helper into a content-addressed,
-  account-private cache and hard-links that exact version into the handle. A normal helper upgrade
-  therefore cannot substitute or strand operations for handles already in flight.
+  account-private cache and hard-links that exact version into the handle. It also records a small
+  execution environment and clears later callers' ambient environment before every helper launch.
+  Additional non-secret variables must be named at registration in
+  `AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST`; their values become durable handle provenance. A normal
+  helper upgrade or later caller environment therefore cannot substitute or strand operations for
+  handles already in flight.
 
 The spooler is **general and provider-agnostic** — it knows nothing about agents or sessions and
 talks to agent-runner only over its CLI. See [`docs/DESIGN.md`](docs/DESIGN.md) for the full

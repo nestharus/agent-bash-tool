@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -14,6 +15,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const FIXTURE_DEADLINE: Duration = Duration::from_secs(30);
+const FAKE_HELPER_ENVIRONMENT: &str = "AGENT_BASH_FAKE_ACTIVATE_RELEASE,AGENT_BASH_FAKE_ACTIVATE_STARTED,AGENT_BASH_FAKE_COMPLETE_FINISHED,AGENT_BASH_FAKE_COMPLETE_RELEASE,AGENT_BASH_FAKE_COMPLETE_STARTED,AGENT_BASH_FAKE_DELIVERY_LOG,AGENT_BASH_FAKE_FIRST_MISS_MARKER,AGENT_BASH_FAKE_META_SNAPSHOT,AGENT_BASH_FAKE_RC_SNAPSHOT,AGENT_BASH_FAKE_RESOLVED_SESSION,AGENT_BASH_FAKE_RESOLVER_DELAY,AGENT_BASH_FAKE_RESOLVER_LOG,AGENT_BASH_FAKE_ROUTE";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ProcIdentity {
@@ -25,6 +27,10 @@ fn agent_bash(temp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("agent-bash").expect("agent-bash binary");
     cmd.env("XDG_STATE_HOME", temp.path())
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env(
+            "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST",
+            FAKE_HELPER_ENVIRONMENT,
+        )
         .env_remove("AGENT_BASH_CONSUMER_GRACE_MS")
         .env_remove("OULIPOLY_PARENT_INVOCATION")
         .env_remove("OULIPOLY_DATA_DIR");
@@ -351,7 +357,11 @@ fn write_consumed_marker(state_dir: &Path) {
     fs::write(state_dir.join("consumed"), b"").expect("write consumed");
 }
 
-fn write_delivery_helper_provenance(state_dir: &Path, helper: &Path) {
+fn write_delivery_helper_provenance(
+    state_dir: &Path,
+    helper: &Path,
+    environment: &[(&str, &Path)],
+) {
     let snapshot = state_dir.join("delivery-helper");
     fs::copy(helper, &snapshot).expect("copy helper snapshot");
     let mut permissions = fs::metadata(&snapshot)
@@ -365,8 +375,12 @@ fn write_delivery_helper_provenance(state_dir: &Path, helper: &Path) {
         "{:x}",
         Sha256::digest(fs::read(&snapshot).expect("read snapshot"))
     );
+    let environment = environment
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), value.to_string_lossy().into_owned()))
+        .collect::<BTreeMap<_, _>>();
     let provenance = json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "path": snapshot.to_str().expect("UTF-8 helper path"),
         "device": metadata.dev(),
         "inode": metadata.ino(),
@@ -375,6 +389,7 @@ fn write_delivery_helper_provenance(state_dir: &Path, helper: &Path) {
         "modified_nanoseconds": metadata.mtime_nsec(),
         "mode": metadata.mode(),
         "sha256": sha256,
+        "environment": environment,
     });
     let meta_path = state_dir.join("meta.json");
     let mut meta = read_meta(&meta_path);
@@ -782,6 +797,10 @@ fn adapter_driver_command(
         .arg(adapter_module_path())
         .env("AGENT_BASH_BIN", adapter_agent_bash)
         .env(
+            "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST",
+            FAKE_HELPER_ENVIRONMENT,
+        )
+        .env(
             "AGENT_BASH_AGENT_RUNNER_BIN",
             owner_resolving_fake_agents(temp),
         )
@@ -1078,7 +1097,15 @@ fn status_with_observing_delivery(
 ) -> Output {
     let state_dir = temp.path().join("agent-bash").join(handle);
     if read_meta(&state_dir.join("meta.json"))["delivery_helper"].is_null() {
-        write_delivery_helper_provenance(&state_dir, fake);
+        write_delivery_helper_provenance(
+            &state_dir,
+            fake,
+            &[
+                ("AGENT_BASH_FAKE_DELIVERY_LOG", delivery_log),
+                ("AGENT_BASH_FAKE_META_SNAPSHOT", meta_snapshot),
+                ("AGENT_BASH_FAKE_RC_SNAPSHOT", rc_snapshot),
+            ],
+        );
     }
     let mut cmd = agent_bash(temp);
     cmd.env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
@@ -3448,6 +3475,14 @@ fn delivery_owner_finishes_after_detach_caller_dies() {
     let fixture = blocking_delivery_fake_agents(&temp);
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &fixture.helper)
+        .env(
+            "AGENT_BASH_FAKE_ACTIVATE_STARTED",
+            &fixture.activation_started,
+        )
+        .env(
+            "AGENT_BASH_FAKE_ACTIVATE_RELEASE",
+            &fixture.activation_release,
+        )
         .env("AGENT_BASH_FAKE_DELIVERY_LOG", &fixture.delivery_log)
         .args(["run", "--delivery", "sync", "--", "sleep", "60"])
         .output()
@@ -3673,6 +3708,87 @@ fn observer_cannot_substitute_registered_delivery_helper() {
         !log_b.exists(),
         "observer helper received registered-handle operations: {}",
         fs::read_to_string(&log_b).unwrap_or_default()
+    );
+}
+
+#[test]
+fn later_caller_cannot_substitute_registered_helper_environment() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let helper = temp.path().join("environment-bound-agents");
+    let log = temp.path().join("environment-bound.log");
+    fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nauthority=absent\n[ -n \"${{OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY:-}}\" ] && authority=present\nprintf '%s:%s:%s\\n' \"${{AGENT_BASH_FAKE_ROUTE-unset}}\" \"${{2:-}}\" \"$authority\" >> {}\nexit 0\n",
+            shell_quote(&log)
+        ),
+    )
+    .expect("write environment-bound helper");
+    set_executable(&helper);
+    let release = temp.path().join("environment-bound-release");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env("AGENT_BASH_FAKE_ROUTE", "registered")
+        .env(
+            "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .env("RELEASE", &release)
+        .args([
+            "run",
+            "--delivery",
+            "sync",
+            "--",
+            "bash",
+            "-lc",
+            "while [ ! -e \"$RELEASE\" ]; do sleep 0.01; done",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let helper_environment = &read_meta(&meta_path(&json))["delivery_helper"]["environment"];
+    assert_eq!(helper_environment["AGENT_BASH_FAKE_ROUTE"], "registered");
+    assert!(
+        helper_environment["OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY"].is_null(),
+        "transient registration authority was persisted: {helper_environment}"
+    );
+
+    let detach = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env("AGENT_BASH_FAKE_ROUTE", "later-caller")
+        .args(["detach", handle])
+        .output()
+        .expect("detach");
+    assert_command_success(&detach);
+    fs::write(&release, b"").expect("release workload");
+    let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+    wait_until(FIXTURE_DEADLINE, || {
+        let operations = fs::read_to_string(&log).unwrap_or_default();
+        operations
+            .lines()
+            .any(|line| line == "registered:agent-bash-complete:absent")
+            .then_some(())
+    });
+
+    let operations = fs::read_to_string(&log).expect("helper log");
+    assert!(
+        operations
+            .lines()
+            .any(|line| line == "registered:agent-bash-register:present"),
+        "registration authority did not reach only the registration helper: {operations}"
+    );
+    assert!(
+        operations
+            .lines()
+            .any(|line| line == "registered:agent-bash-activate:absent"),
+        "registered environment did not reach detach helper: {operations}"
+    );
+    assert!(
+        !operations
+            .lines()
+            .any(|line| line.starts_with("later-caller:")),
+        "later caller substituted helper environment: {operations}"
     );
 }
 
@@ -4661,7 +4777,7 @@ fn list_all_reconciles_lost_supervisors_without_claiming_delivery() {
         Some(dead_workload),
         false,
     );
-    write_delivery_helper_provenance(&temp.path().join("agent-bash").join(handle), &observer);
+    write_delivery_helper_provenance(&temp.path().join("agent-bash").join(handle), &observer, &[]);
 
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &observer)
