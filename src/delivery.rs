@@ -77,6 +77,18 @@ pub(crate) struct DeliveryRegistration {
     helper: DeliveryHelper,
 }
 
+struct DeliveryLockGuard {
+    _file: File,
+}
+
+impl DeliveryLockGuard {
+    fn acquire(paths: &StatePaths) -> io::Result<Self> {
+        Ok(Self {
+            _file: state::lock_delivery(paths)?,
+        })
+    }
+}
+
 impl DeliveryRegistration {
     pub(crate) fn provenance(&self) -> DeliveryHelperProvenance {
         self.helper.provenance.clone()
@@ -819,7 +831,7 @@ pub(crate) fn reconcile_completion_delivery(
     paths: &StatePaths,
     meta: &mut Meta,
 ) -> std::io::Result<()> {
-    let _lock = state::lock_delivery(paths)?;
+    let delivery_lock = DeliveryLockGuard::acquire(paths)?;
     let mut persisted = state::read_meta(paths)?;
     let mode = state::read_delivery_mode(paths)?;
     persisted.delivery_mode = mode;
@@ -850,7 +862,7 @@ pub(crate) fn reconcile_completion_delivery(
             return Ok(());
         }
     };
-    let owner_result = run_delivery_owner(|| {
+    let owner_result = run_delivery_owner_holding_lock(&delivery_lock, || {
         persisted.delivery = delivery_attempt_started_meta();
         persisted.touch();
         state::write_meta_atomic(paths, &persisted)?;
@@ -880,7 +892,7 @@ pub(crate) fn reconcile_completion_delivery(
 }
 
 pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
-    let delivery_lock = state::lock_delivery(paths)?;
+    let delivery_lock = DeliveryLockGuard::acquire(paths)?;
     let mode = state::read_delivery_mode(paths)?;
     if mode == DeliveryMode::Async {
         let meta = repair_delivery_mode_mirror(paths, DeliveryMode::Async)?;
@@ -890,7 +902,7 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
 
     let meta = state::read_meta(paths)?;
     let request = activate_request(&meta, paths).map_err(io::Error::other)?;
-    run_delivery_owner(|| {
+    run_delivery_owner_holding_lock(&delivery_lock, || {
         let claimed = state::record_activation_attempt(paths)?;
         if let Err(err) = state::write_delivery_mode_atomic(paths, DeliveryMode::Async) {
             if claimed {
@@ -925,7 +937,10 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
     Ok(detach_outcome(&meta, true, state::terminal(&meta)))
 }
 
-fn run_delivery_owner(operation: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+fn run_delivery_owner_holding_lock(
+    _delivery_lock: &DeliveryLockGuard,
+    operation: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(io::Error::last_os_error());
