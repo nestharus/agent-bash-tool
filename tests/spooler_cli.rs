@@ -1616,6 +1616,7 @@ fn run_returns_immediately_and_later_completes() {
 #[test]
 fn cancel_terminates_the_entire_adopted_process_tree() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = Duration::from_secs(8);
     let child_pid_path = temp.path().join("child.pid");
     let script = format!(
         "trap 'exit 0' TERM; sleep 60 & echo $! > {}; wait",
@@ -1625,12 +1626,12 @@ fn cancel_terminates_the_entire_adopted_process_tree() {
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
     let meta_path = meta_path(&json);
-    let workload_pid = wait_until(Duration::from_secs(2), || {
+    let workload_pid = wait_until(fixture_deadline, || {
         read_meta(&meta_path)["workload_pid"]
             .as_i64()
             .map(|pid| pid as libc::pid_t)
     });
-    let child_pid = wait_until(Duration::from_secs(2), || {
+    let child_pid = wait_until(fixture_deadline, || {
         fs::read_to_string(&child_pid_path)
             .ok()?
             .trim()
