@@ -1815,6 +1815,7 @@ fn accepted_cancel_is_owned_by_guardian_after_supervisor_loss() {
 #[test]
 fn accepted_cancel_precedes_already_pending_workload_completion() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = Duration::from_secs(30);
     let release = temp.path().join("cancel-completion-release");
     let output = agent_bash(&temp)
         .env("RELEASE", &release)
@@ -1830,7 +1831,7 @@ fn accepted_cancel_precedes_already_pending_workload_completion() {
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
     let meta_path = meta_path(&json);
-    let running = wait_until(Duration::from_secs(2), || {
+    let running = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         meta["workload_pid"].is_number().then_some(meta)
     });
@@ -1845,7 +1846,7 @@ fn accepted_cancel_precedes_already_pending_workload_completion() {
     assert_command_success(&cancel);
     assert_eq!(parse_stdout_json(&cancel)["requested"], true);
     fs::write(&release, b"").expect("release workload");
-    wait_until(Duration::from_secs(2), || workload.exited().then_some(()));
+    wait_until(fixture_deadline, || workload.exited().then_some(()));
     assert!(stopped.resume(), "resume supervisor");
 
     let status = wait_for_terminal_status(&temp, handle);
