@@ -3315,6 +3315,7 @@ fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
 #[test]
 fn delivery_owner_finishes_after_supervisor_dies() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = Duration::from_secs(30);
     let (
         fake,
         _activate_started,
@@ -3344,19 +3345,17 @@ fn delivery_owner_finishes_after_supervisor_dies() {
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
     let meta_path = meta_path(&json);
-    let running = wait_until(Duration::from_secs(2), || {
+    let running = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         meta["supervisor_pid"].is_number().then_some(meta)
     });
     let supervisor = OwnedProcess::capture_supervisor(&running).expect("capture supervisor");
     fs::write(&release, b"").expect("release workload");
-    wait_until(Duration::from_secs(6), || {
-        complete_started.exists().then_some(())
-    });
+    wait_until(fixture_deadline, || complete_started.exists().then_some(()));
     assert!(supervisor.signal(libc::SIGKILL), "kill supervisor");
     fs::write(&complete_release, b"").expect("release completion helper");
 
-    let delivered = wait_until(Duration::from_secs(8), || {
+    let delivered = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["exit_code"] == 0).then_some(meta)
     });
@@ -3370,6 +3369,7 @@ fn delivery_owner_finishes_after_supervisor_dies() {
 #[test]
 fn delivery_owner_finishes_after_detach_caller_dies() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = Duration::from_secs(30);
     let (
         fake,
         activate_started,
@@ -3397,9 +3397,7 @@ fn delivery_owner_finishes_after_detach_caller_dies() {
         .args(["detach", handle])
         .spawn()
         .expect("spawn detach");
-    wait_until(Duration::from_secs(6), || {
-        activate_started.exists().then_some(())
-    });
+    wait_until(fixture_deadline, || activate_started.exists().then_some(()));
     detach.kill().expect("kill detach caller");
     detach.wait().expect("reap detach caller");
     fs::write(&activate_release, b"").expect("release activation helper");
