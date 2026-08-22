@@ -114,6 +114,9 @@ even when the supervisor died before publishing workload identity. The shared te
 operation then records `cancel-request`, status 143, instead of `supervisor-lost`. Recovery without
 an accepted cancel continues to require both exact identities and fails closed when either is
 missing. Every non-sentinel terminal producer uses that same precedence decision.
+`CancellationCause` carries the provisional event-loop cause through finish selection and terminal
+proposal. The terminal publisher then finalizes it from the durable marker while holding
+`completion.lock`; the same type owns the persisted labels and status projection.
 
 `cancel-requested` and `activation-attempted` use one state-layer durable create-once marker
 primitive. It opens the state directory before marker creation, syncs the created file and directory,

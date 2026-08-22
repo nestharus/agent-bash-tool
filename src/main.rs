@@ -683,8 +683,7 @@ enum DoneReason {
     Exit,
     ReadySentinel { workload_running: bool },
     ExitBeforeReady,
-    CancelRequest,
-    OwnerExit,
+    Cancellation(supervisor::CancellationCause),
 }
 
 fn render_status_header(meta: &Meta, rc_from_file: Option<i32>) -> Result<String, AppError> {
@@ -738,13 +737,18 @@ fn corrupt_state_error(meta: &Meta) -> AppError {
 }
 
 fn done_reason(meta: &Meta) -> DoneReason {
+    if let Some(cause) = meta
+        .completion_reason
+        .as_deref()
+        .and_then(supervisor::CancellationCause::from_completion_reason)
+    {
+        return DoneReason::Cancellation(cause);
+    }
     match (meta.mode.as_str(), meta.completion_reason.as_deref()) {
         ("sentinel", Some("ready-sentinel")) => DoneReason::ReadySentinel {
             workload_running: meta.workload_rc.is_none(),
         },
         ("sentinel", Some("exit-before-ready")) => DoneReason::ExitBeforeReady,
-        (_, Some("cancel-request")) => DoneReason::CancelRequest,
-        (_, Some("owner-exit")) => DoneReason::OwnerExit,
         _ => DoneReason::Exit,
     }
 }
@@ -766,10 +770,10 @@ fn format_done_header(handle: &str, rc: i32, reason: &DoneReason) -> String {
         DoneReason::ExitBeforeReady => {
             format!("DONE rc={rc} handle={handle} reason=exit-before-ready")
         }
-        DoneReason::CancelRequest => {
-            format!("DONE rc={rc} handle={handle} reason=cancel-request")
-        }
-        DoneReason::OwnerExit => format!("DONE rc={rc} handle={handle} reason=owner-exit"),
+        DoneReason::Cancellation(cause) => format!(
+            "DONE rc={rc} handle={handle} reason={}",
+            cause.completion_reason()
+        ),
         DoneReason::Exit => format!("DONE rc={rc} handle={handle}"),
     }
 }

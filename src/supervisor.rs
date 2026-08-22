@@ -993,8 +993,74 @@ struct EventLoop {
 }
 
 struct Cancellation {
-    reason: &'static str,
+    provisional_cause: CancellationCause,
     started_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancellationCause {
+    OwnerExit,
+    ExplicitRequest,
+}
+
+impl CancellationCause {
+    fn with_precedence_over(self, other: Self) -> Self {
+        if matches!(self, Self::ExplicitRequest) || matches!(other, Self::ExplicitRequest) {
+            Self::ExplicitRequest
+        } else {
+            Self::OwnerExit
+        }
+    }
+
+    fn finalized(self, explicit_cancel_accepted: bool) -> Self {
+        if explicit_cancel_accepted {
+            self.with_precedence_over(Self::ExplicitRequest)
+        } else {
+            self
+        }
+    }
+
+    pub(crate) fn from_completion_reason(reason: &str) -> Option<Self> {
+        match reason {
+            "cancel-request" => Some(Self::ExplicitRequest),
+            "owner-exit" => Some(Self::OwnerExit),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn completion_reason(self) -> &'static str {
+        match self {
+            Self::ExplicitRequest => "cancel-request",
+            Self::OwnerExit => "owner-exit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitCompletionReason {
+    Exit,
+    ExitBeforeReady,
+    Cancellation(CancellationCause),
+}
+
+impl ExitCompletionReason {
+    fn completion_reason(self) -> &'static str {
+        match self {
+            Self::Exit => "exit",
+            Self::ExitBeforeReady => "exit-before-ready",
+            Self::Cancellation(cause) => cause.completion_reason(),
+        }
+    }
+
+    fn terminal_status(self, root_status: RootStatus) -> TerminalStatus {
+        match self {
+            Self::Cancellation(_) => cancellation_terminal_status(),
+            Self::Exit | Self::ExitBeforeReady => TerminalStatus {
+                rc: root_status.rc,
+                signal: root_status.signal,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1129,7 +1195,7 @@ impl EventLoop {
             PollKey::Pidfd => self.reap_children(),
             PollKey::OwnerPidfd => {
                 self.close_owner_pidfd();
-                self.request_cancellation("owner-exit");
+                self.request_cancellation(CancellationCause::OwnerExit);
                 Ok(())
             }
             PollKey::Cgroup => {
@@ -1142,7 +1208,7 @@ impl EventLoop {
     fn handle_sigchld(&mut self) -> io::Result<()> {
         let signals = self.sigchld.drain();
         if signals.cancel_requested {
-            self.request_cancellation("cancel-request");
+            self.request_cancellation(CancellationCause::ExplicitRequest);
         }
         self.reap_children()
     }
@@ -1161,7 +1227,7 @@ impl EventLoop {
 
     fn check_explicit_cancel(&mut self) {
         if explicit_cancel_accepted(&self.paths) {
-            self.request_cancellation("cancel-request");
+            self.request_cancellation(CancellationCause::ExplicitRequest);
         }
     }
 
@@ -1173,7 +1239,7 @@ impl EventLoop {
             return;
         };
         if !state::process_identity_is_live(owner) {
-            self.request_cancellation("owner-exit");
+            self.request_cancellation(CancellationCause::OwnerExit);
         }
     }
 
@@ -1183,36 +1249,31 @@ impl EventLoop {
         }
     }
 
-    fn request_cancellation(&mut self, reason: &'static str) {
-        let reason = self.cancellation_reason(reason);
-        if self.cancellation.is_none() {
-            self.cancellation = Some(Cancellation {
-                reason,
-                started_at: Instant::now(),
-            });
-        } else if reason == "cancel-request" {
-            self.cancellation.as_mut().expect("cancellation").reason = reason;
+    fn request_cancellation(&mut self, proposed_cause: CancellationCause) {
+        let proposed_cause = proposed_cause.finalized(explicit_cancel_accepted(&self.paths));
+        match self.cancellation.as_mut() {
+            Some(cancellation) => {
+                cancellation.provisional_cause = cancellation
+                    .provisional_cause
+                    .with_precedence_over(proposed_cause);
+            }
+            None => {
+                self.cancellation = Some(Cancellation {
+                    provisional_cause: proposed_cause,
+                    started_at: Instant::now(),
+                });
+            }
         }
         self.drive_cancellation();
     }
 
-    fn cancellation_reason(&self, fallback: &'static str) -> &'static str {
-        if fallback == "cancel-request" || explicit_cancel_accepted(&self.paths) {
-            "cancel-request"
-        } else {
-            fallback
-        }
-    }
-
     fn drive_cancellation(&mut self) {
-        if explicit_cancel_accepted(&self.paths)
-            && let Some(cancellation) = self.cancellation.as_mut()
-        {
-            cancellation.reason = "cancel-request";
-        }
         let Some(cancellation) = self.cancellation.as_mut() else {
             return;
         };
+        cancellation.provisional_cause = cancellation
+            .provisional_cause
+            .finalized(explicit_cancel_accepted(&self.paths));
         let signal = if cancellation.started_at.elapsed() >= CANCEL_GRACE {
             libc::SIGKILL
         } else {
@@ -1404,20 +1465,24 @@ impl EventLoop {
         )? {
             TerminalPublishResult::Published => self.completion_recorded = true,
             TerminalPublishResult::DeferredForAcceptedCancel => {
-                self.request_cancellation("cancel-request");
+                self.request_cancellation(CancellationCause::ExplicitRequest);
             }
         }
         Ok(())
     }
 
-    fn record_exit_completion(&mut self, root_status: RootStatus, reason: &str) -> io::Result<()> {
+    fn record_exit_completion(
+        &mut self,
+        root_status: RootStatus,
+        reason: ExitCompletionReason,
+    ) -> io::Result<()> {
         publish_terminal(
             &self.paths,
             &mut self.meta,
             Some(&mut self.log),
             TerminalProposal::Exit {
                 root_status,
-                reason: reason.to_string(),
+                reason,
             },
             CompletionDeliveryDisposition::ClaimInThisReconciliation,
         )?;
@@ -1502,7 +1567,7 @@ enum FinishDecision {
     SpawnError(String),
     Exit {
         root_status: RootStatus,
-        reason: &'static str,
+        reason: ExitCompletionReason,
     },
 }
 
@@ -1550,13 +1615,13 @@ impl CompletionScope {
     }
 }
 
-fn exit_completion_reason(loop_state: &EventLoop) -> &'static str {
+fn exit_completion_reason(loop_state: &EventLoop) -> ExitCompletionReason {
     if let Some(cancellation) = &loop_state.cancellation {
-        cancellation.reason
+        ExitCompletionReason::Cancellation(cancellation.provisional_cause)
     } else if loop_state.sentinel.is_some() {
-        "exit-before-ready"
+        ExitCompletionReason::ExitBeforeReady
     } else {
-        "exit"
+        ExitCompletionReason::Exit
     }
 }
 
@@ -1585,17 +1650,6 @@ fn apply_terminal_metadata(meta: &mut Meta, status: TerminalStatus, reason: &str
     meta.touch();
 }
 
-fn select_terminal_status(root_status: RootStatus, reason: &str) -> TerminalStatus {
-    if matches!(reason, "cancel-request" | "owner-exit") {
-        cancellation_terminal_status()
-    } else {
-        TerminalStatus {
-            rc: root_status.rc,
-            signal: root_status.signal,
-        }
-    }
-}
-
 fn cancellation_terminal_status() -> TerminalStatus {
     TerminalStatus {
         rc: signal_to_shell_rc(libc::SIGTERM),
@@ -1612,8 +1666,12 @@ fn apply_supervisor_error_metadata(meta: &mut Meta, message: String) {
     meta.touch();
 }
 
-fn apply_explicit_cancel_metadata(meta: &mut Meta) {
-    apply_terminal_metadata(meta, cancellation_terminal_status(), "cancel-request");
+fn apply_cancellation_metadata(meta: &mut Meta, cause: CancellationCause) {
+    apply_terminal_metadata(
+        meta,
+        cancellation_terminal_status(),
+        cause.completion_reason(),
+    );
     meta.error = None;
 }
 
@@ -1740,10 +1798,32 @@ enum TerminalProposal {
     ReadySentinel(u64),
     Exit {
         root_status: RootStatus,
-        reason: String,
+        reason: ExitCompletionReason,
     },
+    Cancellation(CancellationCause),
     SupervisorError(String),
     SupervisorLost,
+}
+
+enum FinalizedTerminalProposal {
+    Publish(TerminalProposal),
+    DeferredForAcceptedCancel,
+}
+
+fn finalize_terminal_proposal(
+    proposal: TerminalProposal,
+    explicit_cancel_accepted: bool,
+) -> FinalizedTerminalProposal {
+    if !explicit_cancel_accepted {
+        return FinalizedTerminalProposal::Publish(proposal);
+    }
+    if matches!(proposal, TerminalProposal::ReadySentinel(_)) {
+        FinalizedTerminalProposal::DeferredForAcceptedCancel
+    } else {
+        FinalizedTerminalProposal::Publish(TerminalProposal::Cancellation(
+            CancellationCause::ExplicitRequest,
+        ))
+    }
 }
 
 enum TerminalPublishResult {
@@ -1768,28 +1848,28 @@ fn publish_terminal(
         }
         return Ok(TerminalPublishResult::Published);
     }
-    if matches!(proposal, TerminalProposal::ReadySentinel(_)) && explicit_cancel_accepted(paths) {
-        drop(completion_lock);
-        return Ok(TerminalPublishResult::DeferredForAcceptedCancel);
-    }
-    sync_optional_log(log)?;
-    if explicit_cancel_accepted(paths) {
-        apply_explicit_cancel_metadata(meta);
-    } else {
-        match proposal {
-            TerminalProposal::ReadySentinel(now) => apply_ready_sentinel_metadata(meta, now),
-            TerminalProposal::Exit {
-                root_status,
-                reason,
-            } => {
-                let terminal_status = select_terminal_status(root_status, &reason);
-                apply_terminal_metadata(meta, terminal_status, &reason);
-            }
-            TerminalProposal::SupervisorError(message) => {
-                apply_supervisor_error_metadata(meta, message);
-            }
-            TerminalProposal::SupervisorLost => apply_lost_supervisor_metadata(meta),
+    let proposal = match finalize_terminal_proposal(proposal, explicit_cancel_accepted(paths)) {
+        FinalizedTerminalProposal::Publish(proposal) => proposal,
+        FinalizedTerminalProposal::DeferredForAcceptedCancel => {
+            drop(completion_lock);
+            return Ok(TerminalPublishResult::DeferredForAcceptedCancel);
         }
+    };
+    sync_optional_log(log)?;
+    match proposal {
+        TerminalProposal::ReadySentinel(now) => apply_ready_sentinel_metadata(meta, now),
+        TerminalProposal::Exit {
+            root_status,
+            reason,
+        } => {
+            let terminal_status = reason.terminal_status(root_status);
+            apply_terminal_metadata(meta, terminal_status, reason.completion_reason());
+        }
+        TerminalProposal::Cancellation(cause) => apply_cancellation_metadata(meta, cause),
+        TerminalProposal::SupervisorError(message) => {
+            apply_supervisor_error_metadata(meta, message);
+        }
+        TerminalProposal::SupervisorLost => apply_lost_supervisor_metadata(meta),
     }
     state::write_rc_atomic(paths, meta.rc.unwrap_or(EX_SOFTWARE))?;
     state::write_meta_atomic(paths, meta)?;
@@ -1825,6 +1905,41 @@ impl Drop for EventLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_cancellation_has_one_precedence_and_persistence_policy() {
+        let cause =
+            CancellationCause::OwnerExit.with_precedence_over(CancellationCause::ExplicitRequest);
+        assert_eq!(cause, CancellationCause::ExplicitRequest);
+        assert_eq!(cause.completion_reason(), "cancel-request");
+        assert_eq!(
+            CancellationCause::from_completion_reason(cause.completion_reason()),
+            Some(cause)
+        );
+        assert_eq!(
+            CancellationCause::OwnerExit.finalized(false),
+            CancellationCause::OwnerExit
+        );
+        assert_eq!(
+            CancellationCause::OwnerExit.finalized(true),
+            CancellationCause::ExplicitRequest
+        );
+    }
+
+    #[test]
+    fn terminal_finalization_resolves_the_durable_cancel_marker() {
+        let finalized = finalize_terminal_proposal(TerminalProposal::SupervisorLost, true);
+        assert!(matches!(
+            finalized,
+            FinalizedTerminalProposal::Publish(TerminalProposal::Cancellation(
+                CancellationCause::ExplicitRequest
+            ))
+        ));
+        assert!(matches!(
+            finalize_terminal_proposal(TerminalProposal::ReadySentinel(1), true),
+            FinalizedTerminalProposal::DeferredForAcceptedCancel
+        ));
+    }
 
     #[test]
     fn sentinel_matches_stdout_only() {
