@@ -787,6 +787,7 @@ fn adapter_driver_command(
         )
         .env("AGENT_BASH_FAKE_RESOLVED_SESSION", "ses_adapter")
         .env("AGENT_BASH_TOOL_POLL_MS", "25")
+        .env("AGENT_BASH_TOOL_PROCESS_TIMEOUT_MS", "120000")
         .env(
             "ADAPTER_ASYNC_STARTED",
             temp.path().join("adapter-async-started"),
