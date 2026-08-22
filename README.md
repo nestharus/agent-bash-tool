@@ -39,8 +39,8 @@ completion returns synchronously in-band or asynchronously through the agent mai
   a bounded grace period. A direct cancel is accepted when its durable marker is synchronized;
   signaling only wakes the supervisor, which also observes the marker independently. Direct CLI
   runs remain detached unless they explicitly request a lease. Direct cancel and detach require
-  the handle's recorded session or exact caller-tree ownership; `list --all` is observation, not a
-  grant of control authority.
+  the handle's recorded session, falling back to exact caller-tree ownership only when no session
+  was recorded; `list --all` is observation, not a grant of control authority.
 - **Completion: root, tree, or sentinel.** Finite jobs use an explicit process boundary;
   never-exiting servers report ready on a stdout marker. Nothing is assumed to exit.
 - **Async delivery via agent-runner.** For asynchronous completion the spooler asks agent-runner

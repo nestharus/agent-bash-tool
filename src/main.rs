@@ -935,8 +935,19 @@ fn handle_owned_by(
     caller_chain: &[state::CallerChainEntry],
     owner_session_id: Option<&str>,
 ) -> bool {
-    owner_session_matches(meta, paths, owner_session_id)
-        || caller_chain_owns_handle(meta, caller_chain)
+    if let Some(recorded_session_id) = meta.owner_session_id.as_deref() {
+        return owner_session_id == Some(recorded_session_id);
+    }
+    match state::read_owner(paths) {
+        Ok(owner) => {
+            if let Some(recorded_session_id) = owner.owner_session_id {
+                return owner_session_id == Some(recorded_session_id.as_str());
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return false,
+    }
+    caller_chain_owns_handle(meta, caller_chain)
 }
 
 fn caller_chain_owns_handle(meta: &Meta, caller_chain: &[state::CallerChainEntry]) -> bool {
@@ -982,20 +993,6 @@ fn require_control_authority(
         EX_NOPERM,
         format!("agent-bash: caller does not own handle {handle}"),
     ))
-}
-
-fn owner_session_matches(meta: &Meta, paths: &StatePaths, owner_session_id: Option<&str>) -> bool {
-    let Some(session_id) = owner_session_id else {
-        return false;
-    };
-    if let Some(meta_session_id) = meta.owner_session_id.as_deref() {
-        return meta_session_id == session_id;
-    }
-    state::read_owner(paths)
-        .ok()
-        .and_then(|owner| owner.owner_session_id)
-        .as_deref()
-        == Some(session_id)
 }
 
 fn list_summary_from_meta(meta: &Meta, state_dir: PathBuf) -> ListSummary {

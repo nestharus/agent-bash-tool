@@ -159,12 +159,13 @@ the PID is **harness-code polling (cheap, no LLM tokens)** — not the LLM self-
 forbidden.
 
 Handle observation and handle control are separate authorities. Default list visibility and
-control use the same recorded owner-session or exact caller-chain predicate. `list --all` and a
-cross-owner `status` may observe account-local handles, but they cannot publish recovery state,
-claim delivery, cancel work, or change delivery mode. Cancel and detach fail with `EX_NOPERM` for
-non-owners. Guardian recovery remains independent of any observing caller and is the automatic
-cleanup/progress path after the originating process disappears. No unauthenticated cross-owner
-operator override is exposed by this CLI.
+control require the recorded owner session when one exists, falling back to the exact caller-chain
+predicate only for handles without session metadata. `list --all` and a cross-owner `status` may
+observe account-local handles, but they cannot publish recovery state, claim delivery, cancel work,
+or change delivery mode. Cancel and detach fail with `EX_NOPERM` for non-owners. Guardian recovery
+remains independent of any observing caller and is the automatic cleanup/progress path after the
+originating process disappears. No unauthenticated cross-owner operator override is exposed by
+this CLI.
 
 ### Delivery resolution metadata
 At launch, while the caller is still alive and `/proc` is readable, the spooler records

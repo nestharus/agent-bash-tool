@@ -2564,6 +2564,47 @@ fn opencode_adapter_standalone_sleep_does_not_create_spool_state() {
 }
 
 #[test]
+fn recorded_owner_session_overrides_matching_caller_chain() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let handle = "ab_session_precedence";
+    let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
+    let meta_path = state_dir.join("meta.json");
+    let mut meta = read_meta(&meta_path);
+    meta["owner_session_id"] = json!("ses_owner");
+    meta["owner_invocation_uuid"] = json!("11111111-1111-4111-8111-111111111111");
+    fs::write(&meta_path, format_seeded_meta(&meta)).expect("write session-owned meta");
+
+    let other_list = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_other")
+        .args(["list", "--json"])
+        .output()
+        .expect("other session list");
+    assert_command_success(&other_list);
+    assert_eq!(parse_stdout_json(&other_list), json!([]));
+
+    let other_cancel = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_other")
+        .args(["cancel", handle])
+        .output()
+        .expect("other session cancel");
+    assert_eq!(other_cancel.status.code(), Some(77));
+    assert!(
+        String::from_utf8_lossy(&other_cancel.stderr).contains("caller does not own handle"),
+        "{}",
+        command_failure_message(&other_cancel)
+    );
+    assert!(!state_dir.join("cancel-requested").exists());
+
+    let owner_list = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_owner")
+        .args(["list", "--json"])
+        .output()
+        .expect("owner session list");
+    assert_command_success(&owner_list);
+    assert_eq!(parse_stdout_json(&owner_list)[0]["handle"], handle);
+}
+
+#[test]
 fn list_adopts_handle_owned_by_resumed_session_after_caller_pid_changes() {
     let temp = tempfile::tempdir().expect("tempdir");
     let state_dir = seed_done_state_dir(&temp, "ab_resumed_owner", unix_ms(), false);
