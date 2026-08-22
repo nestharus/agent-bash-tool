@@ -1665,25 +1665,36 @@ fn sync_optional_log(log: Option<&mut BoundedLog>) -> io::Result<()> {
 }
 
 pub(crate) fn reconcile_lost_supervisor(paths: &StatePaths) -> io::Result<Meta> {
-    reconcile_lost_supervisor_with_delivery(paths, true, false)
+    reconcile_lost_supervisor_with_owner(paths, CompletionDeliveryOwner::Reconciler, false)
 }
 
-pub(crate) fn reconcile_lost_supervisor_without_delivery(paths: &StatePaths) -> io::Result<Meta> {
-    reconcile_lost_supervisor_with_delivery(paths, false, false)
+pub(crate) fn reconcile_lost_supervisor_for_list(paths: &StatePaths) -> io::Result<Meta> {
+    reconcile_lost_supervisor_with_owner(paths, CompletionDeliveryOwner::PerHandleGuardian, false)
 }
 
 fn reconcile_lost_supervisor_after_guardian(
     paths: &StatePaths,
     accepted_cancel_tree_empty: bool,
 ) -> io::Result<Meta> {
-    reconcile_lost_supervisor_with_delivery(paths, true, accepted_cancel_tree_empty)
+    reconcile_lost_supervisor_with_owner(
+        paths,
+        CompletionDeliveryOwner::Reconciler,
+        accepted_cancel_tree_empty,
+    )
 }
 
-fn reconcile_lost_supervisor_with_delivery(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompletionDeliveryOwner {
+    Reconciler,
+    PerHandleGuardian,
+}
+
+fn reconcile_lost_supervisor_with_owner(
     paths: &StatePaths,
-    deliver: bool,
+    delivery_owner: CompletionDeliveryOwner,
     accepted_cancel_tree_empty: bool,
 ) -> io::Result<Meta> {
+    let deliver = delivery_owner == CompletionDeliveryOwner::Reconciler;
     let _lock = state::lock_reconciliation(paths)?;
     let mut meta = state::read_meta(paths)?;
     if state::terminal(&meta) {

@@ -1119,14 +1119,13 @@ fn delivery_attempt_started_meta() -> DeliveryMeta {
     }
 }
 
-pub(crate) fn delivery_needs_retry(meta: &Meta) -> bool {
-    state::terminal(meta) && !meta.delivery.attempted && meta.delivery.retryable == Some(true)
-}
-
-pub(crate) fn delivery_attempt_in_progress(meta: &Meta) -> bool {
+pub(crate) fn completion_delivery_pending(meta: &Meta) -> bool {
     state::terminal(meta)
-        && meta.delivery.attempted
-        && meta.delivery.error_code.as_deref() == Some(DELIVERY_ATTEMPT_IN_PROGRESS)
+        && ((meta.delivery.attempted
+            && meta.delivery.error_code.as_deref() == Some(DELIVERY_ATTEMPT_IN_PROGRESS))
+            || (!meta.delivery.attempted
+                && meta.delivery.skipped.is_none()
+                && (meta.delivery.error_code.is_none() || meta.delivery.retryable == Some(true))))
 }
 
 fn delivery_signal_error(status: ExitStatus) -> String {

@@ -4579,7 +4579,7 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
 }
 
 #[test]
-fn list_all_reconciles_lost_supervisors_without_async_delivery() {
+fn list_all_reconciles_lost_supervisors_without_claiming_delivery() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (observer, observer_log) =
         named_fake_agents(&temp, "list-observer-agents", "list-observer.log");
@@ -4594,6 +4594,7 @@ fn list_all_reconciles_lost_supervisors_without_async_delivery() {
         Some(dead_workload),
         false,
     );
+    write_delivery_helper_provenance(&temp.path().join("agent-bash").join(handle), &observer);
 
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &observer)
@@ -4618,4 +4619,21 @@ fn list_all_reconciles_lost_supervisors_without_async_delivery() {
         "list executed observer-local helper: {}",
         fs::read_to_string(&observer_log).unwrap_or_default()
     );
+
+    let status = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &observer)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &observer_log)
+        .args(["status", "--full", handle])
+        .output()
+        .expect("status after list reconciliation");
+    assert_command_success(&status);
+    let delivered = read_meta(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(handle)
+            .join("meta.json"),
+    );
+    assert_eq!(delivered["delivery"]["attempted"], true);
+    assert_eq!(delivered["delivery"]["exit_code"], 0);
 }

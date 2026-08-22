@@ -574,7 +574,7 @@ fn status_command(handle: String, tail_bytes: u64, full: bool) -> Result<(), App
 
 fn reconcile_status_meta(paths: &StatePaths, handle: &str) -> Result<Meta, AppError> {
     let mut meta = read_meta_for_handle(paths, handle)?;
-    if delivery::delivery_needs_retry(&meta) || delivery::delivery_attempt_in_progress(&meta) {
+    if delivery::completion_delivery_pending(&meta) {
         delivery::reconcile_completion_delivery(paths, &mut meta)
             .map_err(|err| status_reconciliation_error(handle, err))?;
         return Ok(meta);
@@ -877,7 +877,7 @@ fn reconcile_list_meta(paths: &StatePaths, meta: Meta) -> Option<Meta> {
     if !state::running_exit_mode(&meta) {
         return Some(meta);
     }
-    supervisor::reconcile_lost_supervisor_without_delivery(paths).ok()
+    supervisor::reconcile_lost_supervisor_for_list(paths).ok()
 }
 
 fn entry_is_state_dir(entry: &std::fs::DirEntry) -> bool {

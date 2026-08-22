@@ -27,8 +27,11 @@ completion returns synchronously in-band or asynchronously through the agent mai
   agents. Delegated cgroup v2 remains an optional live-set enhancement.
 - **Supervisor-loss recovery.** A detached guardian waits on the exact supervisor child. If the
   supervisor exits abnormally, the guardian reconciles durable process identity and terminal state
-  and performs pending asynchronous delivery without requiring a caller to poll `status`. The
-  guardian also adopts the workload tree and finishes any already-accepted explicit cancellation.
+  and performs pending asynchronous delivery without requiring a caller to poll `status`. Bulk
+  `list` may publish that terminal state for an accurate projection without executing a helper;
+  pending delivery stays owned by the guardian, while targeted `status` may claim it first under the
+  same delivery lock. The guardian also adopts the workload tree and finishes any already-accepted
+  explicit cancellation.
 - **Owner-scoped cancellation.** Integrations can opt into an exact PID/start-time/boot-ID lease
   with `run --cancel-on-owner-exit --owner-pid <pid>`. `cancel <handle>`, an owner exit, or an
   OpenCode tool abort terminates the complete adopted process tree, escalating to `SIGKILL` after

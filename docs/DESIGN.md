@@ -115,6 +115,17 @@ operation then records `cancel-request`, status 143, instead of `supervisor-lost
 an accepted cancel continues to require both exact identities and fails closed when either is
 missing. Every non-sentinel terminal producer uses that same precedence decision.
 
+`status` and bulk `list` share the lost-supervisor terminal transition but not the immediate
+notification role. A targeted `status` reconciliation owns pending completion delivery in its
+current process. Bulk `list` may publish the same terminal state for an accurate projection, but it
+never executes a helper as an incidental enumeration side effect; it leaves delivery unattempted
+for the independent per-handle guardian. The guardian then re-enters reconciliation, observes the
+terminal record, and claims pending delivery. A later targeted `status` may claim it first. Both
+paths use the same `delivery.lock`, pinned helper, and write-ahead attempt record, so this handoff
+changes the delivery owner without permitting a repeated attempt. Every valid run creates the
+guardian before the supervisor; synthetic list fixtures without a guardian validate only that list
+does not claim delivery, then exercise the targeted-status handoff separately.
+
 ### Completion detection — three modes
 - **tree exit mode (default):** wake on root process death with `pidfd_open` + `poll`, and finish
   only after the subreaper has reaped all descendants (`waitpid` → `ECHILD`). Optional cgroup-v2
