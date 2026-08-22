@@ -215,10 +215,10 @@ fn run_command(
     let cwd = current_directory().map_err(current_directory_error)?;
     let mode = run_mode(&ready_sentinel);
     let owner = owner_context(&caller_chain)?;
-    let registration =
+    let registration_candidate =
         delivery::prepare_registration().map_err(completion_event_registration_error)?;
     create_run_state(&paths)?;
-    let registration = match registration.pin_to_handle(&paths) {
+    let registration = match registration_candidate.bind_to_handle(&paths) {
         Ok(registration) => registration,
         Err(err) => {
             let _ = fs::remove_dir_all(&paths.state_dir);

@@ -928,6 +928,12 @@ struct RootStatus {
     signal: Option<i32>,
 }
 
+#[derive(Clone, Copy)]
+struct TerminalStatus {
+    rc: i32,
+    signal: Option<i32>,
+}
+
 struct SentinelMatcher {
     regex: Regex,
     buffer: Vec<u8>,
@@ -1570,23 +1576,30 @@ fn apply_ready_sentinel_metadata(meta: &mut Meta, now: u64) {
     meta.touch();
 }
 
-fn apply_exit_completion_metadata(meta: &mut Meta, root_status: RootStatus, reason: &str) {
+fn apply_terminal_metadata(meta: &mut Meta, status: TerminalStatus, reason: &str) {
     meta.state = "DONE".to_string();
     meta.completion_reason = Some(reason.to_string());
-    meta.rc = Some(root_status.rc);
-    meta.signal = root_status.signal;
+    meta.rc = Some(status.rc);
+    meta.signal = status.signal;
     meta.completed_at_unix_ms = Some(state::unix_ms());
     meta.touch();
 }
 
-fn completion_root_status(root_status: RootStatus, reason: &str) -> RootStatus {
+fn select_terminal_status(root_status: RootStatus, reason: &str) -> TerminalStatus {
     if matches!(reason, "cancel-request" | "owner-exit") {
-        RootStatus {
-            rc: signal_to_shell_rc(libc::SIGTERM),
-            signal: Some(libc::SIGTERM),
-        }
+        cancellation_terminal_status()
     } else {
-        root_status
+        TerminalStatus {
+            rc: root_status.rc,
+            signal: root_status.signal,
+        }
+    }
+}
+
+fn cancellation_terminal_status() -> TerminalStatus {
+    TerminalStatus {
+        rc: signal_to_shell_rc(libc::SIGTERM),
+        signal: Some(libc::SIGTERM),
     }
 }
 
@@ -1600,14 +1613,7 @@ fn apply_supervisor_error_metadata(meta: &mut Meta, message: String) {
 }
 
 fn apply_explicit_cancel_metadata(meta: &mut Meta) {
-    let status = completion_root_status(
-        RootStatus {
-            rc: EX_SOFTWARE,
-            signal: None,
-        },
-        "cancel-request",
-    );
-    apply_exit_completion_metadata(meta, status, "cancel-request");
+    apply_terminal_metadata(meta, cancellation_terminal_status(), "cancel-request");
     meta.error = None;
 }
 
@@ -1758,8 +1764,8 @@ fn publish_terminal(
                 root_status,
                 reason,
             } => {
-                let root_status = completion_root_status(root_status, &reason);
-                apply_exit_completion_metadata(meta, root_status, &reason);
+                let terminal_status = select_terminal_status(root_status, &reason);
+                apply_terminal_metadata(meta, terminal_status, &reason);
             }
             TerminalProposal::SupervisorError(message) => {
                 apply_supervisor_error_metadata(meta, message);

@@ -40,6 +40,17 @@ struct DeliveryHelper {
     executable: File,
 }
 
+pub(crate) struct DeliveryRegistrationCandidate {
+    helper: DeliveryHelper,
+}
+
+impl DeliveryRegistrationCandidate {
+    pub(crate) fn bind_to_handle(self, paths: &StatePaths) -> io::Result<DeliveryRegistration> {
+        let helper = self.helper.pin_to_handle(paths).map_err(io::Error::other)?;
+        Ok(DeliveryRegistration { helper })
+    }
+}
+
 pub(crate) struct DeliveryRegistration {
     helper: DeliveryHelper,
 }
@@ -47,11 +58,6 @@ pub(crate) struct DeliveryRegistration {
 impl DeliveryRegistration {
     pub(crate) fn provenance(&self) -> DeliveryHelperProvenance {
         self.helper.provenance.clone()
-    }
-
-    pub(crate) fn pin_to_handle(self, paths: &StatePaths) -> io::Result<Self> {
-        let helper = self.helper.pin_to_handle(paths).map_err(io::Error::other)?;
-        Ok(Self { helper })
     }
 }
 
@@ -669,9 +675,9 @@ fn resolve_owner_for_pid(
     Ok(Some((session_id, invocation_uuid)))
 }
 
-pub(crate) fn prepare_registration() -> io::Result<DeliveryRegistration> {
+pub(crate) fn prepare_registration() -> io::Result<DeliveryRegistrationCandidate> {
     let helper = DeliveryHelper::from_environment().map_err(io::Error::other)?;
-    Ok(DeliveryRegistration { helper })
+    Ok(DeliveryRegistrationCandidate { helper })
 }
 
 pub(crate) fn register(

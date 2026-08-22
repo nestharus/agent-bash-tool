@@ -427,17 +427,18 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
-fn blocking_delivery_fake_agents(
-    temp: &tempfile::TempDir,
-) -> (
-    PathBuf,
-    PathBuf,
-    PathBuf,
-    PathBuf,
-    PathBuf,
-    PathBuf,
-    PathBuf,
-) {
+#[derive(Clone)]
+struct BlockingDeliveryFixture {
+    helper: PathBuf,
+    activation_started: PathBuf,
+    activation_release: PathBuf,
+    completion_started: PathBuf,
+    completion_release: PathBuf,
+    completion_finished: PathBuf,
+    delivery_log: PathBuf,
+}
+
+fn blocking_delivery_fake_agents(temp: &tempfile::TempDir) -> BlockingDeliveryFixture {
     let fake = temp.path().join("blocking-activate-fake-agents");
     let activate_started = temp.path().join("activate-started");
     let activate_release = temp.path().join("activate-release");
@@ -468,15 +469,15 @@ exit 0
     )
     .expect("write blocking activation fake");
     set_executable(&fake);
-    (
-        fake,
-        activate_started,
-        activate_release,
-        complete_started,
-        complete_release,
-        complete_finished,
+    BlockingDeliveryFixture {
+        helper: fake,
+        activation_started: activate_started,
+        activation_release: activate_release,
+        completion_started: complete_started,
+        completion_release: complete_release,
+        completion_finished: complete_finished,
         delivery_log,
-    )
+    }
 }
 
 fn parent_killing_fake_agents(
@@ -3317,22 +3318,23 @@ fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
 fn delivery_owner_finishes_after_supervisor_dies() {
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
-    let (
-        fake,
-        _activate_started,
-        _activate_release,
-        complete_started,
-        complete_release,
-        complete_finished,
-        delivery_log,
-    ) = blocking_delivery_fake_agents(&temp);
+    let fixture = blocking_delivery_fake_agents(&temp);
     let release = temp.path().join("owner-completion-workload-release");
     let output = agent_bash(&temp)
-        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
-        .env("AGENT_BASH_FAKE_COMPLETE_STARTED", &complete_started)
-        .env("AGENT_BASH_FAKE_COMPLETE_RELEASE", &complete_release)
-        .env("AGENT_BASH_FAKE_COMPLETE_FINISHED", &complete_finished)
-        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fixture.helper)
+        .env(
+            "AGENT_BASH_FAKE_COMPLETE_STARTED",
+            &fixture.completion_started,
+        )
+        .env(
+            "AGENT_BASH_FAKE_COMPLETE_RELEASE",
+            &fixture.completion_release,
+        )
+        .env(
+            "AGENT_BASH_FAKE_COMPLETE_FINISHED",
+            &fixture.completion_finished,
+        )
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &fixture.delivery_log)
         .env("RELEASE", &release)
         .args([
             "run",
@@ -3352,17 +3354,22 @@ fn delivery_owner_finishes_after_supervisor_dies() {
     });
     let supervisor = OwnedProcess::capture_supervisor(&running).expect("capture supervisor");
     fs::write(&release, b"").expect("release workload");
-    wait_until(fixture_deadline, || complete_started.exists().then_some(()));
+    wait_until(fixture_deadline, || {
+        fixture.completion_started.exists().then_some(())
+    });
     assert!(supervisor.signal(libc::SIGKILL), "kill supervisor");
-    fs::write(&complete_release, b"").expect("release completion helper");
+    fs::write(&fixture.completion_release, b"").expect("release completion helper");
 
     let delivered = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["exit_code"] == 0).then_some(meta)
     });
     assert_eq!(delivered["delivery"]["attempted"], true);
-    assert!(complete_finished.exists());
-    assert_eq!(operation_count(&delivery_log, "agent-bash-complete"), 1);
+    assert!(fixture.completion_finished.exists());
+    assert_eq!(
+        operation_count(&fixture.delivery_log, "agent-bash-complete"),
+        1
+    );
     let status = status_text(&temp, handle, true);
     assert!(status.starts_with("DONE rc=0"), "{status}");
 }
@@ -3371,18 +3378,10 @@ fn delivery_owner_finishes_after_supervisor_dies() {
 fn delivery_owner_finishes_after_detach_caller_dies() {
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
-    let (
-        fake,
-        activate_started,
-        activate_release,
-        _complete_started,
-        _complete_release,
-        _complete_finished,
-        delivery_log,
-    ) = blocking_delivery_fake_agents(&temp);
+    let fixture = blocking_delivery_fake_agents(&temp);
     let output = agent_bash(&temp)
-        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
-        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fixture.helper)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &fixture.delivery_log)
         .args(["run", "--delivery", "sync", "--", "sleep", "60"])
         .output()
         .expect("run");
@@ -3391,17 +3390,25 @@ fn delivery_owner_finishes_after_detach_caller_dies() {
     let binary = assert_cmd::cargo::cargo_bin("agent-bash");
     let mut detach = StdCommand::new(binary)
         .env("XDG_STATE_HOME", temp.path())
-        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
-        .env("AGENT_BASH_FAKE_ACTIVATE_STARTED", &activate_started)
-        .env("AGENT_BASH_FAKE_ACTIVATE_RELEASE", &activate_release)
-        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fixture.helper)
+        .env(
+            "AGENT_BASH_FAKE_ACTIVATE_STARTED",
+            &fixture.activation_started,
+        )
+        .env(
+            "AGENT_BASH_FAKE_ACTIVATE_RELEASE",
+            &fixture.activation_release,
+        )
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &fixture.delivery_log)
         .args(["detach", handle])
         .spawn()
         .expect("spawn detach");
-    wait_until(fixture_deadline, || activate_started.exists().then_some(()));
+    wait_until(fixture_deadline, || {
+        fixture.activation_started.exists().then_some(())
+    });
     detach.kill().expect("kill detach caller");
     detach.wait().expect("reap detach caller");
-    fs::write(&activate_release, b"").expect("release activation helper");
+    fs::write(&fixture.activation_release, b"").expect("release activation helper");
 
     let repeated = agent_bash(&temp)
         .args(["detach", handle])
@@ -3411,7 +3418,10 @@ fn delivery_owner_finishes_after_detach_caller_dies() {
     let repeated = parse_stdout_json(&repeated);
     assert_eq!(repeated["transitioned"], false);
     assert_eq!(repeated["notification_attempted"], false);
-    assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
+    assert_eq!(
+        operation_count(&fixture.delivery_log, "agent-bash-activate"),
+        1
+    );
     let _ = agent_bash(&temp).args(["cancel", handle]).output();
 }
 
@@ -4015,24 +4025,31 @@ fn concurrent_detach_and_completion_produce_one_notification() {
 fn detach_does_not_rewrite_terminal_metadata_after_activation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
-    let (
-        fake,
-        activate_started,
-        activate_release,
-        complete_started,
-        complete_release,
-        complete_finished,
-        delivery_log,
-    ) = blocking_delivery_fake_agents(&temp);
+    let fixture = blocking_delivery_fake_agents(&temp);
     let workload_release = temp.path().join("workload-release");
     let output = agent_bash(&temp)
-        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
-        .env("AGENT_BASH_FAKE_ACTIVATE_STARTED", &activate_started)
-        .env("AGENT_BASH_FAKE_ACTIVATE_RELEASE", &activate_release)
-        .env("AGENT_BASH_FAKE_COMPLETE_STARTED", &complete_started)
-        .env("AGENT_BASH_FAKE_COMPLETE_RELEASE", &complete_release)
-        .env("AGENT_BASH_FAKE_COMPLETE_FINISHED", &complete_finished)
-        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fixture.helper)
+        .env(
+            "AGENT_BASH_FAKE_ACTIVATE_STARTED",
+            &fixture.activation_started,
+        )
+        .env(
+            "AGENT_BASH_FAKE_ACTIVATE_RELEASE",
+            &fixture.activation_release,
+        )
+        .env(
+            "AGENT_BASH_FAKE_COMPLETE_STARTED",
+            &fixture.completion_started,
+        )
+        .env(
+            "AGENT_BASH_FAKE_COMPLETE_RELEASE",
+            &fixture.completion_release,
+        )
+        .env(
+            "AGENT_BASH_FAKE_COMPLETE_FINISHED",
+            &fixture.completion_finished,
+        )
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &fixture.delivery_log)
         .env("WORKLOAD_RELEASE", &workload_release)
         .args([
             "run",
@@ -4052,47 +4069,57 @@ fn detach_does_not_rewrite_terminal_metadata_after_activation() {
     });
     let binary = assert_cmd::cargo::cargo_bin("agent-bash");
     let state_root = temp.path().to_path_buf();
-    let detach_fake = fake.clone();
-    let detach_started = activate_started.clone();
-    let detach_release = activate_release.clone();
-    let detach_complete_started = complete_started.clone();
-    let detach_complete_release = complete_release.clone();
-    let detach_complete_finished = complete_finished.clone();
-    let detach_delivery_log = delivery_log.clone();
+    let detach_fixture = fixture.clone();
     let detach_handle = handle.clone();
     let detach = std::thread::spawn(move || {
         StdCommand::new(binary)
             .env("XDG_STATE_HOME", state_root)
-            .env("AGENT_BASH_AGENT_RUNNER_BIN", detach_fake)
-            .env("AGENT_BASH_FAKE_ACTIVATE_STARTED", detach_started)
-            .env("AGENT_BASH_FAKE_ACTIVATE_RELEASE", detach_release)
-            .env("AGENT_BASH_FAKE_COMPLETE_STARTED", detach_complete_started)
-            .env("AGENT_BASH_FAKE_COMPLETE_RELEASE", detach_complete_release)
+            .env("AGENT_BASH_AGENT_RUNNER_BIN", detach_fixture.helper)
+            .env(
+                "AGENT_BASH_FAKE_ACTIVATE_STARTED",
+                detach_fixture.activation_started,
+            )
+            .env(
+                "AGENT_BASH_FAKE_ACTIVATE_RELEASE",
+                detach_fixture.activation_release,
+            )
+            .env(
+                "AGENT_BASH_FAKE_COMPLETE_STARTED",
+                detach_fixture.completion_started,
+            )
+            .env(
+                "AGENT_BASH_FAKE_COMPLETE_RELEASE",
+                detach_fixture.completion_release,
+            )
             .env(
                 "AGENT_BASH_FAKE_COMPLETE_FINISHED",
-                detach_complete_finished,
+                detach_fixture.completion_finished,
             )
-            .env("AGENT_BASH_FAKE_DELIVERY_LOG", detach_delivery_log)
+            .env("AGENT_BASH_FAKE_DELIVERY_LOG", detach_fixture.delivery_log)
             .args(["detach", &detach_handle])
             .output()
             .expect("detach")
     });
-    wait_until(fixture_deadline, || activate_started.exists().then_some(()));
+    wait_until(fixture_deadline, || {
+        fixture.activation_started.exists().then_some(())
+    });
 
     fs::write(&workload_release, b"").expect("release workload");
     wait_until(fixture_deadline, || workload.exited().then_some(()));
     wait_until(fixture_deadline, || {
         (read_meta(&meta_path(&json))["state"] == "DONE").then_some(())
     });
-    fs::write(&activate_release, b"").expect("release activation");
-    wait_until(fixture_deadline, || complete_started.exists().then_some(()));
+    fs::write(&fixture.activation_release, b"").expect("release activation");
+    wait_until(fixture_deadline, || {
+        fixture.completion_started.exists().then_some(())
+    });
     let state_during_delivery = read_meta(&meta_path(&json))["state"]
         .as_str()
         .expect("state")
         .to_string();
-    fs::write(&complete_release, b"").expect("release completion");
+    fs::write(&fixture.completion_release, b"").expect("release completion");
     wait_until(fixture_deadline, || {
-        complete_finished.exists().then_some(())
+        fixture.completion_finished.exists().then_some(())
     });
     let detach = detach.join().expect("detach thread");
 
@@ -4101,7 +4128,7 @@ fn detach_does_not_rewrite_terminal_metadata_after_activation() {
     let status = wait_for_terminal_status(&temp, &handle);
     assert!(status.starts_with("DONE rc=0"), "{status}");
     assert_eq!(read_meta(&meta_path(&json))["state"], "DONE");
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(delivery_attempt_count(&fixture.delivery_log), 1);
     let meta = read_meta(&meta_path(&json));
     assert_eq!(meta["delivery"]["attempted"], true);
     assert_eq!(meta["delivery"]["exit_code"], 0);
