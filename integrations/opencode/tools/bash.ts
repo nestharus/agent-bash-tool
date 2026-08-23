@@ -32,7 +32,7 @@ type ShellCommand = {
 type ExplicitRunAdmission =
   | { kind: "ordinary" }
   | { kind: "unsupported" }
-  | { kind: "direct"; argv: string[]; environment: Record<string, string> }
+  | { kind: "direct"; argv: string[] }
 
 const RESERVED_SPOOLER_ASSIGNMENTS = new Set([
   "AGENT_BASH_AGENT_RUNNER_BIN",
@@ -495,10 +495,9 @@ function parseStructuredExplicitRun(
   command: string,
   delivery: DeliveryMode,
   ownerLease: boolean,
-): { argv: string[]; environment: Record<string, string> } | undefined {
+): string[] | undefined {
   const words = structuredShellWords(command)
   if (!words) return undefined
-  const environment: Record<string, string> = {}
   while (words[0]?.match(/^[A-Za-z_][A-Za-z0-9_]*=/)) {
     const assignment = words.shift()!
     const separator = assignment.indexOf("=")
@@ -520,7 +519,7 @@ function parseStructuredExplicitRun(
   words.splice(2, 0, ...controls)
   const workload = words.indexOf("--") + 1
   if (workload > 0 && ["agents", "oulipoly-agent-runner"].includes(words[workload])) words[workload] = AGENTS
-  return { argv: words, environment }
+  return words
 }
 
 function admitExplicitRun(
@@ -529,8 +528,8 @@ function admitExplicitRun(
   ownerLease: boolean,
 ): ExplicitRunAdmission {
   if (!conservativelyRecognizesExplicitRun(command)) return { kind: "ordinary" }
-  const direct = parseStructuredExplicitRun(command, delivery, ownerLease)
-  return direct ? { kind: "direct", ...direct } : { kind: "unsupported" }
+  const argv = parseStructuredExplicitRun(command, delivery, ownerLease)
+  return argv ? { kind: "direct", argv } : { kind: "unsupported" }
 }
 
 async function dispatchCommand(
@@ -545,13 +544,7 @@ async function dispatchCommand(
     throw new Error("explicit agent-bash run requires structured arguments without shell expansion")
   }
   if (explicitRun.kind === "direct") {
-    return checkedProcessText(
-      explicitRun.argv,
-      "agent-bash dispatch",
-      ownerSessionId,
-      undefined,
-      explicitRun.environment,
-    )
+    return checkedProcessText(explicitRun.argv, "agent-bash dispatch", ownerSessionId)
   }
   command = pinAgentRunnerBinary(command)
   const args = [AGENT_BASH, "run"]
