@@ -714,6 +714,7 @@ mock.module("@opencode-ai/plugin", () => ({ tool }))
 const mode = process.argv[2]
 const adapterPath = process.argv[3]
 const value = process.argv[4]
+const request = mode === "request" ? JSON.parse(value) : null
 const mod = await import(adapterPath)
 const controller = new AbortController()
 const context = {
@@ -770,19 +771,14 @@ if (mode === "move-helper") {
   process.exit(outcome.kind === "error" ? 0 : 1)
 }
 
-const args = mode === "poll"
+const args = request
+  ? request.args
+  : mode === "poll"
   ? { handle: value }
-  : mode === "async"
-    ? {
-        command: `printf started > "$ADAPTER_ASYNC_STARTED"; attempts=0; while [ "$attempts" -lt 800 ]; do if [ -e "$ADAPTER_ASYNC_RELEASE" ]; then printf 'adapter async\\n'; exit 0; fi; attempts=$((attempts + 1)); sleep 0.01; done; exit 1`,
-        delivery: "async",
-      }
-    : mode === "sleep"
+  : mode === "sleep"
       ? { command: "sleep 0.05" }
     : mode === "abort"
       ? { command: "sleep 60; printf 'adapter abort failed\\n'" }
-      : mode === "detachable"
-        ? { command: `printf started > "$ADAPTER_DETACHABLE_STARTED"; attempts=0; while [ "$attempts" -lt 800 ]; do if [ -e "$ADAPTER_DETACHABLE_RELEASE" ]; then printf 'adapter detached\\n'; exit 0; fi; attempts=$((attempts + 1)); sleep 0.01; done; exit 1` }
       : mode === "wrapper"
         ? { command: `${process.env.AGENT_BASH_BIN} run -- agents --version` }
       : mode === "wrapper-env"
@@ -804,7 +800,7 @@ const text = typeof result === "string" ? result : String(result)
 const matched = text.match(/handle=([^\s)]+)/)
 
 console.log(JSON.stringify({ result: text, handle: matched?.[1] ?? null }))
-if (mode === "detachable") await Bun.sleep(3000)
+if (request?.lingerMs) await Bun.sleep(request.lingerMs)
 "#
 }
 
@@ -812,9 +808,9 @@ fn run_adapter_driver(
     temp: &tempfile::TempDir,
     driver: &Path,
     mode: &str,
-    handle: Option<&str>,
+    value: Option<&str>,
 ) -> Value {
-    let mut command = adapter_driver_command(temp, driver, mode, handle);
+    let mut command = adapter_driver_command(temp, driver, mode, value);
     let output = command.output().expect("adapter driver");
     assert_command_success(&output);
     parse_stdout_json(&output)
@@ -824,7 +820,7 @@ fn adapter_driver_command(
     temp: &tempfile::TempDir,
     driver: &Path,
     mode: &str,
-    handle: Option<&str>,
+    value: Option<&str>,
 ) -> StdCommand {
     let mut command = StdCommand::new(bun_bin_path());
     let adapter_agent_bash = temp.path().join("adapter-agent-bash");
@@ -852,22 +848,6 @@ fn adapter_driver_command(
         .env("AGENT_BASH_FAKE_RESOLVED_SESSION", "ses_adapter")
         .env("AGENT_BASH_TOOL_POLL_MS", "25")
         .env("AGENT_BASH_TOOL_PROCESS_TIMEOUT_MS", "120000")
-        .env(
-            "ADAPTER_ASYNC_STARTED",
-            temp.path().join("adapter-async-started"),
-        )
-        .env(
-            "ADAPTER_ASYNC_RELEASE",
-            temp.path().join("adapter-async-release"),
-        )
-        .env(
-            "ADAPTER_DETACHABLE_STARTED",
-            temp.path().join("adapter-detachable-started"),
-        )
-        .env(
-            "ADAPTER_DETACHABLE_RELEASE",
-            temp.path().join("adapter-detachable-release"),
-        )
         .env("XDG_STATE_HOME", temp.path())
         .env(
             "OULIPOLY_PARENT_INVOCATION",
@@ -876,8 +856,8 @@ fn adapter_driver_command(
         .env_remove("OULIPOLY_LIVE_SESSION_BIND_SOCKET")
         .env_remove("OULIPOLY_LIVE_SESSION_BIND_TOKEN")
         .env_remove("OULIPOLY_DATA_DIR");
-    if let Some(handle) = handle {
-        command.arg(handle);
+    if let Some(value) = value {
+        command.arg(value);
     }
     command
 }
@@ -2798,9 +2778,20 @@ fn opencode_adapter_explicit_async_returns_handle_immediately() {
     let driver = write_adapter_driver(&temp);
     let started = temp.path().join("adapter-async-started");
     let release = temp.path().join("adapter-async-release");
+    let request = json!({
+        "args": {
+            "command": format!(
+                "printf started > {}; attempts=0; while [ \"$attempts\" -lt 800 ]; do if [ -e {} ]; then printf 'adapter async\\n'; exit 0; fi; attempts=$((attempts + 1)); sleep 0.01; done; exit 1",
+                started.display(),
+                release.display()
+            ),
+            "delivery": "async"
+        }
+    })
+    .to_string();
     let release_marker = ReleaseMarker::new(release);
 
-    let result = run_adapter_driver(&temp, &driver, "async", None);
+    let result = run_adapter_driver(&temp, &driver, "request", Some(&request));
 
     wait_until(FIXTURE_DEADLINE, || started.exists().then_some(()));
     assert_adapter_result_contains(&result, "Running asynchronously");
@@ -2934,8 +2925,19 @@ fn opencode_adapter_sync_wait_returns_when_handle_is_detached() {
     let driver = write_adapter_driver(&temp);
     let started = temp.path().join("adapter-detachable-started");
     let release = temp.path().join("adapter-detachable-release");
+    let request = json!({
+        "args": {
+            "command": format!(
+                "printf started > {}; attempts=0; while [ \"$attempts\" -lt 800 ]; do if [ -e {} ]; then printf 'adapter detached\\n'; exit 0; fi; attempts=$((attempts + 1)); sleep 0.01; done; exit 1",
+                started.display(),
+                release.display()
+            )
+        },
+        "lingerMs": 3000
+    })
+    .to_string();
     let release_marker = ReleaseMarker::new(release);
-    let mut adapter = adapter_driver_command(&temp, &driver, "detachable", None)
+    let mut adapter = adapter_driver_command(&temp, &driver, "request", Some(&request))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
