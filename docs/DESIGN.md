@@ -192,6 +192,13 @@ completion, status recovery, and guardian recovery accept only that handle-local
 metadata and digest, copy it into a sealed in-memory image, and execute the sealed bytes. Replacing
 or editing the configured source path after registration cannot change an in-flight handle.
 
+The source models that provenance transition explicitly. `ConfiguredDeliveryHelper` is resolved
+from the initiating environment and can perform only owner-session discovery or a consuming bind.
+Binding yields `HandleBoundDeliveryHelper`; registration and every later delivery-helper request
+accept only that handle-bound type. Reconstructing it from durable provenance revalidates the
+handle-local path, metadata, digest, environment, and sealed bytes before exposing its operation
+command.
+
 Registration also pins the helper's execution environment. Helper commands clear the initiating
 process's ambient environment, run from `/`, and restore only a bounded baseline (`HOME`, locale,
 user, `PATH`, temporary-directory, and XDG/agent-runner data paths) plus non-secret variables named

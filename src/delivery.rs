@@ -57,13 +57,19 @@ const DELIVERY_HELPER_INVALID: &str = "delivery_helper_provenance_invalid";
 const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
 
 #[derive(Debug)]
-struct DeliveryHelper {
+struct ConfiguredDeliveryHelper {
+    provenance: DeliveryHelperProvenance,
+    executable: File,
+}
+
+#[derive(Debug)]
+struct HandleBoundDeliveryHelper {
     provenance: DeliveryHelperProvenance,
     executable: File,
 }
 
 pub(crate) struct DeliveryRegistrationCandidate {
-    helper: DeliveryHelper,
+    helper: ConfiguredDeliveryHelper,
 }
 
 impl DeliveryRegistrationCandidate {
@@ -74,7 +80,7 @@ impl DeliveryRegistrationCandidate {
 }
 
 pub(crate) struct DeliveryRegistration {
-    helper: DeliveryHelper,
+    helper: HandleBoundDeliveryHelper,
 }
 
 struct DeliveryLockGuard {
@@ -144,7 +150,7 @@ impl fmt::Display for DeliveryHelperError {
 
 impl std::error::Error for DeliveryHelperError {}
 
-impl DeliveryHelper {
+impl ConfiguredDeliveryHelper {
     fn from_environment() -> Result<Self, DeliveryHelperError> {
         let configured =
             env::var_os("AGENT_BASH_AGENT_RUNNER_BIN").unwrap_or_else(|| OsString::from("agents"));
@@ -243,7 +249,10 @@ impl DeliveryHelper {
         })
     }
 
-    fn pin_to_handle(self, paths: &StatePaths) -> Result<Self, DeliveryHelperError> {
+    fn pin_to_handle(
+        self,
+        paths: &StatePaths,
+    ) -> Result<HandleBoundDeliveryHelper, DeliveryHelperError> {
         let cache_dir = paths.root.join(DELIVERY_HELPER_CACHE_DIR);
         create_helper_cache_dir(&cache_dir).map_err(|err| {
             DeliveryHelperError::unavailable(format!(
@@ -312,12 +321,18 @@ impl DeliveryHelper {
             self.provenance.sha256,
             self.provenance.environment,
         );
-        Ok(Self {
+        Ok(HandleBoundDeliveryHelper {
             provenance,
             executable: self.executable,
         })
     }
 
+    fn owner_lookup_command(&self) -> Command {
+        delivery_helper_command(&self.provenance, &self.executable)
+    }
+}
+
+impl HandleBoundDeliveryHelper {
     fn from_provenance(
         provenance: Option<&DeliveryHelperProvenance>,
         paths: &StatePaths,
@@ -405,27 +420,31 @@ impl DeliveryHelper {
         })
     }
 
-    fn command(&self) -> Command {
-        let fd = self.executable.as_raw_fd();
-        let mut command = Command::new(format!("/proc/self/fd/{fd}"));
-        command
-            .env_clear()
-            .envs(&self.provenance.environment)
-            .current_dir("/");
-        unsafe {
-            command.pre_exec(move || {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        command
+    fn operation_command(&self) -> Command {
+        delivery_helper_command(&self.provenance, &self.executable)
     }
+}
+
+fn delivery_helper_command(provenance: &DeliveryHelperProvenance, executable: &File) -> Command {
+    let fd = executable.as_raw_fd();
+    let mut command = Command::new(format!("/proc/self/fd/{fd}"));
+    command
+        .env_clear()
+        .envs(&provenance.environment)
+        .current_dir("/");
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
 }
 
 fn open_delivery_helper(path: &Path) -> io::Result<File> {
@@ -752,8 +771,8 @@ fn resolve_owner_for_pid(
     pid: libc::pid_t,
     expected_invocation_uuid: &str,
 ) -> io::Result<Option<(String, String)>> {
-    let helper = DeliveryHelper::from_environment().map_err(io::Error::other)?;
-    let mut command = helper.command();
+    let helper = ConfiguredDeliveryHelper::from_environment().map_err(io::Error::other)?;
+    let mut command = helper.owner_lookup_command();
     let mut child = command
         .args(["session", "of-pid", &pid.to_string(), "--json"])
         .stdin(Stdio::null())
@@ -816,7 +835,7 @@ fn resolve_owner_for_pid(
 }
 
 pub(crate) fn prepare_registration() -> io::Result<DeliveryRegistrationCandidate> {
-    let helper = DeliveryHelper::from_environment().map_err(io::Error::other)?;
+    let helper = ConfiguredDeliveryHelper::from_environment().map_err(io::Error::other)?;
     Ok(DeliveryRegistrationCandidate { helper })
 }
 
@@ -1026,14 +1045,14 @@ fn wait_for_consumed_marker(paths: &StatePaths, grace: Duration) -> bool {
 }
 
 struct DeliveryHelperRequest {
-    helper: DeliveryHelper,
+    helper: HandleBoundDeliveryHelper,
     args: Vec<OsString>,
     transient_environment: Vec<(OsString, OsString)>,
 }
 
 impl DeliveryHelperRequest {
     fn command(&self) -> Command {
-        let mut command = self.helper.command();
+        let mut command = self.helper.operation_command();
         command.args(&self.args).envs(
             self.transient_environment
                 .iter()
@@ -1046,7 +1065,7 @@ impl DeliveryHelperRequest {
 fn register_request(
     meta: &Meta,
     paths: &StatePaths,
-    helper: DeliveryHelper,
+    helper: HandleBoundDeliveryHelper,
 ) -> DeliveryHelperRequest {
     DeliveryHelperRequest {
         helper,
@@ -1062,7 +1081,7 @@ fn activate_request(
     paths: &StatePaths,
 ) -> Result<DeliveryHelperRequest, DeliveryHelperError> {
     Ok(DeliveryHelperRequest {
-        helper: DeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)?,
+        helper: HandleBoundDeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)?,
         args: activate_args(&meta.handle),
         transient_environment: Vec::new(),
     })
@@ -1076,7 +1095,7 @@ fn completion_request(
     provenance: Option<&DeliveryHelperProvenance>,
 ) -> Result<DeliveryHelperRequest, DeliveryHelperError> {
     Ok(DeliveryHelperRequest {
-        helper: DeliveryHelper::from_provenance(provenance, paths)?,
+        helper: HandleBoundDeliveryHelper::from_provenance(provenance, paths)?,
         args: completion_args(caller_ppid, handle, paths, consumed),
         transient_environment: Vec::new(),
     })
@@ -1362,7 +1381,7 @@ mod tests {
             .set_times(fs::FileTimes::new().set_modified(modified))
             .expect("restore snapshot mtime");
 
-        let err = DeliveryHelper::from_provenance(Some(&provenance), &paths)
+        let err = HandleBoundDeliveryHelper::from_provenance(Some(&provenance), &paths)
             .expect_err("replacement must fail closed");
         assert_eq!(err.code, DELIVERY_HELPER_CHANGED);
         assert!(err.detail.contains("contents changed"), "{}", err.detail);
