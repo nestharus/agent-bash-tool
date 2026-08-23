@@ -127,8 +127,8 @@ therefore does not become an accepted cancellation or consumed activation claim 
 The activation lifecycle may also invoke the same durable rollback after a conclusive downstream
 pre-admission failure.
 
-Owner-authorized `status` and bulk `list` share the lost-supervisor terminal transition but not the
-delivery-helper-operation role. A targeted owner `status` reconciliation owns pending completion
+Owner-authorized `status` and the default owner-scoped `list` share the lost-supervisor terminal
+transition but not the delivery-helper-operation role. A targeted owner `status` reconciliation owns pending completion
 delivery in its current process and synchronously waits for the local delivery owner and helper
 outcome. An owner-scoped bulk `list` may publish the same terminal state for an accurate projection,
 but it never executes a helper as an incidental enumeration side effect; its disposition is

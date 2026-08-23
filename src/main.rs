@@ -880,15 +880,14 @@ fn list_summary_for_entry(
     }
     let paths = paths_for_entry(root, &entry);
     let meta = read_entry_meta(&paths)?;
+    if all {
+        return Some(list_summary_from_meta(&meta, paths.state_dir));
+    }
     let owned = handle_owned_by(&meta, &paths, caller_chain);
-    let meta = if owned {
-        reconcile_list_meta(&paths, meta)?
-    } else {
-        meta
-    };
-    if !all && !owned {
+    if !owned {
         return None;
     }
+    let meta = reconcile_list_meta(&paths, meta)?;
     Some(list_summary_from_meta(&meta, paths.state_dir))
 }
 

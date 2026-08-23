@@ -4984,7 +4984,7 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
 }
 
 #[test]
-fn list_all_reconciles_lost_supervisors_without_claiming_delivery() {
+fn list_all_observes_lost_supervisors_without_reconciling_or_delivery() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (observer, observer_log) =
         named_fake_agents(&temp, "list-observer-agents", "list-observer.log");
@@ -5009,7 +5009,7 @@ fn list_all_reconciles_lost_supervisors_without_claiming_delivery() {
     assert_command_success(&output);
     let summaries = parse_stdout_json(&output);
     assert_eq!(summaries[0]["handle"], handle);
-    assert_eq!(summaries[0]["state"], "ERROR");
+    assert_eq!(summaries[0]["state"], "RUNNING");
     let meta = read_meta(
         &temp
             .path()
@@ -5017,7 +5017,7 @@ fn list_all_reconciles_lost_supervisors_without_claiming_delivery() {
             .join(handle)
             .join("meta.json"),
     );
-    assert_eq!(meta["completion_reason"], "supervisor-lost");
+    assert!(meta["completion_reason"].is_null());
     assert_eq!(meta["delivery"]["attempted"], false);
     assert!(
         !observer_log.exists(),

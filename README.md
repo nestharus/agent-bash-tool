@@ -28,8 +28,9 @@ completion returns synchronously in-band or asynchronously through the agent mai
 - **Supervisor-loss recovery.** A detached guardian waits on the exact supervisor child. If the
   supervisor exits abnormally, the guardian reconciles durable process identity and terminal state
   and performs pending asynchronous delivery without requiring a caller to poll `status`. Bulk
-  `list` may publish that terminal state for an accurate projection without executing a helper;
-  it leaves delivery unclaimed in that reconciliation. The guardian normally claims the pending
+  the default owner-scoped `list` may publish that terminal state for an accurate projection without
+  executing a helper; it leaves delivery unclaimed in that reconciliation. `list --all` remains a
+  read-only account-wide snapshot. The guardian normally claims the pending
   delivery, while targeted owner `status` may claim it first under the same delivery lock and wait
   for the helper outcome. Cross-owner `status` is read-only. The guardian also adopts the workload
   tree and finishes any already-accepted explicit cancellation.
