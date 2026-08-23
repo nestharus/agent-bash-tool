@@ -162,7 +162,9 @@ forbidden.
 
 Handle observation and handle control are separate authorities. Default list visibility and
 control require the recorded owner session when one exists, falling back to the exact caller-chain
-predicate only for handles without session metadata. `list --all` and a cross-owner `status` may
+predicate only for handles without session metadata. At every mutating control boundary, the
+handle's pinned helper resolves the live caller chain to its acting session; ambient owner strings
+are never authority. `list --all` and a cross-owner `status` may
 observe account-local handles, but they cannot publish recovery state, claim delivery, cancel work,
 or change delivery mode. Cancel and detach fail with `EX_NOPERM` for non-owners. Guardian recovery
 remains independent of any observing caller and is the automatic cleanup/progress path after the
@@ -183,8 +185,11 @@ records these as optional fields in `meta.json` and in a separate `owner.json`, 
 session to rediscover its handles after the adapter process and caller PID change. Agent-runner may
 use this pair as a delivery fallback only after confirming that the invocation belongs to the same
 provider session. The recorded session ID also restores that session's control authority for
-cancel, detach, and status reconciliation after its caller PID changes. Handles without session
-metadata use the nearest exact PID/start-time/boot-ID caller-chain entry as their control anchor.
+cancel, detach, and status reconciliation after its caller PID changes. That authority requires a
+fresh agent-runner resolution of the acting caller chain through the handle's pinned helper;
+presenting the recorded session ID in an environment variable does not grant control. Handles
+without session metadata use the nearest exact PID/start-time/boot-ID caller-chain entry as their
+control anchor.
 
 Registration resolves the configured helper once, reads it into a sealed executable image, and
 stores its SHA-256 identity. The image is installed once per content digest under the account-private
@@ -224,9 +229,10 @@ The state root is a Unix-account trust boundary. Mode `0700` excludes other acco
 same-account workloads and observers are trusted not to rewrite another handle's state or helper
 cache. The observer-isolation guarantee means a later process cannot substitute its environment or
 configured helper path; it is not a sandbox between hostile processes sharing one Unix identity.
-The owner check prevents accidental cross-session control within that account, but is not claimed
-as authentication against a hostile same-UID process. A future cross-owner operator action requires
-a separately authenticated broker or OS identity; `list --all` deliberately does not confer it.
+The owner check uses agent-runner's exact live PID identity records to prevent cross-session control
+within that account, but is not claimed as a sandbox against a hostile same-UID process that rewrites
+durable state. A future cross-owner operator action requires a separately authenticated broker or OS
+identity; `list --all` deliberately does not confer it.
 The selected helper is an opaque trusted extension at this boundary. Its operation handlers may
 maintain downstream state, but this repository claims only pinned byte identity, invocation
 admission, and the observed helper-process outcome, not closure over arbitrary helper internals.

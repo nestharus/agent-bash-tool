@@ -33,7 +33,6 @@ struct OwnerContext {
 
 struct CallerAuthority {
     caller_chain: Vec<CallerChainEntry>,
-    owner_session_id: Option<String>,
 }
 
 #[derive(Parser)]
@@ -820,12 +819,7 @@ fn read_open_status_log(mut file: std::fs::File) -> io::Result<Vec<u8>> {
 
 fn list_command(caller: CallerAuthority, all: bool, json: bool) -> Result<(), AppError> {
     let root = load_state_root().map_err(state_root_unavailable)?;
-    let mut summaries = list_summaries(
-        &root,
-        &caller.caller_chain,
-        caller.owner_session_id.as_deref(),
-        all,
-    )?;
+    let mut summaries = list_summaries(&root, &caller.caller_chain, all)?;
     sort_summaries(&mut summaries);
     emit_list_summaries(&summaries, json)?;
     Ok(())
@@ -834,7 +828,6 @@ fn list_command(caller: CallerAuthority, all: bool, json: bool) -> Result<(), Ap
 fn list_summaries(
     root: &Path,
     caller_chain: &[state::CallerChainEntry],
-    owner_session_id: Option<&str>,
     all: bool,
 ) -> Result<Vec<ListSummary>, AppError> {
     if !root.exists() {
@@ -844,9 +837,7 @@ fn list_summaries(
     let mut summaries = Vec::new();
     for entry in entries {
         let entry = read_state_entry(entry)?;
-        if let Some(summary) =
-            list_summary_for_entry(root, entry, caller_chain, owner_session_id, all)
-        {
+        if let Some(summary) = list_summary_for_entry(root, entry, caller_chain, all) {
             summaries.push(summary);
         }
     }
@@ -882,7 +873,6 @@ fn list_summary_for_entry(
     root: &Path,
     entry: std::fs::DirEntry,
     caller_chain: &[state::CallerChainEntry],
-    owner_session_id: Option<&str>,
     all: bool,
 ) -> Option<ListSummary> {
     if !entry_is_state_dir(&entry) {
@@ -890,13 +880,13 @@ fn list_summary_for_entry(
     }
     let paths = paths_for_entry(root, &entry);
     let meta = read_entry_meta(&paths)?;
-    let owned = handle_owned_by(&meta, &paths, caller_chain, owner_session_id);
+    let owned = handle_owned_by(&meta, &paths, caller_chain);
     let meta = if owned {
         reconcile_list_meta(&paths, meta)?
     } else {
         meta
     };
-    if !include_list_meta(&meta, &paths, caller_chain, owner_session_id, all) {
+    if !all && !owned {
         return None;
     }
     Some(list_summary_from_meta(&meta, paths.state_dir))
@@ -922,35 +912,36 @@ fn read_entry_meta(paths: &StatePaths) -> Option<Meta> {
     state::read_meta(paths).ok()
 }
 
-fn include_list_meta(
-    meta: &Meta,
-    paths: &StatePaths,
-    caller_chain: &[state::CallerChainEntry],
-    owner_session_id: Option<&str>,
-    all: bool,
-) -> bool {
-    all || handle_owned_by(meta, paths, caller_chain, owner_session_id)
-}
-
 fn handle_owned_by(
     meta: &Meta,
     paths: &StatePaths,
     caller_chain: &[state::CallerChainEntry],
-    owner_session_id: Option<&str>,
 ) -> bool {
     if let Some(recorded_session_id) = meta.owner_session_id.as_deref() {
-        return owner_session_id == Some(recorded_session_id);
+        return acting_session_owns_handle(meta, paths, caller_chain, recorded_session_id);
     }
     match state::read_owner(paths) {
         Ok(owner) => {
             if let Some(recorded_session_id) = owner.owner_session_id {
-                return owner_session_id == Some(recorded_session_id.as_str());
+                return acting_session_owns_handle(meta, paths, caller_chain, &recorded_session_id);
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return false,
     }
     caller_chain_owns_handle(meta, caller_chain)
+}
+
+fn acting_session_owns_handle(
+    meta: &Meta,
+    paths: &StatePaths,
+    caller_chain: &[state::CallerChainEntry],
+    recorded_session_id: &str,
+) -> bool {
+    delivery::resolve_handle_owner_binding(paths, meta.delivery_helper.as_ref(), caller_chain)
+        .ok()
+        .flatten()
+        .is_some_and(|(session_id, _)| session_id == recorded_session_id)
 }
 
 fn caller_chain_owns_handle(meta: &Meta, caller_chain: &[state::CallerChainEntry]) -> bool {
@@ -970,17 +961,11 @@ fn caller_chain_owns_handle(meta: &Meta, caller_chain: &[state::CallerChainEntry
 fn caller_authority(guard: &AttachedGuard) -> CallerAuthority {
     CallerAuthority {
         caller_chain: state::capture_caller_chain(guard.startup_ppid()),
-        owner_session_id: nonempty_env(OWNER_SESSION_ID_ENV),
     }
 }
 
 fn caller_controls_handle(meta: &Meta, paths: &StatePaths, caller: &CallerAuthority) -> bool {
-    handle_owned_by(
-        meta,
-        paths,
-        &caller.caller_chain,
-        caller.owner_session_id.as_deref(),
-    )
+    handle_owned_by(meta, paths, &caller.caller_chain)
 }
 
 fn require_control_authority(

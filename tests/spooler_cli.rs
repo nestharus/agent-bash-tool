@@ -32,6 +32,8 @@ fn agent_bash(temp: &tempfile::TempDir) -> Command {
             FAKE_HELPER_ENVIRONMENT,
         )
         .env_remove("AGENT_BASH_CONSUMER_GRACE_MS")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
+        .env_remove("AGENT_BASH_OWNER_SESSION_ID")
         .env_remove("OULIPOLY_PARENT_INVOCATION")
         .env_remove("OULIPOLY_DATA_DIR");
     cmd
@@ -562,6 +564,24 @@ exit 0
     .expect("write owner-resolving fake");
     set_executable(&fake);
     fake
+}
+
+fn routed_owner_resolving_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join("routed-owner-resolving-fake-agents");
+    let route = temp.path().join("acting-session");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+if [ "${1:-}" = session ] && [ "${2:-}" = of-pid ]; then
+    session=$(cat "$AGENT_BASH_FAKE_ROUTE")
+    printf '{"found":true,"invocation_uuid":"11111111-1111-4111-8111-111111111111","session_id":"%s"}\n' "$session"
+fi
+exit 0
+"#,
+    )
+    .expect("write routed owner-resolving fake");
+    set_executable(&fake);
+    (fake, route)
 }
 
 fn registration_rejecting_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
@@ -2013,6 +2033,8 @@ fn owner_exit_cancels_opted_in_workload_and_descendants() {
 #[test]
 fn explicit_cancel_wins_when_owner_exit_is_already_pollable() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let (helper, route) = routed_owner_resolving_fake_agents(&temp);
+    fs::write(&route, "ses_owner_race\n").expect("route owner race session");
     let run_json_path = temp.path().join("owner-race-run.json");
     let owner_ready = temp.path().join("owner-race-ready");
     let fixture_deadline = FIXTURE_DEADLINE;
@@ -2025,10 +2047,23 @@ fn explicit_cancel_wins_when_owner_exit_is_already_pollable() {
         .args(["-c", &launcher_script])
         .stdin(Stdio::piped())
         .env("XDG_STATE_HOME", temp.path())
-        .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", helper)
+        .env(
+            "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST",
+            FAKE_HELPER_ENVIRONMENT,
+        )
+        .env("AGENT_BASH_FAKE_ROUTE", route)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_owner_race")
+        .env(
+            "AGENT_BASH_OWNER_INVOCATION_UUID",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"source":"opencode","id":"11111111-1111-4111-8111-111111111111"}"#,
+        )
         .env("RUN_JSON", &run_json_path)
         .env("OWNER_READY", &owner_ready)
-        .env_remove("OULIPOLY_PARENT_INVOCATION")
         .env_remove("OULIPOLY_DATA_DIR")
         .spawn()
         .expect("owner launcher");
@@ -2570,50 +2605,91 @@ fn opencode_adapter_standalone_sleep_does_not_create_spool_state() {
 }
 
 #[test]
-fn recorded_owner_session_overrides_matching_caller_chain() {
+fn recorded_owner_session_requires_helper_attestation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let handle = "ab_session_precedence";
     let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
+    let (helper, route) = routed_owner_resolving_fake_agents(&temp);
+    write_delivery_helper_provenance(&state_dir, &helper, &[("AGENT_BASH_FAKE_ROUTE", &route)]);
     let meta_path = state_dir.join("meta.json");
     let mut meta = read_meta(&meta_path);
     meta["owner_session_id"] = json!("ses_owner");
     meta["owner_invocation_uuid"] = json!("11111111-1111-4111-8111-111111111111");
+    meta["delivery"]["retryable"] = json!(true);
     fs::write(&meta_path, format_seeded_meta(&meta)).expect("write session-owned meta");
+    fs::write(state_dir.join("delivery-mode"), b"async").expect("write async mode");
+    fs::write(&route, "ses_other\n").expect("route unrelated session");
 
-    let other_list = agent_bash(&temp)
-        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_other")
-        .args(["list", "--json"])
-        .output()
-        .expect("other session list");
-    assert_command_success(&other_list);
-    assert_eq!(parse_stdout_json(&other_list), json!([]));
-
-    let other_cancel = agent_bash(&temp)
-        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_other")
-        .args(["cancel", handle])
-        .output()
-        .expect("other session cancel");
-    assert_eq!(other_cancel.status.code(), Some(77));
-    assert!(
-        String::from_utf8_lossy(&other_cancel.stderr).contains("caller does not own handle"),
-        "{}",
-        command_failure_message(&other_cancel)
-    );
-    assert!(!state_dir.join("cancel-requested").exists());
-
-    let owner_list = agent_bash(&temp)
+    let forged_list = agent_bash(&temp)
         .env("AGENT_BASH_OWNER_SESSION_ID", "ses_owner")
         .args(["list", "--json"])
         .output()
-        .expect("owner session list");
+        .expect("forged owner session list");
+    assert_command_success(&forged_list);
+    assert_eq!(parse_stdout_json(&forged_list), json!([]));
+
+    let forged_status = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_owner")
+        .args(["status", "--full", handle])
+        .output()
+        .expect("forged owner session status");
+    assert_command_success(&forged_status);
+    let unchanged = read_meta(&meta_path);
+    assert_eq!(unchanged["delivery"]["attempted"], false);
+    assert_eq!(unchanged["delivery"]["retryable"], true);
+
+    let forged_cancel = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_owner")
+        .args(["cancel", handle])
+        .output()
+        .expect("forged owner session cancel");
+    assert_eq!(forged_cancel.status.code(), Some(77));
+    assert!(
+        String::from_utf8_lossy(&forged_cancel.stderr).contains("caller does not own handle"),
+        "{}",
+        command_failure_message(&forged_cancel)
+    );
+    assert!(!state_dir.join("cancel-requested").exists());
+
+    fs::write(state_dir.join("delivery-mode"), b"sync").expect("write sync mode");
+    let forged_detach = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_owner")
+        .args(["detach", handle])
+        .output()
+        .expect("forged owner session detach");
+    assert_eq!(forged_detach.status.code(), Some(77));
+    assert_eq!(
+        fs::read_to_string(state_dir.join("delivery-mode")).unwrap(),
+        "sync"
+    );
+
+    fs::write(&route, "ses_owner\n").expect("route owning session");
+    let owner_list = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_other")
+        .args(["list", "--json"])
+        .output()
+        .expect("attested owner session list");
     assert_command_success(&owner_list);
     assert_eq!(parse_stdout_json(&owner_list)[0]["handle"], handle);
+
+    let owner_detach = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_other")
+        .args(["detach", handle])
+        .output()
+        .expect("attested owner session detach");
+    assert_command_success(&owner_detach);
+    assert_eq!(
+        fs::read_to_string(state_dir.join("delivery-mode")).unwrap(),
+        "async"
+    );
 }
 
 #[test]
 fn list_adopts_handle_owned_by_resumed_session_after_caller_pid_changes() {
     let temp = tempfile::tempdir().expect("tempdir");
     let state_dir = seed_done_state_dir(&temp, "ab_resumed_owner", unix_ms(), false);
+    let (helper, route) = routed_owner_resolving_fake_agents(&temp);
+    write_delivery_helper_provenance(&state_dir, &helper, &[("AGENT_BASH_FAKE_ROUTE", &route)]);
     let meta_path = state_dir.join("meta.json");
     let mut meta = read_meta(&meta_path);
     meta["caller_ppid"] = json!(i32::MAX);
@@ -2626,8 +2702,8 @@ fn list_adopts_handle_owned_by_resumed_session_after_caller_pid_changes() {
     )
     .expect("write durable owner");
 
+    fs::write(&route, "ses_resumed\n").expect("route resumed session");
     let matching = agent_bash(&temp)
-        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_resumed")
         .args(["list", "--json"])
         .output()
         .expect("matching list");
@@ -2636,8 +2712,8 @@ fn list_adopts_handle_owned_by_resumed_session_after_caller_pid_changes() {
     assert_eq!(matching.as_array().expect("list").len(), 1);
     assert_eq!(matching[0]["handle"], "ab_resumed_owner");
 
+    fs::write(&route, "ses_other\n").expect("route unrelated session");
     let other = agent_bash(&temp)
-        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_other")
         .args(["list", "--json"])
         .output()
         .expect("other list");
@@ -2645,7 +2721,6 @@ fn list_adopts_handle_owned_by_resumed_session_after_caller_pid_changes() {
     assert_eq!(parse_stdout_json(&other), json!([]));
 
     let unrelated_status = agent_bash(&temp)
-        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_other")
         .args(["status", "--full", "ab_resumed_owner"])
         .output()
         .expect("unrelated status");
@@ -2655,18 +2730,17 @@ fn list_adopts_handle_owned_by_resumed_session_after_caller_pid_changes() {
     assert!(unchanged["delivery"]["error_code"].is_null());
     assert_eq!(unchanged["delivery"]["retryable"], true);
 
+    fs::write(&route, "ses_resumed\n").expect("route resumed session");
     let owner_status = agent_bash(&temp)
-        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_resumed")
         .args(["status", "--full", "ab_resumed_owner"])
         .output()
         .expect("owner status");
     assert_command_success(&owner_status);
     let reconciled = read_meta(&meta_path);
-    assert_eq!(
-        reconciled["delivery"]["error_code"],
-        "delivery_helper_legacy_unsupported"
-    );
-    assert_eq!(reconciled["delivery"]["retryable"], false);
+    assert_eq!(reconciled["delivery"]["attempted"], true);
+    assert_eq!(reconciled["delivery"]["exit_code"], 0);
+    assert!(reconciled["delivery"]["error_code"].is_null());
+    assert!(reconciled["delivery"]["retryable"].is_null());
 }
 
 #[test]

@@ -78,7 +78,9 @@ impl DeliveryRegistrationCandidate {
         caller_chain: &[CallerChainEntry],
         expected_invocation_uuid: &str,
     ) -> io::Result<Option<(String, String)>> {
-        resolve_owner_binding(&self.helper, caller_chain, expected_invocation_uuid)
+        resolve_owner_binding(caller_chain, Some(expected_invocation_uuid), || {
+            self.helper.owner_lookup_command()
+        })
     }
 
     pub(crate) fn bind_to_handle(self, paths: &StatePaths) -> io::Result<DeliveryRegistration> {
@@ -760,15 +762,17 @@ struct PidSessionResponse {
 }
 
 fn resolve_owner_binding(
-    helper: &ConfiguredDeliveryHelper,
     caller_chain: &[CallerChainEntry],
-    expected_invocation_uuid: &str,
+    expected_invocation_uuid: Option<&str>,
+    mut owner_lookup_command: impl FnMut() -> Command,
 ) -> io::Result<Option<(String, String)>> {
     for entry in caller_chain
         .iter()
         .filter(|entry| state::process_identity_is_live(entry))
     {
-        if let Some(owner) = resolve_owner_for_pid(helper, entry.pid, expected_invocation_uuid)? {
+        if let Some(owner) =
+            resolve_owner_for_pid(owner_lookup_command(), entry.pid, expected_invocation_uuid)?
+        {
             return Ok(Some(owner));
         }
     }
@@ -776,11 +780,10 @@ fn resolve_owner_binding(
 }
 
 fn resolve_owner_for_pid(
-    helper: &ConfiguredDeliveryHelper,
+    mut command: Command,
     pid: libc::pid_t,
-    expected_invocation_uuid: &str,
+    expected_invocation_uuid: Option<&str>,
 ) -> io::Result<Option<(String, String)>> {
-    let mut command = helper.owner_lookup_command();
     let mut child = command
         .args(["session", "of-pid", &pid.to_string(), "--json"])
         .stdin(Stdio::null())
@@ -830,7 +833,10 @@ fn resolve_owner_for_pid(
             format!("agents session of-pid {pid} returned invalid JSON: {err}"),
         )
     })?;
-    if !response.found || response.invocation_uuid.as_deref() != Some(expected_invocation_uuid) {
+    if !response.found
+        || expected_invocation_uuid
+            .is_some_and(|expected| response.invocation_uuid.as_deref() != Some(expected))
+    {
         return Ok(None);
     }
     let Some(session_id) = response.session_id.filter(|value| !value.is_empty()) else {
@@ -840,6 +846,16 @@ fn resolve_owner_for_pid(
         return Ok(None);
     };
     Ok(Some((session_id, invocation_uuid)))
+}
+
+pub(crate) fn resolve_handle_owner_binding(
+    paths: &StatePaths,
+    provenance: Option<&DeliveryHelperProvenance>,
+    caller_chain: &[CallerChainEntry],
+) -> io::Result<Option<(String, String)>> {
+    let helper =
+        HandleBoundDeliveryHelper::from_provenance(provenance, paths).map_err(io::Error::other)?;
+    resolve_owner_binding(caller_chain, None, || helper.operation_command())
 }
 
 pub(crate) fn prepare_registration() -> io::Result<DeliveryRegistrationCandidate> {
