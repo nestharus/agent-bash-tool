@@ -168,17 +168,13 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
         return 0;
     }
 
-    let mut recovered_cancel_started = None;
+    let mut recovered_cancel_escalation = None;
     loop {
         let accepted_cancel = explicit_cancel_accepted(paths);
         if accepted_cancel {
-            let started_at = recovered_cancel_started.get_or_insert_with(Instant::now);
-            let signal = if started_at.elapsed() >= CANCEL_GRACE {
-                libc::SIGKILL
-            } else {
-                libc::SIGTERM
-            };
-            signal_descendants(current_pid(), signal);
+            let escalation = recovered_cancel_escalation
+                .get_or_insert_with(CancellationEscalation::begin_guardian_takeover);
+            signal_descendants(current_pid(), escalation.signal());
         }
         let adopted_tree_empty = reap_adopted_children();
         if accepted_cancel && !adopted_tree_empty {
@@ -996,7 +992,35 @@ struct EventLoop {
 
 struct Cancellation {
     provisional_cause: CancellationCause,
+    escalation: CancellationEscalation,
+}
+
+struct CancellationEscalation {
     started_at: Instant,
+}
+
+impl CancellationEscalation {
+    fn begin_live_acceptance() -> Self {
+        Self {
+            started_at: Instant::now(),
+        }
+    }
+
+    fn begin_guardian_takeover() -> Self {
+        // The durable marker has no acceptance timestamp. A fresh grace period lets the
+        // newly responsible guardian deliver SIGTERM before it may escalate.
+        Self {
+            started_at: Instant::now(),
+        }
+    }
+
+    fn signal(&self) -> libc::c_int {
+        if self.started_at.elapsed() >= CANCEL_GRACE {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1263,7 +1287,7 @@ impl EventLoop {
             None => {
                 self.cancellation = Some(Cancellation {
                     provisional_cause: proposed_cause,
-                    started_at: Instant::now(),
+                    escalation: CancellationEscalation::begin_live_acceptance(),
                 });
             }
         }
@@ -1277,12 +1301,7 @@ impl EventLoop {
         cancellation.provisional_cause = cancellation
             .provisional_cause
             .with_observed_explicit_cancel(explicit_cancel_accepted(&self.paths));
-        let signal = if cancellation.started_at.elapsed() >= CANCEL_GRACE {
-            libc::SIGKILL
-        } else {
-            libc::SIGTERM
-        };
-        signal_descendants(current_pid(), signal);
+        signal_descendants(current_pid(), cancellation.escalation.signal());
     }
 
     fn handle_cgroup_event(&self) {

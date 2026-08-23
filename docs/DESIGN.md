@@ -119,6 +119,11 @@ missing. Every non-sentinel terminal producer uses that same precedence decision
 `CancellationCause` carries the provisional event-loop cause through finish selection and terminal
 proposal. The terminal publisher then finalizes it from the durable marker while holding
 `completion.lock`; the same type owns the persisted labels and status projection.
+`CancellationEscalation` owns the shared `SIGTERM`-then-`SIGKILL` decision for both the live
+supervisor and guardian. Live supervision starts its grace clock when cancellation is first
+accepted or observed. Guardian takeover intentionally starts a fresh grace clock because the
+durable marker carries no acceptance timestamp and the newly responsible process must first give
+the adopted tree a bounded `SIGTERM` opportunity before escalating.
 
 `cancel-requested` and `activation-attempted` use one state-layer durable create-once marker
 primitive. It opens the state directory before marker creation, syncs the created file and directory,
