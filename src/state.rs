@@ -138,7 +138,7 @@ pub(crate) enum DeliveryLifecycle {
     RetryablePreAdmissionFailure,
     ClosedPreAdmissionFailure,
     AdmittedOutcome,
-    Skipped,
+    LegacySkipped,
     Invalid,
 }
 
@@ -174,7 +174,7 @@ impl DeliveryMeta {
     pub(crate) fn lifecycle(&self) -> DeliveryLifecycle {
         if self.skipped.is_some() {
             return if !self.attempted && self.error_code.is_none() {
-                DeliveryLifecycle::Skipped
+                DeliveryLifecycle::LegacySkipped
             } else {
                 DeliveryLifecycle::Invalid
             };
@@ -1217,10 +1217,10 @@ mod tests {
             skipped: Some("sync_in_band".to_string()),
             ..DeliveryMeta::default()
         };
-        assert_eq!(delivery.lifecycle(), DeliveryLifecycle::Skipped);
+        assert_eq!(delivery.lifecycle(), DeliveryLifecycle::LegacySkipped);
         assert_eq!(
             serde_json::to_value(&delivery).expect("serialize delivery")["lifecycle"],
-            "skipped"
+            "legacy_skipped"
         );
         delivery.attempted = true;
         assert_eq!(delivery.lifecycle(), DeliveryLifecycle::Invalid);

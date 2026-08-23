@@ -722,7 +722,8 @@ pub(crate) struct DetachOutcome {
     delivery_mode: DeliveryMode,
     state: String,
     transitioned: bool,
-    notification_attempted: bool,
+    #[serde(rename = "notification_attempted")]
+    delivery_helper_operation_attempted: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -824,7 +825,7 @@ pub(crate) fn register(
     meta: &Meta,
     registration: DeliveryRegistration,
 ) -> std::io::Result<()> {
-    run_required_runner_command(&register_request(meta, paths, registration.helper))
+    run_required_delivery_helper_command(&register_request(meta, paths, registration.helper))
 }
 
 pub(crate) fn reconcile_completion_delivery(
@@ -843,7 +844,7 @@ pub(crate) fn reconcile_completion_delivery(
     let retry_count = persisted.delivery.retry_count.saturating_add(u8::from(
         lifecycle == DeliveryLifecycle::RetryablePreAdmissionFailure,
     ));
-    let request = match trigger_request(
+    let request = match completion_request(
         persisted.caller_ppid,
         &persisted.handle,
         paths,
@@ -863,12 +864,12 @@ pub(crate) fn reconcile_completion_delivery(
         persisted.delivery = provisional_delivery_transfer_meta();
         persisted.touch();
         state::write_meta_atomic(paths, &persisted)?;
-        persisted.delivery = match run_notify_command(&request) {
+        persisted.delivery = match run_delivery_helper_command(&request) {
             Ok(status) => delivery_meta_from_status(status),
-            Err(NotifyCommandError::NotStarted(err)) => {
+            Err(DeliveryHelperCommandError::NotStarted(err)) => {
                 delivery_meta_from_launch_error(err, retry_count)
             }
-            Err(NotifyCommandError::Admitted(err)) => delivery_meta_from_error(err),
+            Err(DeliveryHelperCommandError::Admitted(err)) => delivery_meta_from_error(err),
         };
         persisted.touch();
         state::write_meta_atomic(paths, &persisted)
@@ -908,18 +909,18 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
             return Err(err);
         }
         let result = if claimed {
-            run_required_runner_command_detailed(&request)
+            run_required_delivery_helper_command_detailed(&request)
         } else {
             Ok(())
         };
         match result {
-            Err(NotifyCommandError::NotStarted(err)) => {
+            Err(DeliveryHelperCommandError::NotStarted(err)) => {
                 state::rollback_activation_attempt(paths)?;
                 state::write_delivery_mode_atomic(paths, DeliveryMode::Sync)?;
                 repair_delivery_mode_mirror(paths, DeliveryMode::Sync)?;
                 Err(err)
             }
-            Err(NotifyCommandError::Admitted(err)) => {
+            Err(DeliveryHelperCommandError::Admitted(err)) => {
                 repair_delivery_mode_mirror(paths, DeliveryMode::Async)?;
                 Err(err)
             }
@@ -979,13 +980,17 @@ fn repair_delivery_mode_mirror(paths: &StatePaths, mode: DeliveryMode) -> io::Re
     Ok(meta)
 }
 
-fn detach_outcome(meta: &Meta, transitioned: bool, notification_attempted: bool) -> DetachOutcome {
+fn detach_outcome(
+    meta: &Meta,
+    transitioned: bool,
+    delivery_helper_operation_attempted: bool,
+) -> DetachOutcome {
     DetachOutcome {
         handle: meta.handle.clone(),
         delivery_mode: meta.delivery_mode,
         state: meta.state.clone(),
         transitioned,
-        notification_attempted,
+        delivery_helper_operation_attempted,
     }
 }
 
@@ -1020,13 +1025,13 @@ fn wait_for_consumed_marker(paths: &StatePaths, grace: Duration) -> bool {
     false
 }
 
-struct NotifyRequest {
+struct DeliveryHelperRequest {
     helper: DeliveryHelper,
     args: Vec<OsString>,
     transient_environment: Vec<(OsString, OsString)>,
 }
 
-impl NotifyRequest {
+impl DeliveryHelperRequest {
     fn command(&self) -> Command {
         let mut command = self.helper.command();
         command.args(&self.args).envs(
@@ -1038,8 +1043,12 @@ impl NotifyRequest {
     }
 }
 
-fn register_request(meta: &Meta, paths: &StatePaths, helper: DeliveryHelper) -> NotifyRequest {
-    NotifyRequest {
+fn register_request(
+    meta: &Meta,
+    paths: &StatePaths,
+    helper: DeliveryHelper,
+) -> DeliveryHelperRequest {
+    DeliveryHelperRequest {
         helper,
         args: register_args(meta, paths),
         transient_environment: env::var_os(COMPLETION_REGISTRATION_AUTHORITY_ENV)
@@ -1048,24 +1057,27 @@ fn register_request(meta: &Meta, paths: &StatePaths, helper: DeliveryHelper) -> 
     }
 }
 
-fn activate_request(meta: &Meta, paths: &StatePaths) -> Result<NotifyRequest, DeliveryHelperError> {
-    Ok(NotifyRequest {
+fn activate_request(
+    meta: &Meta,
+    paths: &StatePaths,
+) -> Result<DeliveryHelperRequest, DeliveryHelperError> {
+    Ok(DeliveryHelperRequest {
         helper: DeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)?,
         args: activate_args(&meta.handle),
         transient_environment: Vec::new(),
     })
 }
 
-fn trigger_request(
+fn completion_request(
     caller_ppid: libc::pid_t,
     handle: &str,
     paths: &StatePaths,
     consumed: bool,
     provenance: Option<&DeliveryHelperProvenance>,
-) -> Result<NotifyRequest, DeliveryHelperError> {
-    Ok(NotifyRequest {
+) -> Result<DeliveryHelperRequest, DeliveryHelperError> {
+    Ok(DeliveryHelperRequest {
         helper: DeliveryHelper::from_provenance(provenance, paths)?,
-        args: trigger_args(caller_ppid, handle, paths, consumed),
+        args: completion_args(caller_ppid, handle, paths, consumed),
         transient_environment: Vec::new(),
     })
 }
@@ -1098,7 +1110,7 @@ fn activate_args(handle: &str) -> Vec<OsString> {
     ]
 }
 
-fn trigger_args(
+fn completion_args(
     caller_ppid: libc::pid_t,
     handle: &str,
     paths: &StatePaths,
@@ -1130,12 +1142,12 @@ fn path_arg(path: &Path) -> OsString {
     path.as_os_str().to_os_string()
 }
 
-enum NotifyCommandError {
+enum DeliveryHelperCommandError {
     NotStarted(io::Error),
     Admitted(io::Error),
 }
 
-impl NotifyCommandError {
+impl DeliveryHelperCommandError {
     fn into_io_error(self) -> io::Error {
         match self {
             Self::NotStarted(err) | Self::Admitted(err) => err,
@@ -1143,39 +1155,44 @@ impl NotifyCommandError {
     }
 }
 
-fn run_notify_command(request: &NotifyRequest) -> Result<ExitStatus, NotifyCommandError> {
+fn run_delivery_helper_command(
+    request: &DeliveryHelperRequest,
+) -> Result<ExitStatus, DeliveryHelperCommandError> {
     let mut child = request
         .command()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(NotifyCommandError::NotStarted)?;
-    child.wait().map_err(NotifyCommandError::Admitted)
+        .map_err(DeliveryHelperCommandError::NotStarted)?;
+    child.wait().map_err(DeliveryHelperCommandError::Admitted)
 }
 
-fn run_required_runner_command(request: &NotifyRequest) -> std::io::Result<()> {
-    run_required_runner_command_detailed(request).map_err(NotifyCommandError::into_io_error)
+fn run_required_delivery_helper_command(request: &DeliveryHelperRequest) -> std::io::Result<()> {
+    run_required_delivery_helper_command_detailed(request)
+        .map_err(DeliveryHelperCommandError::into_io_error)
 }
 
-fn run_required_runner_command_detailed(request: &NotifyRequest) -> Result<(), NotifyCommandError> {
+fn run_required_delivery_helper_command_detailed(
+    request: &DeliveryHelperRequest,
+) -> Result<(), DeliveryHelperCommandError> {
     let child = request
         .command()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(NotifyCommandError::NotStarted)?;
+        .map_err(DeliveryHelperCommandError::NotStarted)?;
     let output = child
         .wait_with_output()
-        .map_err(NotifyCommandError::Admitted)?;
+        .map_err(DeliveryHelperCommandError::Admitted)?;
     if output.status.success() {
         return Ok(());
     }
     let detail = command_failure_detail(&output.stderr, &output.stdout);
-    Err(NotifyCommandError::Admitted(std::io::Error::other(
+    Err(DeliveryHelperCommandError::Admitted(std::io::Error::other(
         format!(
-            "runner exited with {}{}",
+            "delivery helper exited with {}{}",
             output
                 .status
                 .code()

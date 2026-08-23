@@ -40,11 +40,13 @@ agent-runner.
 ### Detached execution and explicit delivery
 There is no foreground execution mode. Every `run` detaches the workload, returns a handle
 immediately, and leaves the workload under the surviving supervisor. Execution lifetime and result
-delivery are separate choices:
+delivery are separate choices. Every terminal completion invokes the pinned
+`agent-bash-complete` helper operation; the mode recorded at registration tells the opaque helper
+whether that event is active for downstream mailbox delivery:
 
-- `run --delivery sync` records completion for in-band consumption and does not invoke the
-  agent-runner notification seam.
-- `run --delivery async` invokes the notification seam at completion.
+- `run --delivery sync` records completion for in-band consumption and sends an inactive completion
+  event to the helper; it does not enter the downstream mailbox.
+- `run --delivery async` sends an active completion event through the same helper operation.
 - The CLI defaults to `async` so handles created by older callers retain their behavior.
 - The OpenCode adapter defaults ordinary shell commands to `sync` with root-process completion,
   defaults child-agent dispatches to `async` with full-tree completion, and accepts an explicit
@@ -126,7 +128,7 @@ The activation lifecycle may also invoke the same durable rollback after a concl
 pre-admission failure.
 
 Owner-authorized `status` and bulk `list` share the lost-supervisor terminal transition but not the
-immediate notification role. A targeted owner `status` reconciliation owns pending completion
+delivery-helper-operation role. A targeted owner `status` reconciliation owns pending completion
 delivery in its current process and synchronously waits for the local delivery owner and helper
 outcome. An owner-scoped bulk `list` may publish the same terminal state for an accurate projection,
 but it never executes a helper as an incidental enumeration side effect; its disposition is
@@ -233,14 +235,15 @@ that value for observability. Missing mode files are interpreted as `async` for 
 older versions.
 
 `detach <handle>` converts `sync` to `async`. Detach and terminal completion both hold
-`delivery.lock` while deciding whether to invoke the external notification seam. Terminal state is
+`delivery.lock` while transferring their external delivery-helper operations. Terminal state is
 persisted before that decision so detach can safely observe a completion that won the race.
 
-- If detach wins while the workload is running, it persists `async`; completion later notifies.
-- If sync completion wins, it records `delivery.skipped="sync_in_band"`; a later detach transitions
-  the terminal handle and notifies.
-- If detach observes terminal state before completion's delivery step, detach notifies and records
-  the attempt; completion reloads that record and does not notify again.
+- If detach wins while the workload is running, it persists `async` and invokes the
+  `agent-bash-activate` helper operation; completion later invokes `agent-bash-complete`.
+- If sync completion wins, it invokes `agent-bash-complete` for the inactive event; a later detach
+  transitions the terminal handle and invokes `agent-bash-activate`.
+- If detach observes terminal state before completion's delivery step, the helper operations remain
+  serialized and each event type is admitted at most once.
 - Repeated detach calls observe `async` and are no-ops. If a caller died between the canonical mode
   write and the `meta.json` mirror, the retry repairs the mirror without repeating activation.
 
@@ -257,20 +260,23 @@ discarding a provably pre-admission obligation.
 
 `DeliveryMeta::lifecycle` is the source-level and serialized classifier for that protocol. It reports
 `unclaimed`, `provisional_transfer`, `retryable_pre_admission_failure`,
-`closed_pre_admission_failure`, `admitted_outcome`, `skipped`, or `invalid` from the existing metadata
-fields. Reconciliation and status progress decisions consume this classifier rather than independently
-decoding field combinations; the original fields remain present for detailed outcome diagnostics.
+`closed_pre_admission_failure`, `admitted_outcome`, `legacy_skipped`, or `invalid` from the existing
+metadata fields. `legacy_skipped` recognizes persisted records from the retired producer behavior;
+current production paths do not write `delivery.skipped`. Reconciliation and status progress
+decisions consume this classifier rather than independently decoding field combinations; the
+original fields remain present for detailed outcome diagnostics.
 
 The spooler's closed state machine ends at the admitted helper invocation and its observed process
 exit. Agent-runner owns mailbox publication, transaction boundaries, and any downstream idempotency.
 Accordingly, “at most once” in this repository means one admitted `agent-bash-activate` or
 `agent-bash-complete` helper invocation; it does not claim an uninspected end-to-end mailbox theorem.
 
-Before asynchronous notification, the supervisor checks the best-effort `consumed` marker. If
-`AGENT_BASH_CONSUMER_GRACE_MS` is nonzero, it waits up to that bounded interval (clamped to ten
-seconds) for an in-call consumer to create the marker. A marker suppresses the duplicate
-notification and records `delivery.skipped="consumed_in_call"`; delivery locking still makes the
-decision atomic with detach and completion.
+Before invoking the completion helper operation, the supervisor checks the best-effort `consumed`
+marker. If `AGENT_BASH_CONSUMER_GRACE_MS` is nonzero, it waits up to that bounded interval (clamped
+to ten seconds) for an in-call consumer to create the marker. A marker adds `--consumed` to the
+`agent-bash-complete` helper operation so the opaque helper can suppress any downstream duplicate;
+the spooler still records the admitted helper-process outcome. Delivery locking keeps that operation
+atomic with detach and completion.
 
 Startup retention work is sharded by `AGENT_BASH_STATE_REAP_SHARDS` (16 by default) so large state
 roots are scanned incrementally. In addition to settled terminal handles, the reaper may remove an

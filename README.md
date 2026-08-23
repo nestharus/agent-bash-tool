@@ -43,9 +43,10 @@ completion returns synchronously in-band or asynchronously through the agent mai
   was recorded; `list --all` is observation, not a grant of control authority.
 - **Completion: root, tree, or sentinel.** Finite jobs use an explicit process boundary;
   never-exiting servers report ready on a stdout marker. Nothing is assumed to exit.
-- **Async delivery via agent-runner.** For asynchronous completion the spooler asks agent-runner
-  whose session the caller is and hands over the result; agent-runner wakes (headless: `resume`) or
-  forwards (PTY). Synchronous completion never enters that mailbox.
+- **Delivery helper boundary.** Every completion invokes the handle's pinned helper operation.
+  Agent-runner interprets the registered mode and event flags: asynchronous completion wakes
+  (headless: `resume`) or forwards (PTY), while synchronous or already-consumed completion does not
+  enter that mailbox. The spooler owns helper admission and process outcome, not mailbox closure.
 - **Pinned delivery helper.** Registration snapshots the selected helper into a content-addressed,
   account-private cache and hard-links that exact version into the handle. It also records a small
   execution environment and clears later callers' ambient environment before every helper launch.

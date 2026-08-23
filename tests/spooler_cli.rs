@@ -3295,7 +3295,7 @@ fn partial_explicit_owner_fails_closed_with_runner_detail() {
     assert_eq!(output.status.code(), Some(74));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("runner exited with 74: {\"status\":\"notification_event_error\"")
+        stderr.contains("delivery helper exited with 74: {\"status\":\"notification_event_error\"")
             && stderr.contains("owner_session_id and owner_invocation_uuid are both required"),
         "{stderr}"
     );
@@ -4186,7 +4186,7 @@ fn sync_completion_triggers_its_inactive_completion_event() {
 }
 
 #[test]
-fn detach_after_sync_completion_notifies_once() {
+fn detach_after_sync_completion_admits_each_helper_operation_once() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
     let output = agent_bash(&temp)
@@ -4221,6 +4221,7 @@ fn detach_after_sync_completion_notifies_once() {
         (delivery_attempt_count(&delivery_log) == 1).then_some(())
     });
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
     let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path(&json));
         delivery_lifecycle_is_closed(&meta).then_some(meta)
@@ -4230,7 +4231,7 @@ fn detach_after_sync_completion_notifies_once() {
 }
 
 #[test]
-fn concurrent_detach_and_completion_produce_one_notification() {
+fn concurrent_detach_and_completion_admit_each_helper_operation_once() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
     let output = agent_bash(&temp)
@@ -4290,6 +4291,7 @@ fn concurrent_detach_and_completion_produce_one_notification() {
         (delivery_attempt_count(&delivery_log) == 1).then_some(())
     });
     assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
     assert_eq!(mode_text(&temp, &handle), "async");
 }
 
@@ -4407,7 +4409,7 @@ fn detach_does_not_rewrite_terminal_metadata_after_activation() {
 }
 
 #[test]
-fn consumed_marker_before_completion_suppresses_async_delivery() {
+fn consumed_marker_before_completion_marks_helper_operation_consumed() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
 
@@ -4436,7 +4438,7 @@ fn consumed_marker_before_completion_suppresses_async_delivery() {
 }
 
 #[test]
-fn consumed_marker_during_delivery_grace_suppresses_async_delivery() {
+fn consumed_marker_during_delivery_grace_marks_helper_operation_consumed() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
 
@@ -4476,7 +4478,7 @@ fn consumed_marker_during_delivery_grace_suppresses_async_delivery() {
 fn delivery_lifecycle_is_closed(meta: &Value) -> bool {
     matches!(
         meta["delivery"]["lifecycle"].as_str(),
-        Some("admitted_outcome" | "skipped")
+        Some("admitted_outcome" | "legacy_skipped")
     )
 }
 
