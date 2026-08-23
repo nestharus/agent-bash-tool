@@ -4214,7 +4214,7 @@ fn completion_uses_pinned_interpreter_after_source_is_replaced() {
 
     let completed = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
-        (meta["delivery"]["attempted"] == true).then_some(meta)
+        (meta["delivery"]["lifecycle"] == "admitted_outcome").then_some(meta)
     });
     assert_eq!(completed["delivery"]["exit_code"], 0);
     assert!(completed["delivery"]["error_code"].is_null());
