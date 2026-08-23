@@ -3122,14 +3122,6 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
     let active_status = status_text(&temp, &handle, false);
     let unrelated = shell_list_json(&temp, false);
     let all_access = shell_list_json(&temp, true);
-    let unrelated_cancel = agent_bash(&temp)
-        .args(["cancel", &handle])
-        .output()
-        .expect("unrelated cancel");
-    let unrelated_detach = agent_bash(&temp)
-        .args(["detach", &handle])
-        .output()
-        .expect("unrelated detach");
 
     fs::write(&owner.list_now, b"").expect("release owner list");
     let owner_status = owner.wait().expect("owner scenario");
@@ -3170,6 +3162,35 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
         all_access.iter().any(|entry| entry["handle"] == handle),
         "explicit --all did not expose workload {handle}: {all_access:?}"
     );
+    assert!(final_status.contains("--- output ---"));
+}
+
+#[test]
+fn unrelated_observer_cannot_cancel_or_detach_visible_handle() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut owner = spawn_releasable_owner_scenario(&temp);
+    wait_until(FIXTURE_DEADLINE, || owner.ready.exists().then_some(()));
+    let run_json: Value =
+        serde_json::from_slice(&fs::read(&owner.run_json).expect("owner run JSON"))
+            .expect("owner run JSON value");
+    let handle = run_json["handle"].as_str().expect("handle").to_string();
+    let state_dir = Path::new(run_json["state_dir"].as_str().expect("state dir"));
+    assert!(
+        shell_list_json(&temp, true)
+            .iter()
+            .any(|entry| entry["handle"] == handle),
+        "unrelated observer could not see handle through --all"
+    );
+
+    let unrelated_cancel = agent_bash(&temp)
+        .args(["cancel", &handle])
+        .output()
+        .expect("unrelated cancel");
+    let unrelated_detach = agent_bash(&temp)
+        .args(["detach", &handle])
+        .output()
+        .expect("unrelated detach");
+
     assert_eq!(unrelated_cancel.status.code(), Some(77));
     assert!(
         String::from_utf8_lossy(&unrelated_cancel.stderr).contains("caller does not own handle"),
@@ -3183,13 +3204,15 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
         command_failure_message(&unrelated_detach)
     );
     assert!(
-        !Path::new(run_json["state_dir"].as_str().expect("state dir"))
-            .join("cancel-requested")
-            .exists(),
+        !state_dir.join("cancel-requested").exists(),
         "unrelated cancellation created the durable acceptance marker"
     );
     assert_eq!(mode_text(&temp, &handle), "sync");
-    assert!(final_status.contains("--- output ---"));
+
+    fs::write(&owner.list_now, b"").expect("release owner list");
+    assert!(owner.wait().expect("owner scenario").success());
+    fs::write(&owner.workload_release, b"").expect("release owner workload");
+    let _ = wait_for_status_prefix(&temp, &handle, &format!("DONE rc=0 handle={handle}"));
 }
 
 #[test]
