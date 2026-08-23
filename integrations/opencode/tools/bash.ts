@@ -525,7 +525,7 @@ function parseStructuredExplicitRun(
     const assignment = words.shift()!
     const separator = assignment.indexOf("=")
     const name = assignment.slice(0, separator)
-    if (!adapterOwnsAssignment(name)) environment[name] = assignment.slice(separator + 1)
+    if (!adapterOwnsAssignment(name)) return undefined
   }
   if ((words[0] !== AGENT_BASH && words[0] !== "agent-bash") || words[1] !== "run") return undefined
   words[0] = AGENT_BASH

@@ -781,8 +781,6 @@ const args = request
       ? { command: "sleep 60; printf 'adapter abort failed\\n'" }
       : mode === "wrapper"
         ? { command: `${process.env.AGENT_BASH_BIN} run -- agents --version` }
-      : mode === "wrapper-env"
-        ? { command: `XDG_STATE_HOME=${process.env.XDG_STATE_HOME} ${process.env.AGENT_BASH_BIN} run -- agents --version` }
       : mode === "binding-env"
         ? { command: "printf '%s|%s\\n' \"${OULIPOLY_LIVE_SESSION_BIND_SOCKET-unset}\" \"${OULIPOLY_LIVE_SESSION_BIND_TOKEN-unset}\"" }
       : mode === "inherited-env"
@@ -1992,6 +1990,8 @@ fn owner_exit_cancels_opted_in_workload_and_descendants() {
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
         .env("WORKLOAD_SCRIPT", workload_script)
         .env("CHILD_PID_PATH", &child_pid_path)
+        .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
         .env_remove("OULIPOLY_PARENT_INVOCATION")
         .env_remove("OULIPOLY_DATA_DIR")
         .output()
@@ -2876,24 +2876,32 @@ fn opencode_adapter_explicit_agent_bash_run_is_not_nested() {
 }
 
 #[test]
-fn opencode_adapter_environment_prefixed_agent_bash_run_is_not_nested() {
+fn opencode_adapter_rejects_command_environment_on_registration_launcher() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
 
-    let result = run_adapter_driver(&temp, &driver, "wrapper-env", None);
-
-    assert_adapter_result_contains(&result, "Running asynchronously");
-    let handle = adapter_result_handle(&result);
-    assert_eq!(state_handles(&temp), vec![handle]);
-    let meta = read_meta(
-        &temp
-            .path()
-            .join("agent-bash")
-            .join(handle)
-            .join("meta.json"),
+    let explicit_run = format!(
+        "LD_PRELOAD=/actor/library.so {} run -- agents --version",
+        temp.path().join("adapter-agent-bash").display()
     );
-    assert!(meta["cancel_owner"].is_null());
+    let output = adapter_driver_command(&temp, &driver, "control", Some(&explicit_run))
+        .output()
+        .expect("adapter driver");
+
+    assert!(
+        !output.status.success(),
+        "{}",
+        command_failure_message(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "explicit agent-bash run requires structured arguments without shell expansion"
+        ),
+        "{}",
+        command_failure_message(&output)
+    );
+    assert_eq!(state_dir_count(&temp), 0);
 }
 
 #[test]
@@ -3350,6 +3358,8 @@ fn concurrent_registrations_share_warm_cache_within_declared_bound() {
                 .env("XDG_STATE_HOME", root)
                 .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
                 .env("AGENT_BASH_FAKE_DELIVERY_LOG", delivery_log)
+                .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+                .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
                 .env_remove("OULIPOLY_PARENT_INVOCATION")
                 .env_remove("OULIPOLY_DATA_DIR")
                 .args(["run", "--", "true"])
@@ -3470,8 +3480,9 @@ fn partial_explicit_owner_fails_closed_with_runner_detail() {
     assert_eq!(output.status.code(), Some(74));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("delivery helper exited with 74: {\"status\":\"notification_event_error\"")
-            && stderr.contains("owner_session_id and owner_invocation_uuid are both required"),
+        stderr.contains(
+            "explicit completion owner requires matching parent invocation and helper attestation"
+        ),
         "{stderr}"
     );
     assert!(

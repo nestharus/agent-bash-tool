@@ -56,9 +56,10 @@ whether that event is active for downstream mailbox delivery:
 - A headless asynchronous handle has no process owner lease because normal completion of a
   headless turn destroys that OpenCode process. The detached workload survives and notifies the
   durable session. Synchronous handles and interactive PTY handles remain owner-leased.
-- Leading shell environment assignments are ignored when classifying the command. An explicit
-  `VAR=value agent-bash run -- agents ...` command is dispatched directly as one asynchronous
-  spool instead of being captured by a synchronous outer spool.
+- Leading shell environment assignments are ignored when classifying the command, but a recognized
+  explicit run with a command-authored assignment is rejected. Adapter-owned assignments are
+  stripped and restored only from adapter state, so actor-selected loader or runtime hooks never
+  execute inside the registration-capable launcher.
 - The adapter resolves a leading `agents` or `oulipoly-agent-runner` command to the configured
   `AGENT_BASH_AGENT_RUNNER_BIN`, avoiding PATH drift between interactive and detached execution.
 - A standalone `sleep N` stays inside the adapter for up to five minutes by default, so passive
@@ -227,8 +228,9 @@ removed before workload execution. The OpenCode adapter invokes recognized expli
 from conservatively parsed arguments and rejects shell expansion around that registration-capable
 launch. One explicit-run admission result distinguishes ordinary commands, conservatively
 recognized but unsupported explicit syntax, and validated direct invocations; only the last carries
-normalized arguments and environment to the launcher. One adapter-owned assignment policy removes
-either reserved control from both command representations. A later workload,
+normalized arguments to the launcher. Command-authored assignments make an explicit run unsupported,
+while one adapter-owned assignment policy removes reserved controls from both command representations
+and restores them only from adapter state. A later workload,
 detach, status, supervisor, or guardian process therefore
 cannot retain the registration capability or alter interpreter lookup, the agent-runner data
 namespace, or an explicitly declared helper input through its own environment.

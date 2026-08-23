@@ -429,21 +429,26 @@ fn owner_context(
         session_id: nonempty_env(OWNER_SESSION_ID_ENV),
         invocation_uuid: nonempty_env(OWNER_INVOCATION_UUID_ENV),
     };
-    if let (Some(explicit_invocation_uuid), Some(_)) = (
-        explicit.invocation_uuid.as_deref(),
-        explicit.session_id.as_deref(),
-    ) && parent_invocation_uuid().as_deref() == Some(explicit_invocation_uuid)
-        && let Some((session_id, invocation_uuid)) = registration_candidate
+    if explicit.session_id.is_some() || explicit.invocation_uuid.is_some() {
+        let (Some(explicit_invocation_uuid), Some(_)) = (
+            explicit.invocation_uuid.as_deref(),
+            explicit.session_id.as_deref(),
+        ) else {
+            return Err(owner_attestation_error());
+        };
+        if parent_invocation_uuid().as_deref() != Some(explicit_invocation_uuid) {
+            return Err(owner_attestation_error());
+        }
+        let Some((session_id, invocation_uuid)) = registration_candidate
             .resolve_owner_binding(caller_chain, explicit_invocation_uuid)
             .map_err(owner_resolution_error)?
-    {
+        else {
+            return Err(owner_attestation_error());
+        };
         return Ok(OwnerContext {
             session_id: Some(session_id),
             invocation_uuid: Some(invocation_uuid),
         });
-    }
-    if explicit.session_id.is_some() || explicit.invocation_uuid.is_some() {
-        return Ok(explicit);
     }
 
     let Some(expected_invocation_uuid) = parent_invocation_uuid() else {
@@ -459,6 +464,13 @@ fn owner_context(
         session_id: Some(session_id),
         invocation_uuid: Some(invocation_uuid),
     })
+}
+
+fn owner_attestation_error() -> AppError {
+    AppError::new(
+        EX_IOERR,
+        "agent-bash: explicit completion owner requires matching parent invocation and helper attestation",
+    )
 }
 
 fn owner_resolution_error(err: io::Error) -> AppError {
