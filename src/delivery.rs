@@ -1174,7 +1174,13 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
             return Err(err);
         }
         let result = if claimed {
-            state::write_activation_outcome(paths, "pending\n")?;
+            if let Err(err) = state::write_activation_outcome(paths, "pending\n") {
+                state::rollback_activation_attempt(paths)?;
+                state::remove_activation_outcome(paths)?;
+                state::write_delivery_mode_atomic(paths, DeliveryMode::Sync)?;
+                repair_delivery_mode_mirror(paths, DeliveryMode::Sync)?;
+                return Err(err);
+            }
             run_required_delivery_helper_command_detailed(&request)
         } else {
             require_settled_activation(paths)?;
@@ -1211,9 +1217,11 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
     ))
 }
 
-fn require_settled_activation(paths: &StatePaths) -> io::Result<()> {
+pub(crate) fn require_settled_activation(paths: &StatePaths) -> io::Result<()> {
     match state::read_activation_outcome(paths)?.as_deref() {
-        None | Some("succeeded\n") => Ok(()),
+        None if !paths.activation_attempted.exists() => Ok(()),
+        None => Err(io::Error::other("delivery activation outcome is unknown")),
+        Some("succeeded\n") => Ok(()),
         Some("pending\n") => Err(io::Error::other("delivery activation outcome is unknown")),
         Some(outcome) => Err(io::Error::other(outcome.trim().to_string())),
     }

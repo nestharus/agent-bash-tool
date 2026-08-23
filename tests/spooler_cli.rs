@@ -3892,13 +3892,53 @@ fn admitted_activation_failure_is_durable_and_not_reported_as_settled() {
             command_failure_message(failed)
         );
     }
-    assert_eq!(mode_text(&temp, handle), "async");
+    let mode = agent_bash(&temp)
+        .args(["mode", handle])
+        .output()
+        .expect("mode after failed activation");
+    assert_eq!(
+        mode.status.code(),
+        Some(74),
+        "{}",
+        command_failure_message(&mode)
+    );
+    assert!(
+        String::from_utf8_lossy(&mode.stderr).contains("activation rejected"),
+        "{}",
+        command_failure_message(&mode)
+    );
     assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
     assert_eq!(
         fs::read_to_string(state_dir_path(&json).join("activation-outcome")).unwrap(),
         "failed: delivery helper exited with 19: activation rejected\n"
     );
     let _ = agent_bash(&temp).args(["cancel", handle]).output();
+}
+
+#[test]
+fn attempted_activation_without_outcome_is_not_reported_as_async_handoff() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let handle = "ab_unknown_activation";
+    let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
+    fs::write(state_dir.join("delivery-mode"), b"async").expect("write async mode");
+    fs::write(state_dir.join("activation-attempted"), b"").expect("write attempted marker");
+
+    let mode = agent_bash(&temp)
+        .args(["mode", handle])
+        .output()
+        .expect("mode after unknown activation");
+
+    assert_eq!(
+        mode.status.code(),
+        Some(74),
+        "{}",
+        command_failure_message(&mode)
+    );
+    assert!(
+        String::from_utf8_lossy(&mode.stderr).contains("activation outcome is unknown"),
+        "{}",
+        command_failure_message(&mode)
+    );
 }
 
 #[test]

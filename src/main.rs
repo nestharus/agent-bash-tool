@@ -581,6 +581,10 @@ fn mode_command(handle: String) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
     let mode =
         state::read_delivery_mode(&paths).map_err(|err| delivery_mode_error(&handle, err))?;
+    if mode == DeliveryMode::Async {
+        delivery::require_settled_activation(&paths)
+            .map_err(|err| delivery_mode_error(&handle, err))?;
+    }
     println!("{}", mode.as_str());
     Ok(())
 }
