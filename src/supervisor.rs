@@ -1014,7 +1014,7 @@ impl CancellationCause {
         }
     }
 
-    fn finalized(self, explicit_cancel_accepted: bool) -> Self {
+    fn with_observed_explicit_cancel(self, explicit_cancel_accepted: bool) -> Self {
         if explicit_cancel_accepted {
             self.with_precedence_over(Self::ExplicitRequest)
         } else {
@@ -1252,7 +1252,8 @@ impl EventLoop {
     }
 
     fn request_cancellation(&mut self, proposed_cause: CancellationCause) {
-        let proposed_cause = proposed_cause.finalized(explicit_cancel_accepted(&self.paths));
+        let proposed_cause =
+            proposed_cause.with_observed_explicit_cancel(explicit_cancel_accepted(&self.paths));
         match self.cancellation.as_mut() {
             Some(cancellation) => {
                 cancellation.provisional_cause = cancellation
@@ -1275,7 +1276,7 @@ impl EventLoop {
         };
         cancellation.provisional_cause = cancellation
             .provisional_cause
-            .finalized(explicit_cancel_accepted(&self.paths));
+            .with_observed_explicit_cancel(explicit_cancel_accepted(&self.paths));
         let signal = if cancellation.started_at.elapsed() >= CANCEL_GRACE {
             libc::SIGKILL
         } else {
@@ -1919,11 +1920,11 @@ mod tests {
             Some(cause)
         );
         assert_eq!(
-            CancellationCause::OwnerExit.finalized(false),
+            CancellationCause::OwnerExit.with_observed_explicit_cancel(false),
             CancellationCause::OwnerExit
         );
         assert_eq!(
-            CancellationCause::OwnerExit.finalized(true),
+            CancellationCause::OwnerExit.with_observed_explicit_cancel(true),
             CancellationCause::ExplicitRequest
         );
     }

@@ -16,14 +16,14 @@ agent *thinks* it is calling foreground or background, our tool always runs the 
 detached and returns immediately. The result is delivered back to the agent out-of-band via
 agent-runner.
 
-## Two layers (strict separation)
+## Two layers (ownership separation)
 
 1. **agent-bash-tool (this repo) — the spooler. General, provider-agnostic.**
-   Knows nothing about agents, sessions, or providers. It detaches a command, captures its
-   process tree, watches for completion, and reports. It is *always called by* an agent, so on
-   completion it shells out to agent-runner to deliver the result — but it has no agent logic of
-   its own. Loose coupling: it invokes the `agent-runner` / `agents` CLI, it does **not** depend
-   on agent-runner crates.
+   Detaches a command, captures its process tree, watches for completion, and reports. It invokes
+   the `agent-runner` / `agents` CLI to resolve an opaque owner-session binding and to deliver the
+   result. The spooler records and compares that opaque session ID for handle authority, but does
+   not own PID-to-session mapping, interpret provider session semantics, determine session
+   liveness, or manage a mailbox. Loose coupling: it does **not** depend on agent-runner crates.
 
 2. **agent-runner — the agent layer. Specialized.** Owns PID↔session mapping, session
    liveness, the agent process tree, and delivery (resume for headless, PTY injection for
@@ -174,8 +174,9 @@ At launch, while the caller is still alive and `/proc` is readable, the spooler 
 `caller_ppid` and a nearest-first `caller_chain` in `meta.json`. Each chain element contains
 `pid`, `/proc/<pid>/stat` field 22 as `starttime_ticks`, and the host `boot_id` from
 `/proc/sys/kernel/random/boot_id`. The delivery seam still passes `--caller-ppid` and
-`--meta <path>`; agent-runner resolves the owning session from the recorded chain by pure DB
-lookup. The spooler does not resolve sessions.
+`--meta <path>`; the configured helper asks agent-runner to resolve the owning session from the
+recorded chain by pure DB lookup. The spooler stores the returned opaque binding but does not own or
+implement the mapping.
 
 The OpenCode adapter also supplies its provider session ID and parent invocation UUID. The spooler
 records these as optional fields in `meta.json` and in a separate `owner.json`, allowing a resumed

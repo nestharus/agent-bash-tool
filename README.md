@@ -56,9 +56,11 @@ completion returns synchronously in-band or asynchronously through the agent mai
   handles already in flight. Registration-only authority and helper-selection controls are removed
   before the workload starts.
 
-The spooler is **general and provider-agnostic** — it knows nothing about agents or sessions and
-talks to agent-runner only over its CLI. See [`docs/DESIGN.md`](docs/DESIGN.md) for the full
-architecture, layering, and the agent-runner-side mailbox.
+The spooler is **general, provider-agnostic, and mailbox-agnostic**. It talks to agent-runner only
+over its CLI, asks that helper to resolve an opaque owner-session binding, and compares the recorded
+session ID when enforcing handle authority. Agent-runner still owns PID-to-session mapping, session
+semantics and liveness, and all mailbox behavior. See [`docs/DESIGN.md`](docs/DESIGN.md) for the full
+architecture and ownership boundary.
 
 The spooler transfers each helper operation to a local delivery owner before persisting its
 write-ahead claim and guarantees at most one admitted helper invocation per handle operation.
