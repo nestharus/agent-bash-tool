@@ -183,8 +183,13 @@ async function runProcess(
   ownerSessionId?: string,
   abort?: AbortSignal,
   operation = "subprocess",
+  environment: Record<string, string> = {},
 ): Promise<ProcessResult> {
-  const child = Bun.spawn(argv, { env: runEnv(ownerSessionId), stdout: "pipe", stderr: "pipe" })
+  const child = Bun.spawn(argv, {
+    env: { ...runEnv(ownerSessionId), ...environment },
+    stdout: "pipe",
+    stderr: "pipe",
+  })
   let timeout: ReturnType<typeof setTimeout> | undefined
   const stopped = new Promise<never>((_, reject) => {
     const stop = (message: string) => {
@@ -219,8 +224,9 @@ async function checkedProcessText(
   operation: string,
   ownerSessionId?: string,
   abort?: AbortSignal,
+  environment?: Record<string, string>,
 ): Promise<string> {
-  const result = await runProcess(argv, ownerSessionId, abort, operation)
+  const result = await runProcess(argv, ownerSessionId, abort, operation, environment)
   if (result.exitCode !== 0) throw processFailure(operation, result)
   return result.stdout.trim()
 }
@@ -441,14 +447,92 @@ function selectedCompletionScope(command: string): CompletionScope {
   return isAgentDispatch(command) ? "tree" : "root"
 }
 
-function commandWithDelivery(command: string, delivery: DeliveryMode, ownerLease: boolean): string {
-  const shellCommand = splitShellCommand(command)
-  const prefix = agentBashRunPrefix(shellCommand.body)
-  if (!prefix) return command
-  const suffix = shellCommand.body.slice(prefix.length)
-  const normalizedSuffix = suffix.replace(/^\s+--delivery\s+(?:sync|async)\b/, "")
-  const lease = ownerLease ? ` --cancel-on-owner-exit --owner-pid ${process.pid}` : ""
-  return `${shellCommand.prefix}${prefix}${lease} --delivery ${delivery}${normalizedSuffix}`
+function structuredShellWords(command: string): string[] | undefined {
+  const words: string[] = []
+  let word = ""
+  let started = false
+  let quote: "single" | "double" | undefined
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index]
+    if (quote === "single") {
+      if (character === "'") quote = undefined
+      else word += character
+      continue
+    }
+    if (quote === "double") {
+      if (character === '"') {
+        quote = undefined
+      } else if (character === "\\") {
+        index += 1
+        if (index >= command.length) return undefined
+        word += command[index]
+      } else if (character === "$" || character === "`") {
+        return undefined
+      } else {
+        word += character
+      }
+      continue
+    }
+    if (character === "\n" || character === "\r") return undefined
+    if (/\s/.test(character)) {
+      if (started) {
+        words.push(word)
+        word = ""
+        started = false
+      }
+    } else if (character === "'") {
+      quote = "single"
+      started = true
+    } else if (character === '"') {
+      quote = "double"
+      started = true
+    } else if (character === "\\") {
+      index += 1
+      if (index >= command.length) return undefined
+      word += command[index]
+      started = true
+    } else if ("$`;|&<>()".includes(character)) {
+      return undefined
+    } else {
+      word += character
+      started = true
+    }
+  }
+  if (quote) return undefined
+  if (started) words.push(word)
+  return words
+}
+
+function structuredExplicitRun(
+  command: string,
+  delivery: DeliveryMode,
+  ownerLease: boolean,
+): { argv: string[]; environment: Record<string, string> } | undefined {
+  const words = structuredShellWords(command)
+  if (!words) return undefined
+  const environment: Record<string, string> = {}
+  while (words[0]?.match(/^[A-Za-z_][A-Za-z0-9_]*=/)) {
+    const assignment = words.shift()!
+    const separator = assignment.indexOf("=")
+    const name = assignment.slice(0, separator)
+    if (!RESERVED_SPOOLER_ASSIGNMENTS.has(name)) environment[name] = assignment.slice(separator + 1)
+  }
+  if ((words[0] !== AGENT_BASH && words[0] !== "agent-bash") || words[1] !== "run") return undefined
+  words[0] = AGENT_BASH
+  const separator = words.indexOf("--")
+  const optionsEnd = separator < 0 ? words.length : separator
+  for (let index = 2; index < optionsEnd; index += 1) {
+    if (words[index] === "--delivery") {
+      words.splice(index, 2)
+      break
+    }
+  }
+  const controls = ["--delivery", delivery]
+  if (ownerLease) controls.unshift("--cancel-on-owner-exit", "--owner-pid", String(process.pid))
+  words.splice(2, 0, ...controls)
+  const workload = words.indexOf("--") + 1
+  if (workload > 0 && ["agents", "oulipoly-agent-runner"].includes(words[workload])) words[workload] = AGENTS
+  return { argv: words, environment }
 }
 
 async function dispatchCommand(
@@ -458,11 +542,18 @@ async function dispatchCommand(
   completionScope: CompletionScope,
   ownerSessionId: string,
 ): Promise<string> {
-  command = pinAgentRunnerBinary(command)
   if (isAgentBashRun(command)) {
-    const explicitRun = commandWithDelivery(command, delivery, ownerLease)
-    return checkedProcessText(["bash", "-lc", explicitRun], "agent-bash dispatch", ownerSessionId)
+    const explicitRun = structuredExplicitRun(command, delivery, ownerLease)
+    if (!explicitRun) throw new Error("explicit agent-bash run requires structured arguments without shell expansion")
+    return checkedProcessText(
+      explicitRun.argv,
+      "agent-bash dispatch",
+      ownerSessionId,
+      undefined,
+      explicitRun.environment,
+    )
   }
+  command = pinAgentRunnerBinary(command)
   const args = [AGENT_BASH, "run"]
   if (!ownerLease) {
     args.push("--completion-scope", completionScope, "--delivery", delivery)

@@ -774,6 +774,8 @@ const args = mode === "poll"
         ? { command: "printf '%s|%s|%s|%s\\n' \"$INHERITED_ENV_SENTINEL\" \"${OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY-unset}\" \"${AGENT_BASH_AGENT_RUNNER_BIN-unset}\" \"$OULIPOLY_PARENT_INVOCATION\"" }
       : mode === "reserved-helper-prefix"
         ? { command: `AGENT_BASH_AGENT_RUNNER_BIN=${process.env.RESERVED_HELPER_OVERRIDE} ${process.env.AGENT_BASH_BIN} run -- true` }
+      : mode === "registration-authority-copy"
+        ? { command: `RETAINED_AUTH=$OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY ${process.env.AGENT_BASH_BIN} run -- true` }
       : mode === "agent-sync"
         ? { command: "agents --version", delivery: "sync" }
         : mode === "agent"
@@ -2569,6 +2571,29 @@ fn opencode_adapter_rejects_command_local_registration_helper_override() {
         !override_log.exists(),
         "command-local helper override was invoked: {}",
         fs::read_to_string(&override_log).unwrap_or_default()
+    );
+}
+
+#[test]
+fn opencode_adapter_rejects_shell_copy_of_registration_authority() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+    let output = adapter_driver_command(&temp, &driver, "registration-authority-copy", None)
+        .output()
+        .expect("adapter driver");
+
+    assert!(
+        !output.status.success(),
+        "{}",
+        command_failure_message(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "explicit agent-bash run requires structured arguments without shell expansion"
+        ),
+        "{}",
+        command_failure_message(&output)
     );
 }
 

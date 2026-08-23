@@ -212,8 +212,10 @@ by `AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST` at registration. The explicit valu
 provenance and must not contain credentials. The caller-bound completion-registration authority is
 the sole transient exception: it is injected only into the immediate registration invocation and
 is neither persisted, replayed, nor inherited by the workload. The helper-selection override is also
-removed before workload execution, and the OpenCode adapter ignores command-local assignments to
-either reserved control. A later workload, detach, status, supervisor, or guardian process therefore
+removed before workload execution. The OpenCode adapter invokes recognized explicit runs directly
+from conservatively parsed arguments and rejects shell expansion around that registration-capable
+launch; it also ignores command-local assignments to either reserved control. A later workload,
+detach, status, supervisor, or guardian process therefore
 cannot retain the registration capability or alter interpreter lookup, the agent-runner data
 namespace, or an explicitly declared helper input through its own environment.
 
