@@ -4177,11 +4177,6 @@ fn unavailable_pinned_helper_allows_one_bounded_pre_execution_retry() {
 }
 
 #[test]
-fn completion_launch_failure_is_retryable_and_never_claimed_as_admitted() {
-    completion_uses_pinned_interpreter_after_source_is_replaced();
-}
-
-// The wrapper above retains the immutable verifier node ID.
 fn completion_uses_pinned_interpreter_after_source_is_replaced() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (helper, interpreter, delivery_log) = interpreter_backed_fake_agents(&temp);
@@ -4225,11 +4220,6 @@ fn completion_uses_pinned_interpreter_after_source_is_replaced() {
 }
 
 #[test]
-fn detach_launch_failure_restores_sync_mode_and_allows_retry() {
-    detach_uses_pinned_interpreter_after_source_is_removed();
-}
-
-// The wrapper above retains the immutable verifier node ID.
 fn detach_uses_pinned_interpreter_after_source_is_removed() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (helper, interpreter, _) = interpreter_backed_fake_agents(&temp);
