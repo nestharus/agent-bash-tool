@@ -74,6 +74,8 @@ enum Command {
     Detach { handle: String },
     /// Cancel a supervised workload and all of its adopted descendants.
     Cancel { handle: String },
+    /// Record that the owning in-call consumer received a terminal result.
+    Consume { handle: String },
     /// Print the current completion delivery mode for a handle.
     Mode { handle: String },
     /// Status of a spooled job. Owner calls may reconcile terminal state and delivery first.
@@ -174,6 +176,7 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
         ),
         Command::Detach { handle } => detach_command(handle, caller_authority(&guard)),
         Command::Cancel { handle } => cancel_command(handle, caller_authority(&guard)),
+        Command::Consume { handle } => consume_command(handle, caller_authority(&guard)),
         Command::Mode { handle } => mode_command(handle),
         Command::Status {
             tail_bytes,
@@ -311,6 +314,30 @@ fn cancel_request_error(handle: &str, err: io::Error) -> AppError {
         EX_IOERR,
         format!("agent-bash: failed to cancel {handle}: {err}"),
     )
+}
+
+fn consume_command(handle: String, caller: CallerAuthority) -> Result<(), AppError> {
+    let paths = paths_for_existing_handle(&handle)?;
+    require_control_authority(&paths, &handle, &caller)?;
+    let meta = read_meta_for_handle(&paths, &handle)?;
+    if !state::terminal(&meta) {
+        return Err(AppError::new(
+            EX_DATAERR,
+            format!("agent-bash: cannot consume non-terminal handle {handle}"),
+        ));
+    }
+    let consumed = state::record_consumed(&paths).map_err(|err| {
+        AppError::new(
+            EX_IOERR,
+            format!("agent-bash: failed to record consumption for {handle}: {err}"),
+        )
+    })?;
+    serde_json::to_writer(
+        io::stdout(),
+        &serde_json::json!({ "handle": handle, "consumed": consumed }),
+    )
+    .map_err(json_write_error)?;
+    io::stdout().write_all(b"\n").map_err(json_write_error)
 }
 
 fn persist_delivery_mode(paths: &StatePaths, delivery_mode: DeliveryMode) -> Result<(), AppError> {

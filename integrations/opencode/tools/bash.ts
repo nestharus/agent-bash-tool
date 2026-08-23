@@ -1,6 +1,5 @@
 import { tool } from "@opencode-ai/plugin"
 import { createConnection } from "node:net"
-import { join } from "node:path"
 
 /**
  * opencode `bash` tool override. Workloads survive shell timeouts under agent-bash, but remain
@@ -23,7 +22,6 @@ type CompletionScope = "root" | "tree"
 
 type RunDispatch = {
   handle: string
-  stateDir: string | undefined
 }
 
 type ShellCommand = {
@@ -240,26 +238,6 @@ async function checkedProcessText(
   return result.stdout.trim()
 }
 
-function stateRoot(): string | undefined {
-  if (process.env.XDG_STATE_HOME) return join(process.env.XDG_STATE_HOME, "agent-bash")
-  if (process.env.HOME) return join(process.env.HOME, ".local/state/agent-bash")
-  return undefined
-}
-
-function stateDirForHandle(handle: string): string | undefined {
-  const root = stateRoot()
-  return root ? join(root, handle) : undefined
-}
-
-async function markConsumed(stateDir: string | undefined) {
-  if (!stateDir) return
-  try {
-    await Bun.write(join(stateDir, "consumed"), "")
-  } catch {
-    // Best-effort: failure only risks a duplicate completion notification.
-  }
-}
-
 async function statusText(
   handle: string,
   headerOnly = false,
@@ -279,13 +257,13 @@ async function statusText(
 
 async function terminalStatus(
   handle: string,
-  stateDir: string | undefined,
   ownerSessionId?: string,
   abort?: AbortSignal,
 ): Promise<string | undefined> {
   const status = await statusText(handle, true, ownerSessionId, abort)
   if (!isTerminalStatus(status)) return undefined
-  await markConsumed(stateDir)
+  const consume = await runProcess([AGENT_BASH, "consume", handle], ownerSessionId, abort, "agent-bash consume")
+  if (consume.exitCode !== 0 && consume.exitCode !== 77) throw processFailure("agent-bash consume", consume)
   return statusText(handle, false, ownerSessionId, abort)
 }
 
@@ -371,7 +349,7 @@ function parseRunDispatch(runOut: string): RunDispatch | undefined {
   try {
     const parsed = JSON.parse(runOut)
     return typeof parsed.handle === "string"
-      ? { handle: parsed.handle, stateDir: typeof parsed.state_dir === "string" ? parsed.state_dir : undefined }
+      ? { handle: parsed.handle }
       : undefined
   } catch {
     return undefined
@@ -605,7 +583,6 @@ async function cancelResult(handle: string, ownerSessionId: string): Promise<str
 
 async function waitForSyncResult(
   handle: string,
-  stateDir: string | undefined,
   abort: AbortSignal,
   ownerSessionId: string,
 ): Promise<string> {
@@ -616,7 +593,7 @@ async function waitForSyncResult(
   while (true) {
     if (abort.aborted) return cancelResult(handle, ownerSessionId)
     try {
-      const status = await terminalStatus(handle, stateDir, ownerSessionId, abort)
+      const status = await terminalStatus(handle, ownerSessionId, abort)
       if (status !== undefined) return status
       if ((await modeText(handle, ownerSessionId, abort)) === "async") return asyncDispatchResponse(handle)
     } catch (error) {
@@ -651,7 +628,7 @@ export default tool({
   async execute(args, context) {
     if (args.handle) {
       return (
-        (await terminalStatus(args.handle, stateDirForHandle(args.handle), context.sessionID, context.abort)) ??
+        (await terminalStatus(args.handle, context.sessionID, context.abort)) ??
         statusText(args.handle, false, context.sessionID, context.abort)
       )
     }
@@ -685,6 +662,6 @@ export default tool({
     if (delivery === "async") {
       return asyncDispatchResponse(dispatch.handle, isAgentDispatch(args.command) && isHeadlessCaller())
     }
-    return waitForSyncResult(dispatch.handle, dispatch.stateDir, context.abort, context.sessionID)
+    return waitForSyncResult(dispatch.handle, context.abort, context.sessionID)
   },
 })

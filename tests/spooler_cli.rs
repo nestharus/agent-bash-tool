@@ -755,6 +755,24 @@ if (mode === "parallel-live") {
   process.exit(0)
 }
 
+if (mode === "launch-poll") {
+  const launched = await mod.default.execute(
+    { command: "printf 'adapter owner poll\\n'", delivery: "async" },
+    context,
+  )
+  const launchedResult = typeof launched === "string" ? launched : String(launched)
+  const handle = launchedResult.match(/handle=([^\s)]+)/)?.[1]
+  if (!handle) throw new Error(`launch-poll did not return a handle: ${launchedResult}`)
+  let result = ""
+  for (let attempts = 0; attempts < 200; attempts += 1) {
+    result = String(await mod.default.execute({ handle }, context))
+    if (/^(DONE|ERROR)/.test(result)) break
+    await Bun.sleep(25)
+  }
+  console.log(JSON.stringify({ result, handle }))
+  process.exit(/^(DONE|ERROR)/.test(result) ? 0 : 1)
+}
+
 if (mode === "move-helper") {
   const execution = mod.default.execute(
     { command: `sleep 0.1; mv "$AGENT_BASH_BIN" "$AGENT_BASH_BIN.moved"; sleep 0.2` },
@@ -2387,24 +2405,47 @@ fn cgroup_disable_uses_subreaper_only_without_degradation() {
 }
 
 #[test]
-fn opencode_adapter_poll_marks_terminal_result_consumed_without_mutating_delivery_mode() {
+fn opencode_adapter_cross_owner_poll_cannot_mark_terminal_result_consumed() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
-    let (output, _) = run_cmd(
-        &temp,
-        &["run", "--", "bash", "-lc", "printf 'adapter poll\\n'"],
-    );
-    let json = parse_run_output(&output);
-    let handle = json["handle"].as_str().expect("handle");
-    let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
-    assert!(final_status.contains("adapter poll\n"), "{final_status}");
+    let handle = "ab_cross_owner_adapter_poll";
+    let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
+    let (helper, route) = routed_owner_resolving_fake_agents(&temp);
+    write_delivery_helper_provenance(&state_dir, &helper, &[("AGENT_BASH_FAKE_ROUTE", &route)]);
+    let meta_path = state_dir.join("meta.json");
+    let mut meta = read_meta(&meta_path);
+    meta["owner_session_id"] = json!("ses_owner");
+    meta["owner_invocation_uuid"] = json!("11111111-1111-4111-8111-111111111111");
+    fs::write(&meta_path, format_seeded_meta(&meta)).expect("write session-owned meta");
+    fs::write(state_dir.join("delivery-mode"), b"async").expect("write async mode");
+    fs::write(&route, "ses_other\n").expect("route unrelated session");
 
     let driver = write_adapter_driver(&temp);
     let result = run_adapter_driver(&temp, &driver, "poll", Some(handle));
 
-    assert_adapter_result_contains(&result, "adapter poll");
+    assert_adapter_result_contains(&result, &format!("DONE rc=0 handle={handle}"));
     assert_eq!(mode_text(&temp, handle), "async");
-    assert!(state_dir_path(&json).join("consumed").exists());
+    assert!(!state_dir.join("consumed").exists());
+}
+
+#[test]
+fn opencode_adapter_owner_poll_marks_terminal_result_consumed_without_mutating_delivery_mode() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let result = run_adapter_driver(&temp, &driver, "launch-poll", None);
+    let handle = result["handle"].as_str().expect("handle");
+
+    assert_adapter_result_contains(&result, "adapter owner poll");
+    assert_eq!(mode_text(&temp, handle), "async");
+    assert!(
+        temp.path()
+            .join("agent-bash")
+            .join(handle)
+            .join("consumed")
+            .exists()
+    );
 }
 
 #[test]

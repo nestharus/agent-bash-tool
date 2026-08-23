@@ -174,7 +174,7 @@ predicate only for handles without session metadata. At every mutating control b
 handle's pinned helper resolves the live caller chain to its acting session; ambient owner strings
 are never authority. `list --all` and a cross-owner `status` may
 observe account-local handles, but they cannot publish recovery state, claim delivery, cancel work,
-or change delivery mode. Cancel and detach fail with `EX_NOPERM` for non-owners. Guardian recovery
+or change delivery mode. Cancel, detach, and consume fail with `EX_NOPERM` for non-owners. Guardian recovery
 remains independent of any observing caller and is the automatic cleanup/progress path after the
 originating process disappears. No unauthenticated cross-owner operator override is exposed by
 this CLI.
@@ -326,7 +326,9 @@ the state directory.
 All terminal handles use the configured state TTL. Retryable pre-invocation helper failures do not
 receive a multiplied retention window, so failed delivery does not create a sevenfold retained-state
 population. Each owner-authorized status observer may perform at most one helper-resolution retry
-for the handle it observes; cross-owner status is read-only. `retry_count` bounds each handle to one
+for the handle it observes. The adapter requests the durable `consumed` marker through the
+owner-authorized `consume` operation; cross-owner status remains read-only and cannot suppress the
+owner's pending delivery. `retry_count` bounds each handle to one
 observer-triggered retry in total. The delivery lock serializes concurrently admitted owner
 observers; the first persists either an attempt claim or a closed retry result, and later observers
 cannot repeat it.

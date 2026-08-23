@@ -594,6 +594,10 @@ pub(crate) fn record_activation_attempt(paths: &StatePaths) -> io::Result<bool> 
     record_durable_create_once_marker(&paths.activation_attempted, &paths.state_dir)
 }
 
+pub(crate) fn record_consumed(paths: &StatePaths) -> io::Result<bool> {
+    record_durable_create_once_marker(&paths.consumed, &paths.state_dir)
+}
+
 fn record_durable_create_once_marker(marker: &Path, directory: &Path) -> io::Result<bool> {
     let directory = File::open(directory)?;
     match OpenOptions::new()
