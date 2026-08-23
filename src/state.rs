@@ -32,6 +32,7 @@ pub(crate) struct StatePaths {
     pub(crate) consumed: PathBuf,
     pub(crate) delivery_mode: PathBuf,
     pub(crate) delivery_helper: PathBuf,
+    pub(crate) delivery_helper_interpreter: PathBuf,
     pub(crate) activation_attempted: PathBuf,
     pub(crate) delivery_lock: PathBuf,
     pub(crate) accepted_cancel: PathBuf,
@@ -52,6 +53,7 @@ impl StatePaths {
             consumed: state_dir.join("consumed"),
             delivery_mode: state_dir.join("delivery-mode"),
             delivery_helper: state_dir.join("delivery-helper"),
+            delivery_helper_interpreter: state_dir.join("delivery-helper-interpreter"),
             activation_attempted: state_dir.join("activation-attempted"),
             delivery_lock: state_dir.join("delivery.lock"),
             accepted_cancel: state_dir.join("cancel-requested"),
@@ -104,6 +106,14 @@ pub(crate) struct DeliveryHelperProvenance {
     pub(crate) sha256: String,
     #[serde(default)]
     pub(crate) environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) interpreter: Option<DeliveryHelperInterpreterProvenance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DeliveryHelperInterpreterProvenance {
+    pub(crate) path: String,
+    pub(crate) sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

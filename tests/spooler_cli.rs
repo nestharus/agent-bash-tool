@@ -381,8 +381,23 @@ fn write_delivery_helper_provenance(
         .iter()
         .map(|(name, value)| ((*name).to_string(), value.to_string_lossy().into_owned()))
         .collect::<BTreeMap<_, _>>();
+    let interpreter_source = fs::canonicalize("/bin/sh").expect("canonical shell interpreter");
+    let interpreter_snapshot = state_dir.join("delivery-helper-interpreter");
+    fs::copy(&interpreter_source, &interpreter_snapshot).expect("copy helper interpreter");
+    let mut interpreter_permissions = fs::metadata(&interpreter_snapshot)
+        .expect("interpreter metadata")
+        .permissions();
+    interpreter_permissions.set_mode(0o500);
+    fs::set_permissions(&interpreter_snapshot, interpreter_permissions)
+        .expect("make interpreter executable");
+    let interpreter_snapshot =
+        fs::canonicalize(interpreter_snapshot).expect("canonical helper interpreter");
+    let interpreter_sha256 = format!(
+        "{:x}",
+        Sha256::digest(fs::read(&interpreter_snapshot).expect("read helper interpreter"))
+    );
     let provenance = json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "path": snapshot.to_str().expect("UTF-8 helper path"),
         "device": metadata.dev(),
         "inode": metadata.ino(),
@@ -392,6 +407,10 @@ fn write_delivery_helper_provenance(
         "mode": metadata.mode(),
         "sha256": sha256,
         "environment": environment,
+        "interpreter": {
+            "path": interpreter_snapshot.to_str().expect("UTF-8 interpreter path"),
+            "sha256": interpreter_sha256,
+        },
     });
     let meta_path = state_dir.join("meta.json");
     let mut meta = read_meta(&meta_path);
@@ -426,17 +445,17 @@ fn interpreter_backed_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf
     let interpreter = temp.path().join("delivery-interpreter");
     let helper = temp.path().join("interpreter-backed-agents");
     let log = temp.path().join("interpreter-backed.log");
+    fs::copy("/bin/sh", &interpreter).expect("copy delivery interpreter");
+    set_executable(&interpreter);
     fs::write(
-        &interpreter,
+        &helper,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nexit 0\n",
+            "#!{}\nprintf '%s\\n' \"$@\" >> {}\nexit 0\n",
+            interpreter.display(),
             shell_quote(&log)
         ),
     )
-    .expect("write delivery interpreter");
-    set_executable(&interpreter);
-    fs::write(&helper, format!("#!{}\n", interpreter.display()))
-        .expect("write interpreter-backed helper");
+    .expect("write interpreter-backed helper");
     set_executable(&helper);
     (helper, interpreter, log)
 }
@@ -4158,10 +4177,11 @@ fn unavailable_pinned_helper_allows_one_bounded_pre_execution_retry() {
 }
 
 #[test]
-fn completion_launch_failure_is_retryable_and_never_claimed_as_admitted() {
+fn completion_uses_pinned_interpreter_after_source_is_replaced() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (helper, interpreter, _) = interpreter_backed_fake_agents(&temp);
+    let (helper, interpreter, delivery_log) = interpreter_backed_fake_agents(&temp);
     let retained_interpreter = temp.path().join("retained-delivery-interpreter");
+    let replacement_executed = temp.path().join("replacement-interpreter-executed");
     let release = temp.path().join("launch-failure-release");
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
@@ -4179,26 +4199,28 @@ fn completion_launch_failure_is_retryable_and_never_claimed_as_admitted() {
     let handle = json["handle"].as_str().expect("handle");
     let meta_path = meta_path(&json);
     fs::rename(&interpreter, &retained_interpreter).expect("remove helper interpreter");
+    fs::write(
+        &interpreter,
+        format!("#!/bin/sh\n: > {}\n", shell_quote(&replacement_executed)),
+    )
+    .expect("write replacement interpreter");
+    set_executable(&interpreter);
     fs::write(&release, b"").expect("release workload");
 
-    let initial = wait_until(FIXTURE_DEADLINE, || {
+    let completed = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
-        (meta["delivery"]["error_code"] == "delivery_helper_launch_failed").then_some(meta)
+        (meta["delivery"]["attempted"] == true).then_some(meta)
     });
-    assert_eq!(initial["delivery"]["attempted"], false);
-    assert_eq!(initial["delivery"]["retryable"], true);
-    assert_eq!(initial["delivery"]["retry_count"].as_u64().unwrap_or(0), 0);
-
+    assert_eq!(completed["delivery"]["exit_code"], 0);
+    assert!(completed["delivery"]["error_code"].is_null());
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+    assert!(!replacement_executed.exists());
     let status = status_text(&temp, handle, true);
     assert!(status.starts_with("DONE rc=0"), "{status}");
-    let closed = read_meta(&meta_path);
-    assert_eq!(closed["delivery"]["attempted"], false);
-    assert_eq!(closed["delivery"]["retryable"], false);
-    assert_eq!(closed["delivery"]["retry_count"], 1);
 }
 
 #[test]
-fn detach_launch_failure_restores_sync_mode_and_allows_retry() {
+fn detach_uses_pinned_interpreter_after_source_is_removed() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (helper, interpreter, _) = interpreter_backed_fake_agents(&temp);
     let retained_interpreter = temp.path().join("retained-delivery-interpreter");
@@ -4212,21 +4234,13 @@ fn detach_launch_failure_restores_sync_mode_and_allows_retry() {
     let state_dir = state_dir_path(&json);
     fs::rename(&interpreter, &retained_interpreter).expect("remove helper interpreter");
 
-    let failed = agent_bash(&temp)
+    let detached = agent_bash(&temp)
         .args(["detach", handle])
         .output()
-        .expect("failed detach");
-    assert!(!failed.status.success(), "detach unexpectedly succeeded");
-    assert_eq!(mode_text(&temp, handle), "sync");
-    assert!(!state_dir.join("activation-attempted").exists());
-
-    fs::rename(&retained_interpreter, &interpreter).expect("restore helper interpreter");
-    let retried = agent_bash(&temp)
-        .args(["detach", handle])
-        .output()
-        .expect("retried detach");
-    assert_command_success(&retried);
+        .expect("detach");
+    assert_command_success(&detached);
     assert_eq!(mode_text(&temp, handle), "async");
+    assert!(state_dir.join("activation-attempted").exists());
     let _ = agent_bash(&temp).args(["cancel", handle]).output();
 }
 

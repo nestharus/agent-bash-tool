@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::state::{
-    self, CallerChainEntry, DeliveryHelperProvenance, DeliveryLifecycle, DeliveryMeta,
-    DeliveryMode, Meta, StatePaths,
+    self, CallerChainEntry, DeliveryHelperInterpreterProvenance, DeliveryHelperProvenance,
+    DeliveryLifecycle, DeliveryMeta, DeliveryMode, Meta, StatePaths,
 };
 
 const CONSUMER_GRACE_MS_ENV: &str = "AGENT_BASH_CONSUMER_GRACE_MS";
@@ -28,7 +28,7 @@ const MAX_CONSUMER_GRACE_MS: u64 = 10_000;
 const CONSUMER_GRACE_POLL_MS: u64 = 25;
 const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
 const OWNER_LOOKUP_POLL: Duration = Duration::from_millis(10);
-const DELIVERY_HELPER_SCHEMA_VERSION: u8 = 3;
+const DELIVERY_HELPER_SCHEMA_VERSION: u8 = 4;
 const DELIVERY_HELPER_ENV_ALLOWLIST_ENV: &str = "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST";
 const COMPLETION_REGISTRATION_AUTHORITY_ENV: &str = "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY";
 const BASE_DELIVERY_HELPER_ENVIRONMENT: &[&str] = &[
@@ -60,12 +60,14 @@ const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
 struct ConfiguredDeliveryHelper {
     provenance: DeliveryHelperProvenance,
     executable: File,
+    interpreter: Option<File>,
 }
 
 #[derive(Debug)]
 struct HandleBoundDeliveryHelper {
     provenance: DeliveryHelperProvenance,
     executable: File,
+    interpreter: Option<File>,
 }
 
 pub(crate) struct DeliveryRegistrationCandidate {
@@ -241,6 +243,14 @@ impl ConfiguredDeliveryHelper {
             ))
         })?;
         validate_delivery_helper_metadata(path, &metadata).map_err(DeliveryHelperError::invalid)?;
+        let interpreter = configured_interpreter(&source)?;
+        let interpreter_provenance =
+            interpreter
+                .as_ref()
+                .map(|(path, _, sha256)| DeliveryHelperInterpreterProvenance {
+                    path: path.to_string_lossy().into_owned(),
+                    sha256: sha256.clone(),
+                });
         let (executable, sha256) = sealed_execution_image(&source).map_err(|err| {
             DeliveryHelperError::unavailable(format!(
                 "cannot snapshot delivery helper {}: {err}",
@@ -254,8 +264,10 @@ impl ConfiguredDeliveryHelper {
                 &metadata,
                 sha256,
                 environment,
+                interpreter_provenance,
             ),
             executable,
+            interpreter: interpreter.map(|(_, executable, _)| executable),
         })
     }
 
@@ -297,6 +309,31 @@ impl ConfiguredDeliveryHelper {
                 ))
             })?;
         }
+        if let (Some(interpreter), Some(provenance)) =
+            (&self.interpreter, &self.provenance.interpreter)
+        {
+            let cached_interpreter = cache_dir.join(&provenance.sha256);
+            install_cached_helper(
+                &cached_interpreter,
+                interpreter,
+                &provenance.sha256,
+                &paths.handle,
+            )
+            .map_err(|err| {
+                DeliveryHelperError::unavailable(format!(
+                    "cannot cache delivery helper interpreter for {}: {err}",
+                    paths.handle
+                ))
+            })?;
+            fs::hard_link(&cached_interpreter, &paths.delivery_helper_interpreter).map_err(
+                |err| {
+                    DeliveryHelperError::unavailable(format!(
+                        "cannot pin delivery helper interpreter for {}: {err}",
+                        paths.handle
+                    ))
+                },
+            )?;
+        }
         fs::hard_link(&cached, &paths.delivery_helper).map_err(|err| {
             DeliveryHelperError::unavailable(format!(
                 "cannot pin delivery helper for {}: {err}",
@@ -325,20 +362,41 @@ impl ConfiguredDeliveryHelper {
                 paths.handle
             ))
         })?;
+        let interpreter_provenance = match self.provenance.interpreter {
+            Some(mut provenance) => {
+                provenance.path = fs::canonicalize(&paths.delivery_helper_interpreter)
+                    .map_err(|err| {
+                        DeliveryHelperError::unavailable(format!(
+                            "cannot resolve pinned delivery helper interpreter for {}: {err}",
+                            paths.handle
+                        ))
+                    })?
+                    .to_string_lossy()
+                    .into_owned();
+                Some(provenance)
+            }
+            None => None,
+        };
         let provenance = provenance_from_metadata(
             snapshot_path.to_string_lossy().into_owned(),
             &metadata,
             self.provenance.sha256,
             self.provenance.environment,
+            interpreter_provenance,
         );
         Ok(HandleBoundDeliveryHelper {
             provenance,
             executable: self.executable,
+            interpreter: self.interpreter,
         })
     }
 
     fn owner_lookup_command(&self) -> Command {
-        delivery_helper_command(&self.provenance, &self.executable)
+        delivery_helper_command(
+            &self.provenance,
+            &self.executable,
+            self.interpreter.as_ref(),
+        )
     }
 }
 
@@ -424,20 +482,41 @@ impl HandleBoundDeliveryHelper {
                 paths.handle
             )));
         }
+        let interpreter = match &provenance.interpreter {
+            Some(interpreter) => Some(load_bound_interpreter(interpreter, paths)?),
+            None => None,
+        };
         Ok(Self {
             provenance: provenance.clone(),
             executable,
+            interpreter,
         })
     }
 
     fn operation_command(&self) -> Command {
-        delivery_helper_command(&self.provenance, &self.executable)
+        delivery_helper_command(
+            &self.provenance,
+            &self.executable,
+            self.interpreter.as_ref(),
+        )
     }
 }
 
-fn delivery_helper_command(provenance: &DeliveryHelperProvenance, executable: &File) -> Command {
+fn delivery_helper_command(
+    provenance: &DeliveryHelperProvenance,
+    executable: &File,
+    interpreter: Option<&File>,
+) -> Command {
     let fd = executable.as_raw_fd();
-    let mut command = Command::new(format!("/proc/self/fd/{fd}"));
+    let interpreter_fd = interpreter.map(AsRawFd::as_raw_fd);
+    debug_assert_eq!(provenance.interpreter.is_some(), interpreter_fd.is_some());
+    let mut command = if let Some(interpreter_fd) = interpreter_fd {
+        let mut command = Command::new(format!("/proc/self/fd/{interpreter_fd}"));
+        command.arg(format!("/proc/self/fd/{fd}"));
+        command
+    } else {
+        Command::new(format!("/proc/self/fd/{fd}"))
+    };
     command
         .env_clear()
         .envs(&provenance.environment)
@@ -450,6 +529,15 @@ fn delivery_helper_command(provenance: &DeliveryHelperProvenance, executable: &F
             }
             if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
                 return Err(io::Error::last_os_error());
+            }
+            if let Some(interpreter_fd) = interpreter_fd {
+                let flags = libc::fcntl(interpreter_fd, libc::F_GETFD);
+                if flags < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::fcntl(interpreter_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
             Ok(())
         });
@@ -488,11 +576,142 @@ fn validate_delivery_helper_metadata(path: &Path, metadata: &Metadata) -> Result
     Ok(())
 }
 
+fn configured_interpreter(
+    source: &File,
+) -> Result<Option<(PathBuf, File, String)>, DeliveryHelperError> {
+    let mut reader = source.try_clone().map_err(|err| {
+        DeliveryHelperError::unavailable(format!("cannot inspect delivery helper: {err}"))
+    })?;
+    reader.seek(SeekFrom::Start(0)).map_err(|err| {
+        DeliveryHelperError::unavailable(format!("cannot inspect delivery helper: {err}"))
+    })?;
+    let mut prefix = [0_u8; 4096];
+    let read = reader.read(&mut prefix).map_err(|err| {
+        DeliveryHelperError::unavailable(format!("cannot inspect delivery helper: {err}"))
+    })?;
+    if !prefix[..read].starts_with(b"#!") {
+        return Ok(None);
+    }
+    let line = prefix[2..read]
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let line = std::str::from_utf8(line)
+        .map_err(|_| DeliveryHelperError::invalid("delivery helper shebang is not valid UTF-8"))?
+        .trim();
+    let mut parts = line.split_whitespace();
+    let path = parts
+        .next()
+        .ok_or_else(|| DeliveryHelperError::invalid("delivery helper shebang is empty"))?;
+    if parts.next().is_some() {
+        return Err(DeliveryHelperError::invalid(
+            "delivery helper shebang arguments are unsupported",
+        ));
+    }
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err(DeliveryHelperError::invalid(
+            "delivery helper interpreter path is not absolute",
+        ));
+    }
+    let path = fs::canonicalize(path).map_err(|err| {
+        DeliveryHelperError::unavailable(format!(
+            "cannot resolve delivery helper interpreter {}: {err}",
+            path.display()
+        ))
+    })?;
+    let source = open_delivery_helper(&path).map_err(|err| {
+        DeliveryHelperError::unavailable(format!(
+            "cannot open delivery helper interpreter {}: {err}",
+            path.display()
+        ))
+    })?;
+    let metadata = source.metadata().map_err(|err| {
+        DeliveryHelperError::unavailable(format!(
+            "cannot inspect delivery helper interpreter {}: {err}",
+            path.display()
+        ))
+    })?;
+    validate_delivery_helper_metadata(&path, &metadata).map_err(DeliveryHelperError::invalid)?;
+    let (executable, sha256) = sealed_execution_image(&source).map_err(|err| {
+        DeliveryHelperError::unavailable(format!(
+            "cannot snapshot delivery helper interpreter {}: {err}",
+            path.display()
+        ))
+    })?;
+    if execution_image_is_script(&executable)? {
+        return Err(DeliveryHelperError::invalid(
+            "delivery helper interpreter must be a native executable",
+        ));
+    }
+    Ok(Some((path, executable, sha256)))
+}
+
+fn execution_image_is_script(executable: &File) -> Result<bool, DeliveryHelperError> {
+    let mut reader = executable.try_clone().map_err(|err| {
+        DeliveryHelperError::unavailable(format!("cannot inspect execution image: {err}"))
+    })?;
+    reader.seek(SeekFrom::Start(0)).map_err(|err| {
+        DeliveryHelperError::unavailable(format!("cannot inspect execution image: {err}"))
+    })?;
+    let mut prefix = [0_u8; 2];
+    let read = reader.read(&mut prefix).map_err(|err| {
+        DeliveryHelperError::unavailable(format!("cannot inspect execution image: {err}"))
+    })?;
+    Ok(read == prefix.len() && prefix == *b"#!")
+}
+
+fn load_bound_interpreter(
+    provenance: &DeliveryHelperInterpreterProvenance,
+    paths: &StatePaths,
+) -> Result<File, DeliveryHelperError> {
+    let expected_path = fs::canonicalize(&paths.state_dir)
+        .map_err(|err| {
+            DeliveryHelperError::unavailable(format!(
+                "registered delivery helper state for {} is unavailable: {err}",
+                paths.handle
+            ))
+        })?
+        .join("delivery-helper-interpreter");
+    if Path::new(&provenance.path) != expected_path {
+        return Err(DeliveryHelperError::changed(format!(
+            "registered delivery helper interpreter binding changed for {}",
+            paths.handle
+        )));
+    }
+    let source = open_delivery_helper(&expected_path).map_err(|err| {
+        DeliveryHelperError::unavailable(format!(
+            "registered delivery helper interpreter for {} is unavailable: {err}",
+            paths.handle
+        ))
+    })?;
+    let (executable, sha256) = sealed_execution_image(&source).map_err(|err| {
+        DeliveryHelperError::unavailable(format!(
+            "cannot load registered delivery helper interpreter for {}: {err}",
+            paths.handle
+        ))
+    })?;
+    if sha256 != provenance.sha256 {
+        return Err(DeliveryHelperError::changed(format!(
+            "registered delivery helper interpreter contents changed for {}",
+            paths.handle
+        )));
+    }
+    if execution_image_is_script(&executable)? {
+        return Err(DeliveryHelperError::changed(format!(
+            "registered delivery helper interpreter for {} is not native",
+            paths.handle
+        )));
+    }
+    Ok(executable)
+}
+
 fn provenance_from_metadata(
     path: String,
     metadata: &Metadata,
     sha256: String,
     environment: BTreeMap<String, String>,
+    interpreter: Option<DeliveryHelperInterpreterProvenance>,
 ) -> DeliveryHelperProvenance {
     DeliveryHelperProvenance {
         schema_version: DELIVERY_HELPER_SCHEMA_VERSION,
@@ -505,6 +724,7 @@ fn provenance_from_metadata(
         mode: metadata.mode(),
         sha256,
         environment,
+        interpreter,
     }
 }
 
@@ -1387,6 +1607,7 @@ mod tests {
             &snapshot_metadata,
             sha256,
             BTreeMap::new(),
+            None,
         );
         let mut permissions = fs::metadata(&paths.delivery_helper)
             .expect("snapshot metadata")

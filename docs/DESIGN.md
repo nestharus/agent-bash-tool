@@ -202,13 +202,17 @@ state root and hard-linked as `delivery-helper` inside each dependent handle. La
 completion, status recovery, and guardian recovery accept only that handle-local path, verify its
 metadata and digest, copy it into a sealed in-memory image, and execute the sealed bytes. Replacing
 or editing the configured source path after registration cannot change an in-flight handle.
+When the helper is a shebang script, registration also resolves and seals the direct interpreter,
+stores its digest, and hard-links it as `delivery-helper-interpreter`. Later operations invoke that
+pinned interpreter image explicitly with the pinned script image. Interpreter chains and shebang
+arguments are rejected because they would delegate execution to another unbound program.
 
 The source models that provenance transition explicitly. `ConfiguredDeliveryHelper` is resolved
 from the initiating environment and can perform only owner-session discovery or a consuming bind.
 Binding yields `HandleBoundDeliveryHelper`; registration and every later delivery-helper request
 accept only that handle-bound type. Reconstructing it from durable provenance revalidates the
-handle-local path, metadata, digest, environment, and sealed bytes before exposing its operation
-command.
+handle-local paths, metadata, helper and interpreter digests, environment, and sealed bytes before
+exposing its operation command.
 
 Registration also pins the helper's execution environment. Helper commands clear the initiating
 process's ambient environment, run from `/`, and restore only a bounded baseline (`HOME`, locale,
@@ -247,7 +251,7 @@ The selected helper is an opaque trusted extension at this boundary. Its operati
 maintain downstream state, but this repository claims only pinned byte identity, invocation
 admission, and the observed helper-process outcome, not closure over arbitrary helper internals.
 
-Helper provenance schema 3 is the activation boundary for this convention. A deployment owner must
+Helper provenance schema 4 is the activation boundary for this convention. A deployment owner must
 drain handles created by older binaries before rollout. Draining includes explicitly terminating or
 otherwise settling never-ending old-schema handles; rollout must not wait on them indefinitely.
 Records with missing or older provenance are deliberately retired: later activation or completion fails closed with
