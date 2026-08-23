@@ -254,6 +254,11 @@ persisted before that decision so detach can safely observe a completion that wo
 - Repeated detach calls observe `async` and are no-ops. If a caller died between the canonical mode
   write and the `meta.json` mirror, the retry repairs the mirror without repeating activation.
 
+The detach JSON field `notification_attempted` reports the terminal activation condition: it is true
+when the successful sync-to-async transition observes a terminal handle, allowing the activation to
+attempt an immediate downstream notification. It does not report whether the activation helper
+operation ran; that operation is internal to every claimed sync-to-async transition.
+
 Detach and completion first fork a local delivery owner while retaining `delivery.lock`. That owner
 persists `activation-attempted` plus canonical `async` mode, or `attempted=true` plus
 `error_code="delivery_attempt_in_progress"`, immediately before it launches the helper. The owner

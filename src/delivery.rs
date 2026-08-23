@@ -741,8 +741,7 @@ pub(crate) struct DetachOutcome {
     delivery_mode: DeliveryMode,
     state: String,
     transitioned: bool,
-    #[serde(rename = "notification_attempted")]
-    delivery_helper_operation_attempted: bool,
+    notification_attempted: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -951,7 +950,8 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
     })?;
     let meta = state::read_meta(paths)?;
     drop(delivery_lock);
-    Ok(detach_outcome(&meta, true, state::terminal(&meta)))
+    let notification_attempted = state::terminal(&meta);
+    Ok(detach_outcome(&meta, true, notification_attempted))
 }
 
 fn run_delivery_owner_holding_lock(
@@ -999,17 +999,13 @@ fn repair_delivery_mode_mirror(paths: &StatePaths, mode: DeliveryMode) -> io::Re
     Ok(meta)
 }
 
-fn detach_outcome(
-    meta: &Meta,
-    transitioned: bool,
-    delivery_helper_operation_attempted: bool,
-) -> DetachOutcome {
+fn detach_outcome(meta: &Meta, transitioned: bool, notification_attempted: bool) -> DetachOutcome {
     DetachOutcome {
         handle: meta.handle.clone(),
         delivery_mode: meta.delivery_mode,
         state: meta.state.clone(),
         transitioned,
-        delivery_helper_operation_attempted,
+        notification_attempted,
     }
 }
 
