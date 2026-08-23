@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const FIXTURE_DEADLINE: Duration = Duration::from_secs(30);
-const FAKE_HELPER_ENVIRONMENT: &str = "AGENT_BASH_FAKE_ACTIVATE_RELEASE,AGENT_BASH_FAKE_ACTIVATE_STARTED,AGENT_BASH_FAKE_COMPLETE_FINISHED,AGENT_BASH_FAKE_COMPLETE_RELEASE,AGENT_BASH_FAKE_COMPLETE_STARTED,AGENT_BASH_FAKE_DELIVERY_LOG,AGENT_BASH_FAKE_FIRST_MISS_MARKER,AGENT_BASH_FAKE_META_SNAPSHOT,AGENT_BASH_FAKE_RC_SNAPSHOT,AGENT_BASH_FAKE_RESOLVED_SESSION,AGENT_BASH_FAKE_RESOLVER_DELAY,AGENT_BASH_FAKE_RESOLVER_LOG,AGENT_BASH_FAKE_ROUTE";
+const FAKE_HELPER_ENVIRONMENT: &str = "AGENT_BASH_FAKE_ACTIVATE_RELEASE,AGENT_BASH_FAKE_ACTIVATE_STARTED,AGENT_BASH_FAKE_COMPLETE_FINISHED,AGENT_BASH_FAKE_COMPLETE_RELEASE,AGENT_BASH_FAKE_COMPLETE_STARTED,AGENT_BASH_FAKE_DELIVERY_LOG,AGENT_BASH_FAKE_FIRST_MISS_MARKER,AGENT_BASH_FAKE_META_SNAPSHOT,AGENT_BASH_FAKE_RC_SNAPSHOT,AGENT_BASH_FAKE_RESOLVED_SESSION,AGENT_BASH_FAKE_RESOLVER_DELAY,AGENT_BASH_FAKE_RESOLVER_LOG,AGENT_BASH_FAKE_RESOLVER_RELEASE,AGENT_BASH_FAKE_RESOLVER_STARTED,AGENT_BASH_FAKE_ROUTE";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ProcIdentity {
@@ -540,6 +540,12 @@ fn owner_resolving_fake_agents(temp: &tempfile::TempDir) -> PathBuf {
         &fake,
         r#"#!/bin/sh
 if [ "${1:-}" = session ] && [ "${2:-}" = of-pid ]; then
+    if [ -n "${AGENT_BASH_FAKE_RESOLVER_STARTED:-}" ]; then
+        : > "$AGENT_BASH_FAKE_RESOLVER_STARTED"
+    fi
+    if [ -n "${AGENT_BASH_FAKE_RESOLVER_RELEASE:-}" ]; then
+        while [ ! -e "$AGENT_BASH_FAKE_RESOLVER_RELEASE" ]; do sleep 0.01; done
+    fi
     if [ -n "${AGENT_BASH_FAKE_RESOLVER_DELAY:-}" ]; then
         sleep "$AGENT_BASH_FAKE_RESOLVER_DELAY"
     fi
@@ -3265,6 +3271,51 @@ fn missing_explicit_owner_resolves_verified_parent_invocation() {
     assert_eq!(
         meta["owner_invocation_uuid"],
         "11111111-1111-4111-8111-111111111111"
+    );
+}
+
+#[test]
+fn owner_resolution_and_registration_share_one_configured_helper() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let helper = owner_resolving_fake_agents(&temp);
+    let resolver_started = temp.path().join("resolver-started");
+    let resolver_release = temp.path().join("resolver-release");
+    let replacement_log = temp.path().join("replacement-delivery.log");
+    let run = StdCommand::new(assert_cmd::cargo::cargo_bin("agent-bash"))
+        .env("XDG_STATE_HOME", temp.path())
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env(
+            "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST",
+            FAKE_HELPER_ENVIRONMENT,
+        )
+        .env("AGENT_BASH_FAKE_RESOLVER_STARTED", &resolver_started)
+        .env("AGENT_BASH_FAKE_RESOLVER_RELEASE", &resolver_release)
+        .env_remove("AGENT_BASH_CONSUMER_GRACE_MS")
+        .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
+        .env_remove("OULIPOLY_DATA_DIR")
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"source":"opencode","id":"11111111-1111-4111-8111-111111111111"}"#,
+        )
+        .args(["run", "--", "true"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run");
+    wait_until(FIXTURE_DEADLINE, || resolver_started.exists().then_some(()));
+    fs::write(&helper, fake_agents_script(&replacement_log)).expect("replace configured helper");
+    set_executable(&helper);
+    fs::write(&resolver_release, b"").expect("release owner resolution");
+
+    let output = run.wait_with_output().expect("run output");
+    let json = parse_run_output(&output);
+    let meta = read_meta(&meta_path(&json));
+    assert_eq!(meta["owner_session_id"], "ses_resolved");
+    assert!(
+        !replacement_log.exists(),
+        "replacement helper executed: {}",
+        fs::read_to_string(&replacement_log).unwrap_or_default()
     );
 }
 

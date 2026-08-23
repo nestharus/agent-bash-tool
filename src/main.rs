@@ -220,9 +220,9 @@ fn run_command(
     let cancel_owner = resolve_cancel_owner(&caller_chain, cancel_on_owner_exit, owner_pid)?;
     let cwd = current_directory().map_err(current_directory_error)?;
     let mode = run_mode(&ready_sentinel);
-    let owner = owner_context(&caller_chain)?;
     let registration_candidate =
         delivery::prepare_registration().map_err(completion_event_registration_error)?;
+    let owner = owner_context(&caller_chain, &registration_candidate)?;
     create_run_state(&paths)?;
     let registration = match registration_candidate.bind_to_handle(&paths) {
         Ok(registration) => registration,
@@ -422,7 +422,10 @@ fn run_mode(ready_sentinel: &Option<String>) -> &'static str {
     }
 }
 
-fn owner_context(caller_chain: &[CallerChainEntry]) -> Result<OwnerContext, AppError> {
+fn owner_context(
+    caller_chain: &[CallerChainEntry],
+    registration_candidate: &delivery::DeliveryRegistrationCandidate,
+) -> Result<OwnerContext, AppError> {
     let explicit = OwnerContext {
         session_id: nonempty_env(OWNER_SESSION_ID_ENV),
         invocation_uuid: nonempty_env(OWNER_INVOCATION_UUID_ENV),
@@ -431,9 +434,9 @@ fn owner_context(caller_chain: &[CallerChainEntry]) -> Result<OwnerContext, AppE
         explicit.invocation_uuid.as_deref(),
         explicit.session_id.as_deref(),
     ) && parent_invocation_uuid().as_deref() == Some(explicit_invocation_uuid)
-        && let Some((session_id, invocation_uuid)) =
-            delivery::resolve_owner_binding(caller_chain, explicit_invocation_uuid)
-                .map_err(owner_resolution_error)?
+        && let Some((session_id, invocation_uuid)) = registration_candidate
+            .resolve_owner_binding(caller_chain, explicit_invocation_uuid)
+            .map_err(owner_resolution_error)?
     {
         return Ok(OwnerContext {
             session_id: Some(session_id),
@@ -447,9 +450,9 @@ fn owner_context(caller_chain: &[CallerChainEntry]) -> Result<OwnerContext, AppE
     let Some(expected_invocation_uuid) = parent_invocation_uuid() else {
         return Ok(explicit);
     };
-    let Some((session_id, invocation_uuid)) =
-        delivery::resolve_owner_binding(caller_chain, &expected_invocation_uuid)
-            .map_err(owner_resolution_error)?
+    let Some((session_id, invocation_uuid)) = registration_candidate
+        .resolve_owner_binding(caller_chain, &expected_invocation_uuid)
+        .map_err(owner_resolution_error)?
     else {
         return Ok(explicit);
     };

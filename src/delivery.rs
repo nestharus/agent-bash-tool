@@ -73,6 +73,14 @@ pub(crate) struct DeliveryRegistrationCandidate {
 }
 
 impl DeliveryRegistrationCandidate {
+    pub(crate) fn resolve_owner_binding(
+        &self,
+        caller_chain: &[CallerChainEntry],
+        expected_invocation_uuid: &str,
+    ) -> io::Result<Option<(String, String)>> {
+        resolve_owner_binding(&self.helper, caller_chain, expected_invocation_uuid)
+    }
+
     pub(crate) fn bind_to_handle(self, paths: &StatePaths) -> io::Result<DeliveryRegistration> {
         let helper = self.helper.pin_to_handle(paths).map_err(io::Error::other)?;
         Ok(DeliveryRegistration { helper })
@@ -751,7 +759,8 @@ struct PidSessionResponse {
     session_id: Option<String>,
 }
 
-pub(crate) fn resolve_owner_binding(
+fn resolve_owner_binding(
+    helper: &ConfiguredDeliveryHelper,
     caller_chain: &[CallerChainEntry],
     expected_invocation_uuid: &str,
 ) -> io::Result<Option<(String, String)>> {
@@ -759,7 +768,7 @@ pub(crate) fn resolve_owner_binding(
         .iter()
         .filter(|entry| state::process_identity_is_live(entry))
     {
-        if let Some(owner) = resolve_owner_for_pid(entry.pid, expected_invocation_uuid)? {
+        if let Some(owner) = resolve_owner_for_pid(helper, entry.pid, expected_invocation_uuid)? {
             return Ok(Some(owner));
         }
     }
@@ -767,10 +776,10 @@ pub(crate) fn resolve_owner_binding(
 }
 
 fn resolve_owner_for_pid(
+    helper: &ConfiguredDeliveryHelper,
     pid: libc::pid_t,
     expected_invocation_uuid: &str,
 ) -> io::Result<Option<(String, String)>> {
-    let helper = ConfiguredDeliveryHelper::from_environment().map_err(io::Error::other)?;
     let mut command = helper.owner_lookup_command();
     let mut child = command
         .args(["session", "of-pid", &pid.to_string(), "--json"])
