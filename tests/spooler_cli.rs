@@ -791,10 +791,6 @@ const args = mode === "poll"
         ? { command: "printf '%s|%s\\n' \"${OULIPOLY_LIVE_SESSION_BIND_SOCKET-unset}\" \"${OULIPOLY_LIVE_SESSION_BIND_TOKEN-unset}\"" }
       : mode === "inherited-env"
         ? { command: "printf '%s|%s|%s|%s\\n' \"$INHERITED_ENV_SENTINEL\" \"${OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY-unset}\" \"${AGENT_BASH_AGENT_RUNNER_BIN-unset}\" \"$OULIPOLY_PARENT_INVOCATION\"" }
-      : mode === "reserved-helper-prefix"
-        ? { command: `AGENT_BASH_AGENT_RUNNER_BIN=${process.env.RESERVED_HELPER_OVERRIDE} ${process.env.AGENT_BASH_BIN} run -- true` }
-      : mode === "registration-authority-copy"
-        ? { command: `RETAINED_AUTH=$OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY ${process.env.AGENT_BASH_BIN} run -- true` }
       : mode === "agent-sync"
         ? { command: "agents --version", delivery: "sync" }
         : mode === "agent"
@@ -2580,8 +2576,12 @@ fn opencode_adapter_rejects_command_local_registration_helper_override() {
     let driver = write_adapter_driver(&temp);
     let (override_helper, override_log) =
         named_fake_agents(&temp, "override-agents", "override-delivery.log");
-    let output = adapter_driver_command(&temp, &driver, "reserved-helper-prefix", None)
-        .env("RESERVED_HELPER_OVERRIDE", override_helper)
+    let explicit_run = format!(
+        "AGENT_BASH_AGENT_RUNNER_BIN={} {} run -- true",
+        override_helper.display(),
+        temp.path().join("adapter-agent-bash").display()
+    );
+    let output = adapter_driver_command(&temp, &driver, "control", Some(&explicit_run))
         .output()
         .expect("adapter driver");
 
@@ -2598,7 +2598,11 @@ fn opencode_adapter_rejects_shell_copy_of_registration_authority() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
-    let output = adapter_driver_command(&temp, &driver, "registration-authority-copy", None)
+    let explicit_run = format!(
+        "RETAINED_AUTH=$OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY {} run -- true",
+        temp.path().join("adapter-agent-bash").display()
+    );
+    let output = adapter_driver_command(&temp, &driver, "control", Some(&explicit_run))
         .output()
         .expect("adapter driver");
 
