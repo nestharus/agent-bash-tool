@@ -604,7 +604,7 @@ exit 74
     (fake, resolver_log)
 }
 
-fn delivery_attempt_count(path: &Path) -> usize {
+fn completion_helper_operation_count(path: &Path) -> usize {
     fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
@@ -1880,7 +1880,7 @@ fn accepted_cancel_is_owned_by_guardian_after_supervisor_loss() {
     assert_eq!(terminal["rc"], 143);
     assert_eq!(terminal["signal"], libc::SIGTERM);
     assert!(workload.exited(), "guardian did not terminate workload");
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
 }
 
 #[test]
@@ -3520,11 +3520,11 @@ fn delivery_seam_records_invocation_outcome() {
     assert_eq!(json["delivery_mode"], "async");
     assert_eq!(mode_text(&temp, handle), "async");
     let deadline = Instant::now() + FIXTURE_DEADLINE;
-    while delivery_attempt_count(&delivery_log) != 1 && Instant::now() < deadline {
+    while completion_helper_operation_count(&delivery_log) != 1 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
     assert_eq!(
-        delivery_attempt_count(&delivery_log),
+        completion_helper_operation_count(&delivery_log),
         1,
         "meta={} log={}",
         read_meta(&meta_path),
@@ -3602,7 +3602,7 @@ fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
     let meta_path = meta_path(&json);
 
     wait_until(fixture_deadline, || {
-        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+        (completion_helper_operation_count(&delivery_log) == 1).then_some(())
     });
     let delivered = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
@@ -3616,7 +3616,7 @@ fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
         let status = status_text(&temp, handle, true);
         assert!(status.starts_with("DONE rc=0"), "{status}");
     }
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
 }
 
 #[test]
@@ -3773,7 +3773,7 @@ fn concurrent_status_after_nonzero_helper_exit_does_not_repeat_delivery() {
     for observer in observers {
         assert_command_success(&observer.join().expect("join observer"));
     }
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
     assert_eq!(read_meta(&meta_path)["delivery"]["exit_code"], 17);
 }
 
@@ -3920,7 +3920,7 @@ fn observer_cannot_substitute_registered_delivery_helper() {
     fs::write(&release, b"").expect("release workload");
     let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     wait_until(FIXTURE_DEADLINE, || {
-        (delivery_attempt_count(&log_a) == 1).then_some(())
+        (completion_helper_operation_count(&log_a) == 1).then_some(())
     });
 
     let helper_a_operations = fs::read_to_string(&log_a).expect("helper A log");
@@ -3930,7 +3930,7 @@ fn observer_cannot_substitute_registered_delivery_helper() {
             .any(|line| line == "agent-bash-activate"),
         "registered helper did not receive detach activation: {helper_a_operations}"
     );
-    assert_eq!(delivery_attempt_count(&log_a), 1);
+    assert_eq!(completion_helper_operation_count(&log_a), 1);
     assert!(
         helper_a_operations
             .lines()
@@ -4069,7 +4069,7 @@ fn registered_helper_snapshot_survives_source_replacement_without_polling() {
     });
     assert_eq!(delivered["delivery"]["attempted"], true);
     assert!(delivered["delivery"]["error"].is_null());
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
     assert!(
         !replacement_log.exists(),
         "replacement helper executed: {}",
@@ -4148,7 +4148,7 @@ fn unavailable_pinned_helper_allows_one_bounded_pre_execution_retry() {
     assert_command_success(&repeated);
     let repeated = stdout_utf8(repeated, "status utf8");
     assert!(repeated.starts_with("DONE rc=0"), "{repeated}");
-    assert_eq!(delivery_attempt_count(&delivery_log), 0);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 0);
     assert!(
         !observer_log.exists(),
         "observer-local helper executed: {}",
@@ -4269,7 +4269,7 @@ fn changed_handle_helper_fails_closed_through_completion_boundary() {
     assert_eq!(meta["delivery"]["retryable"], true);
     assert_eq!(meta["delivery"]["retry_count"].as_u64().unwrap_or(0), 0);
     assert!(!executed.exists(), "changed helper executed");
-    assert_eq!(delivery_attempt_count(&delivery_log), 0);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 0);
 }
 
 #[test]
@@ -4322,9 +4322,9 @@ fn sync_completion_triggers_its_inactive_completion_event() {
     assert_eq!(json["delivery_mode"], "sync");
     assert_eq!(mode_text(&temp, handle), "sync");
     wait_until(FIXTURE_DEADLINE, || {
-        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+        (completion_helper_operation_count(&delivery_log) == 1).then_some(())
     });
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
     let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path(&json));
         delivery_lifecycle_is_closed(&meta).then_some(meta)
@@ -4368,9 +4368,9 @@ fn detach_after_sync_completion_admits_each_helper_operation_once() {
     assert_eq!(second["notification_attempted"], false);
     assert_eq!(mode_text(&temp, handle), "async");
     wait_until(FIXTURE_DEADLINE, || {
-        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+        (completion_helper_operation_count(&delivery_log) == 1).then_some(())
     });
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
     assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
     let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path(&json));
@@ -4438,9 +4438,9 @@ fn concurrent_detach_and_completion_admit_each_helper_operation_once() {
         1
     );
     wait_until(FIXTURE_DEADLINE, || {
-        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+        (completion_helper_operation_count(&delivery_log) == 1).then_some(())
     });
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
     assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
     assert_eq!(mode_text(&temp, &handle), "async");
 }
@@ -4552,7 +4552,7 @@ fn detach_does_not_rewrite_terminal_metadata_after_activation() {
     let status = wait_for_terminal_status(&temp, &handle);
     assert!(status.starts_with("DONE rc=0"), "{status}");
     assert_eq!(read_meta(&meta_path(&json))["state"], "DONE");
-    assert_eq!(delivery_attempt_count(&fixture.delivery_log), 1);
+    assert_eq!(completion_helper_operation_count(&fixture.delivery_log), 1);
     let meta = read_meta(&meta_path(&json));
     assert_eq!(meta["delivery"]["attempted"], true);
     assert_eq!(meta["delivery"]["exit_code"], 0);
@@ -4580,7 +4580,7 @@ fn consumed_marker_before_completion_marks_helper_operation_consumed() {
         delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     let delivery = fs::read_to_string(&delivery_log).expect("event commands");
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
     assert!(delivery.lines().any(|line| line == "--consumed"));
     assert_eq!(meta["delivery"]["attempted"], true);
     assert_eq!(meta["delivery"]["exit_code"], 0);
@@ -4610,10 +4610,10 @@ fn consumed_marker_during_delivery_grace_marks_helper_operation_consumed() {
         "{final_status}"
     );
     wait_until(FIXTURE_DEADLINE, || {
-        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+        (completion_helper_operation_count(&delivery_log) == 1).then_some(())
     });
     let delivery = fs::read_to_string(&delivery_log).expect("event commands");
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
     assert!(delivery.lines().any(|line| line == "--consumed"));
     let meta_path = meta_path(&json);
     let meta = wait_until(FIXTURE_DEADLINE, || {
