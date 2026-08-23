@@ -219,7 +219,10 @@ the sole transient exception: it is injected only into the immediate registratio
 is neither persisted, replayed, nor inherited by the workload. The helper-selection override is also
 removed before workload execution. The OpenCode adapter invokes recognized explicit runs directly
 from conservatively parsed arguments and rejects shell expansion around that registration-capable
-launch; it also ignores command-local assignments to either reserved control. A later workload,
+launch. One explicit-run admission result distinguishes ordinary commands, conservatively
+recognized but unsupported explicit syntax, and validated direct invocations; only the last carries
+normalized arguments and environment to the launcher. One adapter-owned assignment policy removes
+either reserved control from both command representations. A later workload,
 detach, status, supervisor, or guardian process therefore
 cannot retain the registration capability or alter interpreter lookup, the agent-runner data
 namespace, or an explicitly declared helper input through its own environment.

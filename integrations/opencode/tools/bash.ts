@@ -31,10 +31,19 @@ type ShellCommand = {
   body: string
 }
 
+type ExplicitRunAdmission =
+  | { kind: "ordinary" }
+  | { kind: "unsupported" }
+  | { kind: "direct"; argv: string[]; environment: Record<string, string> }
+
 const RESERVED_SPOOLER_ASSIGNMENTS = new Set([
   "AGENT_BASH_AGENT_RUNNER_BIN",
   "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
 ])
+
+function adapterOwnsAssignment(name: string): boolean {
+  return RESERVED_SPOOLER_ASSIGNMENTS.has(name)
+}
 
 type ProcessResult = {
   exitCode: number
@@ -390,19 +399,17 @@ function splitShellCommand(command: string): ShellCommand {
     const matched = body.match(assignment)?.[0]
     if (!matched) break
     const name = matched.slice(0, matched.indexOf("="))
-    if (!RESERVED_SPOOLER_ASSIGNMENTS.has(name)) environmentPrefix += matched
+    if (!adapterOwnsAssignment(name)) environmentPrefix += matched
     body = body.slice(matched.length)
   }
   return { prefix: leadingWhitespace + environmentPrefix, body }
 }
 
-function agentBashRunPrefix(command: string): string | undefined {
+// This intentionally broad recognizer only routes potentially privileged input to the
+// authoritative structured admission parser; it never authorizes direct execution itself.
+function conservativelyRecognizesExplicitRun(command: string): boolean {
   const { body } = splitShellCommand(command)
-  return [`${AGENT_BASH} run`, "agent-bash run"].find((prefix) => startsWithToken(body, prefix))
-}
-
-function isAgentBashRun(command: string): boolean {
-  return agentBashRunPrefix(command) !== undefined
+  return [`${AGENT_BASH} run`, "agent-bash run"].some((prefix) => startsWithToken(body, prefix))
 }
 
 function isAgentDispatch(command: string): boolean {
@@ -414,7 +421,10 @@ function isAgentDispatch(command: string): boolean {
   ) {
     return true
   }
-  return isAgentBashRun(body) && /\s--\s+(?:[^\s]+\/)?(?:agents|oulipoly-agent-runner)(?:\s|$)/.test(body)
+  return (
+    conservativelyRecognizesExplicitRun(body) &&
+    /\s--\s+(?:[^\s]+\/)?(?:agents|oulipoly-agent-runner)(?:\s|$)/.test(body)
+  )
 }
 
 function pinAgentRunnerBinary(command: string): string {
@@ -503,7 +513,7 @@ function structuredShellWords(command: string): string[] | undefined {
   return words
 }
 
-function structuredExplicitRun(
+function parseStructuredExplicitRun(
   command: string,
   delivery: DeliveryMode,
   ownerLease: boolean,
@@ -515,7 +525,7 @@ function structuredExplicitRun(
     const assignment = words.shift()!
     const separator = assignment.indexOf("=")
     const name = assignment.slice(0, separator)
-    if (!RESERVED_SPOOLER_ASSIGNMENTS.has(name)) environment[name] = assignment.slice(separator + 1)
+    if (!adapterOwnsAssignment(name)) environment[name] = assignment.slice(separator + 1)
   }
   if ((words[0] !== AGENT_BASH && words[0] !== "agent-bash") || words[1] !== "run") return undefined
   words[0] = AGENT_BASH
@@ -535,6 +545,16 @@ function structuredExplicitRun(
   return { argv: words, environment }
 }
 
+function admitExplicitRun(
+  command: string,
+  delivery: DeliveryMode,
+  ownerLease: boolean,
+): ExplicitRunAdmission {
+  if (!conservativelyRecognizesExplicitRun(command)) return { kind: "ordinary" }
+  const direct = parseStructuredExplicitRun(command, delivery, ownerLease)
+  return direct ? { kind: "direct", ...direct } : { kind: "unsupported" }
+}
+
 async function dispatchCommand(
   command: string,
   delivery: DeliveryMode,
@@ -542,9 +562,11 @@ async function dispatchCommand(
   completionScope: CompletionScope,
   ownerSessionId: string,
 ): Promise<string> {
-  if (isAgentBashRun(command)) {
-    const explicitRun = structuredExplicitRun(command, delivery, ownerLease)
-    if (!explicitRun) throw new Error("explicit agent-bash run requires structured arguments without shell expansion")
+  const explicitRun = admitExplicitRun(command, delivery, ownerLease)
+  if (explicitRun.kind === "unsupported") {
+    throw new Error("explicit agent-bash run requires structured arguments without shell expansion")
+  }
+  if (explicitRun.kind === "direct") {
     return checkedProcessText(
       explicitRun.argv,
       "agent-bash dispatch",
