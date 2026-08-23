@@ -309,6 +309,9 @@ The spooler's closed state machine ends at the admitted helper invocation and it
 exit. Agent-runner owns mailbox publication, transaction boundaries, and any downstream idempotency.
 Accordingly, “at most once” in this repository means one admitted `agent-bash-activate` or
 `agent-bash-complete` helper invocation; it does not claim an uninspected end-to-end mailbox theorem.
+Activation writes a durable pending outcome before helper admission and replaces it with succeeded
+or failed after observing the helper process. A caller loss cannot erase that outcome, and later
+detach calls expose failed or unknown settlement without replaying the admitted activation.
 
 Before invoking the completion helper operation, the supervisor checks the best-effort `consumed`
 marker. If `AGENT_BASH_CONSUMER_GRACE_MS` is nonzero, it waits up to that bounded interval (clamped

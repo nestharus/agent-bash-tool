@@ -1157,6 +1157,7 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
     let delivery_lock = DeliveryLockGuard::acquire(paths)?;
     let mode = state::read_delivery_mode(paths)?;
     if mode == DeliveryMode::Async {
+        require_settled_activation(paths)?;
         let meta = repair_delivery_mode_mirror(paths, DeliveryMode::Async)?;
         drop(delivery_lock);
         return Ok(detach_outcome(&meta, false, false));
@@ -1164,7 +1165,7 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
 
     let meta = state::read_meta(paths)?;
     let request = activate_request(&meta, paths).map_err(io::Error::other)?;
-    run_delivery_owner_holding_lock(&delivery_lock, || {
+    let owner_result = run_delivery_owner_holding_lock(&delivery_lock, || {
         let claimed = state::record_activation_attempt(paths)?;
         if let Err(err) = state::write_delivery_mode_atomic(paths, DeliveryMode::Async) {
             if claimed {
@@ -1173,27 +1174,33 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
             return Err(err);
         }
         let result = if claimed {
+            state::write_activation_outcome(paths, "pending\n")?;
             run_required_delivery_helper_command_detailed(&request)
         } else {
+            require_settled_activation(paths)?;
             Ok(())
         };
         match result {
             Err(DeliveryHelperCommandError::NotStarted(err)) => {
                 state::rollback_activation_attempt(paths)?;
+                state::remove_activation_outcome(paths)?;
                 state::write_delivery_mode_atomic(paths, DeliveryMode::Sync)?;
                 repair_delivery_mode_mirror(paths, DeliveryMode::Sync)?;
                 Err(err)
             }
             Err(DeliveryHelperCommandError::Admitted(err)) => {
+                state::write_activation_outcome(paths, &format!("failed: {err}\n"))?;
                 repair_delivery_mode_mirror(paths, DeliveryMode::Async)?;
                 Err(err)
             }
             Ok(()) => {
+                state::write_activation_outcome(paths, "succeeded\n")?;
                 repair_delivery_mode_mirror(paths, DeliveryMode::Async)?;
                 Ok(())
             }
         }
-    })?;
+    });
+    require_settled_activation(paths).and(owner_result)?;
     let meta = state::read_meta(paths)?;
     drop(delivery_lock);
     let terminal_activation_requests_notification = state::terminal(&meta);
@@ -1202,6 +1209,14 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
         true,
         terminal_activation_requests_notification,
     ))
+}
+
+fn require_settled_activation(paths: &StatePaths) -> io::Result<()> {
+    match state::read_activation_outcome(paths)?.as_deref() {
+        None | Some("succeeded\n") => Ok(()),
+        Some("pending\n") => Err(io::Error::other("delivery activation outcome is unknown")),
+        Some(outcome) => Err(io::Error::other(outcome.trim().to_string())),
+    }
 }
 
 fn run_delivery_owner_holding_lock(

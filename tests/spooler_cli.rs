@@ -555,6 +555,25 @@ exit 0
     (fake, log)
 }
 
+fn nonzero_activation_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join("nonzero-activation-fake-agents");
+    let log = temp.path().join("nonzero-activation.log");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+if [ "${2:-}" = agent-bash-activate ]; then
+    printf 'agent-bash-activate\n' >> "$AGENT_BASH_FAKE_DELIVERY_LOG"
+    printf 'activation rejected\n' >&2
+    exit 19
+fi
+exit 0
+"#,
+    )
+    .expect("write nonzero activation fake");
+    set_executable(&fake);
+    (fake, log)
+}
+
 fn owner_resolving_fake_agents(temp: &tempfile::TempDir) -> PathBuf {
     let fake = temp.path().join("owner-resolving-fake-agents");
     fs::write(
@@ -3834,6 +3853,50 @@ fn delivery_owner_finishes_after_detach_caller_dies() {
     assert_eq!(
         operation_count(&fixture.delivery_log, "agent-bash-activate"),
         1
+    );
+    let _ = agent_bash(&temp).args(["cancel", handle]).output();
+}
+
+#[test]
+fn admitted_activation_failure_is_durable_and_not_reported_as_settled() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = nonzero_activation_fake_agents(&temp);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--delivery", "sync", "--", "sleep", "60"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+
+    let first = agent_bash(&temp)
+        .args(["detach", handle])
+        .output()
+        .expect("first detach");
+    let second = agent_bash(&temp)
+        .args(["detach", handle])
+        .output()
+        .expect("second detach");
+
+    for failed in [&first, &second] {
+        assert_eq!(
+            failed.status.code(),
+            Some(74),
+            "{}",
+            command_failure_message(failed)
+        );
+        assert!(
+            String::from_utf8_lossy(&failed.stderr).contains("activation rejected"),
+            "{}",
+            command_failure_message(failed)
+        );
+    }
+    assert_eq!(mode_text(&temp, handle), "async");
+    assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
+    assert_eq!(
+        fs::read_to_string(state_dir_path(&json).join("activation-outcome")).unwrap(),
+        "failed: delivery helper exited with 19: activation rejected\n"
     );
     let _ = agent_bash(&temp).args(["cancel", handle]).output();
 }

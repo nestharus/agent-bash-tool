@@ -34,6 +34,7 @@ pub(crate) struct StatePaths {
     pub(crate) delivery_helper: PathBuf,
     pub(crate) delivery_helper_interpreter: PathBuf,
     pub(crate) activation_attempted: PathBuf,
+    pub(crate) activation_outcome: PathBuf,
     pub(crate) delivery_lock: PathBuf,
     pub(crate) accepted_cancel: PathBuf,
     pub(crate) completion_lock: PathBuf,
@@ -55,6 +56,7 @@ impl StatePaths {
             delivery_helper: state_dir.join("delivery-helper"),
             delivery_helper_interpreter: state_dir.join("delivery-helper-interpreter"),
             activation_attempted: state_dir.join("activation-attempted"),
+            activation_outcome: state_dir.join("activation-outcome"),
             delivery_lock: state_dir.join("delivery.lock"),
             accepted_cancel: state_dir.join("cancel-requested"),
             completion_lock: state_dir.join("completion.lock"),
@@ -596,6 +598,26 @@ pub(crate) fn record_activation_attempt(paths: &StatePaths) -> io::Result<bool> 
 
 pub(crate) fn record_consumed(paths: &StatePaths) -> io::Result<bool> {
     record_durable_create_once_marker(&paths.consumed, &paths.state_dir)
+}
+
+pub(crate) fn write_activation_outcome(paths: &StatePaths, outcome: &str) -> io::Result<()> {
+    atomic_write(&paths.activation_outcome, outcome.as_bytes())
+}
+
+pub(crate) fn read_activation_outcome(paths: &StatePaths) -> io::Result<Option<String>> {
+    match fs::read_to_string(&paths.activation_outcome) {
+        Ok(outcome) => Ok(Some(outcome)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn remove_activation_outcome(paths: &StatePaths) -> io::Result<()> {
+    match fs::remove_file(&paths.activation_outcome) {
+        Ok(()) => File::open(&paths.state_dir)?.sync_all(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn record_durable_create_once_marker(marker: &Path, directory: &Path) -> io::Result<bool> {
