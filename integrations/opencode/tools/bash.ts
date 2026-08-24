@@ -24,7 +24,7 @@ type RunDispatch = {
   handle: string
 }
 
-type ShellCommand = {
+type SanitizedShellCommand = {
   prefix: string
   body: string
 }
@@ -372,7 +372,7 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
-function splitShellCommand(command: string): ShellCommand {
+function sanitizeShellCommandAssignments(command: string): SanitizedShellCommand {
   const leadingWhitespace = command.match(/^\s*/)?.[0] || ""
   let body = command.slice(leadingWhitespace.length)
   let environmentPrefix = ""
@@ -390,12 +390,12 @@ function splitShellCommand(command: string): ShellCommand {
 // This intentionally broad recognizer only routes potentially privileged input to the
 // authoritative structured admission parser; it never authorizes direct execution itself.
 function conservativelyRecognizesExplicitRun(command: string): boolean {
-  const { body } = splitShellCommand(command)
+  const { body } = sanitizeShellCommandAssignments(command)
   return [`${AGENT_BASH} run`, "agent-bash run"].some((prefix) => startsWithToken(body, prefix))
 }
 
 function isAgentDispatch(command: string): boolean {
-  const { body } = splitShellCommand(command)
+  const { body } = sanitizeShellCommandAssignments(command)
   if (
     startsWithToken(body, "agents") ||
     startsWithToken(body, AGENTS) ||
@@ -410,7 +410,7 @@ function isAgentDispatch(command: string): boolean {
 }
 
 function pinAgentRunnerBinary(command: string): string {
-  const shellCommand = splitShellCommand(command)
+  const shellCommand = sanitizeShellCommandAssignments(command)
   let body = shellCommand.body
   for (const token of ["agents", "oulipoly-agent-runner"]) {
     if (startsWithToken(body, token)) {

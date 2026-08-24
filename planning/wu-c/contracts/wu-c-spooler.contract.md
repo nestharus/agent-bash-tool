@@ -93,7 +93,7 @@ intrinsic_surface_declarations:
       - Meta
       - RunOutput
       - ListSummary
-      - DeliveryMeta
+      - CompletionDeliveryMeta
       - CgroupMeta
       - state_root
       - generate_handle

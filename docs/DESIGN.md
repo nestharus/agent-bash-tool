@@ -58,8 +58,9 @@ whether that event is active for downstream mailbox delivery:
   durable session. Synchronous handles and interactive PTY handles remain owner-leased.
 - Leading shell environment assignments are ignored when classifying the command, but a recognized
   explicit run with a command-authored assignment is rejected. Adapter-owned assignments are
-  stripped and restored only from adapter state, so actor-selected loader or runtime hooks never
-  execute inside the registration-capable launcher.
+  stripped by `sanitizeShellCommandAssignments` and restored only from adapter state, while the
+  structured parser applies the same `adapterOwnsAssignment` policy. Actor-selected loader or
+  runtime hooks therefore never execute inside the registration-capable launcher.
 - The adapter resolves a leading `agents` or `oulipoly-agent-runner` command to the configured
   `AGENT_BASH_AGENT_RUNNER_BIN`, avoiding PATH drift between interactive and detached execution.
 - A standalone `sleep N` stays inside the adapter for up to five minutes by default, so passive
@@ -314,15 +315,16 @@ discarding a provably pre-admission obligation.
 
 The pre-admission retry policies intentionally diverge at the command-authority boundary.
 Completion progression can be entered automatically by the live supervisor, guardian, or an
-owner-authorized status call, so `DeliveryMeta::lifecycle` owns one durable retry budget and closes
-the operation after that budget is spent. Activation is entered only by an explicit
+owner-authorized status call, so `CompletionDeliveryMeta::completion_lifecycle` owns one durable
+retry budget and closes the operation after that budget is spent. Activation is entered only by an explicit
 owner-authorized `detach`; a conclusive pre-admission failure restores sync mode and removes its
 claim, so each later retry requires a new explicit owner decision. Admitted or unknown activation
 never rolls back and cannot be retried. The delivery module owns both policies at the shared
 `delivery.lock` and local-owner transfer boundary; changes to helper admission or retry semantics
 must preserve this automatic-progression versus explicit-command distinction.
 
-`DeliveryMeta::lifecycle` is the source-level and serialized classifier for that protocol. It reports
+`CompletionDeliveryMeta::completion_lifecycle` is the source-level and serialized classifier for
+that completion protocol. It reports
 `unclaimed`, `provisional_transfer`, `retryable_pre_admission_failure`,
 `closed_pre_admission_failure`, `non_replayable_unknown_transfer`, `admitted_outcome`,
 `legacy_skipped`, or `invalid` from the existing
