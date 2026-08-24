@@ -4456,6 +4456,67 @@ fn unavailable_pinned_helper_allows_one_bounded_pre_execution_retry() {
 }
 
 #[test]
+fn sentinel_root_exit_preserves_settled_delivery_retry() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = fake_agents(&temp);
+    let workload_started = temp.path().join("sentinel-retry-started");
+    let ready_release = temp.path().join("sentinel-ready-release");
+    let root_release = temp.path().join("sentinel-root-release");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .env("WORKLOAD_STARTED", &workload_started)
+        .env("READY_RELEASE", &ready_release)
+        .env("ROOT_RELEASE", &root_release)
+        .args([
+            "run",
+            "--ready-sentinel",
+            "READY",
+            "--",
+            "bash",
+            "-lc",
+            "printf started > \"$WORKLOAD_STARTED\"; while [ ! -e \"$READY_RELEASE\" ]; do sleep 0.01; done; printf 'READY\\n'; while [ ! -e \"$ROOT_RELEASE\" ]; do sleep 0.01; done",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+    let snapshot = state_dir_path(&json).join("delivery-helper");
+    let retained_snapshot = state_dir_path(&json).join("retained-delivery-helper");
+
+    wait_until(FIXTURE_DEADLINE, || workload_started.exists().then_some(()));
+    fs::rename(&snapshot, &retained_snapshot).expect("make pinned helper unavailable");
+    fs::write(&ready_release, b"").expect("release ready sentinel");
+    let initial = wait_until(FIXTURE_DEADLINE, || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["error_code"] == "delivery_helper_unavailable").then_some(meta)
+    });
+    assert_eq!(initial["delivery"]["retryable"], true);
+
+    fs::rename(&retained_snapshot, &snapshot).expect("restore pinned helper");
+    let retry = status_text(&temp, handle, true);
+    assert!(retry.starts_with("DONE rc=0"), "{retry}");
+    let settled = read_meta(&meta_path);
+    assert_eq!(settled["delivery"]["attempted"], true);
+    assert_eq!(settled["delivery"]["exit_code"], 0);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+
+    fs::write(&root_release, b"").expect("release sentinel workload");
+    let after_root_exit = wait_until(FIXTURE_DEADLINE, || {
+        let meta = read_meta(&meta_path);
+        (meta["workload_rc"] == 0).then_some(meta)
+    });
+    assert_eq!(after_root_exit["delivery"]["attempted"], true);
+    assert_eq!(after_root_exit["delivery"]["exit_code"], 0);
+    for _ in 0..4 {
+        let status = status_text(&temp, handle, true);
+        assert!(status.starts_with("DONE rc=0"), "{status}");
+    }
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+}
+
+#[test]
 fn completion_uses_pinned_interpreter_after_source_is_replaced() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (helper, interpreter, delivery_log) = interpreter_backed_fake_agents(&temp);

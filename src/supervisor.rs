@@ -1443,7 +1443,15 @@ impl EventLoop {
         let root_status = status_to_root_status(status);
         self.root_status = Some(root_status);
         apply_root_status_metadata(&mut self.meta, root_status);
-        state::write_meta_atomic(&self.paths, &self.meta)?;
+        if self.completion_recorded {
+            let _delivery_lock = state::lock_delivery(&self.paths)?;
+            let mut persisted = state::read_meta(&self.paths)?;
+            apply_root_status_metadata(&mut persisted, root_status);
+            state::write_meta_atomic(&self.paths, &persisted)?;
+            self.meta = persisted;
+        } else {
+            state::write_meta_atomic(&self.paths, &self.meta)?;
+        }
         self.close_root_pidfd();
         Ok(())
     }
@@ -1860,6 +1868,7 @@ fn publish_terminal_and_progress_delivery(
         }
         return Ok(TerminalPublishResult::Published);
     }
+    meta.delivery = current.delivery;
     let proposal = match finalize_terminal_proposal(proposal, explicit_cancel_accepted(paths)) {
         FinalizedTerminalProposal::Publish(proposal) => proposal,
         FinalizedTerminalProposal::DeferredForAcceptedCancel => {
