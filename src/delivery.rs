@@ -1227,6 +1227,15 @@ pub(crate) fn require_settled_activation(paths: &StatePaths) -> io::Result<()> {
     }
 }
 
+pub(crate) fn settled_delivery_mode(paths: &StatePaths) -> io::Result<DeliveryMode> {
+    let _delivery_lock = DeliveryLockGuard::acquire(paths)?;
+    let mode = state::read_delivery_mode(paths)?;
+    if mode == DeliveryMode::Async {
+        require_settled_activation(paths)?;
+    }
+    Ok(mode)
+}
+
 fn run_delivery_owner_holding_lock(
     _delivery_lock: &DeliveryLockGuard,
     operation: impl FnOnce() -> io::Result<()>,
