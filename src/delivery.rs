@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::state::{
-    self, CallerChainEntry, DeliveryHelperInterpreterProvenance, DeliveryHelperProvenance,
-    DeliveryLifecycle, DeliveryMeta, DeliveryMode, Meta, StatePaths,
+    self, CallerChainEntry, DELIVERY_TRANSFER_OUTCOME_UNKNOWN, DeliveryHelperInterpreterProvenance,
+    DeliveryHelperProvenance, DeliveryLifecycle, DeliveryMeta, DeliveryMode, Meta, StatePaths,
 };
 
 const CONSUMER_GRACE_MS_ENV: &str = "AGENT_BASH_CONSUMER_GRACE_MS";
@@ -1172,7 +1172,7 @@ fn delivery_meta_from_unknown_transfer(err: io::Error, retry_count: u8) -> Deliv
         attempted: true,
         exit_code: None,
         error: Some(format!("delivery helper outcome is unknown: {err}")),
-        error_code: Some("transfer_outcome_unknown".to_string()),
+        error_code: Some(DELIVERY_TRANSFER_OUTCOME_UNKNOWN.to_string()),
         retryable: Some(false),
         retry_count,
         skipped: None,

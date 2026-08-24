@@ -141,6 +141,7 @@ impl OwnerMeta {
 }
 
 pub(crate) const DELIVERY_ATTEMPT_IN_PROGRESS: &str = "delivery_attempt_in_progress";
+pub(crate) const DELIVERY_TRANSFER_OUTCOME_UNKNOWN: &str = "transfer_outcome_unknown";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -149,6 +150,7 @@ pub(crate) enum DeliveryLifecycle {
     ProvisionalTransfer,
     RetryablePreAdmissionFailure,
     ClosedPreAdmissionFailure,
+    NonReplayableUnknownTransfer,
     AdmittedOutcome,
     LegacySkipped,
     Invalid,
@@ -192,10 +194,12 @@ impl DeliveryMeta {
             };
         }
         if self.attempted {
-            return if self.error_code.as_deref() == Some(DELIVERY_ATTEMPT_IN_PROGRESS) {
-                DeliveryLifecycle::ProvisionalTransfer
-            } else {
-                DeliveryLifecycle::AdmittedOutcome
+            return match self.error_code.as_deref() {
+                Some(DELIVERY_ATTEMPT_IN_PROGRESS) => DeliveryLifecycle::ProvisionalTransfer,
+                Some(DELIVERY_TRANSFER_OUTCOME_UNKNOWN) => {
+                    DeliveryLifecycle::NonReplayableUnknownTransfer
+                }
+                _ => DeliveryLifecycle::AdmittedOutcome,
             };
         }
         match (self.error_code.is_some(), self.retryable) {
@@ -1271,6 +1275,11 @@ mod tests {
             ..DeliveryMeta::default()
         };
         assert_eq!(delivery.lifecycle(), DeliveryLifecycle::ProvisionalTransfer);
+        delivery.error_code = Some(DELIVERY_TRANSFER_OUTCOME_UNKNOWN.to_string());
+        assert_eq!(
+            delivery.lifecycle(),
+            DeliveryLifecycle::NonReplayableUnknownTransfer
+        );
         delivery.error_code = None;
         assert_eq!(delivery.lifecycle(), DeliveryLifecycle::AdmittedOutcome);
 

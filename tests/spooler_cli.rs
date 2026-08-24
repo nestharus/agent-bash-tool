@@ -3930,7 +3930,10 @@ fn failed_delivery_owner_closes_unknown_transfer_without_replay() {
     });
     assert_eq!(settled["delivery"]["attempted"], true);
     assert_eq!(settled["delivery"]["retryable"], false);
-    assert_eq!(settled["delivery"]["lifecycle"], "admitted_outcome");
+    assert_eq!(
+        settled["delivery"]["lifecycle"],
+        "non_replayable_unknown_transfer"
+    );
 
     for _ in 0..4 {
         let status = status_text(&temp, handle, true);
@@ -3964,7 +3967,10 @@ fn successor_closes_orphaned_completion_transfer_without_replay() {
         "transfer_outcome_unknown"
     );
     assert_eq!(settled["delivery"]["retryable"], false);
-    assert_eq!(settled["delivery"]["lifecycle"], "admitted_outcome");
+    assert_eq!(
+        settled["delivery"]["lifecycle"],
+        "non_replayable_unknown_transfer"
+    );
     assert_eq!(completion_helper_operation_count(&delivery_log), 1);
 }
 
@@ -5111,7 +5117,7 @@ fn consumed_marker_during_delivery_grace_marks_helper_operation_consumed() {
 fn delivery_lifecycle_is_closed(meta: &Value) -> bool {
     matches!(
         meta["delivery"]["lifecycle"].as_str(),
-        Some("admitted_outcome" | "legacy_skipped")
+        Some("non_replayable_unknown_transfer" | "admitted_outcome" | "legacy_skipped")
     )
 }
 

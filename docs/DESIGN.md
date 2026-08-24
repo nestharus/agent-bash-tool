@@ -324,7 +324,8 @@ must preserve this automatic-progression versus explicit-command distinction.
 
 `DeliveryMeta::lifecycle` is the source-level and serialized classifier for that protocol. It reports
 `unclaimed`, `provisional_transfer`, `retryable_pre_admission_failure`,
-`closed_pre_admission_failure`, `admitted_outcome`, `legacy_skipped`, or `invalid` from the existing
+`closed_pre_admission_failure`, `non_replayable_unknown_transfer`, `admitted_outcome`,
+`legacy_skipped`, or `invalid` from the existing
 metadata fields. `legacy_skipped` recognizes persisted records from the retired producer behavior;
 current production paths do not write `delivery.skipped`. Reconciliation and status progress
 decisions consume this classifier rather than independently decoding field combinations; the
