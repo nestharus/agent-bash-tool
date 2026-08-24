@@ -297,6 +297,16 @@ restores sync mode, while completion records a typed result and permits one boun
 helper process received the operation. This chooses at-most-once invocation after admission without
 discarding a provably pre-admission obligation.
 
+The pre-admission retry policies intentionally diverge at the command-authority boundary.
+Completion progression can be entered automatically by the live supervisor, guardian, or an
+owner-authorized status call, so `DeliveryMeta::lifecycle` owns one durable retry budget and closes
+the operation after that budget is spent. Activation is entered only by an explicit
+owner-authorized `detach`; a conclusive pre-admission failure restores sync mode and removes its
+claim, so each later retry requires a new explicit owner decision. Admitted or unknown activation
+never rolls back and cannot be retried. The delivery module owns both policies at the shared
+`delivery.lock` and local-owner transfer boundary; changes to helper admission or retry semantics
+must preserve this automatic-progression versus explicit-command distinction.
+
 `DeliveryMeta::lifecycle` is the source-level and serialized classifier for that protocol. It reports
 `unclaimed`, `provisional_transfer`, `retryable_pre_admission_failure`,
 `closed_pre_admission_failure`, `admitted_outcome`, `legacy_skipped`, or `invalid` from the existing

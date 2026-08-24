@@ -67,13 +67,15 @@ architecture and ownership boundary.
 
 The spooler transfers each helper operation to a local delivery owner before persisting its
 write-ahead claim and guarantees at most one admitted helper invocation per handle operation.
-Conclusive process-launch failures remain pre-admission and get one bounded retry. Agent-runner is
-the authority for mailbox transactions and deduplication after accepting an invocation. The helper
-is an opaque, trusted same-account extension; its internal mailbox effects are outside this
-repository's state machine. State directories and the helper cache are protected between Unix
-accounts, not between mutually untrusted processes running as the same account. Within that trust
-boundary, the CLI still enforces recorded handle ownership before a caller may cancel, detach, or
-spend a status-triggered delivery retry.
+Conclusive process-launch failures remain pre-admission. Automatic completion progression permits
+one bounded status-triggered retry; activation instead restores sync mode and requires another
+explicit owner-authorized `detach` request before retrying. Agent-runner is the authority for
+mailbox transactions and deduplication after accepting an invocation. The helper is an opaque,
+trusted same-account extension; its internal mailbox effects are outside this repository's state
+machine. State directories and the helper cache are protected between Unix accounts, not between
+mutually untrusted processes running as the same account. Within that trust boundary, the CLI still
+enforces recorded handle ownership before a caller may cancel, detach, or spend a
+status-triggered delivery retry.
 
 ## Build
 
