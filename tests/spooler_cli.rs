@@ -555,6 +555,26 @@ exit 0
     (fake, log)
 }
 
+fn delivery_handoff_killing_fake_agents(
+    temp: &tempfile::TempDir,
+    killed_operation: &str,
+) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join(format!("kill-handoff-{killed_operation}"));
+    let log = temp
+        .path()
+        .join(format!("kill-handoff-{killed_operation}.log"));
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\noperation=${{2:-}}\nif [ \"$operation\" = {} ]; then\n  printf '%s\\n' \"$operation\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\n  owner_pid=$PPID\n  initiator_pid=$(ps -o ppid= -p \"$owner_pid\" | tr -d ' ')\n  kill -KILL \"$initiator_pid\" \"$owner_pid\"\nfi\nexit 0\n",
+            shell_quote(Path::new(killed_operation))
+        ),
+    )
+    .expect("write delivery-handoff-killing fake");
+    set_executable(&fake);
+    (fake, log)
+}
+
 fn nonzero_completion_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
     let fake = temp.path().join("nonzero-completion-fake-agents");
     let log = temp.path().join("nonzero-completion.log");
@@ -3891,6 +3911,74 @@ fn failed_delivery_owner_closes_unknown_transfer_without_replay() {
         assert!(status.starts_with("DONE rc=0"), "{status}");
     }
     assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+}
+
+#[test]
+fn successor_closes_orphaned_completion_transfer_without_replay() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = delivery_handoff_killing_fake_agents(&temp, "agent-bash-complete");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--", "sh", "-c", "exit 0"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+
+    wait_until(FIXTURE_DEADLINE, || {
+        (completion_helper_operation_count(&delivery_log) == 1).then_some(())
+    });
+    let status = status_text(&temp, handle, true);
+    assert!(status.starts_with("DONE rc=0"), "{status}");
+    let settled = read_meta(&meta_path);
+    assert_eq!(
+        settled["delivery"]["error_code"],
+        "transfer_outcome_unknown"
+    );
+    assert_eq!(settled["delivery"]["retryable"], false);
+    assert_eq!(settled["delivery"]["lifecycle"], "admitted_outcome");
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+}
+
+#[test]
+fn successor_closes_orphaned_activation_transfer_without_replay() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = delivery_handoff_killing_fake_agents(&temp, "agent-bash-activate");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--delivery", "sync", "--", "sleep", "60"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let state_dir = PathBuf::from(json["state_dir"].as_str().expect("state dir"));
+
+    let detached = detach_with_fake(&temp, handle, &fake, &delivery_log);
+    assert!(
+        !detached.status.success(),
+        "detach initiator should be killed"
+    );
+    wait_until(FIXTURE_DEADLINE, || {
+        (fs::read_to_string(state_dir.join("activation-outcome"))
+            .ok()
+            .as_deref()
+            == Some("pending\n"))
+        .then_some(())
+    });
+
+    let mode = agent_bash(&temp)
+        .args(["mode", handle])
+        .output()
+        .expect("mode command");
+    assert!(!mode.status.success(), "orphaned activation is unknown");
+    assert_eq!(
+        fs::read_to_string(state_dir.join("activation-outcome")).expect("activation outcome"),
+        "transfer_outcome_unknown\n"
+    );
+    assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
 }
 
 #[test]

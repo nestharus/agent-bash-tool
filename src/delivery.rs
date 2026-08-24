@@ -1101,6 +1101,16 @@ pub(crate) fn reconcile_completion_delivery(
     let mode = state::read_delivery_mode(paths)?;
     persisted.delivery_mode = mode;
     let lifecycle = persisted.delivery.lifecycle();
+    if lifecycle == DeliveryLifecycle::ProvisionalTransfer {
+        persisted.delivery = delivery_meta_from_unknown_transfer(
+            io::Error::other("delivery transfer owner is gone"),
+            persisted.delivery.retry_count,
+        );
+        persisted.touch();
+        state::write_meta_atomic(paths, &persisted)?;
+        *meta = persisted;
+        return Ok(());
+    }
     if !lifecycle.permits_attempt() {
         *meta = persisted;
         return Ok(());
@@ -1171,6 +1181,7 @@ fn delivery_meta_from_unknown_transfer(err: io::Error, retry_count: u8) -> Deliv
 
 pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
     let delivery_lock = DeliveryLockGuard::acquire(paths)?;
+    settle_orphaned_activation(paths)?;
     let mode = state::read_delivery_mode(paths)?;
     if mode == DeliveryMode::Async {
         require_settled_activation(paths)?;
@@ -1222,6 +1233,7 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
             }
         }
     });
+    settle_orphaned_activation(paths)?;
     require_settled_activation(paths).and(owner_result)?;
     let meta = state::read_meta(paths)?;
     drop(delivery_lock);
@@ -1245,11 +1257,19 @@ pub(crate) fn require_settled_activation(paths: &StatePaths) -> io::Result<()> {
 
 pub(crate) fn settled_delivery_mode(paths: &StatePaths) -> io::Result<DeliveryMode> {
     let _delivery_lock = DeliveryLockGuard::acquire(paths)?;
+    settle_orphaned_activation(paths)?;
     let mode = state::read_delivery_mode(paths)?;
     if mode == DeliveryMode::Async {
         require_settled_activation(paths)?;
     }
     Ok(mode)
+}
+
+fn settle_orphaned_activation(paths: &StatePaths) -> io::Result<()> {
+    if state::read_activation_outcome(paths)?.as_deref() == Some("pending\n") {
+        state::write_activation_outcome(paths, "transfer_outcome_unknown\n")?;
+    }
+    Ok(())
 }
 
 // The operation runs only in the forked child. Durable files are its sole
