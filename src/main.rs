@@ -249,12 +249,10 @@ fn run_command(
     .with_delivery_helper(registration.provenance());
     persist_delivery_mode(&paths, delivery_mode)?;
     persist_initial_meta(&paths, &meta)?;
-    if let Err(err) = delivery::register(&paths, &meta, registration) {
+    if let Err(err) = validate_guard(&guard) {
         let _ = fs::remove_dir_all(&paths.state_dir);
-        return Err(completion_event_registration_error(err));
+        return Err(err);
     }
-
-    validate_guard(&guard)?;
     let config = supervisor_config(
         paths.clone(),
         meta.clone(),
@@ -262,7 +260,21 @@ fn run_command(
         completion_scope,
         ready_sentinel.clone(),
     );
-    supervisor::fork_supervisor(config).map_err(supervisor_bootstrap_error)?;
+    let pending_supervisor = match supervisor::fork_pending_supervisor(config) {
+        Ok(supervisor) => supervisor,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&paths.state_dir);
+            return Err(supervisor_bootstrap_error(err));
+        }
+    };
+    if let Err(err) = delivery::register(&paths, &meta, registration) {
+        drop(pending_supervisor);
+        let _ = fs::remove_dir_all(&paths.state_dir);
+        return Err(completion_event_registration_error(err));
+    }
+    pending_supervisor
+        .admit()
+        .map_err(supervisor_bootstrap_error)?;
 
     let output = run_output(paths, meta.caller_ppid, mode, delivery_mode, ready_sentinel);
     emit_run_output(&output)?;

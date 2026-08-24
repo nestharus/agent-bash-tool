@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use regex::bytes::Regex;
@@ -51,12 +51,67 @@ pub(crate) fn validate_argv(argv: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn fork_supervisor(config: SupervisorConfig) -> io::Result<()> {
-    match unsafe { libc::fork() } {
-        -1 => Err(io::Error::last_os_error()),
-        0 => unsafe { daemonization_child(config) },
-        _ => Ok(()),
+pub(crate) struct PendingSupervisor {
+    child_pid: libc::pid_t,
+    admission: Option<File>,
+}
+
+impl PendingSupervisor {
+    pub(crate) fn admit(mut self) -> io::Result<()> {
+        let mut admission = self.admission.take().expect("pending supervisor admission");
+        admission.write_all(&[1])?;
+        Ok(())
     }
+}
+
+impl Drop for PendingSupervisor {
+    fn drop(&mut self) {
+        let Some(mut admission) = self.admission.take() else {
+            return;
+        };
+        let _ = admission.write_all(&[0]);
+        drop(admission);
+        let mut status = 0;
+        let _ = unsafe { libc::waitpid(self.child_pid, &mut status, 0) };
+    }
+}
+
+pub(crate) fn fork_pending_supervisor(config: SupervisorConfig) -> io::Result<PendingSupervisor> {
+    let mut pipe = [0; 2];
+    if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    match unsafe { libc::fork() } {
+        -1 => {
+            let err = io::Error::last_os_error();
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+            Err(err)
+        }
+        0 => unsafe {
+            libc::close(pipe[1]);
+            await_supervisor_admission(pipe[0], config)
+        },
+        child_pid => {
+            unsafe { libc::close(pipe[0]) };
+            Ok(PendingSupervisor {
+                child_pid,
+                admission: Some(unsafe { File::from_raw_fd(pipe[1]) }),
+            })
+        }
+    }
+}
+
+unsafe fn await_supervisor_admission(admission_fd: RawFd, config: SupervisorConfig) -> ! {
+    let mut admission = unsafe { File::from_raw_fd(admission_fd) };
+    let mut decision = [0];
+    if admission.read_exact(&mut decision).is_err() || decision[0] != 1 {
+        unsafe { libc::_exit(EX_SOFTWARE) };
+    }
+    drop(admission);
+    unsafe { daemonization_child(config) }
 }
 
 pub(crate) fn request_cancel(paths: &StatePaths) -> io::Result<bool> {
@@ -147,7 +202,19 @@ unsafe fn daemonization_child(config: SupervisorConfig) -> ! {
     }
     let guardian_paths = config.paths.clone();
     match unsafe { libc::fork() } {
-        -1 => unsafe { libc::_exit(EX_SOFTWARE) },
+        -1 => {
+            let mut meta = config.meta.clone();
+            let _ = record_supervisor_error(
+                &config.paths,
+                &mut meta,
+                format!(
+                    "agent-bash: supervisor fork failed: {}",
+                    io::Error::last_os_error()
+                ),
+                None,
+            );
+            unsafe { libc::_exit(EX_SOFTWARE) };
+        }
         0 => {
             let code = run_supervisor(config);
             unsafe { libc::_exit(code) };
