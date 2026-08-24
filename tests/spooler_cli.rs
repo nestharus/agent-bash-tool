@@ -537,7 +537,7 @@ fn parent_killing_fake_agents(
     (fake, log)
 }
 
-fn delivery_owner_killing_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+fn delivery_transfer_worker_killing_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
     let fake = temp.path().join("kill-delivery-owner");
     let log = temp.path().join("kill-delivery-owner.log");
     fs::write(
@@ -2847,7 +2847,8 @@ fn recorded_owner_session_requires_helper_attestation() {
         .expect("forged owner session cancel");
     assert_eq!(forged_cancel.status.code(), Some(77));
     assert!(
-        String::from_utf8_lossy(&forged_cancel.stderr).contains("caller does not own handle"),
+        String::from_utf8_lossy(&forged_cancel.stderr)
+            .contains("caller is not eligible to control handle"),
         "{}",
         command_failure_message(&forged_cancel)
     );
@@ -2887,7 +2888,7 @@ fn recorded_owner_session_requires_helper_attestation() {
 }
 
 #[test]
-fn list_adopts_handle_owned_by_resumed_session_after_caller_pid_changes() {
+fn list_routes_handle_to_resumed_session_after_caller_pid_changes() {
     let temp = tempfile::tempdir().expect("tempdir");
     let state_dir = seed_done_state_dir(&temp, "ab_resumed_owner", unix_ms(), false);
     let (helper, route) = routed_owner_resolving_fake_agents(&temp);
@@ -3367,13 +3368,15 @@ fn unrelated_observer_cannot_cancel_or_detach_visible_handle() {
 
     assert_eq!(unrelated_cancel.status.code(), Some(77));
     assert!(
-        String::from_utf8_lossy(&unrelated_cancel.stderr).contains("caller does not own handle"),
+        String::from_utf8_lossy(&unrelated_cancel.stderr)
+            .contains("caller is not eligible to control handle"),
         "{}",
         command_failure_message(&unrelated_cancel)
     );
     assert_eq!(unrelated_detach.status.code(), Some(77));
     assert!(
-        String::from_utf8_lossy(&unrelated_detach.stderr).contains("caller does not own handle"),
+        String::from_utf8_lossy(&unrelated_detach.stderr)
+            .contains("caller is not eligible to control handle"),
         "{}",
         command_failure_message(&unrelated_detach)
     );
@@ -3879,7 +3882,7 @@ fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
 }
 
 #[test]
-fn delivery_owner_finishes_after_supervisor_dies() {
+fn delivery_transfer_worker_finishes_after_supervisor_dies() {
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
     let fixture = blocking_delivery_fake_agents(&temp);
@@ -3939,9 +3942,9 @@ fn delivery_owner_finishes_after_supervisor_dies() {
 }
 
 #[test]
-fn failed_delivery_owner_closes_unknown_transfer_without_replay() {
+fn failed_delivery_transfer_worker_closes_unknown_transfer_without_replay() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (fake, delivery_log) = delivery_owner_killing_fake_agents(&temp);
+    let (fake, delivery_log) = delivery_transfer_worker_killing_fake_agents(&temp);
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
         .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
@@ -4046,7 +4049,7 @@ fn successor_closes_orphaned_activation_transfer_without_replay() {
 }
 
 #[test]
-fn delivery_owner_finishes_after_detach_caller_dies() {
+fn delivery_transfer_worker_finishes_after_detach_caller_dies() {
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
     let fixture = blocking_delivery_fake_agents(&temp);

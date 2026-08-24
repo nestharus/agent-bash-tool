@@ -20,8 +20,8 @@ agent-runner.
 
 1. **agent-bash-tool (this repo) — the spooler. General, provider-agnostic.**
    Detaches a command, captures its process tree, watches for completion, and reports. It invokes
-   the `agent-runner` / `agents` CLI to resolve an opaque owner-session binding and to deliver the
-   result. The spooler records and compares that opaque session ID for handle authority, but does
+   the `agent-runner` / `agents` CLI to resolve an opaque origin-session binding and to deliver the
+   result. The spooler records and compares that opaque session ID for supported control routing, but does
    not own PID-to-session mapping, interpret provider session semantics, determine session
    liveness, or manage a mailbox. Loose coupling: it does **not** depend on agent-runner crates.
 
@@ -76,7 +76,7 @@ finish, replace every installed adapter copy and the binary while calls remain s
 calls only after the matching pair is active. No adapter/binary overlap pair is supported, including
 the current adapter with a legacy binary or a legacy adapter with the current binary. Adapters that
 write the `consumed` marker directly are retired and unsupported; they are not a compatibility
-practice the spooler preserves. The owner-authorized `consume` command is the sole supported
+practice the spooler preserves. The control-route-eligible `consume` command is the sole supported
 first-party terminal-consumption operation, so future marker changes have one migration boundary.
 
 ### Attached-required — detached invocation bombs out
@@ -151,22 +151,22 @@ therefore does not become an accepted cancellation or consumed activation claim 
 The activation lifecycle may also invoke the same durable rollback after a conclusive downstream
 pre-admission failure.
 
-Owner-authorized `status` and the default owner-scoped `list` share the lost-supervisor terminal
-transition but not the delivery-helper-operation role. A targeted owner `status` reconciliation owns pending completion
-delivery in its current process and synchronously waits for the local delivery owner and helper
-outcome. An owner-scoped bulk `list` may publish the same terminal state for an accurate projection,
+Control-route-eligible `status` and the default origin-session-scoped `list` share the lost-supervisor terminal
+transition but not the delivery-helper-operation role. A targeted eligible `status` reconciliation progresses pending completion
+delivery in its current process and synchronously waits for the local delivery transfer worker and helper
+outcome. An origin-session-scoped bulk `list` may publish the same terminal state for an accurate projection,
 but it never executes a helper as an incidental enumeration side effect; its disposition is
 `CompletionDeliveryAction::LeavePending`. Live terminal producers, targeted status, and the guardian
 use `CompletionDeliveryAction::ClaimPending`; the action names only who progresses delivery, not how
 the terminal state was reached. Cross-owner status and
-`list --all` remain observational and do not reconcile state. Cross-owner `mode` is likewise a
+`list --all` remain observational and do not reconcile state. Cross-route `mode` is likewise a
 point-in-time read, but it still fails closed when the durable activation outcome is unsettled.
 List projections represent that state as `delivery_mode: null` with `delivery_mode_error` in JSON
-and `delivery=unavailable` in text. Owner `mode` may settle an orphaned activation transfer while
+and `delivery=unavailable` in text. Eligible `mode` may settle an orphaned activation transfer while
 holding the delivery lock. The guardian re-enters reconciliation,
-observes the terminal record, and claims pending delivery. A later targeted owner `status` may claim
+observes the terminal record, and claims pending delivery. A later targeted eligible `status` may claim
 it first. Both paths use the same `delivery.lock`, pinned helper, and write-ahead attempt record, so
-this handoff changes the delivery owner without permitting a repeated attempt. Every valid run
+this handoff changes the delivery progress actor without permitting a repeated attempt. Every valid run
 creates the guardian before the supervisor; synthetic list fixtures without a guardian validate
 only that list does not claim delivery, then exercise the targeted-status handoff separately.
 
@@ -197,7 +197,7 @@ At every supported mutating control boundary, the
 handle's pinned helper resolves the live caller chain to its acting session; ambient owner strings
 never satisfy that supported-interface check. `list --all`, cross-owner `status`, and cross-owner `mode` may
 observe account-local handles, but they cannot publish recovery state, claim delivery, cancel work,
-or change delivery mode. Cancel, detach, and consume fail with `EX_NOPERM` for non-owners. Guardian recovery
+or change delivery mode. Cancel, detach, and consume fail with `EX_NOPERM` for ineligible callers. Guardian recovery
 remains independent of any observing caller and is the automatic cleanup/progress path after the
 originating process disappears. No unauthenticated cross-owner operator override is exposed by
 this CLI.
@@ -317,9 +317,9 @@ downstream notification. The detach JSON serializer retains the established wire
 does not mean the spooler observed downstream notification. It also does not report whether the
 activation helper operation ran; that operation is internal to every claimed transition.
 
-Detach and completion first fork a local delivery owner while retaining `delivery.lock`. That owner
+Detach and completion first fork a local delivery transfer worker while retaining `delivery.lock`. That worker
 persists `activation-attempted` plus canonical `async` mode, or `attempted=true` plus
-`error_code="delivery_attempt_in_progress"`, immediately before it launches the helper. The owner
+`error_code="delivery_attempt_in_progress"`, immediately before it launches the helper. The worker
 retains the lock and persists the observed outcome even if the initiating CLI or supervisor dies.
 These are write-ahead transfer claims: once present, a successor never hands the same one-shot
 obligation to the helper again, including after a nonzero exit or unknown admitted outcome.
@@ -329,13 +329,13 @@ helper process received the operation. This chooses at-most-once invocation afte
 discarding a provably pre-admission obligation.
 
 The pre-admission retry policies intentionally diverge at the command-authority boundary.
-Completion progression can be entered automatically by the live supervisor, guardian, or an
-owner-authorized status call, so `CompletionDeliveryMeta::completion_lifecycle` owns one durable
+Completion progression can be entered automatically by the live supervisor, guardian, or a
+control-route-eligible status call, so `CompletionDeliveryMeta::completion_lifecycle` owns one durable
 retry budget and closes the operation after that budget is spent. Activation is entered only by an explicit
-owner-authorized `detach`; a conclusive pre-admission failure restores sync mode and removes its
-claim, so each later retry requires a new explicit owner decision. Admitted or unknown activation
+control-route-eligible `detach`; a conclusive pre-admission failure restores sync mode and removes its
+claim, so each later retry requires a new explicit caller decision. Admitted or unknown activation
 never rolls back and cannot be retried. The delivery module owns both policies at the shared
-`delivery.lock` and local-owner transfer boundary; changes to helper admission or retry semantics
+`delivery.lock` and local-worker transfer boundary; changes to helper admission or retry semantics
 must preserve this automatic-progression versus explicit-command distinction.
 
 Activation rollback retains its durable attempt claim until canonical sync mode and the metadata
@@ -382,11 +382,11 @@ the state directory.
 
 All terminal handles use the configured state TTL. Retryable pre-invocation helper failures do not
 receive a multiplied retention window, so failed delivery does not create a sevenfold retained-state
-population. Each owner-authorized status observer may perform at most one helper-resolution retry
+population. Each control-route-eligible status observer may perform at most one helper-resolution retry
 for the handle it observes. The adapter requests the durable `consumed` marker through the
-owner-authorized `consume` operation; cross-owner status remains read-only and cannot suppress the
-owner's pending delivery. `retry_count` bounds each handle to one
-observer-triggered retry in total. The delivery lock serializes concurrently admitted owner
+control-route-eligible `consume` operation; cross-route status remains read-only and cannot suppress the
+origin session's pending delivery. `retry_count` bounds each handle to one
+observer-triggered retry in total. The delivery lock serializes concurrently admitted eligible
 observers; the first persists either an attempt claim or a closed retry result, and later observers
 cannot repeat it.
 

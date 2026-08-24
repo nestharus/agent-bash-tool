@@ -32,7 +32,7 @@ completion returns synchronously in-band or asynchronously through the agent mai
   executing a helper; it leaves delivery unclaimed in that reconciliation. `list --all` remains a
   read-only account-wide snapshot. The guardian normally claims the pending
   delivery, while targeted owner `status` may claim it first under the same delivery lock and wait
-  for the helper outcome. The adapter records in-call consumption through an owner-authorized
+  for the helper outcome. The adapter records in-call consumption through a control-route-eligible
   spooler operation; cross-owner `status` is read-only. The guardian also adopts the workload
   tree and finishes any already-accepted explicit cancellation.
 - **Owner-scoped cancellation.** Integrations can opt into an exact PID/start-time/boot-ID lease
@@ -68,21 +68,21 @@ completion returns synchronously in-band or asynchronously through the agent mai
   before the workload starts.
 
 The spooler is **general, provider-agnostic, and mailbox-agnostic**. It talks to agent-runner only
-over its CLI, asks that helper to resolve an opaque owner-session binding, and compares the recorded
-session ID when enforcing handle authority. Agent-runner still owns PID-to-session mapping, session
+over its CLI, asks that helper to resolve an opaque origin-session binding, and compares the recorded
+session ID when checking supported control routing. Agent-runner still owns PID-to-session mapping, session
 semantics and liveness, and all mailbox behavior. See [`docs/DESIGN.md`](docs/DESIGN.md) for the full
 architecture and ownership boundary.
 
-The spooler transfers each helper operation to a local delivery owner before persisting its
+The spooler transfers each helper operation to a local delivery transfer worker before persisting its
 write-ahead claim and guarantees at most one admitted helper invocation per handle operation.
 Conclusive process-launch failures remain pre-admission. Automatic completion progression permits
 one bounded status-triggered retry; activation instead restores sync mode and requires another
-explicit owner-authorized `detach` request before retrying. Agent-runner is the authority for
+explicit control-route-eligible `detach` request before retrying. Agent-runner is the authority for
 mailbox transactions and deduplication after accepting an invocation. The helper is an opaque,
 trusted same-account extension; its internal mailbox effects are outside this repository's state
 machine. State directories and the helper cache are protected between Unix accounts, not between
 mutually untrusted processes running as the same account. Within that trust boundary, the CLI still
-enforces recorded handle ownership before a caller may cancel, detach, or spend a
+checks recorded origin-session routing before a caller may cancel, detach, or spend a
 status-triggered delivery retry.
 
 ## Build

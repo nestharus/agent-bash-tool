@@ -31,7 +31,7 @@ struct OwnerContext {
     invocation_uuid: Option<String>,
 }
 
-struct CallerAuthority {
+struct ControlRouteCaller {
     caller_chain: Vec<CallerChainEntry>,
 }
 
@@ -174,10 +174,10 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
             owner_pid,
             argv,
         ),
-        Command::Detach { handle } => detach_command(handle, caller_authority(&guard)),
-        Command::Cancel { handle } => cancel_command(handle, caller_authority(&guard)),
-        Command::Consume { handle } => consume_command(handle, caller_authority(&guard)),
-        Command::Mode { handle } => mode_command(handle, caller_authority(&guard)),
+        Command::Detach { handle } => detach_command(handle, control_route_caller(&guard)),
+        Command::Cancel { handle } => cancel_command(handle, control_route_caller(&guard)),
+        Command::Consume { handle } => consume_command(handle, control_route_caller(&guard)),
+        Command::Mode { handle } => mode_command(handle, control_route_caller(&guard)),
         Command::Status {
             tail_bytes,
             full,
@@ -186,9 +186,9 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
             handle,
             tail_bytes.unwrap_or(65_536),
             full,
-            caller_authority(&guard),
+            control_route_caller(&guard),
         ),
-        Command::List { all, json } => list_command(caller_authority(&guard), all, json),
+        Command::List { all, json } => list_command(control_route_caller(&guard), all, json),
     }
 }
 
@@ -308,9 +308,9 @@ fn resolve_cancel_owner(
         })
 }
 
-fn cancel_command(handle: String, caller: CallerAuthority) -> Result<(), AppError> {
+fn cancel_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
-    require_control_authority(&paths, &handle, &caller)?;
+    require_control_eligibility(&paths, &handle, &caller)?;
     let requested =
         supervisor::request_cancel(&paths).map_err(|err| cancel_request_error(&handle, err))?;
     serde_json::to_writer(
@@ -328,9 +328,9 @@ fn cancel_request_error(handle: &str, err: io::Error) -> AppError {
     )
 }
 
-fn consume_command(handle: String, caller: CallerAuthority) -> Result<(), AppError> {
+fn consume_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
-    require_control_authority(&paths, &handle, &caller)?;
+    require_control_eligibility(&paths, &handle, &caller)?;
     let meta = read_meta_for_handle(&paths, &handle)?;
     if !state::terminal(&meta) {
         return Err(AppError::new(
@@ -581,18 +581,18 @@ fn run_output(
     RunOutput::new(paths, caller_ppid, mode, delivery_mode, ready_sentinel)
 }
 
-fn detach_command(handle: String, caller: CallerAuthority) -> Result<(), AppError> {
+fn detach_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
-    require_control_authority(&paths, &handle, &caller)?;
+    require_control_eligibility(&paths, &handle, &caller)?;
     let outcome = delivery::detach(&paths).map_err(|err| delivery_mode_error(&handle, err))?;
     serde_json::to_writer(io::stdout(), &outcome).map_err(json_write_error)?;
     io::stdout().write_all(b"\n").map_err(json_write_error)
 }
 
-fn mode_command(handle: String, caller: CallerAuthority) -> Result<(), AppError> {
+fn mode_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
     let meta = read_meta_for_handle(&paths, &handle)?;
-    let mode = if caller_controls_handle(&meta, &paths, &caller) {
+    let mode = if caller_is_control_eligible(&meta, &paths, &caller) {
         delivery::settled_delivery_mode(&paths)
     } else {
         delivery::observed_delivery_mode(&paths)
@@ -622,11 +622,11 @@ fn status_command(
     handle: String,
     tail_bytes: u64,
     full: bool,
-    caller: CallerAuthority,
+    caller: ControlRouteCaller,
 ) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
     let meta = read_meta_for_handle(&paths, &handle)?;
-    let meta = if caller_controls_handle(&meta, &paths, &caller) {
+    let meta = if caller_is_control_eligible(&meta, &paths, &caller) {
         reconcile_status_meta(&paths, &handle, meta)?
     } else {
         meta
@@ -873,7 +873,7 @@ fn read_open_status_log(mut file: std::fs::File) -> io::Result<Vec<u8>> {
     Ok(output)
 }
 
-fn list_command(caller: CallerAuthority, all: bool, json: bool) -> Result<(), AppError> {
+fn list_command(caller: ControlRouteCaller, all: bool, json: bool) -> Result<(), AppError> {
     let root = load_state_root().map_err(state_root_unavailable)?;
     let mut summaries = list_summaries(&root, &caller.caller_chain, all)?;
     sort_summaries(&mut summaries);
@@ -939,7 +939,7 @@ fn list_summary_for_entry(
     if all {
         return Some(list_summary_from_meta(&meta, &paths));
     }
-    let owned = handle_owned_by(&meta, &paths, caller_chain);
+    let owned = handle_matches_control_route(&meta, &paths, caller_chain);
     if !owned {
         return None;
     }
@@ -967,27 +967,32 @@ fn read_entry_meta(paths: &StatePaths) -> Option<Meta> {
     state::read_meta(paths).ok()
 }
 
-fn handle_owned_by(
+fn handle_matches_control_route(
     meta: &Meta,
     paths: &StatePaths,
     caller_chain: &[state::CallerChainEntry],
 ) -> bool {
     if let Some(recorded_session_id) = meta.owner_session_id.as_deref() {
-        return acting_session_owns_handle(meta, paths, caller_chain, recorded_session_id);
+        return acting_session_matches_handle(meta, paths, caller_chain, recorded_session_id);
     }
     match state::read_owner(paths) {
         Ok(owner) => {
             if let Some(recorded_session_id) = owner.owner_session_id {
-                return acting_session_owns_handle(meta, paths, caller_chain, &recorded_session_id);
+                return acting_session_matches_handle(
+                    meta,
+                    paths,
+                    caller_chain,
+                    &recorded_session_id,
+                );
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return false,
     }
-    caller_chain_owns_handle(meta, caller_chain)
+    caller_chain_matches_handle(meta, caller_chain)
 }
 
-fn acting_session_owns_handle(
+fn acting_session_matches_handle(
     meta: &Meta,
     paths: &StatePaths,
     caller_chain: &[state::CallerChainEntry],
@@ -999,7 +1004,7 @@ fn acting_session_owns_handle(
         .is_some_and(|(session_id, _)| session_id == recorded_session_id)
 }
 
-fn caller_chain_owns_handle(meta: &Meta, caller_chain: &[state::CallerChainEntry]) -> bool {
+fn caller_chain_matches_handle(meta: &Meta, caller_chain: &[state::CallerChainEntry]) -> bool {
     let Some(anchor) = meta.caller_chain.first() else {
         return false;
     };
@@ -1013,28 +1018,32 @@ fn caller_chain_owns_handle(meta: &Meta, caller_chain: &[state::CallerChainEntry
     })
 }
 
-fn caller_authority(guard: &AttachedGuard) -> CallerAuthority {
-    CallerAuthority {
+fn control_route_caller(guard: &AttachedGuard) -> ControlRouteCaller {
+    ControlRouteCaller {
         caller_chain: state::capture_caller_chain(guard.startup_ppid()),
     }
 }
 
-fn caller_controls_handle(meta: &Meta, paths: &StatePaths, caller: &CallerAuthority) -> bool {
-    handle_owned_by(meta, paths, &caller.caller_chain)
+fn caller_is_control_eligible(
+    meta: &Meta,
+    paths: &StatePaths,
+    caller: &ControlRouteCaller,
+) -> bool {
+    handle_matches_control_route(meta, paths, &caller.caller_chain)
 }
 
-fn require_control_authority(
+fn require_control_eligibility(
     paths: &StatePaths,
     handle: &str,
-    caller: &CallerAuthority,
+    caller: &ControlRouteCaller,
 ) -> Result<(), AppError> {
     let meta = read_meta_for_handle(paths, handle)?;
-    if caller_controls_handle(&meta, paths, caller) {
+    if caller_is_control_eligible(&meta, paths, caller) {
         return Ok(());
     }
     Err(AppError::new(
         EX_NOPERM,
-        format!("agent-bash: caller does not own handle {handle}"),
+        format!("agent-bash: caller is not eligible to control handle {handle}"),
     ))
 }
 

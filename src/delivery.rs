@@ -1130,7 +1130,7 @@ pub(crate) fn reconcile_completion_delivery(
             return Ok(());
         }
     };
-    let owner_result = run_delivery_owner_child_process_holding_lock(&delivery_lock, || {
+    let worker_result = run_delivery_transfer_worker_holding_lock(&delivery_lock, || {
         persisted.delivery = provisional_completion_delivery_transfer_meta();
         persisted.touch();
         state::write_meta_atomic(paths, &persisted)?;
@@ -1147,7 +1147,7 @@ pub(crate) fn reconcile_completion_delivery(
         state::write_meta_atomic(paths, &persisted)
     });
     let mut observed = state::read_meta(paths)?;
-    if let Err(err) = owner_result {
+    if let Err(err) = worker_result {
         observed.delivery = match observed.delivery.completion_lifecycle() {
             CompletionDeliveryLifecycle::Unclaimed => {
                 completion_delivery_meta_from_owner_launch_error(err, retry_count)
@@ -1195,7 +1195,7 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
 
     let meta = state::read_meta(paths)?;
     let request = activate_request(&meta, paths).map_err(io::Error::other)?;
-    let owner_result = run_delivery_owner_child_process_holding_lock(&delivery_lock, || {
+    let worker_result = run_delivery_transfer_worker_holding_lock(&delivery_lock, || {
         let claimed = state::record_activation_attempt(paths)?;
         if let Err(err) = state::write_delivery_mode_atomic(paths, DeliveryMode::Async) {
             if claimed {
@@ -1232,7 +1232,7 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
         }
     });
     settle_orphaned_activation(paths)?;
-    require_settled_activation(paths).and(owner_result)?;
+    require_settled_activation(paths).and(worker_result)?;
     let meta = state::read_meta(paths)?;
     drop(delivery_lock);
     let terminal_activation_requests_notification = state::terminal(&meta);
@@ -1292,7 +1292,7 @@ fn settle_orphaned_activation(paths: &StatePaths) -> io::Result<()> {
 
 // The operation runs only in the forked child. Durable files are its sole
 // handback channel; mutations to captured values are not visible to the parent.
-fn run_delivery_owner_child_process_holding_lock(
+fn run_delivery_transfer_worker_holding_lock(
     _delivery_lock: &DeliveryLockGuard,
     child_operation: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
@@ -1304,10 +1304,10 @@ fn run_delivery_owner_child_process_holding_lock(
         let code = if child_operation().is_ok() { 0 } else { 70 };
         unsafe { libc::_exit(code) };
     }
-    wait_for_delivery_owner(pid)
+    wait_for_delivery_transfer_worker(pid)
 }
 
-fn wait_for_delivery_owner(pid: libc::pid_t) -> io::Result<()> {
+fn wait_for_delivery_transfer_worker(pid: libc::pid_t) -> io::Result<()> {
     loop {
         let mut status = 0;
         let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
@@ -1315,7 +1315,7 @@ fn wait_for_delivery_owner(pid: libc::pid_t) -> io::Result<()> {
             if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
                 return Ok(());
             }
-            return Err(io::Error::other("delivery owner failed"));
+            return Err(io::Error::other("delivery transfer worker failed"));
         }
         if waited < 0 {
             let err = io::Error::last_os_error();
@@ -1607,7 +1607,7 @@ fn completion_delivery_meta_from_owner_launch_error(
         attempted: false,
         exit_code: None,
         error: Some(err.to_string()),
-        error_code: Some("delivery_owner_launch_failed".to_string()),
+        error_code: Some("delivery_transfer_worker_launch_failed".to_string()),
         retryable: Some(retry_count == 0),
         retry_count,
         skipped: None,
