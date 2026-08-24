@@ -24,7 +24,7 @@ type RunDispatch = {
   handle: string
 }
 
-type SanitizedShellCommand = {
+type ShellCommandWithoutAdapterControls = {
   prefix: string
   body: string
 }
@@ -372,7 +372,10 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
-function sanitizeShellCommandAssignments(command: string): SanitizedShellCommand {
+// This removes only adapter-owned controls for classification and shell rewriting.
+// Actor-authored assignments and shell semantics remain; direct execution still
+// requires parseStructuredExplicitRun admission.
+function stripAdapterOwnedAssignmentsForShellRouting(command: string): ShellCommandWithoutAdapterControls {
   const leadingWhitespace = command.match(/^\s*/)?.[0] || ""
   let body = command.slice(leadingWhitespace.length)
   let environmentPrefix = ""
@@ -390,12 +393,12 @@ function sanitizeShellCommandAssignments(command: string): SanitizedShellCommand
 // This intentionally broad recognizer only routes potentially privileged input to the
 // authoritative structured admission parser; it never authorizes direct execution itself.
 function conservativelyRecognizesExplicitRun(command: string): boolean {
-  const { body } = sanitizeShellCommandAssignments(command)
+  const { body } = stripAdapterOwnedAssignmentsForShellRouting(command)
   return [`${AGENT_BASH} run`, "agent-bash run"].some((prefix) => startsWithToken(body, prefix))
 }
 
 function isAgentDispatch(command: string): boolean {
-  const { body } = sanitizeShellCommandAssignments(command)
+  const { body } = stripAdapterOwnedAssignmentsForShellRouting(command)
   if (
     startsWithToken(body, "agents") ||
     startsWithToken(body, AGENTS) ||
@@ -410,7 +413,7 @@ function isAgentDispatch(command: string): boolean {
 }
 
 function pinAgentRunnerBinary(command: string): string {
-  const shellCommand = sanitizeShellCommandAssignments(command)
+  const shellCommand = stripAdapterOwnedAssignmentsForShellRouting(command)
   let body = shellCommand.body
   for (const token of ["agents", "oulipoly-agent-runner"]) {
     if (startsWithToken(body, token)) {

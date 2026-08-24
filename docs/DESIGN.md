@@ -58,9 +58,10 @@ whether that event is active for downstream mailbox delivery:
   durable session. Synchronous handles and interactive PTY handles remain owner-leased.
 - Leading shell environment assignments are ignored when classifying the command, but a recognized
   explicit run with a command-authored assignment is rejected. Adapter-owned assignments are
-  stripped by `sanitizeShellCommandAssignments` and restored only from adapter state, while the
-  structured parser applies the same `adapterOwnsAssignment` policy. Actor-selected loader or
-  runtime hooks therefore never execute inside the registration-capable launcher.
+  stripped by `stripAdapterOwnedAssignmentsForShellRouting` and restored only from adapter state,
+  while the structured parser applies the same `adapterOwnsAssignment` policy. The filtered shell
+  representation retains ordinary assignments and shell semantics and carries no direct-execution
+  authority; only structured explicit-run admission may enter the registration-capable launcher.
 - The adapter resolves a leading `agents` or `oulipoly-agent-runner` command to the configured
   `AGENT_BASH_AGENT_RUNNER_BIN`, avoiding PATH drift between interactive and detached execution.
 - A standalone `sleep N` stays inside the adapter for up to five minutes by default, so passive
