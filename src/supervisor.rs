@@ -1553,12 +1553,12 @@ impl EventLoop {
     }
 
     fn record_ready_sentinel(&mut self) -> io::Result<()> {
-        match publish_terminal_and_progress_delivery(
+        match publish_terminal_with_delivery_disposition(
             &self.paths,
             &mut self.meta,
             Some(&mut self.log),
             TerminalProposal::ReadySentinel(state::unix_ms()),
-            CompletionDeliveryAction::ClaimPending,
+            CompletionDeliveryDisposition::ClaimPending,
         )? {
             TerminalPublishResult::Published => self.completion_recorded = true,
             TerminalPublishResult::DeferredForAcceptedCancel => {
@@ -1573,7 +1573,7 @@ impl EventLoop {
         root_status: RootStatus,
         reason: ExitCompletionReason,
     ) -> io::Result<()> {
-        publish_terminal_and_progress_delivery(
+        publish_terminal_with_delivery_disposition(
             &self.paths,
             &mut self.meta,
             Some(&mut self.log),
@@ -1581,19 +1581,19 @@ impl EventLoop {
                 root_status,
                 reason,
             },
-            CompletionDeliveryAction::ClaimPending,
+            CompletionDeliveryDisposition::ClaimPending,
         )?;
         self.completion_recorded = true;
         Ok(())
     }
 
     fn record_supervisor_error_in_loop(&mut self, message: String) -> io::Result<()> {
-        publish_terminal_and_progress_delivery(
+        publish_terminal_with_delivery_disposition(
             &self.paths,
             &mut self.meta,
             Some(&mut self.log),
             TerminalProposal::SupervisorError(message),
-            CompletionDeliveryAction::ClaimPending,
+            CompletionDeliveryDisposition::ClaimPending,
         )?;
         self.completion_recorded = true;
         Ok(())
@@ -1802,12 +1802,12 @@ fn record_supervisor_error(
     message: String,
     log: Option<&mut BoundedLog>,
 ) -> io::Result<()> {
-    publish_terminal_and_progress_delivery(
+    publish_terminal_with_delivery_disposition(
         paths,
         meta,
         log,
         TerminalProposal::SupervisorError(message),
-        CompletionDeliveryAction::ClaimPending,
+        CompletionDeliveryDisposition::ClaimPending,
     )?;
     Ok(())
 }
@@ -1820,11 +1820,19 @@ fn sync_optional_log(log: Option<&mut BoundedLog>) -> io::Result<()> {
 }
 
 pub(crate) fn reconcile_lost_supervisor(paths: &StatePaths) -> io::Result<Meta> {
-    reconcile_lost_supervisor_with_delivery(paths, CompletionDeliveryAction::ClaimPending, false)
+    reconcile_lost_supervisor_with_delivery(
+        paths,
+        CompletionDeliveryDisposition::ClaimPending,
+        false,
+    )
 }
 
 pub(crate) fn reconcile_lost_supervisor_for_list(paths: &StatePaths) -> io::Result<Meta> {
-    reconcile_lost_supervisor_with_delivery(paths, CompletionDeliveryAction::LeavePending, false)
+    reconcile_lost_supervisor_with_delivery(
+        paths,
+        CompletionDeliveryDisposition::LeavePending,
+        false,
+    )
 }
 
 fn reconcile_lost_supervisor_after_guardian(
@@ -1833,26 +1841,26 @@ fn reconcile_lost_supervisor_after_guardian(
 ) -> io::Result<Meta> {
     reconcile_lost_supervisor_with_delivery(
         paths,
-        CompletionDeliveryAction::ClaimPending,
+        CompletionDeliveryDisposition::ClaimPending,
         accepted_cancel_tree_empty,
     )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CompletionDeliveryAction {
+enum CompletionDeliveryDisposition {
     ClaimPending,
     LeavePending,
 }
 
 fn reconcile_lost_supervisor_with_delivery(
     paths: &StatePaths,
-    delivery_action: CompletionDeliveryAction,
+    delivery_disposition: CompletionDeliveryDisposition,
     accepted_cancel_tree_empty: bool,
 ) -> io::Result<Meta> {
     let _lock = state::lock_reconciliation(paths)?;
     let mut meta = state::read_meta(paths)?;
     if state::terminal(&meta) {
-        if delivery_action == CompletionDeliveryAction::ClaimPending {
+        if delivery_disposition == CompletionDeliveryDisposition::ClaimPending {
             delivery::reconcile_completion_delivery(paths, &mut meta)?;
         }
         return Ok(meta);
@@ -1861,12 +1869,12 @@ fn reconcile_lost_supervisor_with_delivery(
     if !guardian_settled_cancel && !state::exact_supervisor_and_workload_are_gone(&meta) {
         return Ok(meta);
     }
-    publish_terminal_and_progress_delivery(
+    publish_terminal_with_delivery_disposition(
         paths,
         &mut meta,
         None,
         TerminalProposal::SupervisorLost,
-        delivery_action,
+        delivery_disposition,
     )?;
     Ok(meta)
 }
@@ -1918,19 +1926,19 @@ enum TerminalPublishResult {
     DeferredForAcceptedCancel,
 }
 
-fn publish_terminal_and_progress_delivery(
+fn publish_terminal_with_delivery_disposition(
     paths: &StatePaths,
     meta: &mut Meta,
     log: Option<&mut BoundedLog>,
     proposal: TerminalProposal,
-    delivery_action: CompletionDeliveryAction,
+    delivery_disposition: CompletionDeliveryDisposition,
 ) -> io::Result<TerminalPublishResult> {
     let completion_lock = state::lock_completion(paths)?;
     let current = state::read_meta(paths)?;
     if state::terminal(&current) {
         *meta = current;
         drop(completion_lock);
-        if delivery_action == CompletionDeliveryAction::ClaimPending {
+        if delivery_disposition == CompletionDeliveryDisposition::ClaimPending {
             delivery::reconcile_completion_delivery(paths, meta)?;
         }
         return Ok(TerminalPublishResult::Published);
@@ -1962,7 +1970,7 @@ fn publish_terminal_and_progress_delivery(
     state::write_rc_atomic(paths, meta.rc.unwrap_or(EX_SOFTWARE))?;
     state::write_meta_atomic(paths, meta)?;
     drop(completion_lock);
-    if delivery_action == CompletionDeliveryAction::ClaimPending {
+    if delivery_disposition == CompletionDeliveryDisposition::ClaimPending {
         delivery::reconcile_completion_delivery(paths, meta)?;
     }
     Ok(TerminalPublishResult::Published)

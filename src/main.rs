@@ -584,7 +584,8 @@ fn run_output(
 fn detach_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
     require_control_eligibility(&paths, &handle, &caller)?;
-    let outcome = delivery::detach(&paths).map_err(|err| delivery_mode_error(&handle, err))?;
+    let outcome =
+        delivery::detach(&paths).map_err(|err| delivery_mode_update_error(&handle, err))?;
     serde_json::to_writer(io::stdout(), &outcome).map_err(json_write_error)?;
     io::stdout().write_all(b"\n").map_err(json_write_error)
 }
@@ -597,15 +598,22 @@ fn mode_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppErr
     } else {
         delivery::observed_delivery_mode(&paths)
     }
-    .map_err(|err| delivery_mode_error(&handle, err))?;
+    .map_err(|err| delivery_mode_determination_error(&handle, err))?;
     println!("{}", mode.as_str());
     Ok(())
 }
 
-fn delivery_mode_error(handle: &str, err: io::Error) -> AppError {
+fn delivery_mode_update_error(handle: &str, err: io::Error) -> AppError {
     AppError::new(
         EX_IOERR,
         format!("agent-bash: failed to update delivery mode for {handle}: {err}"),
+    )
+}
+
+fn delivery_mode_determination_error(handle: &str, err: io::Error) -> AppError {
+    AppError::new(
+        EX_IOERR,
+        format!("agent-bash: failed to determine delivery mode for {handle}: {err}"),
     )
 }
 
