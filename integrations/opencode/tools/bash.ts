@@ -262,9 +262,13 @@ async function terminalStatus(
 ): Promise<string | undefined> {
   const status = await statusText(handle, true, ownerSessionId, abort)
   if (!isTerminalStatus(status)) return undefined
+  await consumeTerminalStatus(handle, ownerSessionId, abort)
+  return statusText(handle, false, ownerSessionId, abort)
+}
+
+async function consumeTerminalStatus(handle: string, ownerSessionId?: string, abort?: AbortSignal): Promise<void> {
   const consume = await runProcess([AGENT_BASH, "consume", handle], ownerSessionId, abort, "agent-bash consume")
   if (consume.exitCode !== 0 && consume.exitCode !== 77) throw processFailure("agent-bash consume", consume)
-  return statusText(handle, false, ownerSessionId, abort)
 }
 
 async function modeText(handle: string, ownerSessionId: string, abort?: AbortSignal): Promise<DeliveryMode> {
@@ -620,10 +624,11 @@ export default tool({
   },
   async execute(args, context) {
     if (args.handle) {
-      return (
-        (await terminalStatus(args.handle, context.sessionID, context.abort)) ??
-        statusText(args.handle, false, context.sessionID, context.abort)
-      )
+      const terminal = await terminalStatus(args.handle, context.sessionID, context.abort)
+      if (terminal !== undefined) return terminal
+      const status = await statusText(args.handle, false, context.sessionID, context.abort)
+      if (isTerminalStatus(status)) await consumeTerminalStatus(args.handle, context.sessionID, context.abort)
+      return status
     }
     if (!commandProvided(args.command)) return missingCommandResponse()
     if (args.delivery !== undefined && !validDeliveryMode(args.delivery)) {
