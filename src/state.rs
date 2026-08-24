@@ -144,6 +144,7 @@ pub(crate) const DELIVERY_ATTEMPT_IN_PROGRESS: &str = "delivery_attempt_in_progr
 pub(crate) const DELIVERY_TRANSFER_OUTCOME_UNKNOWN: &str = "transfer_outcome_unknown";
 const ACTIVATION_PENDING: &str = "pending\n";
 const ACTIVATION_SUCCEEDED: &str = "succeeded\n";
+const ACTIVATION_PRE_ADMISSION_FAILED_PREFIX: &str = "pre_admission_failed: ";
 const ACTIVATION_TRANSFER_OUTCOME_UNKNOWN: &str = "transfer_outcome_unknown\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +153,7 @@ pub(crate) enum ActivationTransferOutcome {
     ClaimedWithoutOutcome,
     Pending,
     Succeeded,
+    PreAdmissionFailed(String),
     Failed(String),
     TransferOutcomeUnknown,
 }
@@ -659,6 +661,16 @@ pub(crate) fn write_activation_failed(paths: &StatePaths, error: &str) -> io::Re
     write_activation_outcome(paths, &format!("failed: {error}\n"))
 }
 
+pub(crate) fn write_activation_pre_admission_failed(
+    paths: &StatePaths,
+    error: &str,
+) -> io::Result<()> {
+    write_activation_outcome(
+        paths,
+        &format!("{ACTIVATION_PRE_ADMISSION_FAILED_PREFIX}{error}\n"),
+    )
+}
+
 pub(crate) fn write_activation_transfer_outcome_unknown(paths: &StatePaths) -> io::Result<()> {
     write_activation_outcome(paths, ACTIVATION_TRANSFER_OUTCOME_UNKNOWN)
 }
@@ -672,6 +684,13 @@ pub(crate) fn activation_transfer_state(paths: &StatePaths) -> io::Result<Activa
         None => ActivationTransferOutcome::Unclaimed,
         Some(ACTIVATION_PENDING) => ActivationTransferOutcome::Pending,
         Some(ACTIVATION_SUCCEEDED) => ActivationTransferOutcome::Succeeded,
+        Some(outcome) if outcome.starts_with(ACTIVATION_PRE_ADMISSION_FAILED_PREFIX) => {
+            ActivationTransferOutcome::PreAdmissionFailed(
+                outcome[ACTIVATION_PRE_ADMISSION_FAILED_PREFIX.len()..]
+                    .trim()
+                    .to_string(),
+            )
+        }
         Some(ACTIVATION_TRANSFER_OUTCOME_UNKNOWN) => {
             ActivationTransferOutcome::TransferOutcomeUnknown
         }

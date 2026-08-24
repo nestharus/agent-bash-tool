@@ -4146,7 +4146,7 @@ fn admitted_activation_failure_is_durable_and_not_reported_as_settled() {
 }
 
 #[test]
-fn attempted_activation_without_outcome_is_not_reported_as_async_handoff() {
+fn attempted_activation_without_pending_outcome_restores_sync_before_clearing_claim() {
     let temp = tempfile::tempdir().expect("tempdir");
     let handle = "ab_unknown_activation";
     let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
@@ -4158,17 +4158,42 @@ fn attempted_activation_without_outcome_is_not_reported_as_async_handoff() {
         .output()
         .expect("mode after unknown activation");
 
+    assert_command_success(&mode);
+    assert_eq!(String::from_utf8_lossy(&mode.stdout), "sync\n");
     assert_eq!(
-        mode.status.code(),
-        Some(74),
-        "{}",
-        command_failure_message(&mode)
+        fs::read_to_string(state_dir.join("delivery-mode")).expect("restored mode"),
+        "sync"
     );
-    assert!(
-        String::from_utf8_lossy(&mode.stderr).contains("activation outcome is unknown"),
-        "{}",
-        command_failure_message(&mode)
+    assert!(!state_dir.join("activation-attempted").exists());
+    assert!(!state_dir.join("activation-outcome").exists());
+}
+
+#[test]
+fn interrupted_pre_admission_activation_rollback_restores_sync_before_clearing_claim() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let handle = "ab_pre_admission_rollback";
+    let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
+    fs::write(state_dir.join("delivery-mode"), b"async").expect("write async mode");
+    fs::write(state_dir.join("activation-attempted"), b"").expect("write attempted marker");
+    fs::write(
+        state_dir.join("activation-outcome"),
+        b"pre_admission_failed: helper did not start\n",
+    )
+    .expect("write pre-admission outcome");
+
+    let mode = agent_bash(&temp)
+        .args(["mode", handle])
+        .output()
+        .expect("mode after interrupted rollback");
+
+    assert_command_success(&mode);
+    assert_eq!(String::from_utf8_lossy(&mode.stdout), "sync\n");
+    assert_eq!(
+        fs::read_to_string(state_dir.join("delivery-mode")).expect("restored mode"),
+        "sync"
     );
+    assert!(!state_dir.join("activation-attempted").exists());
+    assert!(!state_dir.join("activation-outcome").exists());
 }
 
 #[test]

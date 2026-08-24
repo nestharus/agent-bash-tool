@@ -1205,10 +1205,7 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
         }
         let result = if claimed {
             if let Err(err) = state::write_activation_pending(paths) {
-                state::rollback_activation_attempt(paths)?;
-                state::remove_activation_outcome(paths)?;
-                state::write_delivery_mode_atomic(paths, DeliveryMode::Sync)?;
-                repair_delivery_mode_mirror(paths, DeliveryMode::Sync)?;
+                settle_orphaned_activation(paths)?;
                 return Err(err);
             }
             run_required_delivery_helper_command_detailed(&request)
@@ -1218,10 +1215,8 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
         };
         match result {
             Err(DeliveryHelperCommandError::NotStarted(err)) => {
-                state::rollback_activation_attempt(paths)?;
-                state::remove_activation_outcome(paths)?;
-                state::write_delivery_mode_atomic(paths, DeliveryMode::Sync)?;
-                repair_delivery_mode_mirror(paths, DeliveryMode::Sync)?;
+                state::write_activation_pre_admission_failed(paths, &err.to_string())?;
+                settle_orphaned_activation(paths)?;
                 Err(err)
             }
             Err(DeliveryHelperCommandError::Admitted(err)) => {
@@ -1256,6 +1251,7 @@ pub(crate) fn require_settled_activation(paths: &StatePaths) -> io::Result<()> {
         | state::ActivationTransferOutcome::Pending => {
             Err(io::Error::other("delivery activation outcome is unknown"))
         }
+        state::ActivationTransferOutcome::PreAdmissionFailed(error) => Err(io::Error::other(error)),
         state::ActivationTransferOutcome::Failed(error) => Err(io::Error::other(error)),
         state::ActivationTransferOutcome::TransferOutcomeUnknown => {
             Err(io::Error::other("transfer_outcome_unknown"))
@@ -1278,9 +1274,18 @@ pub(crate) fn observed_delivery_mode(paths: &StatePaths) -> io::Result<DeliveryM
 }
 
 fn settle_orphaned_activation(paths: &StatePaths) -> io::Result<()> {
-    if state::activation_transfer_state(paths)?.outcome == state::ActivationTransferOutcome::Pending
-    {
-        state::write_activation_transfer_outcome_unknown(paths)?;
+    match state::activation_transfer_state(paths)?.outcome {
+        state::ActivationTransferOutcome::ClaimedWithoutOutcome
+        | state::ActivationTransferOutcome::PreAdmissionFailed(_) => {
+            state::write_delivery_mode_atomic(paths, DeliveryMode::Sync)?;
+            repair_delivery_mode_mirror(paths, DeliveryMode::Sync)?;
+            state::remove_activation_outcome(paths)?;
+            state::rollback_activation_attempt(paths)?;
+        }
+        state::ActivationTransferOutcome::Pending => {
+            state::write_activation_transfer_outcome_unknown(paths)?;
+        }
+        _ => {}
     }
     Ok(())
 }
