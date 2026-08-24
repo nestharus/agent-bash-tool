@@ -2152,6 +2152,11 @@ fn explicit_cancel_wins_when_owner_exit_is_already_pollable() {
 fn run_startup_reaps_old_consumed_state_dir_without_stdout_pollution() {
     let temp = tempfile::tempdir().expect("tempdir");
     let old = seed_done_state_dir(&temp, "ab_old_consumed", unix_ms() - 2_000, true);
+    let meta_path = old.join("meta.json");
+    let mut meta = read_meta(&meta_path);
+    meta["delivery"]["attempted"] = json!(true);
+    meta["delivery"]["exit_code"] = json!(0);
+    fs::write(&meta_path, format_seeded_meta(&meta)).expect("write settled old state");
 
     let output = agent_bash(&temp)
         .env("AGENT_BASH_STATE_TTL_SECS", "1")

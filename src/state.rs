@@ -780,6 +780,14 @@ fn reap_state_entry(
         root.to_path_buf(),
         entry.file_name().to_string_lossy().into_owned(),
     );
+    let _delivery_lock = match try_lock_delivery_for_reap(&paths) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return,
+        Err(_) => {
+            stats.errors += 1;
+            return;
+        }
+    };
     if !state_dir_reap_eligible(&paths, config, boot_id) {
         return;
     }
@@ -787,6 +795,32 @@ fn reap_state_entry(
         Ok(()) => stats.reaped += 1,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(_) => stats.errors += 1,
+    }
+}
+
+fn try_lock_delivery_for_reap(paths: &StatePaths) -> io::Result<Option<File>> {
+    use std::os::fd::AsRawFd;
+
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&paths.delivery_lock)?;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return if err.kind() == io::ErrorKind::WouldBlock {
+            Ok(None)
+        } else {
+            Err(err)
+        };
     }
 }
 
@@ -804,7 +838,7 @@ fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig, boot_id: &str
         return false;
     }
     if meta_is_reap_terminal(&meta, boot_id) {
-        return true;
+        return !meta.delivery.lifecycle().needs_progress();
     }
     meta.state == "RUNNING" && meta_processes_are_gone_or_reused(&meta, boot_id)
 }
@@ -1355,6 +1389,13 @@ mod tests {
         fs::write(&paths.consumed, b"").expect("write consumed");
     }
 
+    fn settle_reap_delivery(paths: &StatePaths) {
+        let mut meta = read_meta(paths).expect("read meta");
+        meta.delivery.attempted = true;
+        meta.delivery.exit_code = Some(0);
+        write_meta_atomic(paths, &meta).expect("write settled delivery");
+    }
+
     fn existing_handle_dirs(root: &Path) -> usize {
         fs::read_dir(root)
             .expect("read root")
@@ -1478,6 +1519,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_done_old", "DONE", now - 20_000, true);
+        settle_reap_delivery(&paths);
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
 
@@ -1541,6 +1583,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_error", "ERROR", now - 20_000, true);
+        settle_reap_delivery(&paths);
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
 
@@ -1549,19 +1592,19 @@ mod tests {
     }
 
     #[test]
-    fn reaper_removes_pending_undelivered_state_at_ttl() {
+    fn reaper_keeps_pending_undelivered_state_at_ttl() {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_pending", "DONE", now - 20_000, false);
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
 
-        assert_eq!(stats.reaped, 1);
-        assert!(!paths.state_dir.exists());
+        assert_eq!(stats.reaped, 0);
+        assert!(paths.state_dir.exists());
     }
 
     #[test]
-    fn reaper_removes_retryable_failed_delivery_at_ttl() {
+    fn reaper_keeps_retryable_failed_delivery_at_ttl() {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_retryable", "DONE", now - 20_000, false);
@@ -1575,6 +1618,24 @@ mod tests {
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
 
+        assert_eq!(stats.reaped, 0);
+        assert!(paths.state_dir.exists());
+    }
+
+    #[test]
+    fn reaper_keeps_settled_state_while_delivery_lock_is_held() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_delivery_owned", "DONE", now - 20_000, true);
+        settle_reap_delivery(&paths);
+        let delivery_lock = lock_delivery(&paths).expect("lock delivery");
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 0);
+        assert!(paths.state_dir.exists());
+        drop(delivery_lock);
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
         assert_eq!(stats.reaped, 1);
         assert!(!paths.state_dir.exists());
     }
@@ -1625,13 +1686,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         for index in 0..3 {
-            write_reap_state(
+            let paths = write_reap_state(
                 temp.path(),
                 &format!("ab_done_old_{index}"),
                 "DONE",
                 now - 20_000,
                 true,
             );
+            settle_reap_delivery(&paths);
         }
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 2));
@@ -1645,13 +1707,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         for index in 0..40 {
-            write_reap_state(
+            let paths = write_reap_state(
                 temp.path(),
                 &format!("ab_sharded_{index}"),
                 "DONE",
                 now - 20_000,
                 true,
             );
+            settle_reap_delivery(&paths);
         }
         let config = ReapConfig {
             ttl_secs: 10,
@@ -1673,6 +1736,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_locked", "DONE", now - 20_000, true);
+        settle_reap_delivery(&paths);
         let mut perms = fs::metadata(temp.path()).expect("metadata").permissions();
         perms.set_mode(0o500);
         fs::set_permissions(temp.path(), perms).expect("chmod root readonly");
