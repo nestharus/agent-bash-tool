@@ -537,6 +537,24 @@ fn parent_killing_fake_agents(
     (fake, log)
 }
 
+fn delivery_owner_killing_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join("kill-delivery-owner");
+    let log = temp.path().join("kill-delivery-owner.log");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+if [ "${2:-}" = agent-bash-complete ]; then
+    printf 'agent-bash-complete\n' >> "$AGENT_BASH_FAKE_DELIVERY_LOG"
+    kill -KILL "$PPID"
+fi
+exit 0
+"#,
+    )
+    .expect("write delivery-owner-killing fake");
+    set_executable(&fake);
+    (fake, log)
+}
+
 fn nonzero_completion_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
     let fake = temp.path().join("nonzero-completion-fake-agents");
     let log = temp.path().join("nonzero-completion.log");
@@ -3844,6 +3862,35 @@ fn delivery_owner_finishes_after_supervisor_dies() {
     );
     let status = status_text(&temp, handle, true);
     assert!(status.starts_with("DONE rc=0"), "{status}");
+}
+
+#[test]
+fn failed_delivery_owner_closes_unknown_transfer_without_replay() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = delivery_owner_killing_fake_agents(&temp);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--", "sh", "-c", "exit 0"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+
+    let settled = wait_until(FIXTURE_DEADLINE, || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["error_code"] == "transfer_outcome_unknown").then_some(meta)
+    });
+    assert_eq!(settled["delivery"]["attempted"], true);
+    assert_eq!(settled["delivery"]["retryable"], false);
+    assert_eq!(settled["delivery"]["lifecycle"], "admitted_outcome");
+
+    for _ in 0..4 {
+        let status = status_text(&temp, handle, true);
+        assert!(status.starts_with("DONE rc=0"), "{status}");
+    }
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
 }
 
 #[test]

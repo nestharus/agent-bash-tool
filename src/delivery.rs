@@ -1140,17 +1140,33 @@ pub(crate) fn reconcile_completion_delivery(
     });
     let mut observed = state::read_meta(paths)?;
     if let Err(err) = owner_result {
-        if observed.delivery.lifecycle() == DeliveryLifecycle::Unclaimed {
-            observed.delivery = delivery_meta_from_owner_launch_error(err, retry_count);
-            observed.touch();
-            state::write_meta_atomic(paths, &observed)?;
-        } else {
-            *meta = observed;
-            return Err(err);
-        }
+        observed.delivery = match observed.delivery.lifecycle() {
+            DeliveryLifecycle::Unclaimed => delivery_meta_from_owner_launch_error(err, retry_count),
+            DeliveryLifecycle::ProvisionalTransfer => {
+                delivery_meta_from_unknown_transfer(err, retry_count)
+            }
+            _ => {
+                *meta = observed;
+                return Err(err);
+            }
+        };
+        observed.touch();
+        state::write_meta_atomic(paths, &observed)?;
     }
     *meta = observed;
     Ok(())
+}
+
+fn delivery_meta_from_unknown_transfer(err: io::Error, retry_count: u8) -> DeliveryMeta {
+    DeliveryMeta {
+        attempted: true,
+        exit_code: None,
+        error: Some(format!("delivery helper outcome is unknown: {err}")),
+        error_code: Some("transfer_outcome_unknown".to_string()),
+        retryable: Some(false),
+        retry_count,
+        skipped: None,
+    }
 }
 
 pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
