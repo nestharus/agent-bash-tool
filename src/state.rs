@@ -1177,25 +1177,6 @@ pub(crate) fn exact_supervisor_and_workload_are_gone(meta: &Meta) -> bool {
     )
 }
 
-pub(crate) fn exact_supervisor_is_gone(meta: &Meta) -> bool {
-    if !running_exit_mode(meta) {
-        return false;
-    }
-    let current_boot_id = read_boot_id();
-    if current_boot_id.is_empty() {
-        return false;
-    }
-    matches!(
-        inspect_process_identity(
-            meta.supervisor_pid,
-            meta.supervisor_pid_starttime_ticks,
-            meta.process_boot_id.as_deref(),
-            &current_boot_id,
-        ),
-        ProcessIdentityEvidence::Gone
-    )
-}
-
 enum ProcessIdentityEvidence {
     Live,
     Gone,

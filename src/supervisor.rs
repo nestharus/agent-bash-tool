@@ -1782,9 +1782,7 @@ fn reconcile_lost_supervisor_with_delivery(
         }
         return Ok(meta);
     }
-    let guardian_settled_cancel = accepted_cancel_tree_empty
-        && explicit_cancel_accepted(paths)
-        && state::exact_supervisor_is_gone(&meta);
+    let guardian_settled_cancel = accepted_cancel_tree_empty && explicit_cancel_accepted(paths);
     if !guardian_settled_cancel && !state::exact_supervisor_and_workload_are_gone(&meta) {
         return Ok(meta);
     }

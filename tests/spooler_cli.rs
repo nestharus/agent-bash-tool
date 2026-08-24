@@ -1914,6 +1914,49 @@ fn accepted_cancel_is_owned_by_guardian_after_supervisor_loss() {
 }
 
 #[test]
+fn accepted_sentinel_cancel_is_owned_by_guardian_after_supervisor_loss() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = FIXTURE_DEADLINE;
+    let (fake, delivery_log) = fake_agents(&temp);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--ready-sentinel", "READY", "--", "sleep", "60"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+    let running = wait_until(fixture_deadline, || {
+        let meta = read_meta(&meta_path);
+        meta["workload_pid"].is_number().then_some(meta)
+    });
+    let workload = OwnedProcess::capture_workload(&running).expect("capture workload");
+    let supervisor = OwnedProcess::capture_supervisor(&running).expect("capture supervisor");
+    let stopped = StoppedProcess::stop(&supervisor);
+
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel command");
+    assert_command_success(&cancel);
+    assert_eq!(parse_stdout_json(&cancel)["requested"], true);
+    assert!(supervisor.signal(libc::SIGKILL), "kill exact supervisor");
+    drop(stopped);
+
+    let terminal = wait_until(fixture_deadline, || {
+        let meta = read_meta(&meta_path);
+        (meta["completion_reason"] == "cancel-request" && meta["delivery"]["exit_code"] == 0)
+            .then_some(meta)
+    });
+    assert_eq!(terminal["state"], "DONE");
+    assert_eq!(terminal["rc"], 143);
+    assert_eq!(terminal["signal"], libc::SIGTERM);
+    assert!(workload.exited(), "guardian did not terminate workload");
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+}
+
+#[test]
 fn accepted_cancel_precedes_already_pending_workload_completion() {
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
