@@ -73,6 +73,7 @@ struct HandleBoundDeliveryHelper {
 
 pub(crate) struct DeliveryRegistrationCandidate {
     helper: ConfiguredDeliveryHelper,
+    authority: Option<OsString>,
 }
 
 impl DeliveryRegistrationCandidate {
@@ -88,12 +89,16 @@ impl DeliveryRegistrationCandidate {
 
     pub(crate) fn bind_to_handle(self, paths: &StatePaths) -> io::Result<DeliveryRegistration> {
         let helper = self.helper.pin_to_handle(paths).map_err(io::Error::other)?;
-        Ok(DeliveryRegistration { helper })
+        Ok(DeliveryRegistration {
+            helper,
+            authority: self.authority,
+        })
     }
 }
 
 pub(crate) struct DeliveryRegistration {
     helper: HandleBoundDeliveryHelper,
+    authority: Option<OsString>,
 }
 
 struct DeliveryLockGuard {
@@ -1077,7 +1082,23 @@ pub(crate) fn resolve_handle_owner_binding(
 
 pub(crate) fn prepare_registration() -> io::Result<DeliveryRegistrationCandidate> {
     let helper = ConfiguredDeliveryHelper::from_environment().map_err(io::Error::other)?;
-    Ok(DeliveryRegistrationCandidate { helper })
+    let authority = take_registration_authority();
+    Ok(DeliveryRegistrationCandidate { helper, authority })
+}
+
+fn take_registration_authority() -> Option<OsString> {
+    let authority = env::var_os(COMPLETION_REGISTRATION_AUTHORITY_ENV);
+    // The token belongs only to the immediate registration request. Remove the
+    // ambient copy before the pending supervisor and its descendants are forked.
+    // `unsetenv` alone leaves the original bytes readable through Linux procfs.
+    unsafe {
+        let value = libc::getenv(c"OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY".as_ptr());
+        if !value.is_null() {
+            std::ptr::write_bytes(value, 0, libc::strlen(value));
+        }
+        env::remove_var(COMPLETION_REGISTRATION_AUTHORITY_ENV);
+    }
+    authority
 }
 
 pub(crate) fn register(
@@ -1085,7 +1106,12 @@ pub(crate) fn register(
     meta: &Meta,
     registration: DeliveryRegistration,
 ) -> std::io::Result<()> {
-    run_required_delivery_helper_command(&register_request(meta, paths, registration.helper))
+    run_required_delivery_helper_command(&register_request(
+        meta,
+        paths,
+        registration.helper,
+        registration.authority,
+    ))
 }
 
 pub(crate) fn reconcile_completion_delivery(
@@ -1404,11 +1430,12 @@ fn register_request(
     meta: &Meta,
     paths: &StatePaths,
     helper: HandleBoundDeliveryHelper,
+    authority: Option<OsString>,
 ) -> DeliveryHelperRequest {
     DeliveryHelperRequest {
         helper,
         args: register_args(meta, paths),
-        transient_environment: env::var_os(COMPLETION_REGISTRATION_AUTHORITY_ENV)
+        transient_environment: authority
             .map(|value| vec![(OsString::from(COMPLETION_REGISTRATION_AUTHORITY_ENV), value)])
             .unwrap_or_default(),
     }

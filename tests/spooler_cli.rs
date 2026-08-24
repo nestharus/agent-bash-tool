@@ -859,7 +859,7 @@ const args = request
       : mode === "binding-env"
         ? { command: "printf '%s|%s\\n' \"${OULIPOLY_LIVE_SESSION_BIND_SOCKET-unset}\" \"${OULIPOLY_LIVE_SESSION_BIND_TOKEN-unset}\"" }
       : mode === "inherited-env"
-        ? { command: "printf '%s|%s|%s|%s\\n' \"$INHERITED_ENV_SENTINEL\" \"${OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY-unset}\" \"${AGENT_BASH_AGENT_RUNNER_BIN-unset}\" \"$OULIPOLY_PARENT_INVOCATION\"" }
+        ? { command: "parent_authority=$(tr '\\0' '\\n' < \"/proc/$PPID/environ\" | sed -n 's/^OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY=//p'); printf '%s|%s|%s|%s|%s\\n' \"$INHERITED_ENV_SENTINEL\" \"${OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY-unset}\" \"${AGENT_BASH_AGENT_RUNNER_BIN-unset}\" \"$OULIPOLY_PARENT_INVOCATION\" \"${parent_authority:-unset}\"" }
       : mode === "agent-sync"
         ? { command: "agents --version", delivery: "sync" }
         : mode === "agent"
@@ -2719,7 +2719,7 @@ fn opencode_adapter_initial_dispatch_preserves_inherited_environment() {
 
     assert_adapter_result_contains(
         &result,
-        "fixture-env|unset|unset|{\"source\":\"opencode\",\"id\":\"11111111-1111-4111-8111-111111111111\"}",
+        "fixture-env|unset|unset|{\"source\":\"opencode\",\"id\":\"11111111-1111-4111-8111-111111111111\"}|unset",
     );
 }
 
