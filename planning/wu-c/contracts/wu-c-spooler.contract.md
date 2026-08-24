@@ -8,7 +8,7 @@ Component: WU-C spooler component
 
 Declared role set: `orchestration`, `filter`, `validator`, `predicate`, `mapper`, `accessor`, `formatter`, `parser`.
 
-Justification: the spooler is one cohesive systems component split across focused modules. The component legitimately sequences Linux supervision, filters cgroup/list/log surfaces, validates guard and input invariants, evaluates readiness/completion predicates, maps state metadata, accesses files/proc/fds, formats CLI/state output, and parses proc/cgroup/JSON/rc surfaces. This component declaration is the honest union of the focused module roles below; it is not a waiver for multi-classifier functions. Each production function remains inventoried with one A1 classification.
+Justification: the spooler is one cohesive systems component split across focused modules. The component legitimately sequences Linux supervision, filters cgroup/list/log surfaces, validates guard and input invariants, evaluates readiness/completion predicates, maps state metadata, accesses files/proc/fds, formats CLI/state output, and parses proc/cgroup/JSON/rc surfaces. This component declaration is the honest union of the focused module roles below; it is not a waiver for multi-classifier functions. The inventory records stable responsibility boundaries rather than claiming an exhaustive current-head function list.
 
 ## Per-file declared roles
 
@@ -19,11 +19,11 @@ Justification: the spooler is one cohesive systems component split across focuse
 | `src/guard.rs` | `accessor`, `validator` | Captures/exposes startup PPID and validates parent stability. |
 | `src/supervisor.rs` | `orchestration`, `validator`, `predicate`, `mapper`, `accessor`, `formatter`, `parser`, `filter` | Daemonization, spawn, polling, reaping, completion, argv validation, completion predicates, status mapping, fd/pid access, errno/status formatting, exec-error parsing, and poll/fd readiness filtering. |
 | `src/cgroup.rs` | `orchestration`, `validator`, `mapper`, `accessor`, `formatter`, `parser`, `filter` | Cgroup setup/teardown, path/PID validation, setup metadata mapping, fd/live-state access, PID formatting, proc/cgroup parsing, and live PID line filtering. |
-| `src/delivery.rs` | `orchestration`, `mapper`, `formatter`, `accessor` | Delivery command sequencing, result metadata mapping, CLI argv/error formatting, and delivery-binary environment access. |
+| `src/delivery.rs` | `orchestration`, `validator`, `mapper`, `formatter`, `accessor` | Configured-to-handle-bound helper provenance, owner lookup and registration, helper execution admission, and separate activation and completion transfer lifecycles. |
 
-## Function inventory
+## Responsibility inventory
 
-The inventory is grouped by file and A1 classification. Each row lists production functions with the same single classification after the remediation split.
+The inventory is grouped by file and A1 classification. Function names outside the delivery rows are the phase-6a decomposition record; current source is authoritative when later work renames a helper without changing its responsibility. Delivery is stated as current stable responsibility groups because its helper provenance and transfer protocols evolved after phase 6a.
 
 | File | A1 classification | Functions | Justification |
 |---|---|---|---|
@@ -55,10 +55,11 @@ The inventory is grouped by file and A1 classification. Each row lists productio
 | `src/cgroup.rs` | `accessor` | `ActiveCgroup::procs_fd`, `ActiveCgroup::inotify_fd`, `ActiveCgroup::populated`, `ActiveCgroup::live_pids`, `open_raw_cstring`, `read_cgroup_events`, `read_cgroup_procs`, `cgroup_disabled`, `read_mountinfo_text`, `read_self_cgroup_text`, `open_cgroup_procs`, `open_cgroup_events`, `create_inotify_fd`, `add_inotify_watch`, `write_fd_all` | These retrieve cgroup fds, files, environment switches, and syscall results. |
 | `src/cgroup.rs` | `formatter` | `path_display_string`, `format_pid_line`, `format_valid_pid_line` | These format path display text and cgroup PID write bytes. |
 | `src/cgroup.rs` | `parser` | `parse_cgroup_pid_lines`, `parse_cgroup_pid_line`, `parse_proc_self_cgroup_v2_entry`, `parse_mountinfo_cgroup2_mount`, `unescape_mountinfo`, `parse_cgroup_events_populated` | These parse cgroup/proc/mountinfo text into structured values. |
-| `src/delivery.rs` | `orchestration` | `notify`, `run_notify_command` | These sequence request construction, external command execution, and result handling. |
-| `src/delivery.rs` | `accessor` | `delivery_binary` | Retrieves the configured delivery binary from the environment. |
-| `src/delivery.rs` | `mapper` | `notify_request`, `delivery_meta_from_status`, `delivery_meta_from_error`, `attempted_delivery_meta` | These map notify inputs and process results into request/metadata structures. |
-| `src/delivery.rs` | `formatter` | `notify_args`, `path_arg`, `delivery_signal_error` | These format notify CLI argv and signal-error text. |
+| `src/delivery.rs` | `orchestration` | configured helper acquisition; handle binding and registration; completion progression; activation transfer | These own the ordered provenance, authority, admission, publication, rollback, and no-replay procedures. |
+| `src/delivery.rs` | `validator` | helper path, interpreter, snapshot, content, environment, and owner-binding checks | These fail closed before a configured or persisted helper may exercise registration or delivery authority. |
+| `src/delivery.rs` | `accessor` | configured environment, persisted provenance, pinned snapshots, process status, and delivery locks | These retrieve the inputs protected by the delivery boundary. |
+| `src/delivery.rs` | `mapper` | configured-to-handle-bound provenance; helper failures to completion outcomes; durable activation and completion lifecycle decoding | These preserve the distinction between provenance failure identity and operation-specific retry or no-replay policy. |
+| `src/delivery.rs` | `formatter` | helper argv, provenance diagnostics, admission errors, and persisted outcome detail | These format external helper requests and durable/user-facing failure descriptions. |
 
 ## Adapter declarations
 
@@ -67,10 +68,11 @@ adapter_declarations:
   - component: src/delivery.rs
     role: adapter
     Translates:
-      - agent-runner-notify-cli-contract
+      - agent-runner-registration-activation-completion-cli-contract
 ```
 
-No other adapter is declared. The delivery module translates the stable external notify CLI contract; other modules implement the spooler itself.
+No other adapter is declared. The delivery module translates the stable external registration,
+activation, and completion helper operations; other modules implement the spooler itself.
 
 ## Intrinsic-surface declarations
 

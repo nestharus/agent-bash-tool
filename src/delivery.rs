@@ -118,7 +118,6 @@ impl DeliveryRegistration {
 struct DeliveryHelperError {
     code: &'static str,
     detail: String,
-    retryable: bool,
 }
 
 impl DeliveryHelperError {
@@ -126,7 +125,6 @@ impl DeliveryHelperError {
         Self {
             code: DELIVERY_HELPER_UNAVAILABLE,
             detail: detail.into(),
-            retryable: true,
         }
     }
 
@@ -134,7 +132,6 @@ impl DeliveryHelperError {
         Self {
             code: DELIVERY_HELPER_INVALID,
             detail: detail.into(),
-            retryable: false,
         }
     }
 
@@ -142,7 +139,6 @@ impl DeliveryHelperError {
         Self {
             code: DELIVERY_HELPER_CHANGED,
             detail: detail.into(),
-            retryable: true,
         }
     }
 
@@ -150,7 +146,6 @@ impl DeliveryHelperError {
         Self {
             code: DELIVERY_HELPER_LEGACY_UNSUPPORTED,
             detail: detail.into(),
-            retryable: false,
         }
     }
 }
@@ -1618,12 +1613,16 @@ fn completion_delivery_meta_from_helper_error(
     err: DeliveryHelperError,
     retry_count: u8,
 ) -> CompletionDeliveryMeta {
+    let retryable = matches!(
+        err.code,
+        DELIVERY_HELPER_UNAVAILABLE | DELIVERY_HELPER_CHANGED
+    );
     CompletionDeliveryMeta {
         attempted: false,
         exit_code: None,
         error: Some(err.to_string()),
         error_code: Some(err.code.to_string()),
-        retryable: Some(err.retryable && retry_count == 0),
+        retryable: Some(retryable && retry_count == 0),
         retry_count,
         skipped: None,
     }
