@@ -1258,6 +1258,10 @@ pub(crate) fn require_settled_activation(paths: &StatePaths) -> io::Result<()> {
 pub(crate) fn settled_delivery_mode(paths: &StatePaths) -> io::Result<DeliveryMode> {
     let _delivery_lock = DeliveryLockGuard::acquire(paths)?;
     settle_orphaned_activation(paths)?;
+    observed_delivery_mode(paths)
+}
+
+pub(crate) fn observed_delivery_mode(paths: &StatePaths) -> io::Result<DeliveryMode> {
     let mode = state::read_delivery_mode(paths)?;
     if mode == DeliveryMode::Async {
         require_settled_activation(paths)?;

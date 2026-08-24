@@ -583,7 +583,7 @@ fn mode_command(handle: String, caller: CallerAuthority) -> Result<(), AppError>
     let mode = if caller_controls_handle(&meta, &paths, &caller) {
         delivery::settled_delivery_mode(&paths)
     } else {
-        state::read_delivery_mode(&paths)
+        delivery::observed_delivery_mode(&paths)
     }
     .map_err(|err| delivery_mode_error(&handle, err))?;
     println!("{}", mode.as_str());
@@ -925,14 +925,14 @@ fn list_summary_for_entry(
     let paths = paths_for_entry(root, &entry);
     let meta = read_entry_meta(&paths)?;
     if all {
-        return Some(list_summary_from_meta(&meta, paths.state_dir));
+        return Some(list_summary_from_meta(&meta, &paths));
     }
     let owned = handle_owned_by(&meta, &paths, caller_chain);
     if !owned {
         return None;
     }
     let meta = reconcile_list_meta(&paths, meta)?;
-    Some(list_summary_from_meta(&meta, paths.state_dir))
+    Some(list_summary_from_meta(&meta, &paths))
 }
 
 fn reconcile_list_meta(paths: &StatePaths, meta: Meta) -> Option<Meta> {
@@ -1026,8 +1026,12 @@ fn require_control_authority(
     ))
 }
 
-fn list_summary_from_meta(meta: &Meta, state_dir: PathBuf) -> ListSummary {
-    ListSummary::from_meta(meta, state_dir)
+fn list_summary_from_meta(meta: &Meta, paths: &StatePaths) -> ListSummary {
+    ListSummary::from_meta(
+        meta,
+        paths.state_dir.clone(),
+        delivery::observed_delivery_mode(paths),
+    )
 }
 
 fn sort_summaries(summaries: &mut [ListSummary]) {
@@ -1058,13 +1062,17 @@ fn emit_text_list_summaries(summaries: &[ListSummary]) {
 }
 
 fn format_list_summary(summary: &ListSummary) -> String {
+    let delivery_mode = summary
+        .delivery_mode
+        .map(|mode| mode.as_str())
+        .unwrap_or("unavailable");
     format!(
         "{} {} rc={} mode={} delivery={} created_at={} state_dir={}",
         summary.handle,
         summary.state,
         format_optional_rc(summary.rc),
         summary.mode,
-        summary.delivery_mode.as_str(),
+        delivery_mode,
         summary.created_at_unix_ms,
         summary.state_dir.display()
     )

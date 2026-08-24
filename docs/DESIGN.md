@@ -142,8 +142,10 @@ but it never executes a helper as an incidental enumeration side effect; its dis
 use `CompletionDeliveryAction::ClaimPending`; the action names only who progresses delivery, not how
 the terminal state was reached. Cross-owner status and
 `list --all` remain observational and do not reconcile state. Cross-owner `mode` is likewise a
-point-in-time read; owner `mode` may settle an orphaned activation transfer while holding the
-delivery lock. The guardian re-enters reconciliation,
+point-in-time read, but it still fails closed when the durable activation outcome is unsettled.
+List projections represent that state as `delivery_mode: null` with `delivery_mode_error` in JSON
+and `delivery=unavailable` in text. Owner `mode` may settle an orphaned activation transfer while
+holding the delivery lock. The guardian re-enters reconciliation,
 observes the terminal record, and claims pending delivery. A later targeted owner `status` may claim
 it first. Both paths use the same `delivery.lock`, pinned helper, and write-ahead attempt record, so
 this handoff changes the delivery owner without permitting a repeated attempt. Every valid run

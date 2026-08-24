@@ -415,19 +415,29 @@ pub(crate) struct ListSummary {
     pub(crate) state: String,
     pub(crate) rc: Option<i32>,
     pub(crate) mode: String,
-    pub(crate) delivery_mode: DeliveryMode,
+    pub(crate) delivery_mode: Option<DeliveryMode>,
+    pub(crate) delivery_mode_error: Option<String>,
     pub(crate) created_at_unix_ms: u64,
     pub(crate) state_dir: PathBuf,
 }
 
 impl ListSummary {
-    pub(crate) fn from_meta(meta: &Meta, state_dir: PathBuf) -> Self {
+    pub(crate) fn from_meta(
+        meta: &Meta,
+        state_dir: PathBuf,
+        delivery_mode: io::Result<DeliveryMode>,
+    ) -> Self {
+        let (delivery_mode, delivery_mode_error) = match delivery_mode {
+            Ok(mode) => (Some(mode), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
         Self {
             handle: meta.handle.clone(),
             state: meta.state.clone(),
             rc: meta.rc,
             mode: meta.mode.clone(),
-            delivery_mode: meta.delivery_mode,
+            delivery_mode,
+            delivery_mode_error,
             created_at_unix_ms: meta.created_at_unix_ms,
             state_dir,
         }

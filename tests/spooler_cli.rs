@@ -3356,7 +3356,25 @@ fn unrelated_observer_cannot_cancel_or_detach_visible_handle() {
     fs::write(state_dir.join("delivery-mode"), b"async").expect("write async mode");
     fs::write(state_dir.join("activation-outcome"), b"pending\n")
         .expect("write pending activation");
-    assert_eq!(mode_text(&temp, &handle), "async");
+    let unrelated_mode = agent_bash(&temp)
+        .args(["mode", &handle])
+        .output()
+        .expect("unrelated mode");
+    assert_eq!(unrelated_mode.status.code(), Some(74));
+    assert!(
+        String::from_utf8_lossy(&unrelated_mode.stderr).contains("activation outcome is unknown")
+    );
+    let listed = shell_list_json(&temp, true);
+    let listed = listed
+        .iter()
+        .find(|entry| entry["handle"] == handle)
+        .expect("pending activation in list");
+    assert!(listed["delivery_mode"].is_null());
+    assert!(
+        listed["delivery_mode_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("activation outcome is unknown"))
+    );
     assert_eq!(
         fs::read_to_string(state_dir.join("activation-outcome")).expect("activation outcome"),
         "pending\n",
@@ -4101,6 +4119,17 @@ fn admitted_activation_failure_is_durable_and_not_reported_as_settled() {
         String::from_utf8_lossy(&mode.stderr).contains("activation rejected"),
         "{}",
         command_failure_message(&mode)
+    );
+    let listed = shell_list_json(&temp, true);
+    let listed = listed
+        .iter()
+        .find(|entry| entry["handle"] == handle)
+        .expect("failed activation in list");
+    assert!(listed["delivery_mode"].is_null());
+    assert!(
+        listed["delivery_mode_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("activation rejected"))
     );
     assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
     assert_eq!(
