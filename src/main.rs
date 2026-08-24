@@ -177,7 +177,7 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
         Command::Detach { handle } => detach_command(handle, caller_authority(&guard)),
         Command::Cancel { handle } => cancel_command(handle, caller_authority(&guard)),
         Command::Consume { handle } => consume_command(handle, caller_authority(&guard)),
-        Command::Mode { handle } => mode_command(handle),
+        Command::Mode { handle } => mode_command(handle, caller_authority(&guard)),
         Command::Status {
             tail_bytes,
             full,
@@ -577,10 +577,15 @@ fn detach_command(handle: String, caller: CallerAuthority) -> Result<(), AppErro
     io::stdout().write_all(b"\n").map_err(json_write_error)
 }
 
-fn mode_command(handle: String) -> Result<(), AppError> {
+fn mode_command(handle: String, caller: CallerAuthority) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
-    let mode =
-        delivery::settled_delivery_mode(&paths).map_err(|err| delivery_mode_error(&handle, err))?;
+    let meta = read_meta_for_handle(&paths, &handle)?;
+    let mode = if caller_controls_handle(&meta, &paths, &caller) {
+        delivery::settled_delivery_mode(&paths)
+    } else {
+        state::read_delivery_mode(&paths)
+    }
+    .map_err(|err| delivery_mode_error(&handle, err))?;
     println!("{}", mode.as_str());
     Ok(())
 }

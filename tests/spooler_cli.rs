@@ -3353,7 +3353,15 @@ fn unrelated_observer_cannot_cancel_or_detach_visible_handle() {
         !state_dir.join("cancel-requested").exists(),
         "unrelated cancellation created the durable acceptance marker"
     );
-    assert_eq!(mode_text(&temp, &handle), "sync");
+    fs::write(state_dir.join("delivery-mode"), b"async").expect("write async mode");
+    fs::write(state_dir.join("activation-outcome"), b"pending\n")
+        .expect("write pending activation");
+    assert_eq!(mode_text(&temp, &handle), "async");
+    assert_eq!(
+        fs::read_to_string(state_dir.join("activation-outcome")).expect("activation outcome"),
+        "pending\n",
+        "unrelated mode observation settled activation state"
+    );
 
     fs::write(&owner.list_now, b"").expect("release owner list");
     assert!(owner.wait().expect("owner scenario").success());

@@ -141,7 +141,9 @@ but it never executes a helper as an incidental enumeration side effect; its dis
 `CompletionDeliveryAction::LeavePending`. Live terminal producers, targeted status, and the guardian
 use `CompletionDeliveryAction::ClaimPending`; the action names only who progresses delivery, not how
 the terminal state was reached. Cross-owner status and
-`list --all` remain observational and do not reconcile state. The guardian re-enters reconciliation,
+`list --all` remain observational and do not reconcile state. Cross-owner `mode` is likewise a
+point-in-time read; owner `mode` may settle an orphaned activation transfer while holding the
+delivery lock. The guardian re-enters reconciliation,
 observes the terminal record, and claims pending delivery. A later targeted owner `status` may claim
 it first. Both paths use the same `delivery.lock`, pinned helper, and write-ahead attempt record, so
 this handoff changes the delivery owner without permitting a repeated attempt. Every valid run
@@ -173,7 +175,7 @@ supported CLI. Default list visibility and control require the recorded owner se
 exists, falling back to the exact caller-chain predicate only for handles without session metadata.
 At every supported mutating control boundary, the
 handle's pinned helper resolves the live caller chain to its acting session; ambient owner strings
-are never authority. `list --all` and a cross-owner `status` may
+are never authority. `list --all`, cross-owner `status`, and cross-owner `mode` may
 observe account-local handles, but they cannot publish recovery state, claim delivery, cancel work,
 or change delivery mode. Cancel, detach, and consume fail with `EX_NOPERM` for non-owners. Guardian recovery
 remains independent of any observing caller and is the automatic cleanup/progress path after the
