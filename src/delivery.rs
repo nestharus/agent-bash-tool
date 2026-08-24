@@ -1124,7 +1124,7 @@ pub(crate) fn reconcile_completion_delivery(
             return Ok(());
         }
     };
-    let owner_result = run_delivery_owner_holding_lock(&delivery_lock, || {
+    let owner_result = run_delivery_owner_child_process_holding_lock(&delivery_lock, || {
         persisted.delivery = provisional_delivery_transfer_meta();
         persisted.touch();
         state::write_meta_atomic(paths, &persisted)?;
@@ -1181,7 +1181,7 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
 
     let meta = state::read_meta(paths)?;
     let request = activate_request(&meta, paths).map_err(io::Error::other)?;
-    let owner_result = run_delivery_owner_holding_lock(&delivery_lock, || {
+    let owner_result = run_delivery_owner_child_process_holding_lock(&delivery_lock, || {
         let claimed = state::record_activation_attempt(paths)?;
         if let Err(err) = state::write_delivery_mode_atomic(paths, DeliveryMode::Async) {
             if claimed {
@@ -1252,16 +1252,18 @@ pub(crate) fn settled_delivery_mode(paths: &StatePaths) -> io::Result<DeliveryMo
     Ok(mode)
 }
 
-fn run_delivery_owner_holding_lock(
+// The operation runs only in the forked child. Durable files are its sole
+// handback channel; mutations to captured values are not visible to the parent.
+fn run_delivery_owner_child_process_holding_lock(
     _delivery_lock: &DeliveryLockGuard,
-    operation: impl FnOnce() -> io::Result<()>,
+    child_operation: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
-        let code = if operation().is_ok() { 0 } else { 70 };
+        let code = if child_operation().is_ok() { 0 } else { 70 };
         unsafe { libc::_exit(code) };
     }
     wait_for_delivery_owner(pid)
