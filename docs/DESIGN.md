@@ -168,9 +168,10 @@ delivery, and therefore may wait for the bounded helper subprocess. This general
 the PID is **harness-code polling (cheap, no LLM tokens)** — not the LLM self-polling that is
 forbidden.
 
-Handle observation and handle control are separate authorities. Default list visibility and
-control require the recorded owner session when one exists, falling back to the exact caller-chain
-predicate only for handles without session metadata. At every mutating control boundary, the
+Handle observation and handle control are separate application-level authorities within the
+supported CLI. Default list visibility and control require the recorded owner session when one
+exists, falling back to the exact caller-chain predicate only for handles without session metadata.
+At every supported mutating control boundary, the
 handle's pinned helper resolves the live caller chain to its acting session; ambient owner strings
 are never authority. `list --all` and a cross-owner `status` may
 observe account-local handles, but they cannot publish recovery state, claim delivery, cancel work,
@@ -243,14 +244,18 @@ hashing. The declared normal parallel admission point is eight same-account regi
 one warm helper digest, bounded to eight seconds in the integration contract; the test records the
 effective helper size and elapsed admission time.
 
-The state root is a Unix-account trust boundary. Mode `0700` excludes other accounts, while
-same-account workloads and observers are trusted not to rewrite another handle's state or helper
-cache. The observer-isolation guarantee means a later process cannot substitute its environment or
-configured helper path; it is not a sandbox between hostile processes sharing one Unix identity.
-The owner check uses agent-runner's exact live PID identity records to prevent cross-session control
-within that account, but is not claimed as a sandbox against a hostile same-UID process that rewrites
-durable state. A future cross-owner operator action requires a separately authenticated broker or OS
-identity; `list --all` deliberately does not confer it.
+The state root is a Unix-account trust boundary: the Unix account is the effective filesystem
+principal, while the recorded session is the application-level principal for supported CLI control.
+Mode `0700` excludes other accounts, while same-account workloads and observers are trusted not to
+rewrite another handle's state or helper cache. The observer-isolation guarantee means a later
+process using supported interfaces cannot substitute its environment or configured helper path; it
+is not a sandbox between hostile processes sharing one Unix identity. The owner check uses
+agent-runner's exact live PID identity records to prevent accidental or unsupported cross-session
+control through the CLI, but cannot prevent a hostile same-UID process from directly rewriting
+durable state, including decision-bearing markers. Enforcing session authority against such a
+process would require a separately authenticated broker or distinct OS identity. `list --all`
+deliberately confers no supported control operation and does not strengthen the Unix-account trust
+boundary.
 The selected helper is an opaque trusted extension at this boundary. Its operation handlers may
 maintain downstream state, but this repository claims only pinned byte identity, invocation
 admission, and the observed helper-process outcome, not closure over arbitrary helper internals.
