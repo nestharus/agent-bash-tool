@@ -1301,7 +1301,7 @@ impl EventLoop {
     fn handle_sigchld(&mut self) -> io::Result<()> {
         let signals = self.sigchld.drain();
         if signals.cancel_requested {
-            self.request_cancellation(CancellationCause::ExplicitRequest);
+            self.check_explicit_cancel();
         }
         self.reap_children()
     }

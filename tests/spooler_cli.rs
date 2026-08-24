@@ -1834,6 +1834,34 @@ fn supervisor_finishes_durable_cancel_without_wakeup_signal() {
 }
 
 #[test]
+fn supervisor_cancel_signal_is_wake_only_without_durable_acceptance() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (output, _) = run_cmd(&temp, &["run", "--", "sleep", "60"]);
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+    let supervisor_pid = wait_until(FIXTURE_DEADLINE, || {
+        read_meta(&meta_path)["supervisor_pid"].as_i64()
+    });
+
+    assert_eq!(
+        unsafe { libc::kill(supervisor_pid as libc::pid_t, libc::SIGUSR1) },
+        0
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    let status = status_text(&temp, handle, false);
+    assert!(status.starts_with("RUNNING "), "{status}");
+    assert!(!state_dir_path(&json).join("cancel-requested").exists());
+
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel command");
+    assert_command_success(&cancel);
+    assert!(wait_for_terminal_status(&temp, handle).contains("reason=cancel-request"));
+}
+
+#[test]
 fn cancel_without_a_live_exact_supervisor_is_an_idempotent_noop() {
     let temp = tempfile::tempdir().expect("tempdir");
     let handle = "ab_cancel_missing_supervisor";

@@ -43,9 +43,10 @@ completion returns synchronously in-band or asynchronously through the agent mai
   runs remain detached unless they explicitly request a lease. Direct cancel and detach require
   the handle's recorded session, attested from the live caller chain by the handle's pinned helper,
   falling back to exact caller-tree ownership only when no session was recorded; `list --all` is
-   observation, not a grant of control authority through supported interfaces. These session checks
-   are application-level safeguards within one trusted Unix account, not a sandbox against hostile
-   same-UID processes that directly rewrite spool state.
+    observation, not a supported control route. The Unix account is the security and decision
+    principal; session checks are cooperative routing safeguards that prevent accidental
+    cross-session CLI operations, not a distinct authority boundary or a sandbox against same-UID
+    processes that directly rewrite spool state.
 - **Versioned adapter boundary.** The bundled OpenCode adapter and binary form one supported release
   unit. Deployment owners stop new adapter calls, drain in-flight calls, replace all installed
   adapter copies and the binary while calls remain quiesced, and resume only after the matching pair

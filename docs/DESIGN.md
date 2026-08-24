@@ -190,12 +190,12 @@ delivery, and therefore may wait for the bounded helper subprocess. This general
 the PID is **harness-code polling (cheap, no LLM tokens)** — not the LLM self-polling that is
 forbidden.
 
-Handle observation and handle control are separate application-level authorities within the
+Handle observation and handle control are separate cooperative routing policies within the
 supported CLI. Default list visibility and control require the recorded owner session when one
 exists, falling back to the exact caller-chain predicate only for handles without session metadata.
 At every supported mutating control boundary, the
 handle's pinned helper resolves the live caller chain to its acting session; ambient owner strings
-are never authority. `list --all`, cross-owner `status`, and cross-owner `mode` may
+never satisfy that supported-interface check. `list --all`, cross-owner `status`, and cross-owner `mode` may
 observe account-local handles, but they cannot publish recovery state, claim delivery, cancel work,
 or change delivery mode. Cancel, detach, and consume fail with `EX_NOPERM` for non-owners. Guardian recovery
 remains independent of any observing caller and is the automatic cleanup/progress path after the
@@ -215,12 +215,13 @@ The OpenCode adapter also supplies its provider session ID and parent invocation
 records these as optional fields in `meta.json` and in a separate `owner.json`, allowing a resumed
 session to rediscover its handles after the adapter process and caller PID change. Agent-runner may
 use this pair as a delivery fallback only after confirming that the invocation belongs to the same
-provider session. The recorded session ID also restores that session's control authority for
-cancel, detach, and status reconciliation after its caller PID changes. That authority requires a
+provider session. The recorded session ID also restores that session's supported control routing for
+cancel, detach, and status reconciliation after its caller PID changes. That routing requires a
 fresh agent-runner resolution of the acting caller chain through the handle's pinned helper;
 presenting the recorded session ID in an environment variable does not grant control. Handles
 without session metadata use the nearest exact PID/start-time/boot-ID caller-chain entry as their
-control anchor.
+control anchor. These checks prevent accidental cross-session operation; they do not create a
+security principal distinct from the Unix account.
 
 Registration resolves the configured helper once, reads it into a sealed executable image, and
 stores its SHA-256 identity. The image is installed once per content digest under the account-private
@@ -266,16 +267,19 @@ hashing. The declared normal parallel admission point is eight same-account regi
 one warm helper digest, bounded to eight seconds in the integration contract; the test records the
 effective helper size and elapsed admission time.
 
-The state root is a Unix-account trust boundary: the Unix account is the effective filesystem
-principal, while the recorded session is the application-level principal for supported CLI control.
+The state root is a Unix-account trust boundary: the Unix account is the sole security and
+decision principal. The recorded session is a cooperative routing label for supported CLI control,
+not a separately enforced authority principal.
 Mode `0700` excludes other accounts, while same-account workloads and observers are trusted not to
 rewrite another handle's state or helper cache. The observer-isolation guarantee means a later
 process using supported interfaces cannot substitute its environment or configured helper path; it
 is not a sandbox between hostile processes sharing one Unix identity. The owner check uses
 agent-runner's exact live PID identity records to prevent accidental or unsupported cross-session
-control through the CLI, but cannot prevent a hostile same-UID process from directly rewriting
+control through the CLI, but cannot prevent a same-UID process from directly rewriting
 durable state, including decision-bearing markers. Enforcing session authority against such a
-process would require a separately authenticated broker or distinct OS identity. `list --all`
+process would require a separately authenticated broker or distinct OS identity. Such same-UID
+behavior is authorized by the account security boundary even when it bypasses the cooperative CLI
+routing policy. `list --all`
 deliberately confers no supported control operation and does not strengthen the Unix-account trust
 boundary.
 The selected helper is an opaque trusted extension at this boundary. Its operation handlers may
