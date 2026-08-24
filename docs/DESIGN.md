@@ -324,6 +324,11 @@ never rolls back and cannot be retried. The delivery module owns both policies a
 `delivery.lock` and local-owner transfer boundary; changes to helper admission or retry semantics
 must preserve this automatic-progression versus explicit-command distinction.
 
+`ActivationTransferState` is the source-level decoder for the persisted mode, attempt marker, and
+outcome. Detach, mode observation, and orphan settlement consume its named outcome states rather
+than independently interpreting marker presence or outcome strings; the existing files remain the
+durable representation behind that boundary.
+
 `CompletionDeliveryMeta::completion_lifecycle` is the source-level and serialized classifier for
 that completion protocol. It reports
 `unclaimed`, `provisional_transfer`, `retryable_pre_admission_failure`,

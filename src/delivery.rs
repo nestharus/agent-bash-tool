@@ -1190,8 +1190,8 @@ fn completion_delivery_meta_from_unknown_transfer(
 pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
     let delivery_lock = DeliveryLockGuard::acquire(paths)?;
     settle_orphaned_activation(paths)?;
-    let mode = state::read_delivery_mode(paths)?;
-    if mode == DeliveryMode::Async {
+    let activation = state::activation_transfer_state(paths)?;
+    if activation.mode == DeliveryMode::Async {
         require_settled_activation(paths)?;
         let meta = repair_delivery_mode_mirror(paths, DeliveryMode::Async)?;
         drop(delivery_lock);
@@ -1209,7 +1209,7 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
             return Err(err);
         }
         let result = if claimed {
-            if let Err(err) = state::write_activation_outcome(paths, "pending\n") {
+            if let Err(err) = state::write_activation_pending(paths) {
                 state::rollback_activation_attempt(paths)?;
                 state::remove_activation_outcome(paths)?;
                 state::write_delivery_mode_atomic(paths, DeliveryMode::Sync)?;
@@ -1230,12 +1230,12 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
                 Err(err)
             }
             Err(DeliveryHelperCommandError::Admitted(err)) => {
-                state::write_activation_outcome(paths, &format!("failed: {err}\n"))?;
+                state::write_activation_failed(paths, &err.to_string())?;
                 repair_delivery_mode_mirror(paths, DeliveryMode::Async)?;
                 Err(err)
             }
             Ok(()) => {
-                state::write_activation_outcome(paths, "succeeded\n")?;
+                state::write_activation_succeeded(paths)?;
                 repair_delivery_mode_mirror(paths, DeliveryMode::Async)?;
                 Ok(())
             }
@@ -1254,12 +1254,17 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
 }
 
 pub(crate) fn require_settled_activation(paths: &StatePaths) -> io::Result<()> {
-    match state::read_activation_outcome(paths)?.as_deref() {
-        None if !paths.activation_attempted.exists() => Ok(()),
-        None => Err(io::Error::other("delivery activation outcome is unknown")),
-        Some("succeeded\n") => Ok(()),
-        Some("pending\n") => Err(io::Error::other("delivery activation outcome is unknown")),
-        Some(outcome) => Err(io::Error::other(outcome.trim().to_string())),
+    match state::activation_transfer_state(paths)?.outcome {
+        state::ActivationTransferOutcome::Unclaimed
+        | state::ActivationTransferOutcome::Succeeded => Ok(()),
+        state::ActivationTransferOutcome::ClaimedWithoutOutcome
+        | state::ActivationTransferOutcome::Pending => {
+            Err(io::Error::other("delivery activation outcome is unknown"))
+        }
+        state::ActivationTransferOutcome::Failed(error) => Err(io::Error::other(error)),
+        state::ActivationTransferOutcome::TransferOutcomeUnknown => {
+            Err(io::Error::other("transfer_outcome_unknown"))
+        }
     }
 }
 
@@ -1270,16 +1275,17 @@ pub(crate) fn settled_delivery_mode(paths: &StatePaths) -> io::Result<DeliveryMo
 }
 
 pub(crate) fn observed_delivery_mode(paths: &StatePaths) -> io::Result<DeliveryMode> {
-    let mode = state::read_delivery_mode(paths)?;
-    if mode == DeliveryMode::Async {
+    let activation = state::activation_transfer_state(paths)?;
+    if activation.mode == DeliveryMode::Async {
         require_settled_activation(paths)?;
     }
-    Ok(mode)
+    Ok(activation.mode)
 }
 
 fn settle_orphaned_activation(paths: &StatePaths) -> io::Result<()> {
-    if state::read_activation_outcome(paths)?.as_deref() == Some("pending\n") {
-        state::write_activation_outcome(paths, "transfer_outcome_unknown\n")?;
+    if state::activation_transfer_state(paths)?.outcome == state::ActivationTransferOutcome::Pending
+    {
+        state::write_activation_transfer_outcome_unknown(paths)?;
     }
     Ok(())
 }

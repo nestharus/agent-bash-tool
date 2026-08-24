@@ -142,6 +142,25 @@ impl OwnerMeta {
 
 pub(crate) const DELIVERY_ATTEMPT_IN_PROGRESS: &str = "delivery_attempt_in_progress";
 pub(crate) const DELIVERY_TRANSFER_OUTCOME_UNKNOWN: &str = "transfer_outcome_unknown";
+const ACTIVATION_PENDING: &str = "pending\n";
+const ACTIVATION_SUCCEEDED: &str = "succeeded\n";
+const ACTIVATION_TRANSFER_OUTCOME_UNKNOWN: &str = "transfer_outcome_unknown\n";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ActivationTransferOutcome {
+    Unclaimed,
+    ClaimedWithoutOutcome,
+    Pending,
+    Succeeded,
+    Failed(String),
+    TransferOutcomeUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActivationTransferState {
+    pub(crate) mode: DeliveryMode,
+    pub(crate) outcome: ActivationTransferOutcome,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -616,16 +635,49 @@ pub(crate) fn record_consumed(paths: &StatePaths) -> io::Result<bool> {
     record_durable_create_once_marker(&paths.consumed, &paths.state_dir)
 }
 
-pub(crate) fn write_activation_outcome(paths: &StatePaths, outcome: &str) -> io::Result<()> {
+fn write_activation_outcome(paths: &StatePaths, outcome: &str) -> io::Result<()> {
     atomic_write(&paths.activation_outcome, outcome.as_bytes())
 }
 
-pub(crate) fn read_activation_outcome(paths: &StatePaths) -> io::Result<Option<String>> {
+fn read_activation_outcome(paths: &StatePaths) -> io::Result<Option<String>> {
     match fs::read_to_string(&paths.activation_outcome) {
         Ok(outcome) => Ok(Some(outcome)),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+pub(crate) fn write_activation_pending(paths: &StatePaths) -> io::Result<()> {
+    write_activation_outcome(paths, ACTIVATION_PENDING)
+}
+
+pub(crate) fn write_activation_succeeded(paths: &StatePaths) -> io::Result<()> {
+    write_activation_outcome(paths, ACTIVATION_SUCCEEDED)
+}
+
+pub(crate) fn write_activation_failed(paths: &StatePaths, error: &str) -> io::Result<()> {
+    write_activation_outcome(paths, &format!("failed: {error}\n"))
+}
+
+pub(crate) fn write_activation_transfer_outcome_unknown(paths: &StatePaths) -> io::Result<()> {
+    write_activation_outcome(paths, ACTIVATION_TRANSFER_OUTCOME_UNKNOWN)
+}
+
+pub(crate) fn activation_transfer_state(paths: &StatePaths) -> io::Result<ActivationTransferState> {
+    let mode = read_delivery_mode(paths)?;
+    let outcome = match read_activation_outcome(paths)?.as_deref() {
+        None if paths.activation_attempted.exists() => {
+            ActivationTransferOutcome::ClaimedWithoutOutcome
+        }
+        None => ActivationTransferOutcome::Unclaimed,
+        Some(ACTIVATION_PENDING) => ActivationTransferOutcome::Pending,
+        Some(ACTIVATION_SUCCEEDED) => ActivationTransferOutcome::Succeeded,
+        Some(ACTIVATION_TRANSFER_OUTCOME_UNKNOWN) => {
+            ActivationTransferOutcome::TransferOutcomeUnknown
+        }
+        Some(outcome) => ActivationTransferOutcome::Failed(outcome.trim().to_string()),
+    };
+    Ok(ActivationTransferState { mode, outcome })
 }
 
 pub(crate) fn remove_activation_outcome(paths: &StatePaths) -> io::Result<()> {
