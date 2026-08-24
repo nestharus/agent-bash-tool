@@ -68,6 +68,12 @@ whether that event is active for downstream mailbox delivery:
 A synchronous adapter call can block for its result without owning the workload process. Harness
 timeout or caller death therefore does not terminate the detached workload.
 
+The bundled OpenCode adapter and `agent-bash` binary are one supported release unit. Deployment
+owners must replace installed adapter copies before activating the matching binary. Adapters that
+write the `consumed` marker directly are retired and unsupported; they are not a compatibility
+practice the spooler preserves. The owner-authorized `consume` command is the sole supported
+first-party terminal-consumption operation, so future marker changes have one migration boundary.
+
 ### Attached-required — detached invocation bombs out
 At startup the tool captures `getppid()`. The tool itself must be a real, attached subprocess
 of its caller so it can walk up the tree to find the calling agent. If it was launched

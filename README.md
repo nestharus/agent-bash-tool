@@ -43,9 +43,13 @@ completion returns synchronously in-band or asynchronously through the agent mai
   runs remain detached unless they explicitly request a lease. Direct cancel and detach require
   the handle's recorded session, attested from the live caller chain by the handle's pinned helper,
   falling back to exact caller-tree ownership only when no session was recorded; `list --all` is
-  observation, not a grant of control authority through supported interfaces. These session checks
-  are application-level safeguards within one trusted Unix account, not a sandbox against hostile
-  same-UID processes that directly rewrite spool state.
+   observation, not a grant of control authority through supported interfaces. These session checks
+   are application-level safeguards within one trusted Unix account, not a sandbox against hostile
+   same-UID processes that directly rewrite spool state.
+- **Versioned adapter boundary.** The bundled OpenCode adapter and binary form one supported release
+  unit. Deployment owners replace installed adapter copies before activating the matching binary;
+  older adapters that write spool markers directly are retired rather than supported as a
+  compatibility path.
 - **Completion: root, tree, or sentinel.** Finite jobs use an explicit process boundary;
   never-exiting servers report ready on a stdout marker. Nothing is assumed to exit.
 - **Delivery helper boundary.** Every completion invokes the handle's pinned helper operation.
