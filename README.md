@@ -47,9 +47,10 @@ completion returns synchronously in-band or asynchronously through the agent mai
    are application-level safeguards within one trusted Unix account, not a sandbox against hostile
    same-UID processes that directly rewrite spool state.
 - **Versioned adapter boundary.** The bundled OpenCode adapter and binary form one supported release
-  unit. Deployment owners replace installed adapter copies before activating the matching binary;
-  older adapters that write spool markers directly are retired rather than supported as a
-  compatibility path.
+  unit. Deployment owners stop new adapter calls, drain in-flight calls, replace all installed
+  adapter copies and the binary while calls remain quiesced, and resume only after the matching pair
+  is active. Mixed-version adapter/binary pairs are unsupported. Older adapters that write spool
+  markers directly are retired rather than supported as a compatibility path.
 - **Completion: root, tree, or sentinel.** Finite jobs use an explicit process boundary;
   never-exiting servers report ready on a stdout marker. Nothing is assumed to exit.
 - **Delivery helper boundary.** Every completion invokes the handle's pinned helper operation.

@@ -71,7 +71,10 @@ A synchronous adapter call can block for its result without owning the workload 
 timeout or caller death therefore does not terminate the detached workload.
 
 The bundled OpenCode adapter and `agent-bash` binary are one supported release unit. Deployment
-owners must replace installed adapter copies before activating the matching binary. Adapters that
+owners must use a quiesced cutover: stop new adapter calls, wait for in-flight adapter calls to
+finish, replace every installed adapter copy and the binary while calls remain stopped, and resume
+calls only after the matching pair is active. No adapter/binary overlap pair is supported, including
+the current adapter with a legacy binary or a legacy adapter with the current binary. Adapters that
 write the `consumed` marker directly are retired and unsupported; they are not a compatibility
 practice the spooler preserves. The owner-authorized `consume` command is the sole supported
 first-party terminal-consumption operation, so future marker changes have one migration boundary.
