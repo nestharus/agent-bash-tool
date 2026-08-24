@@ -39,7 +39,7 @@ const RESERVED_SPOOLER_ASSIGNMENTS = new Set([
   "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
 ])
 
-function adapterOwnsAssignment(name: string): boolean {
+function isReservedSpoolerAssignment(name: string): boolean {
   return RESERVED_SPOOLER_ASSIGNMENTS.has(name)
 }
 
@@ -372,10 +372,10 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
-// This removes only adapter-owned controls for classification and shell rewriting.
-// Actor-authored assignments and shell semantics remain; direct execution still
-// requires parseStructuredExplicitRun admission.
-function stripAdapterOwnedAssignmentsForShellRouting(command: string): ShellCommandWithoutAdapterControls {
+// Reserved spooler assignments are neutralized for classification and shell
+// rewriting. Ordinary assignments and shell semantics remain; direct execution
+// still requires parseStructuredExplicitRun admission.
+function stripReservedSpoolerAssignmentsForShellRouting(command: string): ShellCommandWithoutAdapterControls {
   const leadingWhitespace = command.match(/^\s*/)?.[0] || ""
   let body = command.slice(leadingWhitespace.length)
   let environmentPrefix = ""
@@ -384,7 +384,7 @@ function stripAdapterOwnedAssignmentsForShellRouting(command: string): ShellComm
     const matched = body.match(assignment)?.[0]
     if (!matched) break
     const name = matched.slice(0, matched.indexOf("="))
-    if (!adapterOwnsAssignment(name)) environmentPrefix += matched
+    if (!isReservedSpoolerAssignment(name)) environmentPrefix += matched
     body = body.slice(matched.length)
   }
   return { prefix: leadingWhitespace + environmentPrefix, body }
@@ -393,12 +393,12 @@ function stripAdapterOwnedAssignmentsForShellRouting(command: string): ShellComm
 // This intentionally broad recognizer only routes potentially privileged input to the
 // authoritative structured admission parser; it never authorizes direct execution itself.
 function conservativelyRecognizesExplicitRun(command: string): boolean {
-  const { body } = stripAdapterOwnedAssignmentsForShellRouting(command)
+  const { body } = stripReservedSpoolerAssignmentsForShellRouting(command)
   return [`${AGENT_BASH} run`, "agent-bash run"].some((prefix) => startsWithToken(body, prefix))
 }
 
 function isAgentDispatch(command: string): boolean {
-  const { body } = stripAdapterOwnedAssignmentsForShellRouting(command)
+  const { body } = stripReservedSpoolerAssignmentsForShellRouting(command)
   if (
     startsWithToken(body, "agents") ||
     startsWithToken(body, AGENTS) ||
@@ -413,7 +413,7 @@ function isAgentDispatch(command: string): boolean {
 }
 
 function pinAgentRunnerBinary(command: string): string {
-  const shellCommand = stripAdapterOwnedAssignmentsForShellRouting(command)
+  const shellCommand = stripReservedSpoolerAssignmentsForShellRouting(command)
   let body = shellCommand.body
   for (const token of ["agents", "oulipoly-agent-runner"]) {
     if (startsWithToken(body, token)) {
@@ -509,7 +509,7 @@ function parseStructuredExplicitRun(
     const assignment = words.shift()!
     const separator = assignment.indexOf("=")
     const name = assignment.slice(0, separator)
-    if (!adapterOwnsAssignment(name)) return undefined
+    if (!isReservedSpoolerAssignment(name)) return undefined
   }
   if ((words[0] !== AGENT_BASH && words[0] !== "agent-bash") || words[1] !== "run") return undefined
   words[0] = AGENT_BASH

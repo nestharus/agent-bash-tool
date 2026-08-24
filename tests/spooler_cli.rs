@@ -2724,7 +2724,7 @@ fn opencode_adapter_initial_dispatch_preserves_inherited_environment() {
 }
 
 #[test]
-fn opencode_adapter_rejects_command_local_registration_helper_override() {
+fn opencode_adapter_neutralizes_reserved_registration_helper_assignment() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);

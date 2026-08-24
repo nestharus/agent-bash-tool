@@ -57,9 +57,10 @@ whether that event is active for downstream mailbox delivery:
   headless turn destroys that OpenCode process. The detached workload survives and notifies the
   durable session. Synchronous handles and interactive PTY handles remain owner-leased.
 - Leading shell environment assignments are ignored when classifying the command, but a recognized
-  explicit run with a command-authored assignment is rejected. Adapter-owned assignments are
-  stripped by `stripAdapterOwnedAssignmentsForShellRouting` and restored only from adapter state,
-  while the structured parser applies the same `adapterOwnsAssignment` policy. The filtered shell
+  explicit run with an ordinary command-authored assignment is rejected. Reserved spooler-name
+  assignments are neutralized by `stripReservedSpoolerAssignmentsForShellRouting` and the structured
+  parser under the same `isReservedSpoolerAssignment` policy; effective values come only from adapter
+  state. The filtered shell
   representation retains ordinary assignments and shell semantics and carries no direct-execution
   authority; only structured explicit-run admission may enter the registration-capable launcher.
 - The adapter resolves a leading `agents` or `oulipoly-agent-runner` command to the configured
@@ -252,9 +253,9 @@ removed before workload execution. The OpenCode adapter invokes recognized expli
 from conservatively parsed arguments and rejects shell expansion around that registration-capable
 launch. One explicit-run admission result distinguishes ordinary commands, conservatively
 recognized but unsupported explicit syntax, and validated direct invocations; only the last carries
-normalized arguments to the launcher. Command-authored assignments make an explicit run unsupported,
-while one adapter-owned assignment policy removes reserved controls from both command representations
-and restores them only from adapter state. A later workload,
+normalized arguments to the launcher. Command-authored ordinary assignments make an explicit run
+unsupported, while one reserved-name policy neutralizes spooler-control assignments in both command
+representations and supplies effective values only from adapter state. A later workload,
 detach, status, supervisor, or guardian process therefore
 cannot retain the registration capability or alter interpreter lookup, the agent-runner data
 namespace, or an explicitly declared helper input through its own environment.
