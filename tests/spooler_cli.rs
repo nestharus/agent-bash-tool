@@ -3949,7 +3949,7 @@ fn successor_closes_orphaned_activation_transfer_without_replay() {
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
         .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
-        .args(["run", "--delivery", "sync", "--", "sleep", "60"])
+        .args(["run", "--delivery", "sync", "--", "sleep", "1"])
         .output()
         .expect("run");
     let json = parse_run_output(&output);
@@ -3979,6 +3979,10 @@ fn successor_closes_orphaned_activation_transfer_without_replay() {
         "transfer_outcome_unknown\n"
     );
     assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
+    wait_until(FIXTURE_DEADLINE, || {
+        let meta = read_meta(&state_dir.join("meta.json"));
+        (meta["state"] == "DONE").then_some(())
+    });
 }
 
 #[test]
