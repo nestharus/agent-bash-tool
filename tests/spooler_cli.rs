@@ -3731,7 +3731,9 @@ fn successful_registration_survives_launcher_loss_before_supervisor_startup() {
     wait_until(FIXTURE_DEADLINE, || {
         let mut entries = fs::read_dir(&state_root).ok()?;
         let state_dir = entries.next()?.ok()?.path();
-        let meta = read_meta(&state_dir.join("meta.json"));
+        let meta = fs::read(state_dir.join("meta.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())?;
         (meta["state"] == "DONE").then_some(())
     });
     assert!(workload_marker.exists(), "workload was not admitted");
