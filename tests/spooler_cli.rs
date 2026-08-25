@@ -3729,12 +3729,13 @@ fn successful_registration_survives_launcher_loss_before_supervisor_startup() {
     );
     let state_root = temp.path().join("agent-bash");
     wait_until(FIXTURE_DEADLINE, || {
-        let mut entries = fs::read_dir(&state_root).ok()?;
-        let state_dir = entries.next()?.ok()?.path();
-        let meta = fs::read(state_dir.join("meta.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())?;
-        (meta["state"] == "DONE").then_some(())
+        fs::read_dir(&state_root)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read(entry.path().join("meta.json")).ok())
+            .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .any(|meta| meta["state"] == "DONE")
+            .then_some(())
     });
     assert!(workload_marker.exists(), "workload was not admitted");
     wait_until(FIXTURE_DEADLINE, || {
