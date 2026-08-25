@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use regex::bytes::Regex;
@@ -16,6 +16,7 @@ const ONE_MIB: usize = 1024 * 1024;
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 const OWNER_POLL: Duration = Duration::from_millis(250);
+const SUPERVISOR_METADATA_WAIT: Duration = Duration::from_secs(5);
 const SUPERVISOR_RECOVERY_POLL: Duration = Duration::from_millis(100);
 const LOG_MAX_BYTES_ENV: &str = "AGENT_BASH_LOG_MAX_BYTES";
 const DEFAULT_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -30,6 +31,21 @@ pub(crate) struct SupervisorConfig {
     pub(crate) argv: Vec<String>,
     pub(crate) completion_scope: CompletionScope,
     pub(crate) ready_sentinel: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum StartupOutcome {
+    Running,
+    RegistrationOutcomeUnknown,
+}
+
+impl StartupOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::RegistrationOutcomeUnknown => "registration-outcome-unknown",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,49 +66,208 @@ pub(crate) fn validate_argv(argv: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn fork_supervisor(config: SupervisorConfig) -> io::Result<()> {
-    match unsafe { libc::fork() } {
-        -1 => Err(io::Error::last_os_error()),
-        0 => unsafe { daemonization_child(config) },
-        _ => Ok(()),
+pub(crate) fn fork_registered_supervisor(
+    config: SupervisorConfig,
+    registration: delivery::DeliveryRegistration,
+) -> io::Result<StartupOutcome> {
+    let mut sockets = [0; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            sockets.as_mut_ptr(),
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
     }
+    match unsafe { libc::fork() } {
+        -1 => {
+            let err = io::Error::last_os_error();
+            unsafe {
+                libc::close(sockets[0]);
+                libc::close(sockets[1]);
+            }
+            Err(err)
+        }
+        0 => unsafe {
+            libc::close(sockets[0]);
+            register_and_start_supervisor(sockets[1], config, registration)
+        },
+        child_pid => {
+            unsafe { libc::close(sockets[1]) };
+            receive_registration_result(sockets[0], child_pid)
+        }
+    }
+}
+
+fn receive_registration_result(
+    socket: RawFd,
+    child_pid: libc::pid_t,
+) -> io::Result<StartupOutcome> {
+    let mut result = unsafe { File::from_raw_fd(socket) };
+    let mut outcome = [0];
+    result.read_exact(&mut outcome)?;
+    if outcome[0] == 1 {
+        return Ok(StartupOutcome::Running);
+    }
+    if outcome[0] == 2 {
+        let mut status = 0;
+        let _ = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+        return Ok(StartupOutcome::RegistrationOutcomeUnknown);
+    }
+    let mut detail = String::new();
+    result.read_to_string(&mut detail)?;
+    let mut status = 0;
+    let _ = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+    Err(io::Error::other(detail))
+}
+
+unsafe fn register_and_start_supervisor(
+    result_fd: RawFd,
+    config: SupervisorConfig,
+    registration: delivery::DeliveryRegistration,
+) -> ! {
+    match delivery::register(&config.paths, &config.meta, registration) {
+        Ok(()) => {}
+        Err(delivery::RegistrationError::NotStarted(err)) => {
+            let detail = err.to_string();
+            let _ = record_pre_admission_registration_error(&config.paths, &config.meta, &detail);
+            send_registration_result(result_fd, 0, detail.as_bytes());
+            unsafe { libc::close(result_fd) };
+            unsafe { libc::_exit(EX_SOFTWARE) };
+        }
+        Err(delivery::RegistrationError::Admitted(err)) => {
+            let detail = err.to_string();
+            let _ = record_admitted_registration_unknown(&config.paths, &config.meta, &detail);
+            send_registration_result(result_fd, 2, &[]);
+            unsafe { libc::close(result_fd) };
+            unsafe { libc::_exit(EX_SOFTWARE) };
+        }
+    }
+    send_registration_result(result_fd, 1, &[]);
+    unsafe { libc::close(result_fd) };
+    unsafe { daemonization_child(config) }
+}
+
+fn send_registration_result(socket: RawFd, outcome: u8, detail: &[u8]) {
+    let mut result = Vec::with_capacity(detail.len() + 1);
+    result.push(outcome);
+    result.extend_from_slice(detail);
+    let _ = unsafe {
+        libc::send(
+            socket,
+            result.as_ptr().cast(),
+            result.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    };
+}
+
+fn record_pre_admission_registration_error(
+    paths: &StatePaths,
+    initial_meta: &Meta,
+    detail: &str,
+) -> io::Result<()> {
+    let _lock = state::lock_completion(paths)?;
+    let mut meta = state::read_meta(paths).unwrap_or_else(|_| initial_meta.clone());
+    if !state::terminal(&meta) {
+        apply_supervisor_error_metadata(
+            &mut meta,
+            format!("completion event registration failed: {detail}"),
+        );
+        state::write_rc_atomic(paths, EX_SOFTWARE)?;
+        state::write_meta_atomic(paths, &meta)?;
+    }
+    Ok(())
+}
+
+fn record_admitted_registration_unknown(
+    paths: &StatePaths,
+    initial_meta: &Meta,
+    detail: &str,
+) -> io::Result<()> {
+    let _lock = state::lock_completion(paths)?;
+    let mut meta = state::read_meta(paths).unwrap_or_else(|_| initial_meta.clone());
+    if !state::terminal(&meta) {
+        meta.state = "ERROR".to_string();
+        meta.completion_reason = Some("registration-outcome-unknown".to_string());
+        meta.rc = Some(EX_SOFTWARE);
+        meta.signal = None;
+        meta.completed_at_unix_ms = Some(state::unix_ms());
+        meta.error = Some(format!(
+            "completion event registration outcome is unknown after helper admission: {detail}"
+        ));
+        meta.touch();
+        state::write_rc_atomic(paths, EX_SOFTWARE)?;
+        state::write_meta_atomic(paths, &meta)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn request_cancel(paths: &StatePaths) -> io::Result<bool> {
     let meta = wait_for_supervisor_metadata(paths)?;
-    let supervisor = meta
-        .supervisor_pid
-        .zip(meta.supervisor_pid_starttime_ticks)
-        .zip(meta.process_boot_id.as_deref());
-    let Some(((pid, starttime_ticks), boot_id)) = supervisor else {
+    if state::terminal(&meta) {
+        return Ok(false);
+    }
+    let Some(identity) = supervisor_identity(&meta) else {
         reconcile_lost_supervisor(paths)?;
         return Ok(false);
-    };
-    let identity = state::CallerChainEntry {
-        pid,
-        starttime_ticks,
-        boot_id: boot_id.to_string(),
     };
     if !state::process_identity_is_live(&identity) {
         reconcile_lost_supervisor(paths)?;
         return Ok(false);
     }
-    let rc = unsafe { libc::kill(pid, libc::SIGUSR1) };
+    let completion_lock = state::lock_completion(paths)?;
+    let current = state::read_meta(paths)?;
+    if state::terminal(&current) {
+        return Ok(false);
+    }
+    let Some(identity) = supervisor_identity(&current) else {
+        drop(completion_lock);
+        reconcile_lost_supervisor(paths)?;
+        return Ok(false);
+    };
+    if !state::process_identity_is_live(&identity) {
+        drop(completion_lock);
+        reconcile_lost_supervisor(paths)?;
+        return Ok(false);
+    }
+    // Durability is the acceptance boundary. SIGUSR1 only wakes the supervisor;
+    // it also polls the marker so requester death cannot abandon the request.
+    state::record_explicit_cancel_acceptance(paths)?;
+    let rc = unsafe { libc::kill(identity.pid, libc::SIGUSR1) };
     if rc == 0 {
         Ok(true)
     } else {
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ESRCH) {
+            drop(completion_lock);
             reconcile_lost_supervisor(paths)?;
-            Ok(false)
+            Ok(true)
         } else {
-            Err(err)
+            // The accepted marker remains authoritative even when the wake-up
+            // signal fails; the live supervisor polls it.
+            Ok(true)
         }
     }
 }
 
+fn supervisor_identity(meta: &Meta) -> Option<state::CallerChainEntry> {
+    let ((pid, starttime_ticks), boot_id) = meta
+        .supervisor_pid
+        .zip(meta.supervisor_pid_starttime_ticks)
+        .zip(meta.process_boot_id.as_deref())?;
+    Some(state::CallerChainEntry {
+        pid,
+        starttime_ticks,
+        boot_id: boot_id.to_string(),
+    })
+}
+
 fn wait_for_supervisor_metadata(paths: &StatePaths) -> io::Result<Meta> {
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + SUPERVISOR_METADATA_WAIT;
     loop {
         let meta = state::read_meta(paths)?;
         if meta.supervisor_pid.is_some() || state::terminal(&meta) || Instant::now() >= deadline {
@@ -107,9 +282,31 @@ unsafe fn daemonization_child(config: SupervisorConfig) -> ! {
     if unsafe { libc::setsid() } < 0 {
         unsafe { libc::_exit(EX_SOFTWARE) };
     }
+    if let Err(err) = set_subreaper() {
+        let mut meta = config.meta.clone();
+        let _ = record_supervisor_error(
+            &config.paths,
+            &mut meta,
+            subreaper_failed_message(err),
+            None,
+        );
+        unsafe { libc::_exit(EX_SOFTWARE) };
+    }
     let guardian_paths = config.paths.clone();
     match unsafe { libc::fork() } {
-        -1 => unsafe { libc::_exit(EX_SOFTWARE) },
+        -1 => {
+            let mut meta = config.meta.clone();
+            let _ = record_supervisor_error(
+                &config.paths,
+                &mut meta,
+                format!(
+                    "agent-bash: supervisor fork failed: {}",
+                    io::Error::last_os_error()
+                ),
+                None,
+            );
+            unsafe { libc::_exit(EX_SOFTWARE) };
+        }
         0 => {
             let code = run_supervisor(config);
             unsafe { libc::_exit(code) };
@@ -130,13 +327,50 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
         return 0;
     }
 
+    let mut recovered_cancel_escalation = None;
     loop {
-        match reconcile_lost_supervisor(paths) {
+        let accepted_cancel = match explicit_cancel_accepted(paths) {
+            Ok(accepted) => accepted,
+            Err(_) => {
+                std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                continue;
+            }
+        };
+        if accepted_cancel {
+            let escalation = recovered_cancel_escalation
+                .get_or_insert_with(CancellationEscalation::begin_guardian_takeover);
+            signal_descendants(current_pid(), escalation.signal());
+        }
+        let adopted_tree_empty = reap_adopted_children();
+        if accepted_cancel && !adopted_tree_empty {
+            std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+            continue;
+        }
+        match reconcile_lost_supervisor_after_guardian(paths, accepted_cancel && adopted_tree_empty)
+        {
             Ok(meta) if state::terminal(&meta) => return 0,
             Ok(meta) if !state::running_exit_mode(&meta) => return 0,
             Ok(_) => std::thread::sleep(SUPERVISOR_RECOVERY_POLL),
             Err(_) => return EX_SOFTWARE,
         }
+    }
+}
+
+fn reap_adopted_children() -> bool {
+    loop {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if waited > 0 {
+            continue;
+        }
+        if waited == 0 {
+            return false;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return err.raw_os_error() == Some(libc::ECHILD);
     }
 }
 
@@ -207,6 +441,7 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
             return EX_SOFTWARE;
         }
     };
+    persist_supervisor_meta_best_effort(&config.paths, &meta);
 
     let cgroup_setup = cgroup::setup(&meta.handle);
     apply_cgroup_setup_meta(&mut meta, cgroup_setup.meta.clone());
@@ -697,6 +932,8 @@ fn argv_pointers(c_argv: &[CString]) -> Vec<*const libc::c_char> {
 
 fn exec_workload(pointers: &[*const libc::c_char]) {
     unsafe {
+        libc::unsetenv(c"OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY".as_ptr());
+        libc::unsetenv(c"AGENT_BASH_AGENT_RUNNER_BIN".as_ptr());
         libc::execvp(pointers[0], pointers.as_ptr());
     }
 }
@@ -854,6 +1091,12 @@ struct RootStatus {
     signal: Option<i32>,
 }
 
+#[derive(Clone, Copy)]
+struct TerminalStatus {
+    rc: i32,
+    signal: Option<i32>,
+}
+
 struct SentinelMatcher {
     regex: Regex,
     buffer: Vec<u8>,
@@ -913,8 +1156,102 @@ struct EventLoop {
 }
 
 struct Cancellation {
-    reason: &'static str,
+    provisional_cause: CancellationCause,
+    escalation: CancellationEscalation,
+}
+
+struct CancellationEscalation {
     started_at: Instant,
+}
+
+impl CancellationEscalation {
+    fn begin_live_acceptance() -> Self {
+        Self {
+            started_at: Instant::now(),
+        }
+    }
+
+    fn begin_guardian_takeover() -> Self {
+        // The durable marker has no acceptance timestamp. A fresh grace period lets the
+        // newly responsible guardian deliver SIGTERM before it may escalate.
+        Self {
+            started_at: Instant::now(),
+        }
+    }
+
+    fn signal(&self) -> libc::c_int {
+        if self.started_at.elapsed() >= CANCEL_GRACE {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancellationCause {
+    OwnerExit,
+    ExplicitRequest,
+}
+
+impl CancellationCause {
+    fn with_precedence_over(self, other: Self) -> Self {
+        if matches!(self, Self::ExplicitRequest) || matches!(other, Self::ExplicitRequest) {
+            Self::ExplicitRequest
+        } else {
+            Self::OwnerExit
+        }
+    }
+
+    fn with_observed_explicit_cancel(self, explicit_cancel_accepted: bool) -> Self {
+        if explicit_cancel_accepted {
+            self.with_precedence_over(Self::ExplicitRequest)
+        } else {
+            self
+        }
+    }
+
+    pub(crate) fn from_completion_reason(reason: &str) -> Option<Self> {
+        match reason {
+            "cancel-request" => Some(Self::ExplicitRequest),
+            "owner-exit" => Some(Self::OwnerExit),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn completion_reason(self) -> &'static str {
+        match self {
+            Self::ExplicitRequest => "cancel-request",
+            Self::OwnerExit => "owner-exit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitCompletionReason {
+    Exit,
+    ExitBeforeReady,
+    Cancellation(CancellationCause),
+}
+
+impl ExitCompletionReason {
+    fn completion_reason(self) -> &'static str {
+        match self {
+            Self::Exit => "exit",
+            Self::ExitBeforeReady => "exit-before-ready",
+            Self::Cancellation(cause) => cause.completion_reason(),
+        }
+    }
+
+    fn terminal_status(self, root_status: RootStatus) -> TerminalStatus {
+        match self {
+            Self::Cancellation(_) => cancellation_terminal_status(),
+            Self::Exit | Self::ExitBeforeReady => TerminalStatus {
+                rc: root_status.rc,
+                signal: root_status.signal,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -936,6 +1273,7 @@ struct PollEntry {
 
 fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
     loop {
+        loop_state.check_explicit_cancel();
         loop_state.check_polled_owner();
         loop_state.drive_cancellation();
         loop_state.maybe_finish()?;
@@ -955,13 +1293,13 @@ fn poll_entries(loop_state: &EventLoop) -> Vec<PollEntry> {
     push_optional_poll_entry(&mut entries, loop_state.stdout_fd, PollKey::Stdout);
     push_optional_poll_entry(&mut entries, loop_state.stderr_fd, PollKey::Stderr);
     push_optional_poll_entry(&mut entries, loop_state.exec_err_fd, PollKey::ExecErr);
+    push_optional_poll_entry(&mut entries, loop_state.owner_pidfd, PollKey::OwnerPidfd);
     entries.push(poll_entry(
         loop_state.sigchld.fd,
         libc::POLLIN,
         PollKey::Sigchld,
     ));
     push_optional_poll_entry(&mut entries, loop_state.root_pidfd, PollKey::Pidfd);
-    push_optional_poll_entry(&mut entries, loop_state.owner_pidfd, PollKey::OwnerPidfd);
     push_optional_poll_entry(&mut entries, cgroup_inotify_fd(loop_state), PollKey::Cgroup);
     entries
 }
@@ -1048,7 +1386,7 @@ impl EventLoop {
             PollKey::Pidfd => self.reap_children(),
             PollKey::OwnerPidfd => {
                 self.close_owner_pidfd();
-                self.request_cancellation("owner-exit");
+                self.request_cancellation(CancellationCause::OwnerExit);
                 Ok(())
             }
             PollKey::Cgroup => {
@@ -1061,7 +1399,7 @@ impl EventLoop {
     fn handle_sigchld(&mut self) -> io::Result<()> {
         let signals = self.sigchld.drain();
         if signals.cancel_requested {
-            self.request_cancellation("cancel-request");
+            self.check_explicit_cancel();
         }
         self.reap_children()
     }
@@ -1072,7 +1410,15 @@ impl EventLoop {
         } else if self.meta.cancel_owner.is_some() && self.owner_pidfd.is_none() {
             Some(OWNER_POLL)
         } else {
-            None
+            // The accepted marker is the durable cancellation handoff. Polling
+            // covers requester death before its best-effort wake-up signal.
+            Some(OWNER_POLL)
+        }
+    }
+
+    fn check_explicit_cancel(&mut self) {
+        if matches!(explicit_cancel_accepted(&self.paths), Ok(true)) {
+            self.request_cancellation(CancellationCause::ExplicitRequest);
         }
     }
 
@@ -1084,7 +1430,7 @@ impl EventLoop {
             return;
         };
         if !state::process_identity_is_live(owner) {
-            self.request_cancellation("owner-exit");
+            self.request_cancellation(CancellationCause::OwnerExit);
         }
     }
 
@@ -1094,12 +1440,23 @@ impl EventLoop {
         }
     }
 
-    fn request_cancellation(&mut self, reason: &'static str) {
-        if self.cancellation.is_none() {
-            self.cancellation = Some(Cancellation {
-                reason,
-                started_at: Instant::now(),
-            });
+    fn request_cancellation(&mut self, proposed_cause: CancellationCause) {
+        let proposed_cause = proposed_cause.with_observed_explicit_cancel(matches!(
+            explicit_cancel_accepted(&self.paths),
+            Ok(true)
+        ));
+        match self.cancellation.as_mut() {
+            Some(cancellation) => {
+                cancellation.provisional_cause = cancellation
+                    .provisional_cause
+                    .with_precedence_over(proposed_cause);
+            }
+            None => {
+                self.cancellation = Some(Cancellation {
+                    provisional_cause: proposed_cause,
+                    escalation: CancellationEscalation::begin_live_acceptance(),
+                });
+            }
         }
         self.drive_cancellation();
     }
@@ -1108,12 +1465,13 @@ impl EventLoop {
         let Some(cancellation) = self.cancellation.as_mut() else {
             return;
         };
-        let signal = if cancellation.started_at.elapsed() >= CANCEL_GRACE {
-            libc::SIGKILL
-        } else {
-            libc::SIGTERM
-        };
-        signal_descendants(current_pid(), signal);
+        cancellation.provisional_cause = cancellation
+            .provisional_cause
+            .with_observed_explicit_cancel(matches!(
+                explicit_cancel_accepted(&self.paths),
+                Ok(true)
+            ));
+        signal_descendants(current_pid(), cancellation.escalation.signal());
     }
 
     fn handle_cgroup_event(&self) {
@@ -1255,7 +1613,15 @@ impl EventLoop {
         let root_status = status_to_root_status(status);
         self.root_status = Some(root_status);
         apply_root_status_metadata(&mut self.meta, root_status);
-        state::write_meta_atomic(&self.paths, &self.meta)?;
+        if self.completion_recorded {
+            let _delivery_lock = state::lock_delivery(&self.paths)?;
+            let mut persisted = state::read_meta(&self.paths)?;
+            apply_root_status_metadata(&mut persisted, root_status);
+            state::write_meta_atomic(&self.paths, &persisted)?;
+            self.meta = persisted;
+        } else {
+            state::write_meta_atomic(&self.paths, &self.meta)?;
+        }
         self.close_root_pidfd();
         Ok(())
     }
@@ -1278,25 +1644,6 @@ impl EventLoop {
         }
     }
 
-    fn apply_ready_sentinel_metadata(&mut self, now: u64) {
-        apply_ready_sentinel_metadata(&mut self.meta, now);
-    }
-
-    fn apply_exit_completion_metadata(&mut self, root_status: RootStatus, reason: &str) {
-        apply_exit_completion_metadata(&mut self.meta, root_status, reason);
-    }
-
-    fn apply_supervisor_error_metadata(&mut self, message: String) {
-        apply_supervisor_error_metadata(&mut self.meta, message);
-    }
-
-    fn persist_completion_and_delivery(&mut self) -> io::Result<()> {
-        state::write_meta_atomic(&self.paths, &self.meta)?;
-        delivery::complete(&self.paths, &mut self.meta)?;
-        self.completion_recorded = true;
-        Ok(())
-    }
-
     fn output_closed(&self) -> bool {
         self.stdout_fd.is_none() && self.stderr_fd.is_none() && self.exec_err_fd.is_none()
     }
@@ -1309,25 +1656,50 @@ impl EventLoop {
     }
 
     fn record_ready_sentinel(&mut self) -> io::Result<()> {
-        let now = state::unix_ms();
-        self.log.sync_all()?;
-        state::write_rc_atomic(&self.paths, 0)?;
-        self.apply_ready_sentinel_metadata(now);
-        self.persist_completion_and_delivery()
+        match publish_terminal_with_delivery_disposition(
+            &self.paths,
+            &mut self.meta,
+            Some(&mut self.log),
+            TerminalProposal::ReadySentinel(state::unix_ms()),
+            CompletionDeliveryDisposition::ClaimPending,
+        )? {
+            TerminalPublishResult::Published => self.completion_recorded = true,
+            TerminalPublishResult::DeferredForAcceptedCancel => {
+                self.request_cancellation(CancellationCause::ExplicitRequest);
+            }
+        }
+        Ok(())
     }
 
-    fn record_exit_completion(&mut self, root_status: RootStatus, reason: &str) -> io::Result<()> {
-        self.log.sync_all()?;
-        state::write_rc_atomic(&self.paths, root_status.rc)?;
-        self.apply_exit_completion_metadata(root_status, reason);
-        self.persist_completion_and_delivery()
+    fn record_exit_completion(
+        &mut self,
+        root_status: RootStatus,
+        reason: ExitCompletionReason,
+    ) -> io::Result<()> {
+        publish_terminal_with_delivery_disposition(
+            &self.paths,
+            &mut self.meta,
+            Some(&mut self.log),
+            TerminalProposal::Exit {
+                root_status,
+                reason,
+            },
+            CompletionDeliveryDisposition::ClaimPending,
+        )?;
+        self.completion_recorded = true;
+        Ok(())
     }
 
     fn record_supervisor_error_in_loop(&mut self, message: String) -> io::Result<()> {
-        self.log.sync_all()?;
-        state::write_rc_atomic(&self.paths, EX_SOFTWARE)?;
-        self.apply_supervisor_error_metadata(message);
-        self.persist_completion_and_delivery()
+        publish_terminal_with_delivery_disposition(
+            &self.paths,
+            &mut self.meta,
+            Some(&mut self.log),
+            TerminalProposal::SupervisorError(message),
+            CompletionDeliveryDisposition::ClaimPending,
+        )?;
+        self.completion_recorded = true;
+        Ok(())
     }
 }
 
@@ -1395,7 +1767,7 @@ enum FinishDecision {
     SpawnError(String),
     Exit {
         root_status: RootStatus,
-        reason: &'static str,
+        reason: ExitCompletionReason,
     },
 }
 
@@ -1443,13 +1815,13 @@ impl CompletionScope {
     }
 }
 
-fn exit_completion_reason(loop_state: &EventLoop) -> &'static str {
+fn exit_completion_reason(loop_state: &EventLoop) -> ExitCompletionReason {
     if let Some(cancellation) = &loop_state.cancellation {
-        cancellation.reason
+        ExitCompletionReason::Cancellation(cancellation.provisional_cause)
     } else if loop_state.sentinel.is_some() {
-        "exit-before-ready"
+        ExitCompletionReason::ExitBeforeReady
     } else {
-        "exit"
+        ExitCompletionReason::Exit
     }
 }
 
@@ -1469,13 +1841,20 @@ fn apply_ready_sentinel_metadata(meta: &mut Meta, now: u64) {
     meta.touch();
 }
 
-fn apply_exit_completion_metadata(meta: &mut Meta, root_status: RootStatus, reason: &str) {
+fn apply_terminal_metadata(meta: &mut Meta, status: TerminalStatus, reason: &str) {
     meta.state = "DONE".to_string();
     meta.completion_reason = Some(reason.to_string());
-    meta.rc = Some(root_status.rc);
-    meta.signal = root_status.signal;
+    meta.rc = Some(status.rc);
+    meta.signal = status.signal;
     meta.completed_at_unix_ms = Some(state::unix_ms());
     meta.touch();
+}
+
+fn cancellation_terminal_status() -> TerminalStatus {
+    TerminalStatus {
+        rc: signal_to_shell_rc(libc::SIGTERM),
+        signal: Some(libc::SIGTERM),
+    }
 }
 
 fn apply_supervisor_error_metadata(meta: &mut Meta, message: String) {
@@ -1485,6 +1864,15 @@ fn apply_supervisor_error_metadata(meta: &mut Meta, message: String) {
     meta.error = Some(message);
     meta.completed_at_unix_ms = Some(state::unix_ms());
     meta.touch();
+}
+
+fn apply_cancellation_metadata(meta: &mut Meta, cause: CancellationCause) {
+    apply_terminal_metadata(
+        meta,
+        cancellation_terminal_status(),
+        cause.completion_reason(),
+    );
+    meta.error = None;
 }
 
 fn status_to_root_status(status: i32) -> RootStatus {
@@ -1517,10 +1905,14 @@ fn record_supervisor_error(
     message: String,
     log: Option<&mut BoundedLog>,
 ) -> io::Result<()> {
-    sync_optional_log(log)?;
-    state::write_rc_atomic(paths, EX_SOFTWARE)?;
-    apply_supervisor_error_metadata(meta, message);
-    persist_meta_with_delivery(paths, meta)
+    publish_terminal_with_delivery_disposition(
+        paths,
+        meta,
+        log,
+        TerminalProposal::SupervisorError(message),
+        CompletionDeliveryDisposition::ClaimPending,
+    )?;
+    Ok(())
 }
 
 fn sync_optional_log(log: Option<&mut BoundedLog>) -> io::Result<()> {
@@ -1530,39 +1922,63 @@ fn sync_optional_log(log: Option<&mut BoundedLog>) -> io::Result<()> {
     log.sync_all()
 }
 
-fn persist_meta_with_delivery(paths: &StatePaths, meta: &mut Meta) -> io::Result<()> {
-    state::write_meta_atomic(paths, meta)?;
-    delivery::complete(paths, meta)
-}
-
 pub(crate) fn reconcile_lost_supervisor(paths: &StatePaths) -> io::Result<Meta> {
-    reconcile_lost_supervisor_with_delivery(paths, true)
+    reconcile_lost_supervisor_with_delivery(
+        paths,
+        CompletionDeliveryDisposition::ClaimPending,
+        false,
+    )
 }
 
-pub(crate) fn reconcile_lost_supervisor_without_delivery(paths: &StatePaths) -> io::Result<Meta> {
-    reconcile_lost_supervisor_with_delivery(paths, false)
+pub(crate) fn reconcile_lost_supervisor_for_list(paths: &StatePaths) -> io::Result<Meta> {
+    reconcile_lost_supervisor_with_delivery(
+        paths,
+        CompletionDeliveryDisposition::LeavePending,
+        false,
+    )
 }
 
-fn reconcile_lost_supervisor_with_delivery(paths: &StatePaths, deliver: bool) -> io::Result<Meta> {
+fn reconcile_lost_supervisor_after_guardian(
+    paths: &StatePaths,
+    accepted_cancel_tree_empty: bool,
+) -> io::Result<Meta> {
+    reconcile_lost_supervisor_with_delivery(
+        paths,
+        CompletionDeliveryDisposition::ClaimPending,
+        accepted_cancel_tree_empty,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompletionDeliveryDisposition {
+    ClaimPending,
+    LeavePending,
+}
+
+fn reconcile_lost_supervisor_with_delivery(
+    paths: &StatePaths,
+    delivery_disposition: CompletionDeliveryDisposition,
+    accepted_cancel_tree_empty: bool,
+) -> io::Result<Meta> {
     let _lock = state::lock_reconciliation(paths)?;
     let mut meta = state::read_meta(paths)?;
     if state::terminal(&meta) {
-        if deliver {
-            delivery::complete(paths, &mut meta)?;
+        if delivery_disposition == CompletionDeliveryDisposition::ClaimPending {
+            delivery::reconcile_completion_delivery(paths, &mut meta)?;
         }
         return Ok(meta);
     }
-    if !state::exact_supervisor_and_workload_are_gone(&meta) {
+    let guardian_settled_cancel = accepted_cancel_tree_empty && explicit_cancel_accepted(paths)?;
+    if !guardian_settled_cancel && !state::exact_supervisor_and_workload_are_gone(&meta) {
         return Ok(meta);
     }
-
-    state::write_rc_atomic(paths, EX_SOFTWARE)?;
-    apply_lost_supervisor_metadata(&mut meta);
-    if deliver {
-        persist_meta_with_delivery(paths, &mut meta)?;
-    } else {
-        state::write_meta_atomic(paths, &meta)?;
-    }
+    publish_terminal_with_delivery_disposition(
+        paths,
+        &mut meta,
+        None,
+        TerminalProposal::SupervisorLost,
+        delivery_disposition,
+    )?;
     Ok(meta)
 }
 
@@ -1574,6 +1990,97 @@ fn apply_lost_supervisor_metadata(meta: &mut Meta) {
     meta.completed_at_unix_ms = Some(state::unix_ms());
     meta.error = Some("supervisor and workload process identities are gone".to_string());
     meta.touch();
+}
+
+enum TerminalProposal {
+    ReadySentinel(u64),
+    Exit {
+        root_status: RootStatus,
+        reason: ExitCompletionReason,
+    },
+    Cancellation(CancellationCause),
+    SupervisorError(String),
+    SupervisorLost,
+}
+
+enum FinalizedTerminalProposal {
+    Publish(TerminalProposal),
+    DeferredForAcceptedCancel,
+}
+
+fn finalize_terminal_proposal(
+    proposal: TerminalProposal,
+    explicit_cancel_accepted: bool,
+) -> FinalizedTerminalProposal {
+    if !explicit_cancel_accepted {
+        return FinalizedTerminalProposal::Publish(proposal);
+    }
+    if matches!(proposal, TerminalProposal::ReadySentinel(_)) {
+        FinalizedTerminalProposal::DeferredForAcceptedCancel
+    } else {
+        FinalizedTerminalProposal::Publish(TerminalProposal::Cancellation(
+            CancellationCause::ExplicitRequest,
+        ))
+    }
+}
+
+enum TerminalPublishResult {
+    Published,
+    DeferredForAcceptedCancel,
+}
+
+fn publish_terminal_with_delivery_disposition(
+    paths: &StatePaths,
+    meta: &mut Meta,
+    log: Option<&mut BoundedLog>,
+    proposal: TerminalProposal,
+    delivery_disposition: CompletionDeliveryDisposition,
+) -> io::Result<TerminalPublishResult> {
+    let completion_lock = state::lock_completion(paths)?;
+    let current = state::read_meta(paths)?;
+    if state::terminal(&current) {
+        *meta = current;
+        drop(completion_lock);
+        if delivery_disposition == CompletionDeliveryDisposition::ClaimPending {
+            delivery::reconcile_completion_delivery(paths, meta)?;
+        }
+        return Ok(TerminalPublishResult::Published);
+    }
+    meta.delivery = current.delivery;
+    let proposal = match finalize_terminal_proposal(proposal, explicit_cancel_accepted(paths)?) {
+        FinalizedTerminalProposal::Publish(proposal) => proposal,
+        FinalizedTerminalProposal::DeferredForAcceptedCancel => {
+            drop(completion_lock);
+            return Ok(TerminalPublishResult::DeferredForAcceptedCancel);
+        }
+    };
+    sync_optional_log(log)?;
+    match proposal {
+        TerminalProposal::ReadySentinel(now) => apply_ready_sentinel_metadata(meta, now),
+        TerminalProposal::Exit {
+            root_status,
+            reason,
+        } => {
+            let terminal_status = reason.terminal_status(root_status);
+            apply_terminal_metadata(meta, terminal_status, reason.completion_reason());
+        }
+        TerminalProposal::Cancellation(cause) => apply_cancellation_metadata(meta, cause),
+        TerminalProposal::SupervisorError(message) => {
+            apply_supervisor_error_metadata(meta, message);
+        }
+        TerminalProposal::SupervisorLost => apply_lost_supervisor_metadata(meta),
+    }
+    state::write_rc_atomic(paths, meta.rc.unwrap_or(EX_SOFTWARE))?;
+    state::write_meta_atomic(paths, meta)?;
+    drop(completion_lock);
+    if delivery_disposition == CompletionDeliveryDisposition::ClaimPending {
+        delivery::reconcile_completion_delivery(paths, meta)?;
+    }
+    Ok(TerminalPublishResult::Published)
+}
+
+fn explicit_cancel_accepted(paths: &StatePaths) -> io::Result<bool> {
+    state::durable_marker_exists(&paths.accepted_cancel)
 }
 
 impl Drop for EventLoop {
@@ -1596,7 +2103,91 @@ impl Drop for EventLoop {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::symlink;
+
     use super::*;
+
+    #[test]
+    fn explicit_cancellation_has_one_precedence_and_persistence_policy() {
+        let cause =
+            CancellationCause::OwnerExit.with_precedence_over(CancellationCause::ExplicitRequest);
+        assert_eq!(cause, CancellationCause::ExplicitRequest);
+        assert_eq!(cause.completion_reason(), "cancel-request");
+        assert_eq!(
+            CancellationCause::from_completion_reason(cause.completion_reason()),
+            Some(cause)
+        );
+        assert_eq!(
+            CancellationCause::OwnerExit.with_observed_explicit_cancel(false),
+            CancellationCause::OwnerExit
+        );
+        assert_eq!(
+            CancellationCause::OwnerExit.with_observed_explicit_cancel(true),
+            CancellationCause::ExplicitRequest
+        );
+    }
+
+    #[test]
+    fn terminal_finalization_resolves_the_durable_cancel_marker() {
+        let finalized = finalize_terminal_proposal(TerminalProposal::SupervisorLost, true);
+        assert!(matches!(
+            finalized,
+            FinalizedTerminalProposal::Publish(TerminalProposal::Cancellation(
+                CancellationCause::ExplicitRequest
+            ))
+        ));
+        assert!(matches!(
+            finalize_terminal_proposal(TerminalProposal::ReadySentinel(1), true),
+            FinalizedTerminalProposal::DeferredForAcceptedCancel
+        ));
+    }
+
+    #[test]
+    fn cancel_marker_lookup_failure_blocks_competing_terminal_publication() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let handle = "ab_cancel_observation_error".to_string();
+        let paths = StatePaths::new(temp.path().join("agent-bash"), handle.clone());
+        state::create_handle_state(&paths).expect("create state");
+        state::create_log(&paths).expect("create log");
+        state::write_delivery_mode_atomic(&paths, state::DeliveryMode::Sync)
+            .expect("write delivery mode");
+        let mut meta = Meta::new(
+            handle,
+            unsafe { libc::getpid() },
+            unsafe { libc::getpid() },
+            vec!["true".to_string()],
+            std::path::PathBuf::from("/tmp"),
+            "exit",
+            state::DeliveryMode::Sync,
+            None,
+            Vec::new(),
+            None,
+        );
+        state::write_meta_atomic(&paths, &meta).expect("write running meta");
+        state::record_explicit_cancel_acceptance(&paths).expect("accept cancellation");
+        std::fs::rename(
+            &paths.accepted_cancel,
+            paths.state_dir.join("retained-cancel-requested"),
+        )
+        .expect("retain cancellation marker");
+        symlink(&paths.accepted_cancel, &paths.accepted_cancel)
+            .expect("make cancellation lookup fail");
+
+        assert!(
+            publish_terminal_with_delivery_disposition(
+                &paths,
+                &mut meta,
+                None,
+                TerminalProposal::SupervisorLost,
+                CompletionDeliveryDisposition::LeavePending,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            state::read_meta(&paths).expect("read meta").state,
+            "RUNNING"
+        );
+    }
 
     #[test]
     fn sentinel_matches_stdout_only() {
@@ -1613,6 +2204,54 @@ mod tests {
     #[test]
     fn signal_to_shell_rc_maps_signal() {
         assert_eq!(signal_to_shell_rc(15), 143);
+    }
+
+    #[test]
+    fn guardian_settles_accepted_startup_cancel_without_workload_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let handle = "ab_guardian_startup_cancel".to_string();
+        let paths = StatePaths::new(temp.path().join("agent-bash"), handle.clone());
+        state::create_handle_state(&paths).expect("create state");
+        state::create_log(&paths).expect("create log");
+        state::write_delivery_mode_atomic(&paths, state::DeliveryMode::Sync)
+            .expect("write delivery mode");
+        let mut supervisor = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn supervisor identity");
+        let supervisor_pid = supervisor.id() as libc::pid_t;
+        let supervisor_starttime =
+            state::process_starttime_ticks(supervisor_pid).expect("supervisor start time");
+        let mut meta = Meta::new(
+            handle,
+            unsafe { libc::getpid() },
+            unsafe { libc::getpid() },
+            vec!["true".to_string()],
+            std::path::PathBuf::from("/tmp"),
+            "exit",
+            state::DeliveryMode::Sync,
+            None,
+            Vec::new(),
+            None,
+        );
+        meta.supervisor_pid = Some(supervisor_pid);
+        meta.supervisor_pid_starttime_ticks = Some(supervisor_starttime);
+        meta.process_boot_id = Some(state::current_boot_id());
+        state::write_meta_atomic(&paths, &meta).expect("write running meta");
+        state::record_explicit_cancel_acceptance(&paths).expect("accept cancel");
+        supervisor.kill().expect("kill supervisor identity");
+        supervisor.wait().expect("reap supervisor identity");
+
+        let terminal = reconcile_lost_supervisor_after_guardian(&paths, true)
+            .expect("guardian reconciliation");
+
+        assert_eq!(terminal.state, "DONE");
+        assert_eq!(
+            terminal.completion_reason.as_deref(),
+            Some("cancel-request")
+        );
+        assert_eq!(terminal.rc, Some(143));
+        assert!(state::terminal(&terminal));
     }
 
     #[test]

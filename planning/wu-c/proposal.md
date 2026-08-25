@@ -1,6 +1,8 @@
 # WU-C Spooler Core Proposal
 
-This proposal implements the WU-C behavior described in `docs/DESIGN.md` without adding agent-specific logic. `agent-bash` is a Linux-first, always-background spooler: it accepts an attached invocation from an agent harness, returns a handle immediately, supervises the workload out of band, captures output and process-tree state, and exposes non-blocking status. Delivery to agent-runner is specified as a CLI seam only; the spooler must not depend on agent-runner crates.
+Status: **frozen historical proposal; superseded for current behavior**. This document is retained for WU-C decision lineage and must not be used as the current behavioral or proof contract. Current authority is `docs/DESIGN.md`, `planning/wu-c/contracts/wu-c-spooler.contract.md`, and the implemented source and tests; those surfaces replace this proposal's ambient-helper and read-only-status practices.
+
+This proposal originally described the WU-C behavior without adding agent-specific logic. `agent-bash` is a Linux-first, always-background spooler: it accepts an attached invocation from an agent harness, returns a handle immediately, supervises the workload out of band, captures output and process-tree state, and exposes non-blocking status. Delivery to agent-runner was specified as a CLI seam only; the spooler did not depend on agent-runner crates.
 
 ## Scope
 

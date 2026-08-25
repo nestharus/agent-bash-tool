@@ -21,6 +21,7 @@ const EX_NOINPUT: i32 = 66;
 const EX_SOFTWARE: i32 = 70;
 const EX_CANTCREAT: i32 = 73;
 const EX_IOERR: i32 = 74;
+const EX_NOPERM: i32 = 77;
 const OWNER_SESSION_ID_ENV: &str = "AGENT_BASH_OWNER_SESSION_ID";
 const OWNER_INVOCATION_UUID_ENV: &str = "AGENT_BASH_OWNER_INVOCATION_UUID";
 const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
@@ -28,6 +29,10 @@ const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
 struct OwnerContext {
     session_id: Option<String>,
     invocation_uuid: Option<String>,
+}
+
+struct ControlRouteCaller {
+    caller_chain: Vec<CallerChainEntry>,
 }
 
 #[derive(Parser)]
@@ -69,9 +74,11 @@ enum Command {
     Detach { handle: String },
     /// Cancel a supervised workload and all of its adopted descendants.
     Cancel { handle: String },
+    /// Record that the owning in-call consumer received a terminal result.
+    Consume { handle: String },
     /// Print the current completion delivery mode for a handle.
     Mode { handle: String },
-    /// Non-blocking status of a spooled job: RUNNING, or DONE rc=<n> + captured output.
+    /// Status of a spooled job. Owner calls may reconcile terminal state and delivery first.
     Status {
         /// Print this many trailing log bytes. Defaults to 65536.
         #[arg(long, conflicts_with = "full")]
@@ -79,6 +86,9 @@ enum Command {
         /// Print the whole captured log.
         #[arg(long)]
         full: bool,
+        /// Observe current state without owner-triggered reconciliation or delivery progression.
+        #[arg(long)]
+        observe_only: bool,
         handle: String,
     },
     /// List spooled jobs owned by the calling agent's process tree.
@@ -167,20 +177,23 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
             owner_pid,
             argv,
         ),
-        Command::Detach { handle } => detach_command(handle),
-        Command::Cancel { handle } => cancel_command(handle),
-        Command::Mode { handle } => mode_command(handle),
+        Command::Detach { handle } => detach_command(handle, control_route_caller(&guard)),
+        Command::Cancel { handle } => cancel_command(handle, control_route_caller(&guard)),
+        Command::Consume { handle } => consume_command(handle, control_route_caller(&guard)),
+        Command::Mode { handle } => mode_command(handle, control_route_caller(&guard)),
         Command::Status {
             tail_bytes,
             full,
+            observe_only,
             handle,
-        } => status_command(handle, tail_bytes.unwrap_or(65_536), full),
-        Command::List { all, json } => list_command(
-            guard.startup_ppid(),
-            nonempty_env(OWNER_SESSION_ID_ENV),
-            all,
-            json,
+        } => status_command(
+            handle,
+            tail_bytes.unwrap_or(65_536),
+            full,
+            observe_only,
+            control_route_caller(&guard),
         ),
+        Command::List { all, json } => list_command(control_route_caller(&guard), all, json),
     }
 }
 
@@ -214,7 +227,17 @@ fn run_command(
     let cancel_owner = resolve_cancel_owner(&caller_chain, cancel_on_owner_exit, owner_pid)?;
     let cwd = current_directory().map_err(current_directory_error)?;
     let mode = run_mode(&ready_sentinel);
-    let owner = owner_context(&caller_chain)?;
+    let registration_candidate =
+        delivery::prepare_registration().map_err(completion_event_registration_error)?;
+    let owner = owner_context(&caller_chain, &registration_candidate)?;
+    create_run_state(&paths)?;
+    let registration = match registration_candidate.bind_to_handle(&paths) {
+        Ok(registration) => registration,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&paths.state_dir);
+            return Err(completion_event_registration_error(err));
+        }
+    };
     let meta = Meta::new(
         handle,
         guard.startup_ppid(),
@@ -227,16 +250,14 @@ fn run_command(
         caller_chain,
         cancel_owner,
     )
-    .with_owner_context(owner.session_id, owner.invocation_uuid);
-    create_run_state(&paths)?;
+    .with_owner_context(owner.session_id, owner.invocation_uuid)
+    .with_delivery_helper(registration.provenance());
     persist_delivery_mode(&paths, delivery_mode)?;
     persist_initial_meta(&paths, &meta)?;
-    if let Err(err) = delivery::register(&paths, &meta) {
+    if let Err(err) = validate_guard(&guard) {
         let _ = fs::remove_dir_all(&paths.state_dir);
-        return Err(completion_event_registration_error(err));
+        return Err(err);
     }
-
-    validate_guard(&guard)?;
     let config = supervisor_config(
         paths.clone(),
         meta.clone(),
@@ -244,9 +265,22 @@ fn run_command(
         completion_scope,
         ready_sentinel.clone(),
     );
-    supervisor::fork_supervisor(config).map_err(supervisor_bootstrap_error)?;
+    let startup_outcome = match supervisor::fork_registered_supervisor(config, registration) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&paths.state_dir);
+            return Err(completion_event_registration_error(err));
+        }
+    };
 
-    let output = run_output(paths, meta.caller_ppid, mode, delivery_mode, ready_sentinel);
+    let output = run_output(
+        paths,
+        meta.caller_ppid,
+        mode,
+        delivery_mode,
+        ready_sentinel,
+        startup_outcome,
+    );
     emit_run_output(&output)?;
     Ok(())
 }
@@ -278,8 +312,9 @@ fn resolve_cancel_owner(
         })
 }
 
-fn cancel_command(handle: String) -> Result<(), AppError> {
+fn cancel_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
+    require_control_eligibility(&paths, &handle, &caller)?;
     let requested =
         supervisor::request_cancel(&paths).map_err(|err| cancel_request_error(&handle, err))?;
     serde_json::to_writer(
@@ -295,6 +330,30 @@ fn cancel_request_error(handle: &str, err: io::Error) -> AppError {
         EX_IOERR,
         format!("agent-bash: failed to cancel {handle}: {err}"),
     )
+}
+
+fn consume_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {
+    let paths = paths_for_existing_handle(&handle)?;
+    require_control_eligibility(&paths, &handle, &caller)?;
+    let meta = read_meta_for_handle(&paths, &handle)?;
+    if !state::terminal(&meta) {
+        return Err(AppError::new(
+            EX_DATAERR,
+            format!("agent-bash: cannot consume non-terminal handle {handle}"),
+        ));
+    }
+    let consumed = state::record_consumed(&paths).map_err(|err| {
+        AppError::new(
+            EX_IOERR,
+            format!("agent-bash: failed to record consumption for {handle}: {err}"),
+        )
+    })?;
+    serde_json::to_writer(
+        io::stdout(),
+        &serde_json::json!({ "handle": handle, "consumed": consumed }),
+    )
+    .map_err(json_write_error)?;
+    io::stdout().write_all(b"\n").map_err(json_write_error)
 }
 
 fn persist_delivery_mode(paths: &StatePaths, delivery_mode: DeliveryMode) -> Result<(), AppError> {
@@ -405,34 +464,42 @@ fn run_mode(ready_sentinel: &Option<String>) -> &'static str {
     }
 }
 
-fn owner_context(caller_chain: &[CallerChainEntry]) -> Result<OwnerContext, AppError> {
+fn owner_context(
+    caller_chain: &[CallerChainEntry],
+    registration_candidate: &delivery::DeliveryRegistrationCandidate,
+) -> Result<OwnerContext, AppError> {
     let explicit = OwnerContext {
         session_id: nonempty_env(OWNER_SESSION_ID_ENV),
         invocation_uuid: nonempty_env(OWNER_INVOCATION_UUID_ENV),
     };
-    if let (Some(explicit_invocation_uuid), Some(_)) = (
-        explicit.invocation_uuid.as_deref(),
-        explicit.session_id.as_deref(),
-    ) && parent_invocation_uuid().as_deref() == Some(explicit_invocation_uuid)
-        && let Some((session_id, invocation_uuid)) =
-            delivery::resolve_owner_binding(caller_chain, explicit_invocation_uuid)
-                .map_err(owner_resolution_error)?
-    {
+    if explicit.session_id.is_some() || explicit.invocation_uuid.is_some() {
+        let (Some(explicit_invocation_uuid), Some(_)) = (
+            explicit.invocation_uuid.as_deref(),
+            explicit.session_id.as_deref(),
+        ) else {
+            return Err(owner_attestation_error());
+        };
+        if parent_invocation_uuid().as_deref() != Some(explicit_invocation_uuid) {
+            return Err(owner_attestation_error());
+        }
+        let Some((session_id, invocation_uuid)) = registration_candidate
+            .resolve_owner_binding(caller_chain, explicit_invocation_uuid)
+            .map_err(owner_resolution_error)?
+        else {
+            return Err(owner_attestation_error());
+        };
         return Ok(OwnerContext {
             session_id: Some(session_id),
             invocation_uuid: Some(invocation_uuid),
         });
     }
-    if explicit.session_id.is_some() || explicit.invocation_uuid.is_some() {
-        return Ok(explicit);
-    }
 
     let Some(expected_invocation_uuid) = parent_invocation_uuid() else {
         return Ok(explicit);
     };
-    let Some((session_id, invocation_uuid)) =
-        delivery::resolve_owner_binding(caller_chain, &expected_invocation_uuid)
-            .map_err(owner_resolution_error)?
+    let Some((session_id, invocation_uuid)) = registration_candidate
+        .resolve_owner_binding(caller_chain, &expected_invocation_uuid)
+        .map_err(owner_resolution_error)?
     else {
         return Ok(explicit);
     };
@@ -440,6 +507,13 @@ fn owner_context(caller_chain: &[CallerChainEntry]) -> Result<OwnerContext, AppE
         session_id: Some(session_id),
         invocation_uuid: Some(invocation_uuid),
     })
+}
+
+fn owner_attestation_error() -> AppError {
+    AppError::new(
+        EX_IOERR,
+        "agent-bash: explicit completion owner requires matching parent invocation and helper attestation",
+    )
 }
 
 fn owner_resolution_error(err: io::Error) -> AppError {
@@ -507,29 +581,51 @@ fn run_output(
     mode: &str,
     delivery_mode: DeliveryMode,
     ready_sentinel: Option<String>,
+    startup_outcome: supervisor::StartupOutcome,
 ) -> RunOutput {
-    RunOutput::new(paths, caller_ppid, mode, delivery_mode, ready_sentinel)
+    RunOutput::new(
+        paths,
+        caller_ppid,
+        mode,
+        delivery_mode,
+        ready_sentinel,
+        startup_outcome.as_str(),
+    )
 }
 
-fn detach_command(handle: String) -> Result<(), AppError> {
+fn detach_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
-    let outcome = delivery::detach(&paths).map_err(|err| delivery_mode_error(&handle, err))?;
+    require_control_eligibility(&paths, &handle, &caller)?;
+    let outcome =
+        delivery::detach(&paths).map_err(|err| delivery_mode_update_error(&handle, err))?;
     serde_json::to_writer(io::stdout(), &outcome).map_err(json_write_error)?;
     io::stdout().write_all(b"\n").map_err(json_write_error)
 }
 
-fn mode_command(handle: String) -> Result<(), AppError> {
+fn mode_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
-    let mode =
-        state::read_delivery_mode(&paths).map_err(|err| delivery_mode_error(&handle, err))?;
+    let meta = read_meta_for_handle(&paths, &handle)?;
+    let mode = if caller_is_control_eligible(&meta, &paths, &caller) {
+        delivery::settled_delivery_mode(&paths)
+    } else {
+        delivery::observed_delivery_mode(&paths)
+    }
+    .map_err(|err| delivery_mode_determination_error(&handle, err))?;
     println!("{}", mode.as_str());
     Ok(())
 }
 
-fn delivery_mode_error(handle: &str, err: io::Error) -> AppError {
+fn delivery_mode_update_error(handle: &str, err: io::Error) -> AppError {
     AppError::new(
         EX_IOERR,
         format!("agent-bash: failed to update delivery mode for {handle}: {err}"),
+    )
+}
+
+fn delivery_mode_determination_error(handle: &str, err: io::Error) -> AppError {
+    AppError::new(
+        EX_IOERR,
+        format!("agent-bash: failed to determine delivery mode for {handle}: {err}"),
     )
 }
 
@@ -542,9 +638,20 @@ fn json_write_error(err: impl std::fmt::Display) -> AppError {
     AppError::new(EX_IOERR, format!("agent-bash: failed to write JSON: {err}"))
 }
 
-fn status_command(handle: String, tail_bytes: u64, full: bool) -> Result<(), AppError> {
+fn status_command(
+    handle: String,
+    tail_bytes: u64,
+    full: bool,
+    observe_only: bool,
+    caller: ControlRouteCaller,
+) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
-    let meta = reconcile_status_meta(&paths, &handle)?;
+    let meta = read_meta_for_handle(&paths, &handle)?;
+    let meta = if !observe_only && caller_is_control_eligible(&meta, &paths, &caller) {
+        reconcile_status_meta(&paths, &handle, meta)?
+    } else {
+        meta
+    };
 
     let rc_from_file = if rc_file_exists(&paths) {
         Some(read_rc_for_handle(&paths, &handle)?)
@@ -562,8 +669,16 @@ fn status_command(handle: String, tail_bytes: u64, full: bool) -> Result<(), App
     Ok(())
 }
 
-fn reconcile_status_meta(paths: &StatePaths, handle: &str) -> Result<Meta, AppError> {
-    let meta = read_meta_for_handle(paths, handle)?;
+fn reconcile_status_meta(
+    paths: &StatePaths,
+    handle: &str,
+    mut meta: Meta,
+) -> Result<Meta, AppError> {
+    if delivery::completion_delivery_pending(&meta) {
+        delivery::reconcile_completion_delivery(paths, &mut meta)
+            .map_err(|err| status_reconciliation_error(handle, err))?;
+        return Ok(meta);
+    }
     if !state::running_exit_mode(&meta) {
         return Ok(meta);
     }
@@ -647,8 +762,7 @@ enum DoneReason {
     Exit,
     ReadySentinel { workload_running: bool },
     ExitBeforeReady,
-    CancelRequest,
-    OwnerExit,
+    Cancellation(supervisor::CancellationCause),
 }
 
 fn render_status_header(meta: &Meta, rc_from_file: Option<i32>) -> Result<String, AppError> {
@@ -702,13 +816,18 @@ fn corrupt_state_error(meta: &Meta) -> AppError {
 }
 
 fn done_reason(meta: &Meta) -> DoneReason {
+    if let Some(cause) = meta
+        .completion_reason
+        .as_deref()
+        .and_then(supervisor::CancellationCause::from_completion_reason)
+    {
+        return DoneReason::Cancellation(cause);
+    }
     match (meta.mode.as_str(), meta.completion_reason.as_deref()) {
         ("sentinel", Some("ready-sentinel")) => DoneReason::ReadySentinel {
             workload_running: meta.workload_rc.is_none(),
         },
         ("sentinel", Some("exit-before-ready")) => DoneReason::ExitBeforeReady,
-        (_, Some("cancel-request")) => DoneReason::CancelRequest,
-        (_, Some("owner-exit")) => DoneReason::OwnerExit,
         _ => DoneReason::Exit,
     }
 }
@@ -730,10 +849,10 @@ fn format_done_header(handle: &str, rc: i32, reason: &DoneReason) -> String {
         DoneReason::ExitBeforeReady => {
             format!("DONE rc={rc} handle={handle} reason=exit-before-ready")
         }
-        DoneReason::CancelRequest => {
-            format!("DONE rc={rc} handle={handle} reason=cancel-request")
-        }
-        DoneReason::OwnerExit => format!("DONE rc={rc} handle={handle} reason=owner-exit"),
+        DoneReason::Cancellation(cause) => format!(
+            "DONE rc={rc} handle={handle} reason={}",
+            cause.completion_reason()
+        ),
         DoneReason::Exit => format!("DONE rc={rc} handle={handle}"),
     }
 }
@@ -775,19 +894,9 @@ fn read_open_status_log(mut file: std::fs::File) -> io::Result<Vec<u8>> {
     Ok(output)
 }
 
-fn list_command(
-    caller_ppid: libc::pid_t,
-    owner_session_id: Option<String>,
-    all: bool,
-    json: bool,
-) -> Result<(), AppError> {
+fn list_command(caller: ControlRouteCaller, all: bool, json: bool) -> Result<(), AppError> {
     let root = load_state_root().map_err(state_root_unavailable)?;
-    let caller_chain = if all {
-        Vec::new()
-    } else {
-        state::capture_caller_chain(caller_ppid)
-    };
-    let mut summaries = list_summaries(&root, &caller_chain, owner_session_id.as_deref(), all)?;
+    let mut summaries = list_summaries(&root, &caller.caller_chain, all)?;
     sort_summaries(&mut summaries);
     emit_list_summaries(&summaries, json)?;
     Ok(())
@@ -796,7 +905,6 @@ fn list_command(
 fn list_summaries(
     root: &Path,
     caller_chain: &[state::CallerChainEntry],
-    owner_session_id: Option<&str>,
     all: bool,
 ) -> Result<Vec<ListSummary>, AppError> {
     if !root.exists() {
@@ -806,9 +914,7 @@ fn list_summaries(
     let mut summaries = Vec::new();
     for entry in entries {
         let entry = read_state_entry(entry)?;
-        if let Some(summary) =
-            list_summary_for_entry(root, entry, caller_chain, owner_session_id, all)
-        {
+        if let Some(summary) = list_summary_for_entry(root, entry, caller_chain, all) {
             summaries.push(summary);
         }
     }
@@ -844,25 +950,29 @@ fn list_summary_for_entry(
     root: &Path,
     entry: std::fs::DirEntry,
     caller_chain: &[state::CallerChainEntry],
-    owner_session_id: Option<&str>,
     all: bool,
 ) -> Option<ListSummary> {
     if !entry_is_state_dir(&entry) {
         return None;
     }
     let paths = paths_for_entry(root, &entry);
-    let meta = reconcile_list_meta(&paths, read_entry_meta(&paths)?)?;
-    if !include_list_meta(&meta, &paths, caller_chain, owner_session_id, all) {
+    let meta = read_entry_meta(&paths)?;
+    if all {
+        return Some(list_summary_from_meta(&meta, &paths));
+    }
+    let owned = handle_matches_control_route(&meta, &paths, caller_chain);
+    if !owned {
         return None;
     }
-    Some(list_summary_from_meta(&meta, paths.state_dir))
+    let meta = reconcile_list_meta(&paths, meta)?;
+    Some(list_summary_from_meta(&meta, &paths))
 }
 
 fn reconcile_list_meta(paths: &StatePaths, meta: Meta) -> Option<Meta> {
     if !state::running_exit_mode(&meta) {
         return Some(meta);
     }
-    supervisor::reconcile_lost_supervisor_without_delivery(paths).ok()
+    supervisor::reconcile_lost_supervisor_for_list(paths).ok()
 }
 
 fn entry_is_state_dir(entry: &std::fs::DirEntry) -> bool {
@@ -878,19 +988,44 @@ fn read_entry_meta(paths: &StatePaths) -> Option<Meta> {
     state::read_meta(paths).ok()
 }
 
-fn include_list_meta(
+fn handle_matches_control_route(
     meta: &Meta,
     paths: &StatePaths,
     caller_chain: &[state::CallerChainEntry],
-    owner_session_id: Option<&str>,
-    all: bool,
 ) -> bool {
-    if all {
-        return true;
+    if let Some(recorded_session_id) = meta.owner_session_id.as_deref() {
+        return acting_session_matches_handle(meta, paths, caller_chain, recorded_session_id);
     }
-    if owner_session_matches(meta, paths, owner_session_id) {
-        return true;
+    match state::read_owner(paths) {
+        Ok(owner) => {
+            if let Some(recorded_session_id) = owner.owner_session_id {
+                return acting_session_matches_handle(
+                    meta,
+                    paths,
+                    caller_chain,
+                    &recorded_session_id,
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return false,
     }
+    caller_chain_matches_handle(meta, caller_chain)
+}
+
+fn acting_session_matches_handle(
+    meta: &Meta,
+    paths: &StatePaths,
+    caller_chain: &[state::CallerChainEntry],
+    recorded_session_id: &str,
+) -> bool {
+    delivery::resolve_handle_owner_binding(paths, meta.delivery_helper.as_ref(), caller_chain)
+        .ok()
+        .flatten()
+        .is_some_and(|(session_id, _)| session_id == recorded_session_id)
+}
+
+fn caller_chain_matches_handle(meta: &Meta, caller_chain: &[state::CallerChainEntry]) -> bool {
     let Some(anchor) = meta.caller_chain.first() else {
         return false;
     };
@@ -904,22 +1039,41 @@ fn include_list_meta(
     })
 }
 
-fn owner_session_matches(meta: &Meta, paths: &StatePaths, owner_session_id: Option<&str>) -> bool {
-    let Some(session_id) = owner_session_id else {
-        return false;
-    };
-    if let Some(meta_session_id) = meta.owner_session_id.as_deref() {
-        return meta_session_id == session_id;
+fn control_route_caller(guard: &AttachedGuard) -> ControlRouteCaller {
+    ControlRouteCaller {
+        caller_chain: state::capture_caller_chain(guard.startup_ppid()),
     }
-    state::read_owner(paths)
-        .ok()
-        .and_then(|owner| owner.owner_session_id)
-        .as_deref()
-        == Some(session_id)
 }
 
-fn list_summary_from_meta(meta: &Meta, state_dir: PathBuf) -> ListSummary {
-    ListSummary::from_meta(meta, state_dir)
+fn caller_is_control_eligible(
+    meta: &Meta,
+    paths: &StatePaths,
+    caller: &ControlRouteCaller,
+) -> bool {
+    handle_matches_control_route(meta, paths, &caller.caller_chain)
+}
+
+fn require_control_eligibility(
+    paths: &StatePaths,
+    handle: &str,
+    caller: &ControlRouteCaller,
+) -> Result<(), AppError> {
+    let meta = read_meta_for_handle(paths, handle)?;
+    if caller_is_control_eligible(&meta, paths, caller) {
+        return Ok(());
+    }
+    Err(AppError::new(
+        EX_NOPERM,
+        format!("agent-bash: caller is not eligible to control handle {handle}"),
+    ))
+}
+
+fn list_summary_from_meta(meta: &Meta, paths: &StatePaths) -> ListSummary {
+    ListSummary::from_meta(
+        meta,
+        paths.state_dir.clone(),
+        delivery::observed_delivery_mode(paths),
+    )
 }
 
 fn sort_summaries(summaries: &mut [ListSummary]) {
@@ -950,13 +1104,17 @@ fn emit_text_list_summaries(summaries: &[ListSummary]) {
 }
 
 fn format_list_summary(summary: &ListSummary) -> String {
+    let delivery_mode = summary
+        .delivery_mode
+        .map(|mode| mode.as_str())
+        .unwrap_or("unavailable");
     format!(
         "{} {} rc={} mode={} delivery={} created_at={} state_dir={}",
         summary.handle,
         summary.state,
         format_optional_rc(summary.rc),
         summary.mode,
-        summary.delivery_mode.as_str(),
+        delivery_mode,
         summary.created_at_unix_ms,
         summary.state_dir.display()
     )

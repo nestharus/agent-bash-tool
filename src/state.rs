@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -7,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -15,7 +17,6 @@ const DEFAULT_STATE_TTL_SECS: u64 = 48 * 60 * 60;
 const DEFAULT_REAP_MAX_DIRS: usize = 128;
 const DEFAULT_REAP_MAX_SCAN: usize = 4096;
 const DEFAULT_REAP_SHARDS: usize = 16;
-const PENDING_DELIVERY_GRACE_MULTIPLIER: u64 = 7;
 const REAP_SHARD_CURSOR_FILE: &str = ".reap-shard";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -30,7 +31,13 @@ pub(crate) struct StatePaths {
     pub(crate) owner: PathBuf,
     pub(crate) consumed: PathBuf,
     pub(crate) delivery_mode: PathBuf,
+    pub(crate) delivery_helper: PathBuf,
+    pub(crate) delivery_helper_interpreter: PathBuf,
+    pub(crate) activation_attempted: PathBuf,
+    pub(crate) activation_outcome: PathBuf,
     pub(crate) delivery_lock: PathBuf,
+    pub(crate) accepted_cancel: PathBuf,
+    pub(crate) completion_lock: PathBuf,
     pub(crate) reconciliation_lock: PathBuf,
 }
 
@@ -46,7 +53,13 @@ impl StatePaths {
             owner: state_dir.join("owner.json"),
             consumed: state_dir.join("consumed"),
             delivery_mode: state_dir.join("delivery-mode"),
+            delivery_helper: state_dir.join("delivery-helper"),
+            delivery_helper_interpreter: state_dir.join("delivery-helper-interpreter"),
+            activation_attempted: state_dir.join("activation-attempted"),
+            activation_outcome: state_dir.join("activation-outcome"),
             delivery_lock: state_dir.join("delivery.lock"),
+            accepted_cancel: state_dir.join("cancel-requested"),
+            completion_lock: state_dir.join("completion.lock"),
             reconciliation_lock: state_dir.join("reconciliation.lock"),
             state_dir,
         }
@@ -81,6 +94,30 @@ impl DeliveryMode {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DeliveryHelperProvenance {
+    pub(crate) schema_version: u8,
+    pub(crate) path: String,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) size: u64,
+    pub(crate) modified_seconds: i64,
+    pub(crate) modified_nanoseconds: i64,
+    pub(crate) mode: u32,
+    #[serde(default)]
+    pub(crate) sha256: String,
+    #[serde(default)]
+    pub(crate) environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) interpreter: Option<DeliveryHelperInterpreterProvenance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DeliveryHelperInterpreterProvenance {
+    pub(crate) path: String,
+    pub(crate) sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CallerChainEntry {
     pub(crate) pid: libc::pid_t,
@@ -103,13 +140,123 @@ impl OwnerMeta {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(crate) struct DeliveryMeta {
+pub(crate) const DELIVERY_ATTEMPT_IN_PROGRESS: &str = "delivery_attempt_in_progress";
+pub(crate) const DELIVERY_TRANSFER_OUTCOME_UNKNOWN: &str = "transfer_outcome_unknown";
+const ACTIVATION_PENDING: &str = "pending\n";
+const ACTIVATION_SUCCEEDED: &str = "succeeded\n";
+const ACTIVATION_PRE_ADMISSION_FAILED_PREFIX: &str = "pre_admission_failed: ";
+const ACTIVATION_TRANSFER_OUTCOME_UNKNOWN: &str = "transfer_outcome_unknown\n";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ActivationTransferOutcome {
+    Unclaimed,
+    ClaimedWithoutOutcome,
+    Pending,
+    Succeeded,
+    PreAdmissionFailed(String),
+    Failed(String),
+    TransferOutcomeUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActivationTransferState {
+    pub(crate) mode: DeliveryMode,
+    pub(crate) outcome: ActivationTransferOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompletionDeliveryLifecycle {
+    Unclaimed,
+    ProvisionalTransfer,
+    RetryablePreAdmissionFailure,
+    ClosedPreAdmissionFailure,
+    NonReplayableUnknownTransfer,
+    AdmittedOutcome,
+    LegacySkipped,
+    Invalid,
+}
+
+impl CompletionDeliveryLifecycle {
+    pub(crate) fn permits_attempt(self) -> bool {
+        matches!(self, Self::Unclaimed | Self::RetryablePreAdmissionFailure)
+    }
+
+    pub(crate) fn needs_progress(self) -> bool {
+        matches!(
+            self,
+            Self::Unclaimed | Self::ProvisionalTransfer | Self::RetryablePreAdmissionFailure
+        )
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct CompletionDeliveryMeta {
     pub(crate) attempted: bool,
     pub(crate) exit_code: Option<i32>,
     pub(crate) error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retryable: Option<bool>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) retry_count: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) skipped: Option<String>,
+}
+
+impl CompletionDeliveryMeta {
+    pub(crate) fn completion_lifecycle(&self) -> CompletionDeliveryLifecycle {
+        if self.skipped.is_some() {
+            return if !self.attempted && self.error_code.is_none() {
+                CompletionDeliveryLifecycle::LegacySkipped
+            } else {
+                CompletionDeliveryLifecycle::Invalid
+            };
+        }
+        if self.attempted {
+            return match self.error_code.as_deref() {
+                Some(DELIVERY_ATTEMPT_IN_PROGRESS) => {
+                    CompletionDeliveryLifecycle::ProvisionalTransfer
+                }
+                Some(DELIVERY_TRANSFER_OUTCOME_UNKNOWN) => {
+                    CompletionDeliveryLifecycle::NonReplayableUnknownTransfer
+                }
+                _ => CompletionDeliveryLifecycle::AdmittedOutcome,
+            };
+        }
+        match (self.error_code.is_some(), self.retryable) {
+            (false, _) => CompletionDeliveryLifecycle::Unclaimed,
+            (true, Some(true)) => CompletionDeliveryLifecycle::RetryablePreAdmissionFailure,
+            (true, _) => CompletionDeliveryLifecycle::ClosedPreAdmissionFailure,
+        }
+    }
+}
+
+impl Serialize for CompletionDeliveryMeta {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("CompletionDeliveryMeta", 9)?;
+        state.serialize_field("attempted", &self.attempted)?;
+        state.serialize_field("exit_code", &self.exit_code)?;
+        state.serialize_field("error", &self.error)?;
+        if let Some(error_code) = &self.error_code {
+            state.serialize_field("error_code", error_code)?;
+        }
+        if let Some(retryable) = self.retryable {
+            state.serialize_field("retryable", &retryable)?;
+        }
+        if self.retry_count != 0 {
+            state.serialize_field("retry_count", &self.retry_count)?;
+        }
+        if let Some(skipped) = &self.skipped {
+            state.serialize_field("skipped", skipped)?;
+        }
+        state.serialize_field("lifecycle", &self.completion_lifecycle())?;
+        state.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +312,8 @@ pub(crate) struct Meta {
     pub(crate) mode: String,
     #[serde(default)]
     pub(crate) delivery_mode: DeliveryMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) delivery_helper: Option<DeliveryHelperProvenance>,
     pub(crate) ready_sentinel: Option<String>,
     pub(crate) ready_at_unix_ms: Option<u64>,
     pub(crate) completed_at_unix_ms: Option<u64>,
@@ -172,7 +321,7 @@ pub(crate) struct Meta {
     pub(crate) signal: Option<i32>,
     pub(crate) workload_rc: Option<i32>,
     pub(crate) workload_signal: Option<i32>,
-    pub(crate) delivery: DeliveryMeta,
+    pub(crate) delivery: CompletionDeliveryMeta,
     pub(crate) cgroup: CgroupMeta,
     pub(crate) error: Option<String>,
 }
@@ -216,6 +365,7 @@ impl Meta {
             cwd: cwd.display().to_string(),
             mode: mode.to_string(),
             delivery_mode,
+            delivery_helper: None,
             ready_sentinel,
             ready_at_unix_ms: None,
             completed_at_unix_ms: None,
@@ -223,7 +373,7 @@ impl Meta {
             signal: None,
             workload_rc: None,
             workload_signal: None,
-            delivery: DeliveryMeta::default(),
+            delivery: CompletionDeliveryMeta::default(),
             cgroup: CgroupMeta::subreaper_only(),
             error: None,
         }
@@ -242,6 +392,11 @@ impl Meta {
         self.owner_invocation_uuid = invocation_uuid;
         self
     }
+
+    pub(crate) fn with_delivery_helper(mut self, helper: DeliveryHelperProvenance) -> Self {
+        self.delivery_helper = Some(helper);
+        self
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -256,6 +411,7 @@ pub(crate) struct RunOutput {
     mode: String,
     delivery_mode: DeliveryMode,
     ready_sentinel: Option<String>,
+    dispatch_state: String,
 }
 
 impl RunOutput {
@@ -265,6 +421,7 @@ impl RunOutput {
         mode: &str,
         delivery_mode: DeliveryMode,
         ready_sentinel: Option<String>,
+        dispatch_state: &str,
     ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -277,6 +434,7 @@ impl RunOutput {
             mode: mode.to_string(),
             delivery_mode,
             ready_sentinel,
+            dispatch_state: dispatch_state.to_string(),
         }
     }
 }
@@ -287,19 +445,29 @@ pub(crate) struct ListSummary {
     pub(crate) state: String,
     pub(crate) rc: Option<i32>,
     pub(crate) mode: String,
-    pub(crate) delivery_mode: DeliveryMode,
+    pub(crate) delivery_mode: Option<DeliveryMode>,
+    pub(crate) delivery_mode_error: Option<String>,
     pub(crate) created_at_unix_ms: u64,
     pub(crate) state_dir: PathBuf,
 }
 
 impl ListSummary {
-    pub(crate) fn from_meta(meta: &Meta, state_dir: PathBuf) -> Self {
+    pub(crate) fn from_meta(
+        meta: &Meta,
+        state_dir: PathBuf,
+        delivery_mode: io::Result<DeliveryMode>,
+    ) -> Self {
+        let (delivery_mode, delivery_mode_error) = match delivery_mode {
+            Ok(mode) => (Some(mode), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
         Self {
             handle: meta.handle.clone(),
             state: meta.state.clone(),
             rc: meta.rc,
             mode: meta.mode.clone(),
-            delivery_mode: meta.delivery_mode,
+            delivery_mode,
+            delivery_mode_error,
             created_at_unix_ms: meta.created_at_unix_ms,
             state_dir,
         }
@@ -448,6 +616,154 @@ pub(crate) fn lock_delivery(paths: &StatePaths) -> io::Result<File> {
     Ok(file)
 }
 
+pub(crate) fn lock_completion(paths: &StatePaths) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&paths.completion_lock)?;
+    lock_file_exclusive(&file)?;
+    Ok(file)
+}
+
+pub(crate) fn record_explicit_cancel_acceptance(paths: &StatePaths) -> io::Result<bool> {
+    record_durable_create_once_marker(&paths.accepted_cancel, &paths.state_dir)
+}
+
+pub(crate) fn record_activation_attempt(paths: &StatePaths) -> io::Result<bool> {
+    record_durable_create_once_marker(&paths.activation_attempted, &paths.state_dir)
+}
+
+pub(crate) fn record_consumed(paths: &StatePaths) -> io::Result<bool> {
+    record_durable_create_once_marker(&paths.consumed, &paths.state_dir)
+}
+
+pub(crate) fn durable_marker_exists(marker: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(marker) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("durable marker is not a regular file: {}", marker.display()),
+        )),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn write_activation_outcome(paths: &StatePaths, outcome: &str) -> io::Result<()> {
+    atomic_write(&paths.activation_outcome, outcome.as_bytes())
+}
+
+fn read_activation_outcome(paths: &StatePaths) -> io::Result<Option<String>> {
+    match fs::read_to_string(&paths.activation_outcome) {
+        Ok(outcome) => Ok(Some(outcome)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn write_activation_pending(paths: &StatePaths) -> io::Result<()> {
+    write_activation_outcome(paths, ACTIVATION_PENDING)
+}
+
+pub(crate) fn write_activation_succeeded(paths: &StatePaths) -> io::Result<()> {
+    write_activation_outcome(paths, ACTIVATION_SUCCEEDED)
+}
+
+pub(crate) fn write_activation_failed(paths: &StatePaths, error: &str) -> io::Result<()> {
+    write_activation_outcome(paths, &format!("failed: {error}\n"))
+}
+
+pub(crate) fn write_activation_pre_admission_failed(
+    paths: &StatePaths,
+    error: &str,
+) -> io::Result<()> {
+    write_activation_outcome(
+        paths,
+        &format!("{ACTIVATION_PRE_ADMISSION_FAILED_PREFIX}{error}\n"),
+    )
+}
+
+pub(crate) fn write_activation_transfer_outcome_unknown(paths: &StatePaths) -> io::Result<()> {
+    write_activation_outcome(paths, ACTIVATION_TRANSFER_OUTCOME_UNKNOWN)
+}
+
+pub(crate) fn activation_transfer_state(paths: &StatePaths) -> io::Result<ActivationTransferState> {
+    let mode = read_delivery_mode(paths)?;
+    let outcome = match read_activation_outcome(paths)?.as_deref() {
+        None if durable_marker_exists(&paths.activation_attempted)? => {
+            ActivationTransferOutcome::ClaimedWithoutOutcome
+        }
+        None => ActivationTransferOutcome::Unclaimed,
+        Some(ACTIVATION_PENDING) => ActivationTransferOutcome::Pending,
+        Some(ACTIVATION_SUCCEEDED) => ActivationTransferOutcome::Succeeded,
+        Some(outcome) if outcome.starts_with(ACTIVATION_PRE_ADMISSION_FAILED_PREFIX) => {
+            ActivationTransferOutcome::PreAdmissionFailed(
+                outcome[ACTIVATION_PRE_ADMISSION_FAILED_PREFIX.len()..]
+                    .trim()
+                    .to_string(),
+            )
+        }
+        Some(ACTIVATION_TRANSFER_OUTCOME_UNKNOWN) => {
+            ActivationTransferOutcome::TransferOutcomeUnknown
+        }
+        Some(outcome) => ActivationTransferOutcome::Failed(outcome.trim().to_string()),
+    };
+    Ok(ActivationTransferState { mode, outcome })
+}
+
+pub(crate) fn remove_activation_outcome(paths: &StatePaths) -> io::Result<()> {
+    match fs::remove_file(&paths.activation_outcome) {
+        Ok(()) => File::open(&paths.state_dir)?.sync_all(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn record_durable_create_once_marker(marker: &Path, directory: &Path) -> io::Result<bool> {
+    let directory = File::open(directory)?;
+    match OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(marker)
+    {
+        Ok(file) => {
+            if let Err(publication_error) = file.sync_all().and_then(|()| directory.sync_all()) {
+                drop(file);
+                if let Err(rollback_error) = rollback_created_marker(marker, &directory) {
+                    return Err(io::Error::new(
+                        publication_error.kind(),
+                        format!(
+                            "failed to publish durable marker: {publication_error}; rollback failed: {rollback_error}"
+                        ),
+                    ));
+                }
+                return Err(publication_error);
+            }
+            Ok(true)
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn rollback_activation_attempt(paths: &StatePaths) -> io::Result<()> {
+    let directory = File::open(&paths.state_dir)?;
+    rollback_created_marker(&paths.activation_attempted, &directory)
+}
+
+fn rollback_created_marker(marker: &Path, directory: &File) -> io::Result<()> {
+    match fs::remove_file(marker) {
+        Ok(()) => directory.sync_all(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 fn lock_file_exclusive(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -484,13 +800,6 @@ impl ReapConfig {
 
     fn ttl_ms(self) -> u64 {
         secs_to_ms(self.ttl_secs)
-    }
-
-    fn pending_delivery_moot_ms(self) -> u64 {
-        secs_to_ms(
-            self.ttl_secs
-                .saturating_mul(PENDING_DELIVERY_GRACE_MULTIPLIER),
-        )
     }
 }
 
@@ -573,6 +882,14 @@ fn reap_state_entry(
         root.to_path_buf(),
         entry.file_name().to_string_lossy().into_owned(),
     );
+    let _delivery_lock = match try_lock_delivery_for_reap(&paths) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return,
+        Err(_) => {
+            stats.errors += 1;
+            return;
+        }
+    };
     if !state_dir_reap_eligible(&paths, config, boot_id) {
         return;
     }
@@ -580,6 +897,32 @@ fn reap_state_entry(
         Ok(()) => stats.reaped += 1,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(_) => stats.errors += 1,
+    }
+}
+
+fn try_lock_delivery_for_reap(paths: &StatePaths) -> io::Result<Option<File>> {
+    use std::os::fd::AsRawFd;
+
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&paths.delivery_lock)?;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return if err.kind() == io::ErrorKind::WouldBlock {
+            Ok(None)
+        } else {
+            Err(err)
+        };
     }
 }
 
@@ -597,15 +940,9 @@ fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig, boot_id: &str
         return false;
     }
     if meta_is_reap_terminal(&meta, boot_id) {
-        return delivery_is_settled(paths, &meta) || age_ms >= config.pending_delivery_moot_ms();
+        return !meta.delivery.completion_lifecycle().needs_progress();
     }
     meta.state == "RUNNING" && meta_processes_are_gone_or_reused(&meta, boot_id)
-}
-
-fn delivery_is_settled(paths: &StatePaths, meta: &Meta) -> bool {
-    paths.consumed.exists()
-        || meta.delivery.attempted
-        || meta.delivery.skipped.as_deref() == Some("sync_in_band")
 }
 
 fn meta_is_reap_terminal(meta: &Meta, boot_id: &str) -> bool {
@@ -1003,6 +1340,65 @@ fn parse_proc_stat(contents: &str) -> Option<ProcStat> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn completion_delivery_lifecycle_classifies_existing_metadata_protocol() {
+        let mut delivery = CompletionDeliveryMeta::default();
+        assert_eq!(
+            delivery.completion_lifecycle(),
+            CompletionDeliveryLifecycle::Unclaimed
+        );
+
+        delivery.error_code = Some("delivery_helper_launch_failed".to_string());
+        delivery.retryable = Some(true);
+        assert_eq!(
+            delivery.completion_lifecycle(),
+            CompletionDeliveryLifecycle::RetryablePreAdmissionFailure
+        );
+        delivery.retryable = Some(false);
+        assert_eq!(
+            delivery.completion_lifecycle(),
+            CompletionDeliveryLifecycle::ClosedPreAdmissionFailure
+        );
+
+        delivery = CompletionDeliveryMeta {
+            attempted: true,
+            error_code: Some(DELIVERY_ATTEMPT_IN_PROGRESS.to_string()),
+            ..CompletionDeliveryMeta::default()
+        };
+        assert_eq!(
+            delivery.completion_lifecycle(),
+            CompletionDeliveryLifecycle::ProvisionalTransfer
+        );
+        delivery.error_code = Some(DELIVERY_TRANSFER_OUTCOME_UNKNOWN.to_string());
+        assert_eq!(
+            delivery.completion_lifecycle(),
+            CompletionDeliveryLifecycle::NonReplayableUnknownTransfer
+        );
+        delivery.error_code = None;
+        assert_eq!(
+            delivery.completion_lifecycle(),
+            CompletionDeliveryLifecycle::AdmittedOutcome
+        );
+
+        delivery = CompletionDeliveryMeta {
+            skipped: Some("sync_in_band".to_string()),
+            ..CompletionDeliveryMeta::default()
+        };
+        assert_eq!(
+            delivery.completion_lifecycle(),
+            CompletionDeliveryLifecycle::LegacySkipped
+        );
+        assert_eq!(
+            serde_json::to_value(&delivery).expect("serialize delivery")["lifecycle"],
+            "legacy_skipped"
+        );
+        delivery.attempted = true;
+        assert_eq!(
+            delivery.completion_lifecycle(),
+            CompletionDeliveryLifecycle::Invalid
+        );
+    }
+
     fn test_reap_config(now_unix_ms: u64, ttl_secs: u64, max_dirs: usize) -> ReapConfig {
         ReapConfig {
             ttl_secs,
@@ -1094,6 +1490,13 @@ mod tests {
 
     fn write_reap_state_consumed_marker(paths: &StatePaths) {
         fs::write(&paths.consumed, b"").expect("write consumed");
+    }
+
+    fn settle_reap_delivery(paths: &StatePaths) {
+        let mut meta = read_meta(paths).expect("read meta");
+        meta.delivery.attempted = true;
+        meta.delivery.exit_code = Some(0);
+        write_meta_atomic(paths, &meta).expect("write settled delivery");
     }
 
     fn existing_handle_dirs(root: &Path) -> usize {
@@ -1189,6 +1592,44 @@ mod tests {
     }
 
     #[test]
+    fn durable_create_once_markers_share_publication_and_rollback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_test".to_string());
+        create_handle_state(&paths).expect("create state");
+
+        assert!(record_explicit_cancel_acceptance(&paths).expect("record cancellation"));
+        assert!(!record_explicit_cancel_acceptance(&paths).expect("repeat cancellation"));
+        assert!(record_activation_attempt(&paths).expect("record activation"));
+        assert!(!record_activation_attempt(&paths).expect("repeat activation"));
+
+        rollback_activation_attempt(&paths).expect("rollback activation");
+        assert!(!paths.activation_attempted.exists());
+        assert!(record_activation_attempt(&paths).expect("retry activation"));
+    }
+
+    #[test]
+    fn decision_marker_lookup_failure_is_not_absence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_test".to_string());
+        create_handle_state(&paths).expect("create state");
+        write_delivery_mode_atomic(&paths, DeliveryMode::Async).expect("write mode");
+
+        assert!(!durable_marker_exists(&paths.activation_attempted).expect("absent marker"));
+        record_activation_attempt(&paths).expect("record activation");
+        assert!(durable_marker_exists(&paths.activation_attempted).expect("published marker"));
+        fs::rename(
+            &paths.activation_attempted,
+            paths.state_dir.join("retained-activation-attempted"),
+        )
+        .expect("retain marker");
+        std::os::unix::fs::symlink(&paths.activation_attempted, &paths.activation_attempted)
+            .expect("make marker lookup fail");
+
+        assert!(durable_marker_exists(&paths.activation_attempted).is_err());
+        assert!(activation_transfer_state(&paths).is_err());
+    }
+
+    #[test]
     fn rc_write_is_atomic_single_line() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = StatePaths::new(temp.path().to_path_buf(), "ab_test".to_string());
@@ -1203,6 +1644,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_done_old", "DONE", now - 20_000, true);
+        settle_reap_delivery(&paths);
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
 
@@ -1266,6 +1708,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_error", "ERROR", now - 20_000, true);
+        settle_reap_delivery(&paths);
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
 
@@ -1274,7 +1717,7 @@ mod tests {
     }
 
     #[test]
-    fn reaper_keeps_pending_undelivered_state_dir_until_moot() {
+    fn reaper_keeps_pending_undelivered_state_at_ttl() {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_pending", "DONE", now - 20_000, false);
@@ -1283,6 +1726,43 @@ mod tests {
 
         assert_eq!(stats.reaped, 0);
         assert!(paths.state_dir.exists());
+    }
+
+    #[test]
+    fn reaper_keeps_retryable_failed_delivery_at_ttl() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_retryable", "DONE", now - 20_000, false);
+        let mut meta = read_meta(&paths).expect("read meta");
+        meta.delivery.attempted = false;
+        meta.delivery.error = Some("registered delivery helper is unavailable".to_string());
+        meta.delivery.error_code = Some("delivery_helper_unavailable".to_string());
+        meta.delivery.retryable = Some(true);
+        meta.delivery.retry_count = 0;
+        write_meta_atomic(&paths, &meta).expect("write retryable delivery metadata");
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 0);
+        assert!(paths.state_dir.exists());
+    }
+
+    #[test]
+    fn reaper_keeps_settled_state_while_delivery_lock_is_held() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_delivery_owned", "DONE", now - 20_000, true);
+        settle_reap_delivery(&paths);
+        let delivery_lock = lock_delivery(&paths).expect("lock delivery");
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 0);
+        assert!(paths.state_dir.exists());
+        drop(delivery_lock);
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+        assert_eq!(stats.reaped, 1);
+        assert!(!paths.state_dir.exists());
     }
 
     #[test]
@@ -1331,13 +1811,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         for index in 0..3 {
-            write_reap_state(
+            let paths = write_reap_state(
                 temp.path(),
                 &format!("ab_done_old_{index}"),
                 "DONE",
                 now - 20_000,
                 true,
             );
+            settle_reap_delivery(&paths);
         }
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 2));
@@ -1351,13 +1832,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         for index in 0..40 {
-            write_reap_state(
+            let paths = write_reap_state(
                 temp.path(),
                 &format!("ab_sharded_{index}"),
                 "DONE",
                 now - 20_000,
                 true,
             );
+            settle_reap_delivery(&paths);
         }
         let config = ReapConfig {
             ttl_secs: 10,
@@ -1379,6 +1861,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_locked", "DONE", now - 20_000, true);
+        settle_reap_delivery(&paths);
         let mut perms = fs::metadata(temp.path()).expect("metadata").permissions();
         perms.set_mode(0o500);
         fs::set_permissions(temp.path(), perms).expect("chmod root readonly");

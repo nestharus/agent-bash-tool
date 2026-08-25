@@ -1,7 +1,8 @@
 # agent-bash-tool — Design Baseline
 
-Status: **draft baseline** (owner-shaped; pre-implementation). This is the spec the
-implementation pipeline builds against. Course-correct here before code.
+Status: **implemented current baseline**. This is the authoritative behavioral design for the
+current implementation. Historical proposals under `planning/` are retained for decision lineage;
+when they differ, this baseline, the current component contract, source, and executable tests govern.
 
 ## Problem
 
@@ -16,14 +17,14 @@ agent *thinks* it is calling foreground or background, our tool always runs the 
 detached and returns immediately. The result is delivered back to the agent out-of-band via
 agent-runner.
 
-## Two layers (strict separation)
+## Two layers (ownership separation)
 
 1. **agent-bash-tool (this repo) — the spooler. General, provider-agnostic.**
-   Knows nothing about agents, sessions, or providers. It detaches a command, captures its
-   process tree, watches for completion, and reports. It is *always called by* an agent, so on
-   completion it shells out to agent-runner to deliver the result — but it has no agent logic of
-   its own. Loose coupling: it invokes the `agent-runner` / `agents` CLI, it does **not** depend
-   on agent-runner crates.
+   Detaches a command, captures its process tree, watches for completion, and reports. It invokes
+   the `agent-runner` / `agents` CLI to resolve an opaque origin-session binding and to deliver the
+   result. The spooler records and compares that opaque session ID for supported control routing, but does
+   not own PID-to-session mapping, interpret provider session semantics, determine session
+   liveness, or manage a mailbox. Loose coupling: it does **not** depend on agent-runner crates.
 
 2. **agent-runner — the agent layer. Specialized.** Owns PID↔session mapping, session
    liveness, the agent process tree, and delivery (resume for headless, PTY injection for
@@ -40,11 +41,13 @@ agent-runner.
 ### Detached execution and explicit delivery
 There is no foreground execution mode. Every `run` detaches the workload, returns a handle
 immediately, and leaves the workload under the surviving supervisor. Execution lifetime and result
-delivery are separate choices:
+delivery are separate choices. Every terminal completion invokes the pinned
+`agent-bash-complete` helper operation; the mode recorded at registration tells the opaque helper
+whether that event is active for downstream mailbox delivery:
 
-- `run --delivery sync` records completion for in-band consumption and does not invoke the
-  agent-runner notification seam.
-- `run --delivery async` invokes the notification seam at completion.
+- `run --delivery sync` records completion for in-band consumption and sends an inactive completion
+  event to the helper; it does not enter the downstream mailbox.
+- `run --delivery async` sends an active completion event through the same helper operation.
 - The CLI defaults to `async` so handles created by older callers retain their behavior.
 - The OpenCode adapter defaults ordinary shell commands to `sync` with root-process completion,
   defaults child-agent dispatches to `async` with full-tree completion, and accepts an explicit
@@ -54,9 +57,13 @@ delivery are separate choices:
 - A headless asynchronous handle has no process owner lease because normal completion of a
   headless turn destroys that OpenCode process. The detached workload survives and notifies the
   durable session. Synchronous handles and interactive PTY handles remain owner-leased.
-- Leading shell environment assignments are ignored when classifying the command. An explicit
-  `VAR=value agent-bash run -- agents ...` command is dispatched directly as one asynchronous
-  spool instead of being captured by a synchronous outer spool.
+- Leading shell environment assignments are ignored when classifying the command, but a recognized
+  explicit run with an ordinary command-authored assignment is rejected. Reserved spooler-name
+  assignments are neutralized by `stripReservedSpoolerAssignmentsForShellRouting` and the structured
+  parser under the same `isReservedSpoolerAssignment` policy; effective values come only from adapter
+  state. The filtered shell
+  representation retains ordinary assignments and shell semantics and carries no direct-execution
+  authority; only structured explicit-run admission may enter the registration-capable launcher.
 - The adapter resolves a leading `agents` or `oulipoly-agent-runner` command to the configured
   `AGENT_BASH_AGENT_RUNNER_BIN`, avoiding PATH drift between interactive and detached execution.
 - A standalone `sleep N` stays inside the adapter for up to five minutes by default, so passive
@@ -64,6 +71,15 @@ delivery are separate choices:
 
 A synchronous adapter call can block for its result without owning the workload process. Harness
 timeout or caller death therefore does not terminate the detached workload.
+
+The bundled OpenCode adapter and `agent-bash` binary are one supported release unit. Deployment
+owners must use a quiesced cutover: stop new adapter calls, wait for in-flight adapter calls to
+finish, replace every installed adapter copy and the binary while calls remain stopped, and resume
+calls only after the matching pair is active. No adapter/binary overlap pair is supported, including
+the current adapter with a legacy binary or a legacy adapter with the current binary. Adapters that
+write the `consumed` marker directly are retired and unsupported; they are not a compatibility
+practice the spooler preserves. The control-route-eligible `consume` command is the sole supported
+first-party terminal-consumption operation, so future marker changes have one migration boundary.
 
 ### Attached-required — detached invocation bombs out
 At startup the tool captures `getppid()`. The tool itself must be a real, attached subprocess
@@ -93,6 +109,14 @@ without degradation because the subreaper remains authoritative. Process-group +
 stdout/stderr to a per-handle log, and records exit code. The `run` invocation itself returns
 the handle and exits — it does not `wait`.
 
+Supervisor creation is admitted around a socketpair registration-result handoff. The launcher forks
+one startup child and waits for its result. That child owns completion-event registration; on
+failure it records the terminal registration error, reports failure, and exits without starting a
+workload. On success it reports acceptance and continues directly into daemonization. Launcher loss
+cannot abandon an accepted registration because the startup child continues even if the result send
+has no receiver. A later daemon fork failure is published through the normal terminal-error and
+completion-delivery path rather than leaving a registered handle in an unowned `RUNNING` state.
+
 Captured output is bounded by `AGENT_BASH_LOG_MAX_BYTES` (16 MiB by default, clamped between
 64 KiB and 1 GiB). When the limit is crossed, the log records a truncation marker and retains the
 newest output rather than allowing an unbounded state-directory file.
@@ -103,6 +127,53 @@ the persisted PID/start-time/boot-ID identities and per-handle reconciliation lo
 supervisor loss is conclusive, record `supervisor-lost`, and run any pending async delivery. A
 persisted root exit code remains diagnostic evidence; supervisor loss is still `ERROR rc=70`
 because full process-tree completion can no longer be proven.
+
+The guardian becomes a subreaper before it forks the supervisor. If explicit cancellation was
+accepted before abnormal supervisor exit, the synchronized `cancel-requested` marker is the
+durable handoff and transfers that obligation to the guardian. `SIGUSR1` is only a low-latency
+wake-up; the supervisor also observes the marker on its bounded poll, so requester death cannot
+abandon an accepted request. The guardian adopts and terminates the remaining workload tree. Once
+it has authoritatively observed an empty adopted tree, it can settle an accepted startup cancel
+even when the supervisor died before publishing workload identity. The shared terminal-publication
+operation then records `cancel-request`, status 143, instead of `supervisor-lost`. Recovery without
+an accepted cancel continues to require both exact identities and fails closed when either is
+missing. Every non-sentinel terminal producer uses that same precedence decision.
+`CancellationCause` carries the provisional event-loop cause through finish selection and terminal
+proposal. The terminal publisher then finalizes it from the durable marker while holding
+`completion.lock`; the same type owns the persisted labels and status projection.
+`CancellationEscalation` owns the shared `SIGTERM`-then-`SIGKILL` decision for both the live
+supervisor and guardian. Live supervision starts its grace clock when cancellation is first
+accepted or observed. Guardian takeover intentionally starts a fresh grace clock because the
+durable marker carries no acceptance timestamp and the newly responsible process must first give
+the adopted tree a bounded `SIGTERM` opportunity before escalating.
+
+`cancel-requested`, `activation-attempted`, and `consumed` use one state-layer durable create-once
+marker primitive. It opens the state directory before marker creation, syncs the created file and
+directory, and removes plus directory-syncs the marker if either publication sync fails. A failed
+publication therefore does not become an accepted decision on a later call. Settlement observes
+these markers through one fallible state operation: only `NotFound` means absence, while any other
+lookup failure leaves cancellation, activation mode, or completion delivery unsettled. The
+activation lifecycle may also invoke the same durable rollback after a conclusive downstream
+pre-admission failure.
+
+Control-route-eligible `status` and the default origin-session-scoped `list` share the lost-supervisor terminal
+transition but not the delivery-helper-operation role. A targeted eligible `status` reconciliation progresses pending completion
+delivery in its current process and synchronously waits for the local delivery transfer worker and helper
+outcome. An origin-session-scoped bulk `list` may publish the same terminal state for an accurate projection,
+but it never executes a helper as an incidental enumeration side effect; its disposition is
+`CompletionDeliveryDisposition::LeavePending`. Live terminal producers, targeted status, and the guardian
+use `CompletionDeliveryDisposition::ClaimPending`; the disposition names only who progresses delivery, not how
+the terminal state was reached. Cross-owner status and
+`list --all` remain observational and do not reconcile state. Cross-route `mode` is likewise a
+point-in-time read, but it still fails closed when the durable activation outcome is unsettled.
+List projections represent that state as `delivery_mode: null` with `delivery_mode_error` in JSON
+and `delivery=unavailable` in text. Eligible `mode` may settle an orphaned activation transfer while
+holding the delivery lock. The guardian re-enters reconciliation,
+observes the terminal record, and claims pending delivery. A later targeted eligible `status` may claim
+it first. Both paths use the same `delivery.lock`, pinned helper, and write-ahead attempt record, so
+this handoff changes the delivery progress actor without permitting a repeated attempt. Every valid run
+creates the guardian before the supervisor; synthetic list fixtures without a guardian validate
+only that list does not claim delivery, then exercise the targeted-status handoff separately.
 
 ### Completion detection — three modes
 - **tree exit mode (default):** wake on root process death with `pidfd_open` + `poll`, and finish
@@ -116,24 +187,132 @@ because full process-tree completion can no longer be proven.
   *We never assume a workload will exit.*
 
 ### Output / handle
-`run` prints a handle (JSON) immediately. `status <handle>` is non-blocking: `RUNNING`, or
-`DONE rc=<n>` + captured output. This generalizes the current `agents-bg{,-poll}` tmux helpers
-into an event-driven, cgroup-tracked tool. The supervisor's poll of the PID is **harness-code
-polling (cheap, no LLM tokens)** — not the LLM self-polling that is forbidden.
+`run` prints a handle (JSON) immediately. `status <handle>` reports `RUNNING`, or `DONE rc=<n>` plus
+captured output. Cross-owner status is a point-in-time read. Owner status is also a progress
+operation: it may publish conclusively lost-supervisor terminal state or claim pending completion
+delivery, and therefore may wait for the bounded helper subprocess. This generalizes the current
+`agents-bg{,-poll}` tmux helpers into an event-driven, cgroup-tracked tool. The supervisor's poll of
+the PID is **harness-code polling (cheap, no LLM tokens)** — not the LLM self-polling that is
+forbidden.
+
+`status --observe-only <handle>` suppresses owner-triggered reconciliation and delivery progression.
+The bundled adapter uses it to observe a terminal asynchronous result, records `consume`, and then
+issues progress-capable status. This ordering puts the in-call consumer decision ahead of the
+completion helper request so the helper receives `--consumed` rather than admitting a duplicate
+active mailbox publication.
+
+Handle observation and handle control are separate cooperative routing policies within the
+supported CLI. Default list visibility and control require the recorded owner session when one
+exists, falling back to the exact caller-chain predicate only for handles without session metadata.
+At every supported mutating control boundary, the
+handle's pinned helper resolves the live caller chain to its acting session; ambient owner strings
+never satisfy that supported-interface check. `list --all`, cross-owner `status`, and cross-owner `mode` may
+observe account-local handles, but they cannot publish recovery state, claim delivery, cancel work,
+or change delivery mode. Cancel, detach, and consume fail with `EX_NOPERM` for ineligible callers. Guardian recovery
+remains independent of any observing caller and is the automatic cleanup/progress path after the
+originating process disappears. No unauthenticated cross-owner operator override is exposed by
+this CLI.
 
 ### Delivery resolution metadata
 At launch, while the caller is still alive and `/proc` is readable, the spooler records
 `caller_ppid` and a nearest-first `caller_chain` in `meta.json`. Each chain element contains
 `pid`, `/proc/<pid>/stat` field 22 as `starttime_ticks`, and the host `boot_id` from
 `/proc/sys/kernel/random/boot_id`. The delivery seam still passes `--caller-ppid` and
-`--meta <path>`; agent-runner resolves the owning session from the recorded chain by pure DB
-lookup. The spooler does not resolve sessions.
+`--meta <path>`; the configured helper asks agent-runner to resolve the owning session from the
+recorded chain by pure DB lookup. The spooler stores the returned opaque binding but does not own or
+implement the mapping.
 
 The OpenCode adapter also supplies its provider session ID and parent invocation UUID. The spooler
 records these as optional fields in `meta.json` and in a separate `owner.json`, allowing a resumed
 session to rediscover its handles after the adapter process and caller PID change. Agent-runner may
 use this pair as a delivery fallback only after confirming that the invocation belongs to the same
-provider session.
+provider session. The recorded session ID also restores that session's supported control routing for
+cancel, detach, and status reconciliation after its caller PID changes. That routing requires a
+fresh agent-runner resolution of the acting caller chain through the handle's pinned helper;
+presenting the recorded session ID in an environment variable does not grant control. Handles
+without session metadata use the nearest exact PID/start-time/boot-ID caller-chain entry as their
+control anchor. These checks prevent accidental cross-session operation; they do not create a
+security principal distinct from the Unix account.
+
+Registration resolves the configured helper once, reads it into a sealed executable image, and
+stores its SHA-256 identity. The image is installed once per content digest under the account-private
+state root and hard-linked as `delivery-helper` inside each dependent handle. Later activation,
+completion, status recovery, and guardian recovery accept only that handle-local path, verify its
+metadata and digest, copy it into a sealed in-memory image, and execute the sealed bytes. Replacing
+or editing the configured source path after registration cannot change an in-flight handle.
+When the helper is a shebang script, registration also resolves and seals the direct interpreter,
+stores its digest, and hard-links it as `delivery-helper-interpreter`. Later operations invoke that
+pinned interpreter image explicitly with the pinned script image. Interpreter chains and shebang
+arguments are rejected because they would delegate execution to another unbound program.
+
+The source models that provenance transition explicitly. `ConfiguredDeliveryHelper` is resolved
+from the initiating environment and can perform only owner-session discovery or a consuming bind.
+Binding yields `HandleBoundDeliveryHelper`; registration and every later delivery-helper request
+accept only that handle-bound type. Reconstructing it from durable provenance revalidates the
+handle-local paths, metadata, helper and interpreter digests, environment, and sealed bytes before
+exposing its operation command.
+
+Registration also pins the helper's execution environment. Helper commands clear the initiating
+process's ambient environment, run from `/`, and restore only a bounded baseline (`HOME`, locale,
+user, `PATH`, temporary-directory, and XDG/agent-runner data paths) plus non-secret variables named
+by `AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST` at registration. The explicit values are durable
+provenance and must not contain credentials. The caller-bound completion-registration authority is
+the sole transient exception: it is injected only into the immediate registration invocation and
+is neither persisted, replayed, nor inherited by the workload. The helper-selection override is also
+removed before workload execution. The OpenCode adapter invokes recognized explicit runs directly
+from conservatively parsed arguments and rejects shell expansion around that registration-capable
+launch. One explicit-run admission result distinguishes ordinary commands, conservatively
+recognized but unsupported explicit syntax, and validated direct invocations; only the last carries
+normalized arguments to the launcher. Command-authored ordinary assignments make an explicit run
+unsupported, while one reserved-name policy neutralizes spooler-control assignments in both command
+representations and supplies effective values only from adapter state. A later workload,
+detach, status, supervisor, or guardian process therefore
+cannot retain the registration capability or alter interpreter lookup, the agent-runner data
+namespace, or an explicitly declared helper input through its own environment.
+
+The forked startup child owns completion registration and transitions directly into daemonization
+after registration succeeds. The launcher waits only for that child's registration result. Launcher
+loss cannot strand a successful external registration before supervisor admission; the surviving
+child admits the workload. A conclusive helper pre-spawn failure is terminally recorded before the
+child reports rejection and exits. Once the helper process is admitted, any non-success is instead
+retained under the exact handle as terminal `registration-outcome-unknown`: no workload starts, the
+state is not deleted, and registration is not replayed because the opaque helper may already have
+committed its external effect. The run result exposes that terminal disposition as
+`dispatch_state=registration-outcome-unknown`; adapters report it as unresolved and do not describe
+the workload as running or promise a completion wake-up.
+
+The helper cache lock serializes cache installation, per-handle linking, and removal of cache entries
+with no remaining handle links. Warm-cache content validation occurs before the lock; the critical
+section rechecks the validated file identity before linking it. This keeps one physical snapshot per
+live helper version rather than one full executable copy per handle without serializing full-image
+hashing. The declared normal parallel admission point is eight same-account registrations sharing
+one warm helper digest, bounded to eight seconds in the integration contract; the test records the
+effective helper size and elapsed admission time.
+
+The state root is a Unix-account trust boundary: the Unix account is the sole security and
+decision principal. The recorded session is a cooperative routing label for supported CLI control,
+not a separately enforced authority principal.
+Mode `0700` excludes other accounts, while same-account workloads and observers are trusted not to
+rewrite another handle's state or helper cache. The observer-isolation guarantee means a later
+process using supported interfaces cannot substitute its environment or configured helper path; it
+is not a sandbox between hostile processes sharing one Unix identity. The owner check uses
+agent-runner's exact live PID identity records to prevent accidental or unsupported cross-session
+control through the CLI, but cannot prevent a same-UID process from directly rewriting
+durable state, including decision-bearing markers. Enforcing session authority against such a
+process would require a separately authenticated broker or distinct OS identity. Such same-UID
+behavior is authorized by the account security boundary even when it bypasses the cooperative CLI
+routing policy. `list --all`
+deliberately confers no supported control operation and does not strengthen the Unix-account trust
+boundary.
+The selected helper is an opaque trusted extension at this boundary. Its operation handlers may
+maintain downstream state, but this repository claims only pinned byte identity, invocation
+admission, and the observed helper-process outcome, not closure over arbitrary helper internals.
+
+Helper provenance schema 4 is the activation boundary for this convention. A deployment owner must
+drain handles created by older binaries before rollout. Draining includes explicitly terminating or
+otherwise settling never-ending old-schema handles; rollout must not wait on them indefinitely.
+Records with missing or older provenance are deliberately retired: later activation or completion fails closed with
+`delivery_helper_legacy_unsupported` and does not fall back to the observer's helper.
 
 ### Durable delivery mode and atomic detach
 Each handle stores its canonical delivery mode in `delivery-mode`; `meta.json.delivery_mode` mirrors
@@ -141,27 +320,97 @@ that value for observability. Missing mode files are interpreted as `async` for 
 older versions.
 
 `detach <handle>` converts `sync` to `async`. Detach and terminal completion both hold
-`delivery.lock` while deciding whether to invoke the external notification seam. Terminal state is
+`delivery.lock` while transferring their external delivery-helper operations. Terminal state is
 persisted before that decision so detach can safely observe a completion that won the race.
 
-- If detach wins while the workload is running, it persists `async`; completion later notifies.
-- If sync completion wins, it records `delivery.skipped="sync_in_band"`; a later detach transitions
-  the terminal handle and notifies.
-- If detach observes terminal state before completion's delivery step, detach notifies and records
-  the attempt; completion reloads that record and does not notify again.
-- Repeated detach calls observe `async` and are no-ops.
+- If detach wins while the workload is running, it persists `async` and invokes the
+  `agent-bash-activate` helper operation; completion later invokes `agent-bash-complete`.
+- If sync completion wins, it invokes `agent-bash-complete` for the inactive event; a later detach
+  transitions the terminal handle and invokes `agent-bash-activate`.
+- If detach observes terminal state before completion's delivery step, the helper operations remain
+  serialized and each event type is admitted at most once.
+- Repeated detach calls observe `async` and are no-ops. If a caller died between the canonical mode
+  write and the `meta.json` mirror, the retry repairs the mirror without repeating activation.
 
-Before asynchronous notification, the supervisor checks the best-effort `consumed` marker. If
-`AGENT_BASH_CONSUMER_GRACE_MS` is nonzero, it waits up to that bounded interval (clamped to ten
-seconds) for an in-call consumer to create the marker. A marker suppresses the duplicate
-notification and records `delivery.skipped="consumed_in_call"`; delivery locking still makes the
-decision atomic with detach and completion.
+The source fact `terminal_activation_requests_notification` reports whether a successful
+sync-to-async transition observes a terminal handle, allowing activation to request an immediate
+downstream notification. The detach JSON serializer retains the established wire field
+`notification_attempted`; that compatibility name is isolated at the serialization boundary and
+does not mean the spooler observed downstream notification. It also does not report whether the
+activation helper operation ran; that operation is internal to every claimed transition.
+
+Detach and completion first fork a local delivery transfer worker while retaining `delivery.lock`. That worker
+persists `activation-attempted` plus canonical `async` mode, or `attempted=true` plus
+`error_code="delivery_attempt_in_progress"`, immediately before it launches the helper. The worker
+retains the lock and persists the observed outcome even if the initiating CLI or supervisor dies.
+These are write-ahead transfer claims: once present, a successor never hands the same one-shot
+obligation to the helper again, including after a nonzero exit or unknown admitted outcome.
+Conclusive helper-resolution, fork, spawn, or pre-exec failures remain `attempted=false`; detach
+restores sync mode, while completion records a typed result and permits one bounded retry because no
+helper process received the operation. This chooses at-most-once invocation after admission without
+discarding a provably pre-admission obligation.
+
+The pre-admission retry policies intentionally diverge at the command-authority boundary.
+Completion progression can be entered automatically by the live supervisor, guardian, or a
+control-route-eligible status call, so `CompletionDeliveryMeta::completion_lifecycle` owns one durable
+retry budget and closes the operation after that budget is spent. Activation is entered only by an explicit
+control-route-eligible `detach`; a conclusive pre-admission failure restores sync mode and removes its
+claim, so each later retry requires a new explicit caller decision. Admitted or unknown activation
+never rolls back and cannot be retried. The delivery module owns both policies at the shared
+`delivery.lock` and local-worker transfer boundary; changes to helper admission or retry semantics
+must preserve this automatic-progression versus explicit-command distinction.
+
+Activation rollback retains its durable attempt claim until canonical sync mode and the metadata
+mirror are restored. A pre-admission failure is persisted before reversal, and a successor holding
+`delivery.lock` completes either that rollback or a claim that never reached pending publication.
+Only after sync restoration does cleanup remove the outcome and then the attempt marker, preventing
+an interrupted rollback from appearing as settled async activation.
+
+`ActivationTransferState` is the source-level decoder for the persisted mode, attempt marker, and
+outcome. Detach, mode observation, and orphan settlement consume its named outcome states rather
+than independently interpreting marker presence or outcome strings; the existing files remain the
+durable representation behind that boundary.
+
+`CompletionDeliveryMeta::completion_lifecycle` is the source-level and serialized classifier for
+that completion protocol. It reports
+`unclaimed`, `provisional_transfer`, `retryable_pre_admission_failure`,
+`closed_pre_admission_failure`, `non_replayable_unknown_transfer`, `admitted_outcome`,
+`legacy_skipped`, or `invalid` from the existing
+metadata fields. `legacy_skipped` recognizes persisted records from the retired producer behavior;
+current production paths do not write `delivery.skipped`. Reconciliation and status progress
+decisions consume this classifier rather than independently decoding field combinations; the
+original fields remain present for detailed outcome diagnostics.
+
+The spooler's closed state machine ends at the admitted helper invocation and its observed process
+exit. Agent-runner owns mailbox publication, transaction boundaries, and any downstream idempotency.
+Accordingly, “at most once” in this repository means one admitted `agent-bash-activate` or
+`agent-bash-complete` helper invocation; it does not claim an uninspected end-to-end mailbox theorem.
+Activation writes a durable pending outcome before helper admission and replaces it with succeeded
+or failed after observing the helper process. A caller loss cannot erase that outcome, and later
+detach calls expose failed or unknown settlement without replaying the admitted activation.
+
+Before invoking the completion helper operation, the supervisor checks the best-effort `consumed`
+marker. If `AGENT_BASH_CONSUMER_GRACE_MS` is nonzero, it waits up to that bounded interval (clamped
+to ten seconds) for an in-call consumer to create the marker. A marker adds `--consumed` to the
+`agent-bash-complete` helper operation so the opaque helper can suppress any downstream duplicate;
+the spooler still records the admitted helper-process outcome. Delivery locking keeps that operation
+atomic with detach and completion.
 
 Startup retention work is sharded by `AGENT_BASH_STATE_REAP_SHARDS` (16 by default) so large state
 roots are scanned incrementally. In addition to settled terminal handles, the reaper may remove an
 expired `ERROR` handle or `RUNNING` handle whose exact supervisor and workload identities are both
 conclusively gone or reused. Missing or unreadable process identity evidence fails closed and keeps
 the state directory.
+
+All terminal handles use the configured state TTL. Retryable pre-invocation helper failures do not
+receive a multiplied retention window, so failed delivery does not create a sevenfold retained-state
+population. Each control-route-eligible status observer may perform at most one helper-resolution retry
+for the handle it observes. The adapter requests the durable `consumed` marker through the
+control-route-eligible `consume` operation; cross-route status remains read-only and cannot suppress the
+origin session's pending delivery. `retry_count` bounds each handle to one
+observer-triggered retry in total. The delivery lock serializes concurrently admitted eligible
+observers; the first persists either an attempt claim or a closed retry result, and later observers
+cannot repeat it.
 
 ## agent-runner additions
 

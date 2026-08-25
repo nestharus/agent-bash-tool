@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
@@ -11,6 +12,10 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+const FIXTURE_DEADLINE: Duration = Duration::from_secs(30);
+const FAKE_HELPER_ENVIRONMENT: &str = "AGENT_BASH_FAKE_ACTIVATE_RELEASE,AGENT_BASH_FAKE_ACTIVATE_STARTED,AGENT_BASH_FAKE_COMPLETE_FINISHED,AGENT_BASH_FAKE_COMPLETE_RELEASE,AGENT_BASH_FAKE_COMPLETE_STARTED,AGENT_BASH_FAKE_DELIVERY_LOG,AGENT_BASH_FAKE_FIRST_MISS_MARKER,AGENT_BASH_FAKE_META_SNAPSHOT,AGENT_BASH_FAKE_RC_SNAPSHOT,AGENT_BASH_FAKE_RESOLVED_SESSION,AGENT_BASH_FAKE_RESOLVER_DELAY,AGENT_BASH_FAKE_RESOLVER_LOG,AGENT_BASH_FAKE_RESOLVER_RELEASE,AGENT_BASH_FAKE_RESOLVER_STARTED,AGENT_BASH_FAKE_ROUTE";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ProcIdentity {
@@ -22,6 +27,13 @@ fn agent_bash(temp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("agent-bash").expect("agent-bash binary");
     cmd.env("XDG_STATE_HOME", temp.path())
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env(
+            "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST",
+            FAKE_HELPER_ENVIRONMENT,
+        )
+        .env_remove("AGENT_BASH_CONSUMER_GRACE_MS")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
+        .env_remove("AGENT_BASH_OWNER_SESSION_ID")
         .env_remove("OULIPOLY_PARENT_INVOCATION")
         .env_remove("OULIPOLY_DATA_DIR");
     cmd
@@ -94,6 +106,7 @@ fn stdout_utf8(output: Output, context: &str) -> String {
     String::from_utf8(output.stdout).expect(context)
 }
 
+#[track_caller]
 fn wait_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + timeout;
     loop {
@@ -105,6 +118,7 @@ fn wait_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
     }
 }
 
+#[track_caller]
 fn assert_wait_pending(deadline: Instant, timeout: Duration) {
     assert!(Instant::now() < deadline, "timed out after {timeout:?}");
 }
@@ -155,7 +169,7 @@ fn detached_guard_compile_failure_message(output: &Output) -> String {
 }
 
 fn wait_for_status_prefix(temp: &tempfile::TempDir, handle: &str, prefix: &str) -> String {
-    wait_until(Duration::from_secs(6), || {
+    wait_until(FIXTURE_DEADLINE, || {
         let text = status_text(temp, handle, true);
         if text.starts_with(prefix) {
             Some(text)
@@ -166,7 +180,7 @@ fn wait_for_status_prefix(temp: &tempfile::TempDir, handle: &str, prefix: &str) 
 }
 
 fn wait_for_terminal_status(temp: &tempfile::TempDir, handle: &str) -> String {
-    wait_until(Duration::from_secs(6), || {
+    wait_until(FIXTURE_DEADLINE, || {
         let text = status_text(temp, handle, true);
         (!text.starts_with("RUNNING ")).then_some(text)
     })
@@ -216,6 +230,7 @@ fn seed_done_state_dir(
 }
 
 fn done_state_meta(handle: &str, updated_at_unix_ms: u64) -> Value {
+    let (caller_identity, _) = proc_identity(unsafe { libc::getpid() }).expect("caller identity");
     json!({
         "schema_version": 1,
         "handle": handle,
@@ -224,7 +239,7 @@ fn done_state_meta(handle: &str, updated_at_unix_ms: u64) -> Value {
         "state": "DONE",
         "completion_reason": "exit",
         "caller_ppid": unsafe { libc::getpid() },
-        "caller_chain": [],
+        "caller_chain": [exact_identity(&caller_identity)],
         "launcher_pid": unsafe { libc::getpid() },
         "supervisor_pid": null,
         "workload_pid": null,
@@ -319,7 +334,10 @@ fn state_dir_count(temp: &tempfile::TempDir) -> usize {
     match fs::read_dir(root) {
         Ok(entries) => entries
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+            .filter(|entry| {
+                entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                    && entry.file_name().to_string_lossy().starts_with("ab_")
+            })
             .count(),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
         Err(err) => panic!("read isolated state root: {err}"),
@@ -341,22 +359,287 @@ fn write_consumed_marker(state_dir: &Path) {
     fs::write(state_dir.join("consumed"), b"").expect("write consumed");
 }
 
+fn write_delivery_helper_provenance(
+    state_dir: &Path,
+    helper: &Path,
+    environment: &[(&str, &Path)],
+) {
+    let snapshot = state_dir.join("delivery-helper");
+    fs::copy(helper, &snapshot).expect("copy helper snapshot");
+    let mut permissions = fs::metadata(&snapshot)
+        .expect("snapshot metadata")
+        .permissions();
+    permissions.set_mode(0o500);
+    fs::set_permissions(&snapshot, permissions).expect("make snapshot executable");
+    let snapshot = fs::canonicalize(snapshot).expect("canonical helper snapshot");
+    let metadata = fs::metadata(&snapshot).expect("helper metadata");
+    let sha256 = format!(
+        "{:x}",
+        Sha256::digest(fs::read(&snapshot).expect("read snapshot"))
+    );
+    let environment = environment
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), value.to_string_lossy().into_owned()))
+        .collect::<BTreeMap<_, _>>();
+    let interpreter_source = fs::canonicalize("/bin/sh").expect("canonical shell interpreter");
+    let interpreter_snapshot = state_dir.join("delivery-helper-interpreter");
+    fs::copy(&interpreter_source, &interpreter_snapshot).expect("copy helper interpreter");
+    let mut interpreter_permissions = fs::metadata(&interpreter_snapshot)
+        .expect("interpreter metadata")
+        .permissions();
+    interpreter_permissions.set_mode(0o500);
+    fs::set_permissions(&interpreter_snapshot, interpreter_permissions)
+        .expect("make interpreter executable");
+    let interpreter_snapshot =
+        fs::canonicalize(interpreter_snapshot).expect("canonical helper interpreter");
+    let interpreter_sha256 = format!(
+        "{:x}",
+        Sha256::digest(fs::read(&interpreter_snapshot).expect("read helper interpreter"))
+    );
+    let provenance = json!({
+        "schema_version": 4,
+        "path": snapshot.to_str().expect("UTF-8 helper path"),
+        "device": metadata.dev(),
+        "inode": metadata.ino(),
+        "size": metadata.size(),
+        "modified_seconds": metadata.mtime(),
+        "modified_nanoseconds": metadata.mtime_nsec(),
+        "mode": metadata.mode(),
+        "sha256": sha256,
+        "environment": environment,
+        "interpreter": {
+            "path": interpreter_snapshot.to_str().expect("UTF-8 interpreter path"),
+            "sha256": interpreter_sha256,
+        },
+    });
+    let meta_path = state_dir.join("meta.json");
+    let mut meta = read_meta(&meta_path);
+    meta["delivery_helper"] = provenance;
+    fs::write(&meta_path, format_seeded_meta(&meta)).expect("write delivery helper provenance");
+}
+
 fn fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
-    let (fake, delivery_log) = fake_agents_paths(temp);
-    fs::write(&fake, fake_agents_script()).expect("write fake");
+    named_fake_agents(temp, "fake-agents", "delivery.log")
+}
+
+fn named_fake_agents(
+    temp: &tempfile::TempDir,
+    helper_name: &str,
+    log_name: &str,
+) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join(helper_name);
+    let delivery_log = temp.path().join(log_name);
+    fs::write(&fake, fake_agents_script(&delivery_log)).expect("write fake");
     set_executable(&fake);
     (fake, delivery_log)
 }
 
-fn fake_agents_paths(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
-    (
-        temp.path().join("fake-agents"),
-        temp.path().join("delivery.log"),
+fn fake_agents_script(delivery_log: &Path) -> String {
+    format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nexit 0\n",
+        shell_quote(delivery_log)
     )
 }
 
-fn fake_agents_script() -> &'static str {
-    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\nexit 0\n"
+fn registration_launcher_killing_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join("registration-launcher-killing-agents");
+    let log = temp.path().join("registration-launcher-killing.log");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nif [ \"${{2:-}}\" = agent-bash-register ]; then\n  launcher=$(ps -o ppid= -p \"$PPID\" | tr -d ' ')\n  kill -KILL \"$launcher\"\nfi\nexit 0\n",
+            shell_quote(&log)
+        ),
+    )
+    .expect("write registration-launcher-killing fake");
+    set_executable(&fake);
+    (fake, log)
+}
+
+fn admitted_registration_failure_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join("admitted-registration-failure-agents");
+    let log = temp.path().join("admitted-registration-failure.log");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf '%s\n' \"$@\" >> {}\nif [ \"${{1:-}}\" = session ] && [ \"${{2:-}}\" = of-pid ]; then\n  printf '{{\"found\":true,\"invocation_uuid\":\"11111111-1111-4111-8111-111111111111\",\"session_id\":\"%s\"}}\\n' \"${{AGENT_BASH_FAKE_RESOLVED_SESSION:-ses_resolved}}\"\nelif [ \"${{2:-}}\" = agent-bash-register ]; then\n  exit 19\nfi\nexit 0\n",
+            shell_quote(&log)
+        ),
+    )
+    .expect("write admitted-registration-failure fake");
+    set_executable(&fake);
+    (fake, log)
+}
+
+fn interpreter_backed_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf) {
+    let interpreter = temp.path().join("delivery-interpreter");
+    let helper = temp.path().join("interpreter-backed-agents");
+    let log = temp.path().join("interpreter-backed.log");
+    fs::copy("/bin/sh", &interpreter).expect("copy delivery interpreter");
+    set_executable(&interpreter);
+    fs::write(
+        &helper,
+        format!(
+            "#!{}\nprintf '%s\\n' \"$@\" >> {}\nexit 0\n",
+            interpreter.display(),
+            shell_quote(&log)
+        ),
+    )
+    .expect("write interpreter-backed helper");
+    set_executable(&helper);
+    (helper, interpreter, log)
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
+#[derive(Clone)]
+struct BlockingDeliveryFixture {
+    helper: PathBuf,
+    activation_started: PathBuf,
+    activation_release: PathBuf,
+    completion_started: PathBuf,
+    completion_release: PathBuf,
+    completion_finished: PathBuf,
+    delivery_log: PathBuf,
+}
+
+fn blocking_delivery_fake_agents(temp: &tempfile::TempDir) -> BlockingDeliveryFixture {
+    let fake = temp.path().join("blocking-activate-fake-agents");
+    let activate_started = temp.path().join("activate-started");
+    let activate_release = temp.path().join("activate-release");
+    let complete_started = temp.path().join("complete-started");
+    let complete_release = temp.path().join("complete-release");
+    let complete_finished = temp.path().join("complete-finished");
+    let delivery_log = temp.path().join("blocking-delivery.log");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+if [ "${2:-}" = agent-bash-activate ]; then
+    printf 'agent-bash-activate\n' >> "$AGENT_BASH_FAKE_DELIVERY_LOG"
+    : > "$AGENT_BASH_FAKE_ACTIVATE_STARTED"
+    while [ ! -e "$AGENT_BASH_FAKE_ACTIVATE_RELEASE" ]; do sleep 0.01; done
+elif [ "${2:-}" = agent-bash-complete ]; then
+    printf 'agent-bash-complete\n' >> "$AGENT_BASH_FAKE_DELIVERY_LOG"
+    : > "$AGENT_BASH_FAKE_COMPLETE_STARTED"
+    attempts=0
+    while [ ! -e "$AGENT_BASH_FAKE_COMPLETE_RELEASE" ] && [ "$attempts" -lt 800 ]; do
+        attempts=$((attempts + 1))
+        sleep 0.01
+    done
+    [ -e "$AGENT_BASH_FAKE_COMPLETE_RELEASE" ] || exit 1
+    : > "$AGENT_BASH_FAKE_COMPLETE_FINISHED"
+fi
+exit 0
+"#,
+    )
+    .expect("write blocking activation fake");
+    set_executable(&fake);
+    BlockingDeliveryFixture {
+        helper: fake,
+        activation_started: activate_started,
+        activation_release: activate_release,
+        completion_started: complete_started,
+        completion_release: complete_release,
+        completion_finished: complete_finished,
+        delivery_log,
+    }
+}
+
+fn parent_killing_fake_agents(
+    temp: &tempfile::TempDir,
+    killed_operation: &str,
+) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join(format!("kill-parent-{killed_operation}"));
+    let log = temp
+        .path()
+        .join(format!("kill-parent-{killed_operation}.log"));
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\noperation=${{2:-}}\nif [ \"$operation\" = {} ]; then\n  printf '%s\\n' \"$operation\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\n  caller_pid=$(ps -o ppid= -p \"$PPID\")\n  kill -KILL \"$caller_pid\"\nfi\nexit 0\n",
+            shell_quote(Path::new(killed_operation))
+        ),
+    )
+    .expect("write parent-killing fake");
+    set_executable(&fake);
+    (fake, log)
+}
+
+fn delivery_transfer_worker_killing_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join("kill-delivery-owner");
+    let log = temp.path().join("kill-delivery-owner.log");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+if [ "${2:-}" = agent-bash-complete ]; then
+    printf 'agent-bash-complete\n' >> "$AGENT_BASH_FAKE_DELIVERY_LOG"
+    kill -KILL "$PPID"
+fi
+exit 0
+"#,
+    )
+    .expect("write delivery-owner-killing fake");
+    set_executable(&fake);
+    (fake, log)
+}
+
+fn delivery_handoff_killing_fake_agents(
+    temp: &tempfile::TempDir,
+    killed_operation: &str,
+) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join(format!("kill-handoff-{killed_operation}"));
+    let log = temp
+        .path()
+        .join(format!("kill-handoff-{killed_operation}.log"));
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\noperation=${{2:-}}\nif [ \"$operation\" = {} ]; then\n  printf '%s\\n' \"$operation\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\n  owner_pid=$PPID\n  initiator_pid=$(ps -o ppid= -p \"$owner_pid\" | tr -d ' ')\n  kill -KILL \"$initiator_pid\" \"$owner_pid\"\nfi\nexit 0\n",
+            shell_quote(Path::new(killed_operation))
+        ),
+    )
+    .expect("write delivery-handoff-killing fake");
+    set_executable(&fake);
+    (fake, log)
+}
+
+fn nonzero_completion_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join("nonzero-completion-fake-agents");
+    let log = temp.path().join("nonzero-completion.log");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+if [ "${2:-}" = agent-bash-complete ]; then
+    printf 'agent-bash-complete\n' >> "$AGENT_BASH_FAKE_DELIVERY_LOG"
+    exit 17
+fi
+exit 0
+"#,
+    )
+    .expect("write nonzero completion fake");
+    set_executable(&fake);
+    (fake, log)
+}
+
+fn nonzero_activation_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join("nonzero-activation-fake-agents");
+    let log = temp.path().join("nonzero-activation.log");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+if [ "${2:-}" = agent-bash-activate ]; then
+    printf 'agent-bash-activate\n' >> "$AGENT_BASH_FAKE_DELIVERY_LOG"
+    printf 'activation rejected\n' >&2
+    exit 19
+fi
+exit 0
+"#,
+    )
+    .expect("write nonzero activation fake");
+    set_executable(&fake);
+    (fake, log)
 }
 
 fn owner_resolving_fake_agents(temp: &tempfile::TempDir) -> PathBuf {
@@ -365,6 +648,12 @@ fn owner_resolving_fake_agents(temp: &tempfile::TempDir) -> PathBuf {
         &fake,
         r#"#!/bin/sh
 if [ "${1:-}" = session ] && [ "${2:-}" = of-pid ]; then
+    if [ -n "${AGENT_BASH_FAKE_RESOLVER_STARTED:-}" ]; then
+        : > "$AGENT_BASH_FAKE_RESOLVER_STARTED"
+    fi
+    if [ -n "${AGENT_BASH_FAKE_RESOLVER_RELEASE:-}" ]; then
+        while [ ! -e "$AGENT_BASH_FAKE_RESOLVER_RELEASE" ]; do sleep 0.01; done
+    fi
     if [ -n "${AGENT_BASH_FAKE_RESOLVER_DELAY:-}" ]; then
         sleep "$AGENT_BASH_FAKE_RESOLVER_DELAY"
     fi
@@ -374,6 +663,8 @@ if [ "${1:-}" = session ] && [ "${2:-}" = of-pid ]; then
         exit 1
     fi
     printf '{"found":true,"invocation_uuid":"11111111-1111-4111-8111-111111111111","session_id":"%s"}\n' "${AGENT_BASH_FAKE_RESOLVED_SESSION:-ses_resolved}"
+elif [ -n "${AGENT_BASH_FAKE_DELIVERY_LOG:-}" ]; then
+    printf '%s\n' "$@" >> "$AGENT_BASH_FAKE_DELIVERY_LOG"
 fi
 exit 0
 "#,
@@ -381,6 +672,24 @@ exit 0
     .expect("write owner-resolving fake");
     set_executable(&fake);
     fake
+}
+
+fn routed_owner_resolving_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join("routed-owner-resolving-fake-agents");
+    let route = temp.path().join("acting-session");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+if [ "${1:-}" = session ] && [ "${2:-}" = of-pid ]; then
+    session=$(cat "$AGENT_BASH_FAKE_ROUTE")
+    printf '{"found":true,"invocation_uuid":"11111111-1111-4111-8111-111111111111","session_id":"%s"}\n' "$session"
+fi
+exit 0
+"#,
+    )
+    .expect("write routed owner-resolving fake");
+    set_executable(&fake);
+    (fake, route)
 }
 
 fn registration_rejecting_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
@@ -403,11 +712,19 @@ exit 74
     (fake, resolver_log)
 }
 
-fn delivery_attempt_count(path: &Path) -> usize {
+fn completion_helper_operation_count(path: &Path) -> usize {
     fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
         .filter(|line| *line == "agent-bash-complete")
+        .count()
+}
+
+fn operation_count(path: &Path, operation: &str) -> usize {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == operation)
         .count()
 }
 
@@ -486,6 +803,7 @@ mock.module("@opencode-ai/plugin", () => ({ tool }))
 const mode = process.argv[2]
 const adapterPath = process.argv[3]
 const value = process.argv[4]
+const request = mode === "request" ? JSON.parse(value) : null
 const mod = await import(adapterPath)
 const controller = new AbortController()
 const context = {
@@ -526,6 +844,24 @@ if (mode === "parallel-live") {
   process.exit(0)
 }
 
+if (mode === "launch-poll") {
+  const launched = await mod.default.execute(
+    { command: "printf 'adapter owner poll\\n'", delivery: "async" },
+    context,
+  )
+  const launchedResult = typeof launched === "string" ? launched : String(launched)
+  const handle = launchedResult.match(/handle=([^\s)]+)/)?.[1]
+  if (!handle) throw new Error(`launch-poll did not return a handle: ${launchedResult}`)
+  let result = ""
+  for (let attempts = 0; attempts < 200; attempts += 1) {
+    result = String(await mod.default.execute({ handle }, context))
+    if (/^(DONE|ERROR)/.test(result)) break
+    await Bun.sleep(25)
+  }
+  console.log(JSON.stringify({ result, handle }))
+  process.exit(/^(DONE|ERROR)/.test(result) ? 0 : 1)
+}
+
 if (mode === "move-helper") {
   const execution = mod.default.execute(
     { command: `sleep 0.1; mv "$AGENT_BASH_BIN" "$AGENT_BASH_BIN.moved"; sleep 0.2` },
@@ -536,30 +872,26 @@ if (mode === "move-helper") {
   )
   const outcome = await Promise.race([
     execution,
-    Bun.sleep(2000).then(() => ({ kind: "timeout", result: "polling did not terminate" })),
+    Bun.sleep(30000).then(() => ({ kind: "timeout", result: "polling did not terminate" })),
   ])
   console.log(JSON.stringify(outcome))
   process.exit(outcome.kind === "error" ? 0 : 1)
 }
 
-const args = mode === "poll"
+const args = request
+  ? request.args
+  : mode === "poll"
   ? { handle: value }
-  : mode === "async"
-    ? { command: "sleep 1; printf 'adapter async\\n'", delivery: "async" }
-    : mode === "sleep"
+  : mode === "sleep"
       ? { command: "sleep 0.05" }
     : mode === "abort"
       ? { command: "sleep 60; printf 'adapter abort failed\\n'" }
-      : mode === "detachable"
-        ? { command: "sleep 2; printf 'adapter detached\\n'" }
       : mode === "wrapper"
         ? { command: `${process.env.AGENT_BASH_BIN} run -- agents --version` }
-      : mode === "wrapper-env"
-        ? { command: `XDG_STATE_HOME=${process.env.XDG_STATE_HOME} ${process.env.AGENT_BASH_BIN} run -- agents --version` }
       : mode === "binding-env"
         ? { command: "printf '%s|%s\\n' \"${OULIPOLY_LIVE_SESSION_BIND_SOCKET-unset}\" \"${OULIPOLY_LIVE_SESSION_BIND_TOKEN-unset}\"" }
       : mode === "inherited-env"
-        ? { command: "printf '%s|%s|%s\\n' \"$INHERITED_ENV_SENTINEL\" \"$OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY\" \"$OULIPOLY_PARENT_INVOCATION\"" }
+        ? { command: "parent_authority=$(tr '\\0' '\\n' < \"/proc/$PPID/environ\" | sed -n 's/^OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY=//p'); printf '%s|%s|%s|%s|%s\\n' \"$INHERITED_ENV_SENTINEL\" \"${OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY-unset}\" \"${AGENT_BASH_AGENT_RUNNER_BIN-unset}\" \"$OULIPOLY_PARENT_INVOCATION\" \"${parent_authority:-unset}\"" }
       : mode === "agent-sync"
         ? { command: "agents --version", delivery: "sync" }
         : mode === "agent"
@@ -573,7 +905,7 @@ const text = typeof result === "string" ? result : String(result)
 const matched = text.match(/handle=([^\s)]+)/)
 
 console.log(JSON.stringify({ result: text, handle: matched?.[1] ?? null }))
-if (mode === "detachable") await Bun.sleep(3000)
+if (request?.lingerMs) await Bun.sleep(request.lingerMs)
 "#
 }
 
@@ -581,9 +913,9 @@ fn run_adapter_driver(
     temp: &tempfile::TempDir,
     driver: &Path,
     mode: &str,
-    handle: Option<&str>,
+    value: Option<&str>,
 ) -> Value {
-    let mut command = adapter_driver_command(temp, driver, mode, handle);
+    let mut command = adapter_driver_command(temp, driver, mode, value);
     let output = command.output().expect("adapter driver");
     assert_command_success(&output);
     parse_stdout_json(&output)
@@ -593,7 +925,7 @@ fn adapter_driver_command(
     temp: &tempfile::TempDir,
     driver: &Path,
     mode: &str,
-    handle: Option<&str>,
+    value: Option<&str>,
 ) -> StdCommand {
     let mut command = StdCommand::new(bun_bin_path());
     let adapter_agent_bash = temp.path().join("adapter-agent-bash");
@@ -611,11 +943,16 @@ fn adapter_driver_command(
         .arg(adapter_module_path())
         .env("AGENT_BASH_BIN", adapter_agent_bash)
         .env(
+            "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST",
+            FAKE_HELPER_ENVIRONMENT,
+        )
+        .env(
             "AGENT_BASH_AGENT_RUNNER_BIN",
             owner_resolving_fake_agents(temp),
         )
         .env("AGENT_BASH_FAKE_RESOLVED_SESSION", "ses_adapter")
         .env("AGENT_BASH_TOOL_POLL_MS", "25")
+        .env("AGENT_BASH_TOOL_PROCESS_TIMEOUT_MS", "120000")
         .env("XDG_STATE_HOME", temp.path())
         .env(
             "OULIPOLY_PARENT_INVOCATION",
@@ -624,8 +961,8 @@ fn adapter_driver_command(
         .env_remove("OULIPOLY_LIVE_SESSION_BIND_SOCKET")
         .env_remove("OULIPOLY_LIVE_SESSION_BIND_TOKEN")
         .env_remove("OULIPOLY_DATA_DIR");
-    if let Some(handle) = handle {
-        command.arg(handle);
+    if let Some(value) = value {
+        command.arg(value);
     }
     command
 }
@@ -824,6 +1161,7 @@ fn seed_running_state_dir(
 ) -> Value {
     let state_dir = temp.path().join("agent-bash").join(handle);
     fs::create_dir_all(&state_dir).expect("state dir");
+    let (caller_identity, _) = proc_identity(unsafe { libc::getpid() }).expect("caller identity");
     let meta = json!({
         "schema_version": 1,
         "handle": handle,
@@ -832,7 +1170,7 @@ fn seed_running_state_dir(
         "state": "RUNNING",
         "completion_reason": null,
         "caller_ppid": unsafe { libc::getpid() },
-        "caller_chain": [],
+        "caller_chain": [exact_identity(&caller_identity)],
         "launcher_pid": unsafe { libc::getpid() },
         "supervisor_pid": supervisor_identity.as_ref().and_then(|value| value["pid"].as_i64()),
         "supervisor_pid_starttime_ticks": supervisor_identity
@@ -887,6 +1225,18 @@ fn status_with_observing_delivery(
     meta_snapshot: &Path,
     rc_snapshot: &Path,
 ) -> Output {
+    let state_dir = temp.path().join("agent-bash").join(handle);
+    if read_meta(&state_dir.join("meta.json"))["delivery_helper"].is_null() {
+        write_delivery_helper_provenance(
+            &state_dir,
+            fake,
+            &[
+                ("AGENT_BASH_FAKE_DELIVERY_LOG", delivery_log),
+                ("AGENT_BASH_FAKE_META_SNAPSHOT", meta_snapshot),
+                ("AGENT_BASH_FAKE_RC_SNAPSHOT", rc_snapshot),
+            ],
+        );
+    }
     let mut cmd = agent_bash(temp);
     cmd.env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
         .env("AGENT_BASH_FAKE_DELIVERY_LOG", delivery_log)
@@ -927,9 +1277,29 @@ fn assert_process_alive(pid: libc::pid_t) {
 }
 
 fn wait_for_process_gone(pid: libc::pid_t) {
-    wait_until(Duration::from_secs(6), || {
+    wait_until(FIXTURE_DEADLINE, || {
         proc_identity(pid).is_none().then_some(())
     });
+}
+
+struct ReleaseMarker(Option<PathBuf>);
+
+impl ReleaseMarker {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn release(mut self) {
+        fs::write(self.0.take().expect("release marker path"), b"").expect("write release marker");
+    }
+}
+
+impl Drop for ReleaseMarker {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::write(path, b"");
+        }
+    }
 }
 
 struct OwnerScenario {
@@ -939,6 +1309,7 @@ struct OwnerScenario {
     list_now: PathBuf,
     owner_list: PathBuf,
     list_caller_pid: PathBuf,
+    workload_release: PathBuf,
 }
 
 impl OwnerScenario {
@@ -957,7 +1328,7 @@ impl Drop for OwnerScenario {
             return;
         };
         let _ = child.kill();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + FIXTURE_DEADLINE;
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => return,
@@ -994,15 +1365,34 @@ fn owner_scenario_reaper() -> &'static mpsc::Sender<Child> {
 }
 
 fn spawn_owner_scenario(temp: &tempfile::TempDir, workload_seconds: &str) -> OwnerScenario {
+    spawn_owner_scenario_with_release(temp, workload_seconds, false)
+}
+
+fn spawn_releasable_owner_scenario(temp: &tempfile::TempDir) -> OwnerScenario {
+    spawn_owner_scenario_with_release(temp, "0", true)
+}
+
+fn spawn_owner_scenario_with_release(
+    temp: &tempfile::TempDir,
+    workload_seconds: &str,
+    releasable: bool,
+) -> OwnerScenario {
     let _ = owner_scenario_reaper();
     let run_json = temp.path().join("owner-run.json");
     let ready = temp.path().join("owner-ready");
     let list_now = temp.path().join("owner-list-now");
     let owner_list = temp.path().join("owner-list.json");
     let list_caller_pid = temp.path().join("owner-list-caller-pid");
+    let workload_release = temp.path().join("owner-workload-release");
     let script = r#"
 set -eu
-"$AGENT_BASH_BIN" run -- sleep "$OWNER_WORKLOAD_SECONDS" > "$RUN_JSON"
+test -z "${AGENT_BASH_OWNER_SESSION_ID+x}"
+test -z "${AGENT_BASH_OWNER_INVOCATION_UUID+x}"
+if [ "$OWNER_WORKLOAD_RELEASABLE" = 1 ]; then
+    "$AGENT_BASH_BIN" run --delivery sync -- bash -lc 'for _ in {1..800}; do [ -e "$OWNER_WORKLOAD_RELEASE" ] && exit 0; sleep 0.01; done; exit 1' > "$RUN_JSON"
+else
+    "$AGENT_BASH_BIN" run -- sleep "$OWNER_WORKLOAD_SECONDS" > "$RUN_JSON"
+fi
 while [ ! -e "$LIST_NOW" ]; do : > "$READY"; sleep 0.01; done
 bash -c 'printf "%s\n" "$$" > "$LIST_CALLER_PID"; "$AGENT_BASH_BIN" list --json > "$OWNER_LIST"; rc=$?; exit "$rc"'
 rc=$?
@@ -1025,6 +1415,11 @@ exit "$rc"
         .env("OWNER_LIST", &owner_list)
         .env("LIST_CALLER_PID", &list_caller_pid)
         .env("OWNER_WORKLOAD_SECONDS", workload_seconds)
+        .env(
+            "OWNER_WORKLOAD_RELEASABLE",
+            if releasable { "1" } else { "0" },
+        )
+        .env("OWNER_WORKLOAD_RELEASE", &workload_release)
         .spawn()
         .expect("spawn owner scenario");
     OwnerScenario {
@@ -1034,12 +1429,17 @@ exit "$rc"
         list_now,
         owner_list,
         list_caller_pid,
+        workload_release,
     }
 }
 
 fn shell_list_json(temp: &tempfile::TempDir, all: bool) -> Vec<Value> {
     let all_arg = if all { " --all" } else { "" };
-    let script = format!("\"$AGENT_BASH_BIN\" list{all_arg} --json; rc=$?; exit \"$rc\"");
+    let script = format!(
+        "test -z \"${{AGENT_BASH_OWNER_SESSION_ID+x}}\" && \
+         test -z \"${{AGENT_BASH_OWNER_INVOCATION_UUID+x}}\" && \
+         \"$AGENT_BASH_BIN\" list{all_arg} --json"
+    );
     let output = StdCommand::new("bash")
         .arg("-c")
         .arg(script)
@@ -1063,6 +1463,34 @@ struct ProcessCleanup {
 #[derive(Debug)]
 struct OwnedProcess {
     pidfd: OwnedFd,
+}
+
+struct StoppedProcess<'a> {
+    process: &'a OwnedProcess,
+    resumed: bool,
+}
+
+impl<'a> StoppedProcess<'a> {
+    fn stop(process: &'a OwnedProcess) -> Self {
+        assert!(process.signal(libc::SIGSTOP), "stop owned process");
+        Self {
+            process,
+            resumed: false,
+        }
+    }
+
+    fn resume(&mut self) -> bool {
+        self.resumed = self.process.signal(libc::SIGCONT);
+        self.resumed
+    }
+}
+
+impl Drop for StoppedProcess<'_> {
+    fn drop(&mut self) {
+        if !self.resumed {
+            let _ = self.process.signal(libc::SIGCONT);
+        }
+    }
 }
 
 impl OwnedProcess {
@@ -1199,16 +1627,14 @@ fn process_cleanup_rejects_mismatched_workload_identity() {
         .env("SIGNALED", &signaled)
         .spawn()
         .expect("spawn workload");
-    wait_until(Duration::from_secs(2), || ready.exists().then_some(()));
+    wait_until(FIXTURE_DEADLINE, || ready.exists().then_some(()));
     let pid = workload.id() as libc::pid_t;
     let (mut mismatched, _) = proc_identity(pid).expect("workload identity");
     mismatched.starttime_ticks += 1;
 
     let cleanup = terminate_workload_from_meta(&workload_meta(&mismatched));
     fs::write(&check, b"").expect("release mismatch observation");
-    wait_until(Duration::from_secs(2), || {
-        acknowledged.exists().then_some(())
-    });
+    wait_until(FIXTURE_DEADLINE, || acknowledged.exists().then_some(()));
     let signal_observed = signaled.exists();
     workload.kill().expect("kill workload");
     workload.wait().expect("reap workload");
@@ -1253,7 +1679,7 @@ fn process_cleanup_escalates_for_owned_group_members_and_reaps_descendant() {
         .spawn()
         .expect("spawn workload tree");
     let pid = workload.id() as libc::pid_t;
-    let child_pid = wait_until(Duration::from_secs(2), || {
+    let child_pid = wait_until(FIXTURE_DEADLINE, || {
         ready_path.exists().then(|| {
             fs::read_to_string(&child_pid_path)
                 .expect("child pid")
@@ -1312,7 +1738,7 @@ fn attached_guard_rejects_detached_invocation() {
         .status()
         .expect("detached helper launcher");
     assert!(status.success(), "detached helper launcher failed");
-    let child_rc = wait_until(Duration::from_secs(3), || fs::read_to_string(&rc).ok());
+    let child_rc = wait_until(FIXTURE_DEADLINE, || fs::read_to_string(&rc).ok());
     assert_eq!(child_rc.trim(), "64", "detached child rc");
     let observed_ppids = fs::read_to_string(&ppid_trace).expect("ppid trace");
     let ppids: Vec<_> = observed_ppids.lines().collect();
@@ -1329,12 +1755,21 @@ fn attached_guard_rejects_detached_invocation() {
 #[test]
 fn run_returns_immediately_and_later_completes() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (output, elapsed) = run_cmd(&temp, &["run", "--", "bash", "-lc", "sleep 2; echo late"]);
-    assert!(elapsed < Duration::from_secs(1), "run took {elapsed:?}");
+    let started = temp.path().join("run-immediate-started");
+    let release = temp.path().join("run-immediate-release");
+    let release_marker = ReleaseMarker::new(release.clone());
+    let script = format!(
+        "printf started > {}; attempts=0; while [ \"$attempts\" -lt 400 ]; do if [ -e {} ]; then echo late; exit 0; fi; attempts=$((attempts + 1)); sleep 0.01; done; exit 1",
+        started.display(),
+        release.display()
+    );
+    let (output, _) = run_cmd(&temp, &["run", "--", "bash", "-lc", &script]);
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
+    wait_until(FIXTURE_DEADLINE, || started.exists().then_some(()));
     let immediate = status_text(&temp, handle, false);
     assert!(immediate.starts_with("RUNNING handle="), "{immediate}");
+    release_marker.release();
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.contains("late\n"), "{final_status}");
 }
@@ -1342,18 +1777,22 @@ fn run_returns_immediately_and_later_completes() {
 #[test]
 fn cancel_terminates_the_entire_adopted_process_tree() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = FIXTURE_DEADLINE;
     let child_pid_path = temp.path().join("child.pid");
-    let script = format!("sleep 60 & echo $! > {}; wait", child_pid_path.display());
+    let script = format!(
+        "trap 'exit 0' TERM; sleep 60 & echo $! > {}; wait",
+        child_pid_path.display()
+    );
     let (output, _) = run_cmd(&temp, &["run", "--", "bash", "-lc", &script]);
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
     let meta_path = meta_path(&json);
-    let workload_pid = wait_until(Duration::from_secs(2), || {
+    let workload_pid = wait_until(fixture_deadline, || {
         read_meta(&meta_path)["workload_pid"]
             .as_i64()
             .map(|pid| pid as libc::pid_t)
     });
-    let child_pid = wait_until(Duration::from_secs(2), || {
+    let child_pid = wait_until(fixture_deadline, || {
         fs::read_to_string(&child_pid_path)
             .ok()?
             .trim()
@@ -1376,6 +1815,11 @@ fn cancel_terminates_the_entire_adopted_process_tree() {
         )),
         "{status}"
     );
+    let meta = read_meta(&meta_path);
+    assert_eq!(meta["rc"], 143);
+    assert_eq!(meta["signal"], libc::SIGTERM);
+    assert_eq!(meta["workload_rc"], 0);
+    assert!(meta["workload_signal"].is_null());
     wait_for_process_gone(workload_pid);
     wait_for_process_gone(child_pid);
 }
@@ -1398,10 +1842,321 @@ fn cancel_immediately_after_run_is_not_lost_during_supervisor_startup() {
 }
 
 #[test]
+fn supervisor_finishes_durable_cancel_without_wakeup_signal() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (output, _) = run_cmd(&temp, &["run", "--", "sleep", "60"]);
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let state_dir = state_dir_path(&json);
+    wait_until(FIXTURE_DEADLINE, || {
+        read_meta(&meta_path(&json))["supervisor_pid"]
+            .is_number()
+            .then_some(())
+    });
+    let marker = state_dir.join("cancel-requested");
+    let file = fs::File::create(&marker).expect("create accepted cancel marker");
+    file.sync_all().expect("sync accepted cancel marker");
+    fs::File::open(&state_dir)
+        .expect("open state dir")
+        .sync_all()
+        .expect("sync state dir");
+
+    let status = wait_for_terminal_status(&temp, handle);
+    assert!(status.contains("reason=cancel-request"), "{status}");
+}
+
+#[test]
+fn supervisor_cancel_signal_is_wake_only_without_durable_acceptance() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (output, _) = run_cmd(&temp, &["run", "--", "sleep", "60"]);
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+    let supervisor_pid = wait_until(FIXTURE_DEADLINE, || {
+        read_meta(&meta_path)["supervisor_pid"].as_i64()
+    });
+
+    assert_eq!(
+        unsafe { libc::kill(supervisor_pid as libc::pid_t, libc::SIGUSR1) },
+        0
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    let status = status_text(&temp, handle, false);
+    assert!(status.starts_with("RUNNING "), "{status}");
+    assert!(!state_dir_path(&json).join("cancel-requested").exists());
+
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel command");
+    assert_command_success(&cancel);
+    assert!(wait_for_terminal_status(&temp, handle).contains("reason=cancel-request"));
+}
+
+#[test]
+fn cancel_without_a_live_exact_supervisor_is_an_idempotent_noop() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let handle = "ab_cancel_missing_supervisor";
+    let (caller_identity, _) = proc_identity(unsafe { libc::getpid() }).expect("caller identity");
+    let meta = active_state_meta(
+        handle,
+        unsafe { libc::getpid() },
+        json!([exact_identity(&caller_identity)]),
+    );
+    seed_active_state_dir(&temp, handle, &meta);
+
+    for _ in 0..2 {
+        let output = agent_bash(&temp)
+            .args(["cancel", handle])
+            .output()
+            .expect("cancel missing supervisor");
+        assert_command_success(&output);
+        assert_eq!(parse_stdout_json(&output)["requested"], false);
+    }
+
+    let state_dir = temp.path().join("agent-bash").join(handle);
+    assert_eq!(read_meta(&state_dir.join("meta.json"))["state"], "RUNNING");
+    assert!(!state_dir.join("cancel-requested").exists());
+}
+
+#[test]
+fn cancel_rejects_a_live_pid_with_stale_supervisor_identity() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let ready = temp.path().join("stale-supervisor-ready");
+    let signaled = temp.path().join("stale-supervisor-signaled");
+    let mut process = StdCommand::new("bash")
+        .args([
+            "-c",
+            "trap ': > \"$SIGNALED\"' USR1; : > \"$READY\"; sleep 60",
+        ])
+        .env("READY", &ready)
+        .env("SIGNALED", &signaled)
+        .spawn()
+        .expect("spawn stale-identity process");
+    wait_until(FIXTURE_DEADLINE, || ready.exists().then_some(()));
+    let pid = process.id() as libc::pid_t;
+    let (identity, _) = proc_identity(pid).expect("live process identity");
+    let handle = "ab_cancel_stale_supervisor";
+    let (caller_identity, _) = proc_identity(unsafe { libc::getpid() }).expect("caller identity");
+    let mut meta = active_state_meta(
+        handle,
+        unsafe { libc::getpid() },
+        json!([exact_identity(&caller_identity)]),
+    );
+    meta["supervisor_pid"] = json!(pid);
+    meta["supervisor_pid_starttime_ticks"] = json!(identity.starttime_ticks + 1);
+    meta["process_boot_id"] = json!(read_boot_id());
+    seed_active_state_dir(&temp, handle, &meta);
+
+    let output = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel stale supervisor");
+
+    assert_command_success(&output);
+    assert_eq!(parse_stdout_json(&output)["requested"], false);
+    assert!(!signaled.exists(), "stale supervisor identity was signaled");
+    assert!(
+        !temp
+            .path()
+            .join("agent-bash")
+            .join(handle)
+            .join("cancel-requested")
+            .exists()
+    );
+    process.kill().expect("kill stale-identity process");
+    process.wait().expect("reap stale-identity process");
+}
+
+#[test]
+fn accepted_cancel_is_owned_by_guardian_after_supervisor_loss() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = FIXTURE_DEADLINE;
+    let (fake, delivery_log) = fake_agents(&temp);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--", "sleep", "60"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+    let running = wait_until(fixture_deadline, || {
+        let meta = read_meta(&meta_path);
+        meta["workload_pid"].is_number().then_some(meta)
+    });
+    let workload = OwnedProcess::capture_workload(&running).expect("capture workload");
+    let supervisor = OwnedProcess::capture_supervisor(&running).expect("capture supervisor");
+    let stopped = StoppedProcess::stop(&supervisor);
+
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel command");
+    assert_command_success(&cancel);
+    assert_eq!(parse_stdout_json(&cancel)["requested"], true);
+    assert!(supervisor.signal(libc::SIGKILL), "kill exact supervisor");
+    drop(stopped);
+
+    let terminal = wait_until(fixture_deadline, || {
+        let meta = read_meta(&meta_path);
+        (meta["completion_reason"] == "cancel-request" && meta["delivery"]["exit_code"] == 0)
+            .then_some(meta)
+    });
+    assert_eq!(terminal["state"], "DONE");
+    assert_eq!(terminal["rc"], 143);
+    assert_eq!(terminal["signal"], libc::SIGTERM);
+    assert!(workload.exited(), "guardian did not terminate workload");
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+}
+
+#[test]
+fn accepted_sentinel_cancel_is_owned_by_guardian_after_supervisor_loss() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = FIXTURE_DEADLINE;
+    let (fake, delivery_log) = fake_agents(&temp);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--ready-sentinel", "READY", "--", "sleep", "60"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+    let running = wait_until(fixture_deadline, || {
+        let meta = read_meta(&meta_path);
+        meta["workload_pid"].is_number().then_some(meta)
+    });
+    let workload = OwnedProcess::capture_workload(&running).expect("capture workload");
+    let supervisor = OwnedProcess::capture_supervisor(&running).expect("capture supervisor");
+    let stopped = StoppedProcess::stop(&supervisor);
+
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel command");
+    assert_command_success(&cancel);
+    assert_eq!(parse_stdout_json(&cancel)["requested"], true);
+    assert!(supervisor.signal(libc::SIGKILL), "kill exact supervisor");
+    drop(stopped);
+
+    let terminal = wait_until(fixture_deadline, || {
+        let meta = read_meta(&meta_path);
+        (meta["completion_reason"] == "cancel-request" && meta["delivery"]["exit_code"] == 0)
+            .then_some(meta)
+    });
+    assert_eq!(terminal["state"], "DONE");
+    assert_eq!(terminal["rc"], 143);
+    assert_eq!(terminal["signal"], libc::SIGTERM);
+    assert!(workload.exited(), "guardian did not terminate workload");
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+}
+
+#[test]
+fn accepted_cancel_precedes_already_pending_workload_completion() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = FIXTURE_DEADLINE;
+    let release = temp.path().join("cancel-completion-release");
+    let output = agent_bash(&temp)
+        .env("RELEASE", &release)
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            "while [ ! -e \"$RELEASE\" ]; do sleep 0.01; done",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+    let running = wait_until(fixture_deadline, || {
+        let meta = read_meta(&meta_path);
+        meta["workload_pid"].is_number().then_some(meta)
+    });
+    let supervisor = OwnedProcess::capture_supervisor(&running).expect("capture supervisor");
+    let workload = OwnedProcess::capture_workload(&running).expect("capture workload");
+    let mut stopped = StoppedProcess::stop(&supervisor);
+
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel command");
+    assert_command_success(&cancel);
+    assert_eq!(parse_stdout_json(&cancel)["requested"], true);
+    fs::write(&release, b"").expect("release workload");
+    wait_until(fixture_deadline, || workload.exited().then_some(()));
+    assert!(stopped.resume(), "resume supervisor");
+
+    let status = wait_for_terminal_status(&temp, handle);
+    assert!(
+        status.starts_with(&format!(
+            "DONE rc=143 handle={handle} reason=cancel-request"
+        )),
+        "{status}"
+    );
+    assert_eq!(read_meta(&meta_path)["workload_rc"], 0);
+}
+
+#[test]
+fn guardian_escalates_accepted_cancel_for_term_resistant_tree() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = FIXTURE_DEADLINE;
+    let child_pid_path = temp.path().join("term-resistant-child.pid");
+    let script = format!(
+        "trap '' TERM; sleep 60 & echo $! > {}; wait",
+        child_pid_path.display()
+    );
+    let (output, _) = run_cmd(&temp, &["run", "--", "bash", "-lc", &script]);
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+    let running = wait_until(fixture_deadline, || {
+        let meta = read_meta(&meta_path);
+        meta["workload_pid"].is_number().then_some(meta)
+    });
+    let workload = OwnedProcess::capture_workload(&running).expect("capture workload");
+    let supervisor = OwnedProcess::capture_supervisor(&running).expect("capture supervisor");
+    let child_pid = wait_until(fixture_deadline, || {
+        fs::read_to_string(&child_pid_path)
+            .ok()?
+            .trim()
+            .parse::<libc::pid_t>()
+            .ok()
+    });
+    let stopped = StoppedProcess::stop(&supervisor);
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel command");
+    assert_command_success(&cancel);
+    assert_eq!(parse_stdout_json(&cancel)["requested"], true);
+    assert!(supervisor.signal(libc::SIGKILL), "kill exact supervisor");
+    drop(stopped);
+
+    let started = Instant::now();
+    let status = wait_for_terminal_status(&temp, handle);
+    assert!(status.contains("reason=cancel-request"), "{status}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(1500),
+        "guardian did not observe cancellation grace"
+    );
+    wait_until(fixture_deadline, || workload.exited().then_some(()));
+    wait_for_process_gone(child_pid);
+}
+
+#[test]
 fn owner_exit_cancels_opted_in_workload_and_descendants() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = FIXTURE_DEADLINE;
     let child_pid_path = temp.path().join("owner-child.pid");
-    let workload_script = format!("sleep 60 & echo $! > {}; wait", child_pid_path.display());
+    let workload_script = format!(
+        "trap 'exit 0' TERM; sleep 60 & echo $! > {}; wait",
+        child_pid_path.display()
+    );
     let binary = assert_cmd::cargo::cargo_bin("agent-bash");
     let launcher_script = format!(
         "\"{}\" run --cancel-on-owner-exit --owner-pid \"$BASHPID\" -- bash -lc \"$WORKLOAD_SCRIPT\"; rc=$?; for _ in {{1..250}}; do [ -s \"$CHILD_PID_PATH\" ] && break; sleep 0.02; done; exit $rc",
@@ -1413,6 +2168,8 @@ fn owner_exit_cancels_opted_in_workload_and_descendants() {
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
         .env("WORKLOAD_SCRIPT", workload_script)
         .env("CHILD_PID_PATH", &child_pid_path)
+        .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
         .env_remove("OULIPOLY_PARENT_INVOCATION")
         .env_remove("OULIPOLY_DATA_DIR")
         .output()
@@ -1420,13 +2177,13 @@ fn owner_exit_cancels_opted_in_workload_and_descendants() {
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
     let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(2), || {
+    let meta = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         meta["workload_pid"].is_number().then_some(meta)
     });
     assert_eq!(meta["cancel_owner"]["pid"], meta["caller_ppid"]);
     let workload_pid = meta["workload_pid"].as_i64().expect("workload pid") as libc::pid_t;
-    let child_pid = wait_until(Duration::from_secs(2), || {
+    let child_pid = wait_until(fixture_deadline, || {
         fs::read_to_string(&child_pid_path)
             .ok()?
             .trim()
@@ -1439,14 +2196,108 @@ fn owner_exit_cancels_opted_in_workload_and_descendants() {
         status.starts_with(&format!("DONE rc=143 handle={handle} reason=owner-exit")),
         "{status}"
     );
+    let meta = read_meta(&meta_path);
+    assert_eq!(meta["rc"], 143);
+    assert_eq!(meta["signal"], libc::SIGTERM);
+    assert_eq!(meta["workload_rc"], 0);
+    assert!(meta["workload_signal"].is_null());
     wait_for_process_gone(workload_pid);
     wait_for_process_gone(child_pid);
+}
+
+#[test]
+fn explicit_cancel_wins_when_owner_exit_is_already_pollable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (helper, route) = routed_owner_resolving_fake_agents(&temp);
+    fs::write(&route, "ses_owner_race\n").expect("route owner race session");
+    let run_json_path = temp.path().join("owner-race-run.json");
+    let owner_ready = temp.path().join("owner-race-ready");
+    let fixture_deadline = FIXTURE_DEADLINE;
+    let binary = assert_cmd::cargo::cargo_bin("agent-bash");
+    let launcher_script = format!(
+        "\"{}\" run --cancel-on-owner-exit --owner-pid \"$BASHPID\" -- sleep 60 > \"$RUN_JSON\"; : > \"$OWNER_READY\"; read -r _",
+        binary.display()
+    );
+    let mut owner = StdCommand::new("bash")
+        .args(["-c", &launcher_script])
+        .stdin(Stdio::piped())
+        .env("XDG_STATE_HOME", temp.path())
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", helper)
+        .env(
+            "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST",
+            FAKE_HELPER_ENVIRONMENT,
+        )
+        .env("AGENT_BASH_FAKE_ROUTE", route)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_owner_race")
+        .env(
+            "AGENT_BASH_OWNER_INVOCATION_UUID",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"source":"opencode","id":"11111111-1111-4111-8111-111111111111"}"#,
+        )
+        .env("RUN_JSON", &run_json_path)
+        .env("OWNER_READY", &owner_ready)
+        .env_remove("OULIPOLY_DATA_DIR")
+        .spawn()
+        .expect("owner launcher");
+    wait_until(fixture_deadline, || owner_ready.exists().then_some(()));
+    let run_json: Value = serde_json::from_slice(&fs::read(&run_json_path).expect("run JSON"))
+        .expect("parse run JSON");
+    let handle = run_json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&run_json);
+    let supervisor_pid = wait_until(fixture_deadline, || {
+        read_meta(&meta_path)["supervisor_pid"]
+            .as_i64()
+            .map(|pid| pid as libc::pid_t)
+    });
+
+    let supervisor =
+        OwnedProcess::capture_current(supervisor_pid, None).expect("capture supervisor process");
+    let mut stopped_supervisor = StoppedProcess::stop(&supervisor);
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel command");
+    owner
+        .stdin
+        .take()
+        .expect("owner stdin")
+        .write_all(b"release\n")
+        .expect("release owner");
+    let owner_status = owner.wait().expect("reap owner");
+    let continued = stopped_supervisor.resume();
+
+    assert!(continued, "continue supervisor");
+    assert!(owner_status.success(), "owner status: {owner_status:?}");
+    assert_command_success(&cancel);
+    assert_eq!(parse_stdout_json(&cancel)["requested"], true);
+    let status = wait_for_terminal_status(&temp, handle);
+    assert!(
+        status.starts_with(&format!(
+            "DONE rc=143 handle={handle} reason=cancel-request"
+        )),
+        "{status}"
+    );
+
+    let repeated = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("repeated cancel command");
+    assert_command_success(&repeated);
+    assert_eq!(parse_stdout_json(&repeated)["requested"], false);
 }
 
 #[test]
 fn run_startup_reaps_old_consumed_state_dir_without_stdout_pollution() {
     let temp = tempfile::tempdir().expect("tempdir");
     let old = seed_done_state_dir(&temp, "ab_old_consumed", unix_ms() - 2_000, true);
+    let meta_path = old.join("meta.json");
+    let mut meta = read_meta(&meta_path);
+    meta["delivery"]["attempted"] = json!(true);
+    meta["delivery"]["exit_code"] = json!(0);
+    fs::write(&meta_path, format_seeded_meta(&meta)).expect("write settled old state");
 
     let output = agent_bash(&temp)
         .env("AGENT_BASH_STATE_TTL_SECS", "1")
@@ -1541,9 +2392,12 @@ fn captured_log_is_bounded_and_retains_newest_output() {
 fn ready_sentinel_reports_done_without_killing_workload() {
     let temp = tempfile::tempdir().expect("tempdir");
     let child_pid_path = temp.path().join("sentinel-child.pid");
+    let workload_release = temp.path().join("sentinel-workload-release");
+    let release_marker = ReleaseMarker::new(workload_release.clone());
     let mut command = agent_bash(&temp);
     command
         .env("SENTINEL_CHILD_PID_PATH", &child_pid_path)
+        .env("SENTINEL_WORKLOAD_RELEASE", &workload_release)
         .args([
             "run",
             "--ready-sentinel",
@@ -1551,7 +2405,7 @@ fn ready_sentinel_reports_done_without_killing_workload() {
             "--",
             "bash",
             "-lc",
-            "echo boot; echo READY:123; sleep 10 & echo $! > \"$SENTINEL_CHILD_PID_PATH\"; wait",
+            "echo boot; echo READY:123; bash -lc 'attempts=0; while [ \"$attempts\" -lt 2000 ]; do [ -e \"$SENTINEL_WORKLOAD_RELEASE\" ] && exit 0; attempts=$((attempts + 1)); sleep 0.01; done; exit 1' & echo $! > \"$SENTINEL_CHILD_PID_PATH\"; wait",
         ]);
     let output = command.output().expect("run sentinel workload");
     let json = parse_run_output(&output);
@@ -1563,7 +2417,7 @@ fn ready_sentinel_reports_done_without_killing_workload() {
     );
     let meta = read_meta(&meta_path(&json));
     let workload_pid = meta["workload_pid"].as_i64().expect("workload pid") as libc::pid_t;
-    let child_pid = wait_until(Duration::from_secs(2), || {
+    let child_pid = wait_until(FIXTURE_DEADLINE, || {
         fs::read_to_string(&child_pid_path)
             .ok()?
             .trim()
@@ -1571,12 +2425,7 @@ fn ready_sentinel_reports_done_without_killing_workload() {
             .ok()
     });
     let workload_alive = unsafe { libc::kill(workload_pid, 0) == 0 };
-    let workload = OwnedProcess::capture_workload(&meta).expect("capture sentinel workload");
-    let child =
-        OwnedProcess::capture_current(child_pid, Some(workload_pid)).expect("capture child");
-    let cleanup = terminate_owned_processes(&[workload, child]);
-    wait_for_process_gone(workload_pid);
-    wait_for_process_gone(child_pid);
+    let child_alive = unsafe { libc::kill(child_pid, 0) == 0 };
 
     assert_eq!(json["mode"], "sentinel");
     assert!(final_status.contains("boot\n"), "{final_status}");
@@ -1586,8 +2435,11 @@ fn ready_sentinel_reports_done_without_killing_workload() {
     assert!(meta["ready_at_unix_ms"].is_number());
     assert!(meta["workload_rc"].is_null());
     assert!(workload_alive, "sentinel workload was not running");
-    assert_eq!(cleanup.term_sent, 2);
-    assert_eq!(cleanup.kill_sent, 0);
+    assert!(child_alive, "sentinel child was not running");
+
+    release_marker.release();
+    wait_for_process_gone(workload_pid);
+    wait_for_process_gone(child_pid);
 }
 
 #[test]
@@ -1619,7 +2471,7 @@ fn tree_capture_waits_for_setsid_detached_grandchild_via_subreaper() {
     let running = status_text(&temp, handle, false);
     assert!(running.starts_with("RUNNING handle="), "{running}");
 
-    wait_until(Duration::from_secs(5), || marker.exists().then_some(()));
+    wait_until(FIXTURE_DEADLINE, || marker.exists().then_some(()));
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.starts_with(&format!("DONE rc=0 handle={handle}")));
     let meta = read_meta(&meta_path);
@@ -1633,22 +2485,38 @@ fn tree_capture_waits_for_setsid_detached_grandchild_via_subreaper() {
 fn root_completion_does_not_wait_for_setsid_detached_grandchild() {
     let temp = tempfile::tempdir().expect("tempdir");
     let marker = temp.path().join("root-completion-grandchild-marker");
-    let script =
-        "(setsid sh -c 'sleep 2; printf grandchild > \"$MARKER\"' >/dev/null 2>&1 &) ; exit 0";
+    let ready = temp.path().join("root-completion-grandchild-ready");
+    let release = temp.path().join("root-completion-grandchild-release");
+    let release_marker = ReleaseMarker::new(release.clone());
+    let script = r#"(setsid bash -lc '
+        printf ready > "$GRANDCHILD_READY"
+        for _ in {1..800}; do
+            if [ -e "$GRANDCHILD_RELEASE" ]; then
+                printf grandchild > "$MARKER"
+                exit 0
+            fi
+            sleep 0.01
+        done
+        exit 1
+    ' >/dev/null 2>&1 &) ; exit 0"#;
     let mut cmd = agent_bash(&temp);
-    cmd.env("MARKER", &marker).args([
-        "run",
-        "--completion-scope",
-        "root",
-        "--",
-        "bash",
-        "-lc",
-        script,
-    ]);
+    cmd.env("MARKER", &marker)
+        .env("GRANDCHILD_READY", &ready)
+        .env("GRANDCHILD_RELEASE", &release)
+        .args([
+            "run",
+            "--completion-scope",
+            "root",
+            "--",
+            "bash",
+            "-lc",
+            script,
+        ]);
     let output = cmd.output().expect("run");
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
 
+    wait_until(FIXTURE_DEADLINE, || ready.exists().then_some(()));
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.starts_with(&format!("DONE rc=0 handle={handle}")));
     assert!(
@@ -1656,7 +2524,8 @@ fn root_completion_does_not_wait_for_setsid_detached_grandchild() {
         "root completion waited for the detached grandchild"
     );
 
-    wait_until(Duration::from_secs(5), || marker.exists().then_some(()));
+    release_marker.release();
+    wait_until(FIXTURE_DEADLINE, || marker.exists().then_some(()));
 }
 
 #[test]
@@ -1665,7 +2534,7 @@ fn cgroup_v2_live_set_path_runs_when_delegated_and_skips_otherwise() {
     let (output, _) = run_cmd(&temp, &["run", "--", "bash", "-lc", "sleep 1.5"]);
     let json = parse_run_output(&output);
     let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(2), || {
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
         meta["workload_pid"].is_number().then_some(meta)
     });
@@ -1701,24 +2570,56 @@ fn cgroup_disable_uses_subreaper_only_without_degradation() {
 }
 
 #[test]
-fn opencode_adapter_poll_marks_terminal_result_consumed_without_mutating_delivery_mode() {
+fn opencode_adapter_cross_owner_poll_cannot_mark_terminal_result_consumed() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
-    let (output, _) = run_cmd(
-        &temp,
-        &["run", "--", "bash", "-lc", "printf 'adapter poll\\n'"],
-    );
-    let json = parse_run_output(&output);
-    let handle = json["handle"].as_str().expect("handle");
-    let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
-    assert!(final_status.contains("adapter poll\n"), "{final_status}");
+    let handle = "ab_cross_owner_adapter_poll";
+    let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
+    let (helper, route) = routed_owner_resolving_fake_agents(&temp);
+    write_delivery_helper_provenance(&state_dir, &helper, &[("AGENT_BASH_FAKE_ROUTE", &route)]);
+    let meta_path = state_dir.join("meta.json");
+    let mut meta = read_meta(&meta_path);
+    meta["owner_session_id"] = json!("ses_owner");
+    meta["owner_invocation_uuid"] = json!("11111111-1111-4111-8111-111111111111");
+    fs::write(&meta_path, format_seeded_meta(&meta)).expect("write session-owned meta");
+    fs::write(state_dir.join("delivery-mode"), b"async").expect("write async mode");
+    fs::write(&route, "ses_other\n").expect("route unrelated session");
 
     let driver = write_adapter_driver(&temp);
     let result = run_adapter_driver(&temp, &driver, "poll", Some(handle));
 
-    assert_adapter_result_contains(&result, "adapter poll");
+    assert_adapter_result_contains(&result, &format!("DONE rc=0 handle={handle}"));
     assert_eq!(mode_text(&temp, handle), "async");
-    assert!(state_dir_path(&json).join("consumed").exists());
+    assert!(!state_dir.join("consumed").exists());
+}
+
+#[test]
+fn opencode_adapter_owner_poll_marks_terminal_result_consumed_without_mutating_delivery_mode() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let delivery_log = temp.path().join("adapter-owner-poll-delivery.log");
+    let output = adapter_driver_command(&temp, &driver, "launch-poll", None)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .output()
+        .expect("adapter driver");
+    assert_command_success(&output);
+    let result = parse_stdout_json(&output);
+    let handle = result["handle"].as_str().expect("handle");
+
+    assert_adapter_result_contains(&result, "adapter owner poll");
+    assert_eq!(mode_text(&temp, handle), "async");
+    assert!(
+        temp.path()
+            .join("agent-bash")
+            .join(handle)
+            .join("consumed")
+            .exists()
+    );
+    let delivery = fs::read_to_string(&delivery_log).expect("completion helper invocation");
+    assert!(delivery.contains("agent-bash-complete"), "{delivery}");
+    assert!(delivery.contains("--consumed"), "{delivery}");
 }
 
 #[test]
@@ -1779,9 +2680,9 @@ fn opencode_adapter_ordinary_command_completes_in_band_in_sync_mode() {
         .join("agent-bash")
         .join(handle)
         .join("meta.json");
-    let meta = wait_until(Duration::from_secs(6), || {
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
-        (meta["delivery"]["attempted"] == true).then_some(meta)
+        delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     assert_eq!(meta["delivery_mode"], "sync");
     assert!(meta["cancel_owner"]["pid"].is_number());
@@ -1859,7 +2760,58 @@ fn opencode_adapter_initial_dispatch_preserves_inherited_environment() {
 
     assert_adapter_result_contains(
         &result,
-        "fixture-env|fixture-authority|{\"source\":\"opencode\",\"id\":\"11111111-1111-4111-8111-111111111111\"}",
+        "fixture-env|unset|unset|{\"source\":\"opencode\",\"id\":\"11111111-1111-4111-8111-111111111111\"}|unset",
+    );
+}
+
+#[test]
+fn opencode_adapter_neutralizes_reserved_registration_helper_assignment() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+    let (override_helper, override_log) =
+        named_fake_agents(&temp, "override-agents", "override-delivery.log");
+    let explicit_run = format!(
+        "AGENT_BASH_AGENT_RUNNER_BIN={} {} run -- true",
+        override_helper.display(),
+        temp.path().join("adapter-agent-bash").display()
+    );
+    let output = adapter_driver_command(&temp, &driver, "control", Some(&explicit_run))
+        .output()
+        .expect("adapter driver");
+
+    assert_command_success(&output);
+    assert!(
+        !override_log.exists(),
+        "command-local helper override was invoked: {}",
+        fs::read_to_string(&override_log).unwrap_or_default()
+    );
+}
+
+#[test]
+fn opencode_adapter_rejects_shell_copy_of_registration_authority() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+    let explicit_run = format!(
+        "RETAINED_AUTH=$OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY {} run -- true",
+        temp.path().join("adapter-agent-bash").display()
+    );
+    let output = adapter_driver_command(&temp, &driver, "control", Some(&explicit_run))
+        .output()
+        .expect("adapter driver");
+
+    assert!(
+        !output.status.success(),
+        "{}",
+        command_failure_message(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "explicit agent-bash run requires structured arguments without shell expansion"
+        ),
+        "{}",
+        command_failure_message(&output)
     );
 }
 
@@ -1896,12 +2848,97 @@ fn opencode_adapter_standalone_sleep_does_not_create_spool_state() {
 }
 
 #[test]
-fn list_adopts_handle_owned_by_resumed_session_after_caller_pid_changes() {
+fn recorded_owner_session_requires_helper_attestation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let handle = "ab_session_precedence";
+    let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
+    let (helper, route) = routed_owner_resolving_fake_agents(&temp);
+    write_delivery_helper_provenance(&state_dir, &helper, &[("AGENT_BASH_FAKE_ROUTE", &route)]);
+    let meta_path = state_dir.join("meta.json");
+    let mut meta = read_meta(&meta_path);
+    meta["owner_session_id"] = json!("ses_owner");
+    meta["owner_invocation_uuid"] = json!("11111111-1111-4111-8111-111111111111");
+    meta["delivery"]["retryable"] = json!(true);
+    fs::write(&meta_path, format_seeded_meta(&meta)).expect("write session-owned meta");
+    fs::write(state_dir.join("delivery-mode"), b"async").expect("write async mode");
+    fs::write(&route, "ses_other\n").expect("route unrelated session");
+
+    let forged_list = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_owner")
+        .args(["list", "--json"])
+        .output()
+        .expect("forged owner session list");
+    assert_command_success(&forged_list);
+    assert_eq!(parse_stdout_json(&forged_list), json!([]));
+
+    let forged_status = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_owner")
+        .args(["status", "--full", handle])
+        .output()
+        .expect("forged owner session status");
+    assert_command_success(&forged_status);
+    let unchanged = read_meta(&meta_path);
+    assert_eq!(unchanged["delivery"]["attempted"], false);
+    assert_eq!(unchanged["delivery"]["retryable"], true);
+
+    let forged_cancel = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_owner")
+        .args(["cancel", handle])
+        .output()
+        .expect("forged owner session cancel");
+    assert_eq!(forged_cancel.status.code(), Some(77));
+    assert!(
+        String::from_utf8_lossy(&forged_cancel.stderr)
+            .contains("caller is not eligible to control handle"),
+        "{}",
+        command_failure_message(&forged_cancel)
+    );
+    assert!(!state_dir.join("cancel-requested").exists());
+
+    fs::write(state_dir.join("delivery-mode"), b"sync").expect("write sync mode");
+    let forged_detach = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_owner")
+        .args(["detach", handle])
+        .output()
+        .expect("forged owner session detach");
+    assert_eq!(forged_detach.status.code(), Some(77));
+    assert_eq!(
+        fs::read_to_string(state_dir.join("delivery-mode")).unwrap(),
+        "sync"
+    );
+
+    fs::write(&route, "ses_owner\n").expect("route owning session");
+    let owner_list = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_other")
+        .args(["list", "--json"])
+        .output()
+        .expect("attested owner session list");
+    assert_command_success(&owner_list);
+    assert_eq!(parse_stdout_json(&owner_list)[0]["handle"], handle);
+
+    let owner_detach = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_other")
+        .args(["detach", handle])
+        .output()
+        .expect("attested owner session detach");
+    assert_command_success(&owner_detach);
+    assert_eq!(
+        fs::read_to_string(state_dir.join("delivery-mode")).unwrap(),
+        "async"
+    );
+}
+
+#[test]
+fn list_routes_handle_to_resumed_session_after_caller_pid_changes() {
     let temp = tempfile::tempdir().expect("tempdir");
     let state_dir = seed_done_state_dir(&temp, "ab_resumed_owner", unix_ms(), false);
+    let (helper, route) = routed_owner_resolving_fake_agents(&temp);
+    write_delivery_helper_provenance(&state_dir, &helper, &[("AGENT_BASH_FAKE_ROUTE", &route)]);
     let meta_path = state_dir.join("meta.json");
     let mut meta = read_meta(&meta_path);
     meta["caller_ppid"] = json!(i32::MAX);
+    meta["caller_chain"] = json!([]);
+    meta["delivery"]["retryable"] = json!(true);
     fs::write(&meta_path, format_seeded_meta(&meta)).expect("write resumed owner meta");
     fs::write(
         state_dir.join("owner.json"),
@@ -1909,8 +2946,8 @@ fn list_adopts_handle_owned_by_resumed_session_after_caller_pid_changes() {
     )
     .expect("write durable owner");
 
+    fs::write(&route, "ses_resumed\n").expect("route resumed session");
     let matching = agent_bash(&temp)
-        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_resumed")
         .args(["list", "--json"])
         .output()
         .expect("matching list");
@@ -1919,13 +2956,35 @@ fn list_adopts_handle_owned_by_resumed_session_after_caller_pid_changes() {
     assert_eq!(matching.as_array().expect("list").len(), 1);
     assert_eq!(matching[0]["handle"], "ab_resumed_owner");
 
+    fs::write(&route, "ses_other\n").expect("route unrelated session");
     let other = agent_bash(&temp)
-        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_other")
         .args(["list", "--json"])
         .output()
         .expect("other list");
     assert_command_success(&other);
     assert_eq!(parse_stdout_json(&other), json!([]));
+
+    let unrelated_status = agent_bash(&temp)
+        .args(["status", "--full", "ab_resumed_owner"])
+        .output()
+        .expect("unrelated status");
+    assert_command_success(&unrelated_status);
+    let unchanged = read_meta(&meta_path);
+    assert_eq!(unchanged["delivery"]["attempted"], false);
+    assert!(unchanged["delivery"]["error_code"].is_null());
+    assert_eq!(unchanged["delivery"]["retryable"], true);
+
+    fs::write(&route, "ses_resumed\n").expect("route resumed session");
+    let owner_status = agent_bash(&temp)
+        .args(["status", "--full", "ab_resumed_owner"])
+        .output()
+        .expect("owner status");
+    assert_command_success(&owner_status);
+    let reconciled = read_meta(&meta_path);
+    assert_eq!(reconciled["delivery"]["attempted"], true);
+    assert_eq!(reconciled["delivery"]["exit_code"], 0);
+    assert!(reconciled["delivery"]["error_code"].is_null());
+    assert!(reconciled["delivery"]["retryable"].is_null());
 }
 
 #[test]
@@ -1933,14 +2992,28 @@ fn opencode_adapter_explicit_async_returns_handle_immediately() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
-    let start = Instant::now();
+    let started = temp.path().join("adapter-async-started");
+    let release = temp.path().join("adapter-async-release");
+    let request = json!({
+        "args": {
+            "command": format!(
+                "printf started > {}; attempts=0; while [ \"$attempts\" -lt 800 ]; do if [ -e {} ]; then printf 'adapter async\\n'; exit 0; fi; attempts=$((attempts + 1)); sleep 0.01; done; exit 1",
+                started.display(),
+                release.display()
+            ),
+            "delivery": "async"
+        }
+    })
+    .to_string();
+    let release_marker = ReleaseMarker::new(release);
 
-    let result = run_adapter_driver(&temp, &driver, "async", None);
+    let result = run_adapter_driver(&temp, &driver, "request", Some(&request));
 
-    assert!(start.elapsed() < Duration::from_secs(1));
+    wait_until(FIXTURE_DEADLINE, || started.exists().then_some(()));
     assert_adapter_result_contains(&result, "Running asynchronously");
     let handle = adapter_result_handle(&result);
     assert_eq!(mode_text(&temp, handle), "async");
+    release_marker.release();
     let status = wait_for_terminal_status(&temp, handle);
     assert!(
         status.starts_with(&format!("DONE rc=0 handle={handle}")),
@@ -1967,6 +3040,14 @@ fn opencode_adapter_abort_signal_cancels_sync_workload() {
 
     assert_adapter_result_contains(&result, "Cancellation requested");
     let handle = adapter_result_handle(&result);
+    let state_dir = temp.path().join("agent-bash").join(handle);
+    let meta = read_meta(&state_dir.join("meta.json"));
+    assert!(
+        adapter_result_text(&result).contains(r#""requested":true"#),
+        "{}\nmeta={meta}\naccepted_cancel={}",
+        adapter_result_text(&result),
+        state_dir.join("cancel-requested").exists()
+    );
     let status = wait_for_terminal_status(&temp, handle);
     assert!(status.contains("reason=cancel-request"), "{status}");
 }
@@ -2011,24 +3092,32 @@ fn opencode_adapter_explicit_agent_bash_run_is_not_nested() {
 }
 
 #[test]
-fn opencode_adapter_environment_prefixed_agent_bash_run_is_not_nested() {
+fn opencode_adapter_rejects_command_environment_on_registration_launcher() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
 
-    let result = run_adapter_driver(&temp, &driver, "wrapper-env", None);
-
-    assert_adapter_result_contains(&result, "Running asynchronously");
-    let handle = adapter_result_handle(&result);
-    assert_eq!(state_handles(&temp), vec![handle]);
-    let meta = read_meta(
-        &temp
-            .path()
-            .join("agent-bash")
-            .join(handle)
-            .join("meta.json"),
+    let explicit_run = format!(
+        "LD_PRELOAD=/actor/library.so {} run -- agents --version",
+        temp.path().join("adapter-agent-bash").display()
     );
-    assert!(meta["cancel_owner"].is_null());
+    let output = adapter_driver_command(&temp, &driver, "control", Some(&explicit_run))
+        .output()
+        .expect("adapter driver");
+
+    assert!(
+        !output.status.success(),
+        "{}",
+        command_failure_message(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "explicit agent-bash run requires structured arguments without shell expansion"
+        ),
+        "{}",
+        command_failure_message(&output)
+    );
+    assert_eq!(state_dir_count(&temp), 0);
 }
 
 #[test]
@@ -2058,34 +3147,52 @@ fn opencode_adapter_sync_wait_returns_when_handle_is_detached() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
-    let mut adapter = adapter_driver_command(&temp, &driver, "detachable", None)
+    let started = temp.path().join("adapter-detachable-started");
+    let release = temp.path().join("adapter-detachable-release");
+    let request = json!({
+        "args": {
+            "command": format!(
+                "printf started > {}; attempts=0; while [ \"$attempts\" -lt 800 ]; do if [ -e {} ]; then printf 'adapter detached\\n'; exit 0; fi; attempts=$((attempts + 1)); sleep 0.01; done; exit 1",
+                started.display(),
+                release.display()
+            )
+        },
+        "lingerMs": 3000
+    })
+    .to_string();
+    let release_marker = ReleaseMarker::new(release);
+    let mut adapter = adapter_driver_command(&temp, &driver, "request", Some(&request))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn adapter driver");
-    let handle = wait_until(Duration::from_secs(2), || initialized_state_handle(&temp));
+    let handle = wait_until(FIXTURE_DEADLINE, || initialized_state_handle(&temp));
+    wait_until(FIXTURE_DEADLINE, || started.exists().then_some(()));
     assert_eq!(mode_text(&temp, &handle), "sync");
 
     let detach = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "ses_adapter")
         .args(["detach", &handle])
         .output()
         .expect("detach command");
     assert_command_success(&detach);
     assert_eq!(parse_stdout_json(&detach)["transitioned"], true);
-    let detached_at = Instant::now();
     let stdout = adapter.stdout.take().expect("adapter stdout");
     let line = BufReader::new(stdout)
         .lines()
         .next()
         .expect("adapter result line")
         .expect("adapter result");
-    assert!(detached_at.elapsed() < Duration::from_secs(1));
     let result: Value = serde_json::from_str(&line).expect("adapter result json");
 
     assert_adapter_result_contains(&result, "Running asynchronously");
     assert_eq!(adapter_result_handle(&result), handle);
-    let final_status =
-        wait_for_status_prefix(&temp, &handle, &format!("DONE rc=0 handle={handle}"));
+    release_marker.release();
+    let final_status = wait_for_terminal_status(&temp, &handle);
+    assert!(
+        final_status.starts_with(&format!("DONE rc=0 handle={handle}")),
+        "{final_status}"
+    );
     assert!(
         final_status.contains("adapter detached\n"),
         "{final_status}"
@@ -2209,14 +3316,25 @@ fn rca_agent_bash_visibility_non_list_only_commands_still_spool() {
 fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
     // Verifies owner-tree visibility and unrelated-caller isolation at the real CLI/process seam.
     let temp = tempfile::tempdir().expect("tempdir");
-    let mut owner = spawn_owner_scenario(&temp, "5");
-    wait_until(Duration::from_secs(3), || {
-        owner.ready.exists().then_some(())
-    });
+    let mut owner = spawn_releasable_owner_scenario(&temp);
+    wait_until(FIXTURE_DEADLINE, || owner.ready.exists().then_some(()));
     let run_json: Value =
         serde_json::from_slice(&fs::read(&owner.run_json).expect("owner run JSON"))
             .expect("owner run JSON value");
     let handle = run_json["handle"].as_str().expect("handle").to_string();
+    let meta = read_meta(&meta_path(&run_json));
+    let owner_meta: Value = serde_json::from_slice(
+        &fs::read(Path::new(run_json["state_dir"].as_str().expect("state dir")).join("owner.json"))
+            .expect("owner metadata"),
+    )
+    .expect("owner metadata JSON");
+    assert!(meta["owner_session_id"].is_null(), "{meta}");
+    assert!(meta["owner_invocation_uuid"].is_null(), "{meta}");
+    assert!(owner_meta["owner_session_id"].is_null(), "{owner_meta}");
+    assert!(
+        owner_meta["owner_invocation_uuid"].is_null(),
+        "{owner_meta}"
+    );
     let active_status = status_text(&temp, &handle, false);
     let unrelated = shell_list_json(&temp, false);
     let all_access = shell_list_json(&temp, true);
@@ -2232,6 +3350,7 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
         .trim()
         .parse()
         .expect("numeric list caller pid");
+    fs::write(&owner.workload_release, b"").expect("release owner workload");
     let final_status =
         wait_for_status_prefix(&temp, &handle, &format!("DONE rc=0 handle={handle}"));
 
@@ -2263,12 +3382,88 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
 }
 
 #[test]
+fn unrelated_observer_cannot_cancel_or_detach_visible_handle() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut owner = spawn_releasable_owner_scenario(&temp);
+    wait_until(FIXTURE_DEADLINE, || owner.ready.exists().then_some(()));
+    let run_json: Value =
+        serde_json::from_slice(&fs::read(&owner.run_json).expect("owner run JSON"))
+            .expect("owner run JSON value");
+    let handle = run_json["handle"].as_str().expect("handle").to_string();
+    let state_dir = Path::new(run_json["state_dir"].as_str().expect("state dir"));
+    assert!(
+        shell_list_json(&temp, true)
+            .iter()
+            .any(|entry| entry["handle"] == handle),
+        "unrelated observer could not see handle through --all"
+    );
+
+    let unrelated_cancel = agent_bash(&temp)
+        .args(["cancel", &handle])
+        .output()
+        .expect("unrelated cancel");
+    let unrelated_detach = agent_bash(&temp)
+        .args(["detach", &handle])
+        .output()
+        .expect("unrelated detach");
+
+    assert_eq!(unrelated_cancel.status.code(), Some(77));
+    assert!(
+        String::from_utf8_lossy(&unrelated_cancel.stderr)
+            .contains("caller is not eligible to control handle"),
+        "{}",
+        command_failure_message(&unrelated_cancel)
+    );
+    assert_eq!(unrelated_detach.status.code(), Some(77));
+    assert!(
+        String::from_utf8_lossy(&unrelated_detach.stderr)
+            .contains("caller is not eligible to control handle"),
+        "{}",
+        command_failure_message(&unrelated_detach)
+    );
+    assert!(
+        !state_dir.join("cancel-requested").exists(),
+        "unrelated cancellation created the durable acceptance marker"
+    );
+    fs::write(state_dir.join("delivery-mode"), b"async").expect("write async mode");
+    fs::write(state_dir.join("activation-outcome"), b"pending\n")
+        .expect("write pending activation");
+    let unrelated_mode = agent_bash(&temp)
+        .args(["mode", &handle])
+        .output()
+        .expect("unrelated mode");
+    assert_eq!(unrelated_mode.status.code(), Some(74));
+    assert!(
+        String::from_utf8_lossy(&unrelated_mode.stderr).contains("activation outcome is unknown")
+    );
+    let listed = shell_list_json(&temp, true);
+    let listed = listed
+        .iter()
+        .find(|entry| entry["handle"] == handle)
+        .expect("pending activation in list");
+    assert!(listed["delivery_mode"].is_null());
+    assert!(
+        listed["delivery_mode_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("activation outcome is unknown"))
+    );
+    assert_eq!(
+        fs::read_to_string(state_dir.join("activation-outcome")).expect("activation outcome"),
+        "pending\n",
+        "unrelated mode observation settled activation state"
+    );
+
+    fs::write(&owner.list_now, b"").expect("release owner list");
+    assert!(owner.wait().expect("owner scenario").success());
+    fs::write(&owner.workload_release, b"").expect("release owner workload");
+    let _ = wait_for_status_prefix(&temp, &handle, &format!("DONE rc=0 handle={handle}"));
+}
+
+#[test]
 fn owner_scenario_drop_terminates_and_reaps_polling_shell() {
     let temp = tempfile::tempdir().expect("tempdir");
     let owner = spawn_owner_scenario(&temp, "1");
-    wait_until(Duration::from_secs(3), || {
-        owner.ready.exists().then_some(())
-    });
+    wait_until(FIXTURE_DEADLINE, || owner.ready.exists().then_some(()));
     let run_json: Value =
         serde_json::from_slice(&fs::read(&owner.run_json).expect("owner run JSON"))
             .expect("owner run JSON value");
@@ -2403,6 +3598,59 @@ fn rca_agent_bash_visibility_many_synthetic_entries_is_bounded() {
 }
 
 #[test]
+fn concurrent_registrations_share_warm_cache_within_declared_bound() {
+    const CONCURRENCY: usize = 8;
+    const ADMISSION_BOUND: Duration = Duration::from_secs(8);
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = fake_agents(&temp);
+    let helper_size = fs::metadata(&fake).expect("helper metadata").len();
+    let warmup = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--", "true"])
+        .output()
+        .expect("warm helper cache");
+    let _ = parse_run_output(&warmup);
+
+    let started = Instant::now();
+    let mut registrations = Vec::new();
+    for _ in 0..CONCURRENCY {
+        let binary = assert_cmd::cargo::cargo_bin("agent-bash");
+        let root = temp.path().to_path_buf();
+        let fake = fake.clone();
+        let delivery_log = delivery_log.clone();
+        registrations.push(std::thread::spawn(move || {
+            StdCommand::new(binary)
+                .env("XDG_STATE_HOME", root)
+                .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+                .env("AGENT_BASH_FAKE_DELIVERY_LOG", delivery_log)
+                .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+                .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
+                .env_remove("OULIPOLY_PARENT_INVOCATION")
+                .env_remove("OULIPOLY_DATA_DIR")
+                .args(["run", "--", "true"])
+                .output()
+                .expect("parallel registration")
+        }));
+    }
+    for output in registrations
+        .into_iter()
+        .map(|registration| registration.join().expect("registration thread"))
+    {
+        let _ = parse_run_output(&output);
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < ADMISSION_BOUND,
+        "{CONCURRENCY} warm-cache registrations of a {helper_size}-byte helper took {elapsed:?}, bound is {ADMISSION_BOUND:?}"
+    );
+    eprintln!(
+        "{CONCURRENCY} warm-cache registrations of a {helper_size}-byte helper completed in {elapsed:?}"
+    );
+}
+
+#[test]
 fn missing_explicit_owner_resolves_verified_parent_invocation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let fake = owner_resolving_fake_agents(&temp);
@@ -2425,6 +3673,191 @@ fn missing_explicit_owner_resolves_verified_parent_invocation() {
         meta["owner_invocation_uuid"],
         "11111111-1111-4111-8111-111111111111"
     );
+}
+
+#[test]
+fn owner_resolution_and_registration_share_one_configured_helper() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let helper = owner_resolving_fake_agents(&temp);
+    let resolver_started = temp.path().join("resolver-started");
+    let resolver_release = temp.path().join("resolver-release");
+    let replacement_log = temp.path().join("replacement-delivery.log");
+    let run = StdCommand::new(assert_cmd::cargo::cargo_bin("agent-bash"))
+        .env("XDG_STATE_HOME", temp.path())
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env(
+            "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST",
+            FAKE_HELPER_ENVIRONMENT,
+        )
+        .env("AGENT_BASH_FAKE_RESOLVER_STARTED", &resolver_started)
+        .env("AGENT_BASH_FAKE_RESOLVER_RELEASE", &resolver_release)
+        .env_remove("AGENT_BASH_CONSUMER_GRACE_MS")
+        .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
+        .env_remove("OULIPOLY_DATA_DIR")
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"source":"opencode","id":"11111111-1111-4111-8111-111111111111"}"#,
+        )
+        .args(["run", "--", "true"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn run");
+    wait_until(FIXTURE_DEADLINE, || resolver_started.exists().then_some(()));
+    fs::write(&helper, fake_agents_script(&replacement_log)).expect("replace configured helper");
+    set_executable(&helper);
+    fs::write(&resolver_release, b"").expect("release owner resolution");
+
+    let output = run.wait_with_output().expect("run output");
+    let json = parse_run_output(&output);
+    let meta = read_meta(&meta_path(&json));
+    assert_eq!(meta["owner_session_id"], "ses_resolved");
+    assert!(
+        !replacement_log.exists(),
+        "replacement helper executed: {}",
+        fs::read_to_string(&replacement_log).unwrap_or_default()
+    );
+}
+
+#[test]
+fn successful_registration_survives_launcher_loss_before_supervisor_startup() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = registration_launcher_killing_fake_agents(&temp);
+    let workload_marker = temp.path().join("workload-started-after-launcher-loss");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            &format!("touch {}", workload_marker.display()),
+        ])
+        .output()
+        .expect("run killed after successful registration");
+
+    assert_eq!(
+        output.status.code(),
+        None,
+        "launcher was not killed: {output:?}"
+    );
+    let state_root = temp.path().join("agent-bash");
+    wait_until(FIXTURE_DEADLINE, || {
+        fs::read_dir(&state_root)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read(entry.path().join("meta.json")).ok())
+            .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .any(|meta| meta["state"] == "DONE")
+            .then_some(())
+    });
+    assert!(workload_marker.exists(), "workload was not admitted");
+    wait_until(FIXTURE_DEADLINE, || {
+        let operations = fs::read_to_string(&delivery_log).ok()?;
+        operations.contains("agent-bash-complete").then_some(())
+    });
+    let operations = fs::read_to_string(&delivery_log).expect("delivery operations");
+    assert_eq!(
+        operations.matches("agent-bash-register").count(),
+        1,
+        "{operations}"
+    );
+    assert_eq!(
+        operations.matches("agent-bash-complete").count(),
+        1,
+        "{operations}"
+    );
+}
+
+#[test]
+fn admitted_registration_failure_retains_non_replayable_unknown_handle() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = admitted_registration_failure_fake_agents(&temp);
+    let workload_marker = temp
+        .path()
+        .join("workload-started-after-unknown-registration");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            &format!("touch {}", workload_marker.display()),
+        ])
+        .output()
+        .expect("run with admitted registration failure");
+    let json = parse_run_output(&output);
+    let meta = read_meta(&meta_path(&json));
+
+    assert_eq!(json["dispatch_state"], "registration-outcome-unknown");
+    assert_eq!(meta["state"], "ERROR");
+    assert_eq!(meta["completion_reason"], "registration-outcome-unknown");
+    assert_eq!(meta["rc"], 70);
+    assert!(meta["workload_pid"].is_null());
+    assert!(
+        meta["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("unknown after helper admission")),
+        "{meta}"
+    );
+    assert!(
+        !workload_marker.exists(),
+        "workload started after unknown registration"
+    );
+    let operations = fs::read_to_string(delivery_log).expect("delivery operations");
+    assert_eq!(
+        operations.matches("agent-bash-register").count(),
+        1,
+        "{operations}"
+    );
+    assert_eq!(
+        operations.matches("agent-bash-complete").count(),
+        0,
+        "{operations}"
+    );
+    assert_eq!(
+        state_dir_count(&temp),
+        1,
+        "unknown registration state was removed"
+    );
+}
+
+#[test]
+fn adapter_reports_admitted_registration_uncertainty_without_running_promise() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+    let (fake, _) = admitted_registration_failure_fake_agents(&temp);
+    let request = json!({
+        "args": { "command": "printf 'must not start\\n'", "delivery": "async" }
+    })
+    .to_string();
+    let mut command = adapter_driver_command(&temp, &driver, "request", Some(&request));
+    let output = command
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+        .output()
+        .expect("adapter driver");
+    assert_command_success(&output);
+    let result = parse_stdout_json(&output);
+    let text = adapter_result_text(&result);
+
+    assert!(text.contains("Dispatch unresolved"), "{text}");
+    assert!(text.contains("workload was not started"), "{text}");
+    assert!(text.contains("registration will not be replayed"), "{text}");
+    assert!(!text.contains("Running asynchronously"), "{text}");
+    assert!(!text.contains("will be woken"), "{text}");
+    let handle = adapter_result_handle(&result);
+    let meta = read_meta(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(handle)
+            .join("meta.json"),
+    );
+    assert_eq!(meta["completion_reason"], "registration-outcome-unknown");
+    assert!(meta["workload_pid"].is_null());
 }
 
 #[test]
@@ -2454,8 +3887,9 @@ fn partial_explicit_owner_fails_closed_with_runner_detail() {
     assert_eq!(output.status.code(), Some(74));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("runner exited with 74: {\"status\":\"notification_event_error\"")
-            && stderr.contains("owner_session_id and owner_invocation_uuid are both required"),
+        stderr.contains(
+            "explicit completion owner requires matching parent invocation and helper attestation"
+        ),
         "{stderr}"
     );
     assert!(
@@ -2474,7 +3908,7 @@ fn partial_explicit_owner_fails_closed_with_runner_detail() {
 }
 
 #[test]
-fn resolved_owner_must_match_parent_invocation_marker() {
+fn mismatched_resolved_owner_retains_admitted_registration_failure() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, resolver_log) = registration_rejecting_fake_agents(&temp);
     let workload_marker = temp.path().join("workload-started");
@@ -2497,19 +3931,25 @@ fn resolved_owner_must_match_parent_invocation_marker() {
         .output()
         .expect("run");
 
-    assert_eq!(output.status.code(), Some(74));
+    let json = parse_run_output(&output);
+    let meta = read_meta(&meta_path(&json));
+    assert_eq!(json["dispatch_state"], "registration-outcome-unknown");
     assert!(
         resolver_log.exists(),
         "verified PID lookup was not attempted"
     );
+    assert!(meta["owner_session_id"].is_null(), "{meta}");
+    assert!(meta["owner_invocation_uuid"].is_null(), "{meta}");
+    assert_eq!(meta["state"], "ERROR");
+    assert_eq!(meta["completion_reason"], "registration-outcome-unknown");
     assert!(
         !workload_marker.exists(),
         "workload launched with mismatched resolved owner"
     );
     assert_eq!(
         state_dir_count(&temp),
-        0,
-        "rejected registration leaked state"
+        1,
+        "admitted registration failure state was removed"
     );
 }
 
@@ -2525,12 +3965,29 @@ fn delivery_seam_records_invocation_outcome() {
     let output = cmd.output().expect("run");
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
     assert_eq!(json["delivery_mode"], "async");
     assert_eq!(mode_text(&temp, handle), "async");
-    let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
-    wait_until(Duration::from_secs(6), || {
-        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+    let deadline = Instant::now() + FIXTURE_DEADLINE;
+    while completion_helper_operation_count(&delivery_log) != 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        completion_helper_operation_count(&delivery_log),
+        1,
+        "meta={} log={}",
+        read_meta(&meta_path),
+        fs::read_to_string(&delivery_log).unwrap_or_default()
+    );
+    wait_until(FIXTURE_DEADLINE, || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["exit_code"] == 0).then_some(())
     });
+    let status = status_text(&temp, handle, true);
+    assert!(
+        status.starts_with(&format!("DONE rc=0 handle={handle}")),
+        "{status}"
+    );
     let delivered = fs::read_to_string(&delivery_log).expect("delivery log");
     let lines: Vec<_> = delivered.lines().map(str::to_string).collect();
     assert_eq!(
@@ -2569,14 +4026,1020 @@ fn delivery_seam_records_invocation_outcome() {
             json["rc"].as_str().expect("rc").to_string(),
         ]
     );
-    let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(6), || {
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
-        (meta["delivery"]["attempted"] == true).then_some(meta)
+        delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     assert_eq!(meta["delivery"]["attempted"], true);
     assert_eq!(meta["delivery"]["exit_code"], 0);
     assert!(meta["delivery"]["skipped"].is_null());
+}
+
+#[test]
+fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = FIXTURE_DEADLINE;
+    let (fake, delivery_log) = parent_killing_fake_agents(&temp, "agent-bash-complete");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--", "bash", "-lc", "printf complete"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+
+    wait_until(fixture_deadline, || {
+        (completion_helper_operation_count(&delivery_log) == 1).then_some(())
+    });
+    let delivered = wait_until(fixture_deadline, || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["exit_code"] == 0).then_some(meta)
+    });
+    assert_eq!(delivered["delivery"]["attempted"], true);
+    assert!(delivered["delivery"]["retryable"].is_null());
+    assert!(delivered["delivery"]["error"].is_null());
+
+    for _ in 0..4 {
+        let status = status_text(&temp, handle, true);
+        assert!(status.starts_with("DONE rc=0"), "{status}");
+    }
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+}
+
+#[test]
+fn delivery_transfer_worker_finishes_after_supervisor_dies() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = FIXTURE_DEADLINE;
+    let fixture = blocking_delivery_fake_agents(&temp);
+    let release = temp.path().join("owner-completion-workload-release");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fixture.helper)
+        .env(
+            "AGENT_BASH_FAKE_COMPLETE_STARTED",
+            &fixture.completion_started,
+        )
+        .env(
+            "AGENT_BASH_FAKE_COMPLETE_RELEASE",
+            &fixture.completion_release,
+        )
+        .env(
+            "AGENT_BASH_FAKE_COMPLETE_FINISHED",
+            &fixture.completion_finished,
+        )
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &fixture.delivery_log)
+        .env("RELEASE", &release)
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            "while [ ! -e \"$RELEASE\" ]; do sleep 0.01; done",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+    let running = wait_until(fixture_deadline, || {
+        let meta = read_meta(&meta_path);
+        meta["supervisor_pid"].is_number().then_some(meta)
+    });
+    let supervisor = OwnedProcess::capture_supervisor(&running).expect("capture supervisor");
+    fs::write(&release, b"").expect("release workload");
+    wait_until(fixture_deadline, || {
+        fixture.completion_started.exists().then_some(())
+    });
+    assert!(supervisor.signal(libc::SIGKILL), "kill supervisor");
+    fs::write(&fixture.completion_release, b"").expect("release completion helper");
+
+    let delivered = wait_until(fixture_deadline, || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["exit_code"] == 0).then_some(meta)
+    });
+    assert_eq!(delivered["delivery"]["attempted"], true);
+    assert!(fixture.completion_finished.exists());
+    assert_eq!(
+        operation_count(&fixture.delivery_log, "agent-bash-complete"),
+        1
+    );
+    let status = status_text(&temp, handle, true);
+    assert!(status.starts_with("DONE rc=0"), "{status}");
+}
+
+#[test]
+fn failed_delivery_transfer_worker_closes_unknown_transfer_without_replay() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = delivery_transfer_worker_killing_fake_agents(&temp);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--", "sh", "-c", "exit 0"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+
+    let settled = wait_until(FIXTURE_DEADLINE, || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["error_code"] == "transfer_outcome_unknown").then_some(meta)
+    });
+    assert_eq!(settled["delivery"]["attempted"], true);
+    assert_eq!(settled["delivery"]["retryable"], false);
+    assert_eq!(
+        settled["delivery"]["lifecycle"],
+        "non_replayable_unknown_transfer"
+    );
+
+    for _ in 0..4 {
+        let status = status_text(&temp, handle, true);
+        assert!(status.starts_with("DONE rc=0"), "{status}");
+    }
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+}
+
+#[test]
+fn successor_closes_orphaned_completion_transfer_without_replay() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = delivery_handoff_killing_fake_agents(&temp, "agent-bash-complete");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--", "sh", "-c", "exit 0"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+
+    wait_until(FIXTURE_DEADLINE, || {
+        (completion_helper_operation_count(&delivery_log) == 1).then_some(())
+    });
+    let status = status_text(&temp, handle, true);
+    assert!(status.starts_with("DONE rc=0"), "{status}");
+    let settled = read_meta(&meta_path);
+    assert_eq!(
+        settled["delivery"]["error_code"],
+        "transfer_outcome_unknown"
+    );
+    assert_eq!(settled["delivery"]["retryable"], false);
+    assert_eq!(
+        settled["delivery"]["lifecycle"],
+        "non_replayable_unknown_transfer"
+    );
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+}
+
+#[test]
+fn successor_closes_orphaned_activation_transfer_without_replay() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = delivery_handoff_killing_fake_agents(&temp, "agent-bash-activate");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--delivery", "sync", "--", "sleep", "1"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let state_dir = PathBuf::from(json["state_dir"].as_str().expect("state dir"));
+
+    let detached = detach_with_fake(&temp, handle, &fake, &delivery_log);
+    assert!(
+        !detached.status.success(),
+        "detach initiator should be killed"
+    );
+    wait_until(FIXTURE_DEADLINE, || {
+        (fs::read_to_string(state_dir.join("activation-outcome"))
+            .ok()
+            .as_deref()
+            == Some("pending\n"))
+        .then_some(())
+    });
+
+    let mode = agent_bash(&temp)
+        .args(["mode", handle])
+        .output()
+        .expect("mode command");
+    assert!(!mode.status.success(), "orphaned activation is unknown");
+    assert_eq!(
+        fs::read_to_string(state_dir.join("activation-outcome")).expect("activation outcome"),
+        "transfer_outcome_unknown\n"
+    );
+    assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
+    wait_until(FIXTURE_DEADLINE, || {
+        let meta = read_meta(&state_dir.join("meta.json"));
+        (meta["state"] == "DONE").then_some(())
+    });
+}
+
+#[test]
+fn delivery_transfer_worker_finishes_after_detach_caller_dies() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = FIXTURE_DEADLINE;
+    let fixture = blocking_delivery_fake_agents(&temp);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fixture.helper)
+        .env(
+            "AGENT_BASH_FAKE_ACTIVATE_STARTED",
+            &fixture.activation_started,
+        )
+        .env(
+            "AGENT_BASH_FAKE_ACTIVATE_RELEASE",
+            &fixture.activation_release,
+        )
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &fixture.delivery_log)
+        .args(["run", "--delivery", "sync", "--", "sleep", "60"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let binary = assert_cmd::cargo::cargo_bin("agent-bash");
+    let mut detach = StdCommand::new(binary)
+        .env("XDG_STATE_HOME", temp.path())
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fixture.helper)
+        .env(
+            "AGENT_BASH_FAKE_ACTIVATE_STARTED",
+            &fixture.activation_started,
+        )
+        .env(
+            "AGENT_BASH_FAKE_ACTIVATE_RELEASE",
+            &fixture.activation_release,
+        )
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &fixture.delivery_log)
+        .args(["detach", handle])
+        .spawn()
+        .expect("spawn detach");
+    wait_until(fixture_deadline, || {
+        fixture.activation_started.exists().then_some(())
+    });
+    detach.kill().expect("kill detach caller");
+    detach.wait().expect("reap detach caller");
+    fs::write(&fixture.activation_release, b"").expect("release activation helper");
+
+    let repeated = agent_bash(&temp)
+        .args(["detach", handle])
+        .output()
+        .expect("repeated detach");
+    assert_command_success(&repeated);
+    let repeated = parse_stdout_json(&repeated);
+    assert_eq!(repeated["transitioned"], false);
+    assert_eq!(repeated["notification_attempted"], false);
+    assert_eq!(
+        operation_count(&fixture.delivery_log, "agent-bash-activate"),
+        1
+    );
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel after detach transfer");
+    assert_command_success(&cancel);
+    wait_for_terminal_status(&temp, handle);
+}
+
+#[test]
+fn admitted_activation_failure_is_durable_and_not_reported_as_settled() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = nonzero_activation_fake_agents(&temp);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--delivery", "sync", "--", "sleep", "60"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+
+    let first = agent_bash(&temp)
+        .args(["detach", handle])
+        .output()
+        .expect("first detach");
+    let second = agent_bash(&temp)
+        .args(["detach", handle])
+        .output()
+        .expect("second detach");
+
+    for failed in [&first, &second] {
+        assert_eq!(
+            failed.status.code(),
+            Some(74),
+            "{}",
+            command_failure_message(failed)
+        );
+        assert!(
+            String::from_utf8_lossy(&failed.stderr).contains("activation rejected"),
+            "{}",
+            command_failure_message(failed)
+        );
+    }
+    let mode = agent_bash(&temp)
+        .args(["mode", handle])
+        .output()
+        .expect("mode after failed activation");
+    assert_eq!(
+        mode.status.code(),
+        Some(74),
+        "{}",
+        command_failure_message(&mode)
+    );
+    assert!(
+        String::from_utf8_lossy(&mode.stderr).contains("activation rejected"),
+        "{}",
+        command_failure_message(&mode)
+    );
+    let listed = shell_list_json(&temp, true);
+    let listed = listed
+        .iter()
+        .find(|entry| entry["handle"] == handle)
+        .expect("failed activation in list");
+    assert!(listed["delivery_mode"].is_null());
+    assert!(
+        listed["delivery_mode_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("activation rejected"))
+    );
+    assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
+    assert_eq!(
+        fs::read_to_string(state_dir_path(&json).join("activation-outcome")).unwrap(),
+        "failed: delivery helper exited with 19: activation rejected\n"
+    );
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel after failed activation");
+    assert_command_success(&cancel);
+    wait_for_terminal_status(&temp, handle);
+}
+
+#[test]
+fn attempted_activation_without_pending_outcome_restores_sync_before_clearing_claim() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let handle = "ab_unknown_activation";
+    let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
+    fs::write(state_dir.join("delivery-mode"), b"async").expect("write async mode");
+    fs::write(state_dir.join("activation-attempted"), b"").expect("write attempted marker");
+
+    let mode = agent_bash(&temp)
+        .args(["mode", handle])
+        .output()
+        .expect("mode after unknown activation");
+
+    assert_command_success(&mode);
+    assert_eq!(String::from_utf8_lossy(&mode.stdout), "sync\n");
+    assert_eq!(
+        fs::read_to_string(state_dir.join("delivery-mode")).expect("restored mode"),
+        "sync"
+    );
+    assert!(!state_dir.join("activation-attempted").exists());
+    assert!(!state_dir.join("activation-outcome").exists());
+}
+
+#[test]
+fn interrupted_pre_admission_activation_rollback_restores_sync_before_clearing_claim() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let handle = "ab_pre_admission_rollback";
+    let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
+    fs::write(state_dir.join("delivery-mode"), b"async").expect("write async mode");
+    fs::write(state_dir.join("activation-attempted"), b"").expect("write attempted marker");
+    fs::write(
+        state_dir.join("activation-outcome"),
+        b"pre_admission_failed: helper did not start\n",
+    )
+    .expect("write pre-admission outcome");
+
+    let mode = agent_bash(&temp)
+        .args(["mode", handle])
+        .output()
+        .expect("mode after interrupted rollback");
+
+    assert_command_success(&mode);
+    assert_eq!(String::from_utf8_lossy(&mode.stdout), "sync\n");
+    assert_eq!(
+        fs::read_to_string(state_dir.join("delivery-mode")).expect("restored mode"),
+        "sync"
+    );
+    assert!(!state_dir.join("activation-attempted").exists());
+    assert!(!state_dir.join("activation-outcome").exists());
+}
+
+#[test]
+fn concurrent_status_after_nonzero_helper_exit_does_not_repeat_delivery() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = nonzero_completion_fake_agents(&temp);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--", "true"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle").to_string();
+    let meta_path = meta_path(&json);
+    wait_until(FIXTURE_DEADLINE, || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["exit_code"] == 17).then_some(())
+    });
+
+    let mut observers = Vec::new();
+    for _ in 0..8 {
+        let binary = assert_cmd::cargo::cargo_bin("agent-bash");
+        let state_root = temp.path().to_path_buf();
+        let handle = handle.clone();
+        observers.push(std::thread::spawn(move || {
+            StdCommand::new(binary)
+                .env("XDG_STATE_HOME", state_root)
+                .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/false")
+                .args(["status", "--full", &handle])
+                .output()
+                .expect("status observer")
+        }));
+    }
+    for observer in observers {
+        assert_command_success(&observer.join().expect("join observer"));
+    }
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+    assert_eq!(read_meta(&meta_path)["delivery"]["exit_code"], 17);
+}
+
+#[test]
+fn legacy_helperless_handles_fail_closed_without_retry() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let handle = "ab_legacy_helperless";
+    let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
+    fs::write(state_dir.join("delivery-mode"), b"async").expect("write delivery mode");
+    let meta_path = state_dir.join("meta.json");
+    let mut meta = read_meta(&meta_path);
+    meta["delivery"]["retryable"] = json!(true);
+    fs::write(&meta_path, format_seeded_meta(&meta)).expect("write retry admission");
+
+    let status = status_text(&temp, handle, true);
+    assert!(status.starts_with("DONE rc=0"), "{status}");
+    let meta = read_meta(&meta_path);
+    assert_eq!(meta["delivery"]["attempted"], false);
+    assert_eq!(
+        meta["delivery"]["error_code"],
+        "delivery_helper_legacy_unsupported"
+    );
+    assert_eq!(meta["delivery"]["retryable"], false);
+
+    let detach_handle = "ab_legacy_helperless_detach";
+    let detach_dir = seed_done_state_dir(&temp, detach_handle, unix_ms(), false);
+    fs::write(detach_dir.join("delivery-mode"), b"sync").expect("write sync mode");
+    let detach = agent_bash(&temp)
+        .args(["detach", detach_handle])
+        .output()
+        .expect("detach legacy handle");
+    assert!(!detach.status.success());
+    assert!(
+        String::from_utf8_lossy(&detach.stderr).contains("delivery_helper_legacy_unsupported"),
+        "{}",
+        String::from_utf8_lossy(&detach.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(detach_dir.join("delivery-mode")).unwrap(),
+        "sync"
+    );
+    assert!(!detach_dir.join("activation-attempted").exists());
+}
+
+#[test]
+fn caller_death_after_activation_handoff_does_not_repeat_or_split_detach() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = FIXTURE_DEADLINE;
+    let (fake, delivery_log) = parent_killing_fake_agents(&temp, "agent-bash-activate");
+    let release = temp.path().join("detach-crash-release");
+    let release_marker = ReleaseMarker::new(release.clone());
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .env("RELEASE", &release)
+        .args([
+            "run",
+            "--delivery",
+            "sync",
+            "--",
+            "bash",
+            "-lc",
+            "while [ ! -e \"$RELEASE\" ]; do sleep 0.01; done",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+
+    let interrupted = agent_bash(&temp)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["detach", handle])
+        .output()
+        .expect("interrupted detach");
+    assert!(!interrupted.status.success());
+    wait_until(fixture_deadline, || {
+        (operation_count(&delivery_log, "agent-bash-activate") == 1).then_some(())
+    });
+    wait_until(fixture_deadline, || {
+        (mode_text(&temp, handle) == "async"
+            && read_meta(&meta_path(&json))["delivery_mode"] == "async")
+            .then_some(())
+    });
+
+    let repeated = agent_bash(&temp)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["detach", handle])
+        .output()
+        .expect("repeated detach");
+    assert_command_success(&repeated);
+    let repeated = parse_stdout_json(&repeated);
+    assert_eq!(repeated["transitioned"], false);
+    assert_eq!(repeated["notification_attempted"], false);
+    assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
+    assert_eq!(mode_text(&temp, handle), "async");
+    assert_eq!(read_meta(&meta_path(&json))["delivery_mode"], "async");
+    release_marker.release();
+    let status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+    assert!(status.starts_with(&format!("DONE rc=0 handle={handle}")));
+    assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
+}
+
+#[test]
+fn observer_cannot_substitute_registered_delivery_helper() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (helper_a, log_a) = named_fake_agents(&temp, "helper-a", "helper-a.log");
+    let (helper_b, log_b) = named_fake_agents(&temp, "helper-b", "helper-b.log");
+    fs::write(
+        &helper_a,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nprintf 'route=%s operation=%s\\n' \"${{AGENT_BASH_FAKE_ROUTE-unset}}\" \"${{2:-}}\" >> {}\nexit 0\n",
+            shell_quote(&log_a),
+            shell_quote(&log_a)
+        ),
+    )
+    .expect("write environment-observing helper");
+    let release = temp.path().join("release-workload");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper_a)
+        .env("AGENT_BASH_FAKE_ROUTE", "registered")
+        .env("RELEASE_WORKLOAD", &release)
+        .args([
+            "run",
+            "--delivery",
+            "sync",
+            "--",
+            "bash",
+            "-lc",
+            "for _ in {1..800}; do [ -e \"$RELEASE_WORKLOAD\" ] && exit 0; sleep 0.01; done; exit 1",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+
+    let detach = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper_b)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &log_b)
+        .env("AGENT_BASH_FAKE_ROUTE", "later-caller")
+        .args(["detach", handle])
+        .output()
+        .expect("detach command");
+    assert_command_success(&detach);
+    fs::write(&release, b"").expect("release workload");
+    let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+    wait_until(FIXTURE_DEADLINE, || {
+        (completion_helper_operation_count(&log_a) == 1).then_some(())
+    });
+
+    let helper_a_operations = fs::read_to_string(&log_a).expect("helper A log");
+    assert!(
+        helper_a_operations
+            .lines()
+            .any(|line| line == "agent-bash-activate"),
+        "registered helper did not receive detach activation: {helper_a_operations}"
+    );
+    assert_eq!(completion_helper_operation_count(&log_a), 1);
+    assert!(
+        helper_a_operations
+            .lines()
+            .any(|line| line == "route=registered operation=agent-bash-activate"),
+        "registered helper environment did not receive detach activation: {helper_a_operations}"
+    );
+    assert!(
+        !helper_a_operations
+            .lines()
+            .any(|line| line.starts_with("route=later-caller ")),
+        "observer environment changed the registered helper context: {helper_a_operations}"
+    );
+    assert!(
+        !log_b.exists(),
+        "observer helper received registered-handle operations: {}",
+        fs::read_to_string(&log_b).unwrap_or_default()
+    );
+}
+
+#[test]
+fn later_caller_cannot_substitute_registered_helper_environment() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let helper = temp.path().join("environment-bound-agents");
+    let log = temp.path().join("environment-bound.log");
+    fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nauthority=absent\n[ -n \"${{OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY:-}}\" ] && authority=present\nprintf '%s:%s:%s\\n' \"${{AGENT_BASH_FAKE_ROUTE-unset}}\" \"${{2:-}}\" \"$authority\" >> {}\nexit 0\n",
+            shell_quote(&log)
+        ),
+    )
+    .expect("write environment-bound helper");
+    set_executable(&helper);
+    let release = temp.path().join("environment-bound-release");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env("AGENT_BASH_FAKE_ROUTE", "registered")
+        .env(
+            "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .env("RELEASE", &release)
+        .args([
+            "run",
+            "--delivery",
+            "sync",
+            "--",
+            "bash",
+            "-lc",
+            "while [ ! -e \"$RELEASE\" ]; do sleep 0.01; done",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let helper_environment = &read_meta(&meta_path(&json))["delivery_helper"]["environment"];
+    assert_eq!(helper_environment["AGENT_BASH_FAKE_ROUTE"], "registered");
+    assert!(
+        helper_environment["OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY"].is_null(),
+        "transient registration authority was persisted: {helper_environment}"
+    );
+
+    let detach = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env("AGENT_BASH_FAKE_ROUTE", "later-caller")
+        .args(["detach", handle])
+        .output()
+        .expect("detach");
+    assert_command_success(&detach);
+    fs::write(&release, b"").expect("release workload");
+    let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+    wait_until(FIXTURE_DEADLINE, || {
+        let operations = fs::read_to_string(&log).unwrap_or_default();
+        operations
+            .lines()
+            .any(|line| line == "registered:agent-bash-complete:absent")
+            .then_some(())
+    });
+
+    let operations = fs::read_to_string(&log).expect("helper log");
+    assert!(
+        operations
+            .lines()
+            .any(|line| line == "registered:agent-bash-register:present"),
+        "registration authority did not reach only the registration helper: {operations}"
+    );
+    assert!(
+        operations
+            .lines()
+            .any(|line| line == "registered:agent-bash-activate:absent"),
+        "registered environment did not reach detach helper: {operations}"
+    );
+    assert!(
+        !operations
+            .lines()
+            .any(|line| line.starts_with("later-caller:")),
+        "later caller substituted helper environment: {operations}"
+    );
+}
+
+#[test]
+fn registered_helper_snapshot_survives_source_replacement_without_polling() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = FIXTURE_DEADLINE;
+    let (helper, delivery_log) = fake_agents(&temp);
+    let retained_helper = temp.path().join("retained-fake-agents");
+    let replacement_log = temp.path().join("replacement-delivery.log");
+    let workload_started = temp.path().join("workload-started");
+    let release = temp.path().join("release-workload");
+    let release_marker = ReleaseMarker::new(release.clone());
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env("WORKLOAD_STARTED", &workload_started)
+        .env("RELEASE_WORKLOAD", &release)
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            "printf started > \"$WORKLOAD_STARTED\"; for _ in {1..800}; do [ -e \"$RELEASE_WORKLOAD\" ] && exit 0; sleep 0.01; done; exit 1",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+
+    wait_until(fixture_deadline, || workload_started.exists().then_some(()));
+    fs::rename(&helper, &retained_helper).expect("retain registered source helper");
+    fs::write(&helper, fake_agents_script(&replacement_log)).expect("write replacement helper");
+    set_executable(&helper);
+    release_marker.release();
+    let delivered = wait_until(fixture_deadline, || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["exit_code"] == 0).then_some(meta)
+    });
+    assert_eq!(delivered["delivery"]["attempted"], true);
+    assert!(delivered["delivery"]["error"].is_null());
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+    assert!(
+        !replacement_log.exists(),
+        "replacement helper executed: {}",
+        fs::read_to_string(&replacement_log).unwrap_or_default()
+    );
+    assert_eq!(
+        delivered["delivery_helper"]["path"],
+        state_dir_path(&json)
+            .join("delivery-helper")
+            .to_string_lossy()
+            .as_ref()
+    );
+    let status = status_text(&temp, handle, true);
+    assert!(
+        status.starts_with(&format!("DONE rc=0 handle={handle}")),
+        "{status}"
+    );
+}
+
+#[test]
+fn unavailable_pinned_helper_allows_one_bounded_pre_execution_retry() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = fake_agents(&temp);
+    let (observer, observer_log) =
+        named_fake_agents(&temp, "observer-agents", "observer-delivery.log");
+    let release = temp.path().join("bounded-retry-release");
+    let release_marker = ReleaseMarker::new(release.clone());
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .env("RELEASE", &release)
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            "while [ ! -e \"$RELEASE\" ]; do sleep 0.01; done",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+    let snapshot = state_dir_path(&json).join("delivery-helper");
+    let retained_snapshot = state_dir_path(&json).join("retained-delivery-helper");
+    fs::rename(&snapshot, &retained_snapshot).expect("make pinned helper unavailable");
+    release_marker.release();
+
+    let initial = wait_until(FIXTURE_DEADLINE, || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["error_code"] == "delivery_helper_unavailable").then_some(meta)
+    });
+    assert_eq!(initial["delivery"]["attempted"], false);
+    assert_eq!(initial["delivery"]["retryable"], true);
+    assert_eq!(initial["delivery"]["retry_count"].as_u64().unwrap_or(0), 0);
+
+    let first_retry = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &observer)
+        .args(["status", "--full", handle])
+        .output()
+        .expect("first status retry");
+    assert_command_success(&first_retry);
+    let first_retry = stdout_utf8(first_retry, "status utf8");
+    assert!(first_retry.starts_with("DONE rc=0"), "{first_retry}");
+    let closed = read_meta(&meta_path);
+    assert_eq!(closed["delivery"]["attempted"], false);
+    assert_eq!(closed["delivery"]["retryable"], false);
+    assert_eq!(closed["delivery"]["retry_count"], 1);
+
+    fs::rename(&retained_snapshot, &snapshot).expect("restore pinned helper");
+    let repeated = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &observer)
+        .args(["status", "--full", handle])
+        .output()
+        .expect("repeated status");
+    assert_command_success(&repeated);
+    let repeated = stdout_utf8(repeated, "status utf8");
+    assert!(repeated.starts_with("DONE rc=0"), "{repeated}");
+    assert_eq!(completion_helper_operation_count(&delivery_log), 0);
+    assert!(
+        !observer_log.exists(),
+        "observer-local helper executed: {}",
+        fs::read_to_string(&observer_log).unwrap_or_default()
+    );
+    assert_eq!(read_meta(&meta_path)["delivery"]["retry_count"], 1);
+}
+
+#[test]
+fn sentinel_root_exit_preserves_settled_delivery_retry() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = fake_agents(&temp);
+    let workload_started = temp.path().join("sentinel-retry-started");
+    let ready_release = temp.path().join("sentinel-ready-release");
+    let root_release = temp.path().join("sentinel-root-release");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .env("WORKLOAD_STARTED", &workload_started)
+        .env("READY_RELEASE", &ready_release)
+        .env("ROOT_RELEASE", &root_release)
+        .args([
+            "run",
+            "--ready-sentinel",
+            "READY",
+            "--",
+            "bash",
+            "-lc",
+            "printf started > \"$WORKLOAD_STARTED\"; while [ ! -e \"$READY_RELEASE\" ]; do sleep 0.01; done; printf 'READY\\n'; while [ ! -e \"$ROOT_RELEASE\" ]; do sleep 0.01; done",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+    let snapshot = state_dir_path(&json).join("delivery-helper");
+    let retained_snapshot = state_dir_path(&json).join("retained-delivery-helper");
+
+    wait_until(FIXTURE_DEADLINE, || workload_started.exists().then_some(()));
+    fs::rename(&snapshot, &retained_snapshot).expect("make pinned helper unavailable");
+    fs::write(&ready_release, b"").expect("release ready sentinel");
+    let initial = wait_until(FIXTURE_DEADLINE, || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["error_code"] == "delivery_helper_unavailable").then_some(meta)
+    });
+    assert_eq!(initial["delivery"]["retryable"], true);
+
+    fs::rename(&retained_snapshot, &snapshot).expect("restore pinned helper");
+    let retry = status_text(&temp, handle, true);
+    assert!(retry.starts_with("DONE rc=0"), "{retry}");
+    let settled = read_meta(&meta_path);
+    assert_eq!(settled["delivery"]["attempted"], true);
+    assert_eq!(settled["delivery"]["exit_code"], 0);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+
+    fs::write(&root_release, b"").expect("release sentinel workload");
+    let after_root_exit = wait_until(FIXTURE_DEADLINE, || {
+        let meta = read_meta(&meta_path);
+        (meta["workload_rc"] == 0).then_some(meta)
+    });
+    assert_eq!(after_root_exit["delivery"]["attempted"], true);
+    assert_eq!(after_root_exit["delivery"]["exit_code"], 0);
+    for _ in 0..4 {
+        let status = status_text(&temp, handle, true);
+        assert!(status.starts_with("DONE rc=0"), "{status}");
+    }
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+}
+
+#[test]
+fn completion_uses_pinned_interpreter_after_source_is_replaced() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (helper, interpreter, delivery_log) = interpreter_backed_fake_agents(&temp);
+    let retained_interpreter = temp.path().join("retained-delivery-interpreter");
+    let replacement_executed = temp.path().join("replacement-interpreter-executed");
+    let release = temp.path().join("launch-failure-release");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env("RELEASE", &release)
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            "while [ ! -e \"$RELEASE\" ]; do sleep 0.01; done",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let meta_path = meta_path(&json);
+    fs::rename(&interpreter, &retained_interpreter).expect("remove helper interpreter");
+    fs::write(
+        &interpreter,
+        format!("#!/bin/sh\n: > {}\n", shell_quote(&replacement_executed)),
+    )
+    .expect("write replacement interpreter");
+    set_executable(&interpreter);
+    fs::write(&release, b"").expect("release workload");
+
+    let completed = wait_until(FIXTURE_DEADLINE, || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["lifecycle"] == "admitted_outcome").then_some(meta)
+    });
+    assert_eq!(completed["delivery"]["exit_code"], 0);
+    assert!(completed["delivery"]["error_code"].is_null());
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+    assert!(!replacement_executed.exists());
+    let status = status_text(&temp, handle, true);
+    assert!(status.starts_with("DONE rc=0"), "{status}");
+}
+
+#[test]
+fn detach_uses_pinned_interpreter_after_source_is_removed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (helper, interpreter, _) = interpreter_backed_fake_agents(&temp);
+    let retained_interpreter = temp.path().join("retained-delivery-interpreter");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .args(["run", "--delivery", "sync", "--", "sleep", "60"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle");
+    let state_dir = state_dir_path(&json);
+    fs::rename(&interpreter, &retained_interpreter).expect("remove helper interpreter");
+
+    let detached = agent_bash(&temp)
+        .args(["detach", handle])
+        .output()
+        .expect("detach");
+    assert_command_success(&detached);
+    assert_eq!(mode_text(&temp, handle), "async");
+    assert!(state_dir.join("activation-attempted").exists());
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel after pinned-interpreter detach");
+    assert_command_success(&cancel);
+    wait_for_terminal_status(&temp, handle);
+}
+
+#[test]
+fn changed_handle_helper_fails_closed_through_completion_boundary() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = fake_agents(&temp);
+    let release = temp.path().join("changed-helper-release");
+    let executed = temp.path().join("changed-helper-executed");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .env("RELEASE", &release)
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            "while [ ! -e \"$RELEASE\" ]; do sleep 0.01; done",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let meta_path = meta_path(&json);
+    let snapshot = state_dir_path(&json).join("delivery-helper");
+    fs::remove_file(&snapshot).expect("remove registered helper link");
+    fs::write(
+        &snapshot,
+        format!("#!/bin/sh\n: > {}\n", shell_quote(&executed)),
+    )
+    .expect("write changed helper");
+    set_executable(&snapshot);
+    fs::write(&release, b"").expect("release workload");
+
+    let meta = wait_until(FIXTURE_DEADLINE, || {
+        let meta = read_meta(&meta_path);
+        (meta["delivery"]["error_code"] == "delivery_helper_changed").then_some(meta)
+    });
+    assert_eq!(meta["delivery"]["attempted"], false);
+    assert_eq!(meta["delivery"]["retryable"], true);
+    assert_eq!(meta["delivery"]["retry_count"].as_u64().unwrap_or(0), 0);
+    assert!(!executed.exists(), "changed helper executed");
+    assert_eq!(completion_helper_operation_count(&delivery_log), 0);
+}
+
+#[test]
+fn product_state_and_helper_cache_are_account_private() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = fake_agents(&temp);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .args(["run", "--", "true"])
+        .output()
+        .expect("run");
+    let _ = parse_run_output(&output);
+    let root = temp.path().join("agent-bash");
+    let cache = root.join(".delivery-helpers");
+    assert_eq!(
+        fs::metadata(&root).expect("root metadata").mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&cache).expect("cache metadata").mode() & 0o777,
+        0o700
+    );
 }
 
 #[test]
@@ -2605,13 +5068,13 @@ fn sync_completion_triggers_its_inactive_completion_event() {
     assert!(status.contains("sync\n"), "{status}");
     assert_eq!(json["delivery_mode"], "sync");
     assert_eq!(mode_text(&temp, handle), "sync");
-    wait_until(Duration::from_secs(6), || {
-        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+    wait_until(FIXTURE_DEADLINE, || {
+        (completion_helper_operation_count(&delivery_log) == 1).then_some(())
     });
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
-    let meta = wait_until(Duration::from_secs(6), || {
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path(&json));
-        (meta["delivery"]["attempted"] == true).then_some(meta)
+        delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     assert_eq!(meta["delivery_mode"], "sync");
     assert_eq!(meta["delivery"]["attempted"], true);
@@ -2620,7 +5083,7 @@ fn sync_completion_triggers_its_inactive_completion_event() {
 }
 
 #[test]
-fn detach_after_sync_completion_notifies_once() {
+fn detach_after_sync_completion_admits_each_helper_operation_once() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
     let output = agent_bash(&temp)
@@ -2651,20 +5114,21 @@ fn detach_after_sync_completion_notifies_once() {
     assert_eq!(second["transitioned"], false);
     assert_eq!(second["notification_attempted"], false);
     assert_eq!(mode_text(&temp, handle), "async");
-    wait_until(Duration::from_secs(6), || {
-        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+    wait_until(FIXTURE_DEADLINE, || {
+        (completion_helper_operation_count(&delivery_log) == 1).then_some(())
     });
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
-    let meta = wait_until(Duration::from_secs(6), || {
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+    assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path(&json));
-        (meta["delivery"]["attempted"] == true).then_some(meta)
+        delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     assert_eq!(meta["delivery_mode"], "async");
     assert_eq!(meta["delivery"]["attempted"], true);
 }
 
 #[test]
-fn concurrent_detach_and_completion_produce_one_notification() {
+fn concurrent_detach_and_completion_admit_each_helper_operation_once() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
     let output = agent_bash(&temp)
@@ -2720,15 +5184,129 @@ fn concurrent_detach_and_completion_produce_one_notification() {
             .count(),
         1
     );
-    wait_until(Duration::from_secs(6), || {
-        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+    wait_until(FIXTURE_DEADLINE, || {
+        (completion_helper_operation_count(&delivery_log) == 1).then_some(())
     });
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
+    assert_eq!(operation_count(&delivery_log, "agent-bash-activate"), 1);
     assert_eq!(mode_text(&temp, &handle), "async");
 }
 
 #[test]
-fn consumed_marker_before_completion_suppresses_async_delivery() {
+fn detach_does_not_rewrite_terminal_metadata_after_activation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fixture_deadline = FIXTURE_DEADLINE;
+    let fixture = blocking_delivery_fake_agents(&temp);
+    let workload_release = temp.path().join("workload-release");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fixture.helper)
+        .env(
+            "AGENT_BASH_FAKE_ACTIVATE_STARTED",
+            &fixture.activation_started,
+        )
+        .env(
+            "AGENT_BASH_FAKE_ACTIVATE_RELEASE",
+            &fixture.activation_release,
+        )
+        .env(
+            "AGENT_BASH_FAKE_COMPLETE_STARTED",
+            &fixture.completion_started,
+        )
+        .env(
+            "AGENT_BASH_FAKE_COMPLETE_RELEASE",
+            &fixture.completion_release,
+        )
+        .env(
+            "AGENT_BASH_FAKE_COMPLETE_FINISHED",
+            &fixture.completion_finished,
+        )
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &fixture.delivery_log)
+        .env("WORKLOAD_RELEASE", &workload_release)
+        .args([
+            "run",
+            "--delivery",
+            "sync",
+            "--",
+            "bash",
+            "-lc",
+            "while [ ! -e \"$WORKLOAD_RELEASE\" ]; do sleep 0.01; done",
+        ])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let handle = json["handle"].as_str().expect("handle").to_string();
+    let workload = wait_until(fixture_deadline, || {
+        OwnedProcess::capture_workload(&read_meta(&meta_path(&json)))
+    });
+    let binary = assert_cmd::cargo::cargo_bin("agent-bash");
+    let state_root = temp.path().to_path_buf();
+    let detach_fixture = fixture.clone();
+    let detach_handle = handle.clone();
+    let detach = std::thread::spawn(move || {
+        StdCommand::new(binary)
+            .env("XDG_STATE_HOME", state_root)
+            .env("AGENT_BASH_AGENT_RUNNER_BIN", detach_fixture.helper)
+            .env(
+                "AGENT_BASH_FAKE_ACTIVATE_STARTED",
+                detach_fixture.activation_started,
+            )
+            .env(
+                "AGENT_BASH_FAKE_ACTIVATE_RELEASE",
+                detach_fixture.activation_release,
+            )
+            .env(
+                "AGENT_BASH_FAKE_COMPLETE_STARTED",
+                detach_fixture.completion_started,
+            )
+            .env(
+                "AGENT_BASH_FAKE_COMPLETE_RELEASE",
+                detach_fixture.completion_release,
+            )
+            .env(
+                "AGENT_BASH_FAKE_COMPLETE_FINISHED",
+                detach_fixture.completion_finished,
+            )
+            .env("AGENT_BASH_FAKE_DELIVERY_LOG", detach_fixture.delivery_log)
+            .args(["detach", &detach_handle])
+            .output()
+            .expect("detach")
+    });
+    wait_until(fixture_deadline, || {
+        fixture.activation_started.exists().then_some(())
+    });
+
+    fs::write(&workload_release, b"").expect("release workload");
+    wait_until(fixture_deadline, || workload.exited().then_some(()));
+    wait_until(fixture_deadline, || {
+        (read_meta(&meta_path(&json))["state"] == "DONE").then_some(())
+    });
+    fs::write(&fixture.activation_release, b"").expect("release activation");
+    wait_until(fixture_deadline, || {
+        fixture.completion_started.exists().then_some(())
+    });
+    let state_during_delivery = read_meta(&meta_path(&json))["state"]
+        .as_str()
+        .expect("state")
+        .to_string();
+    fs::write(&fixture.completion_release, b"").expect("release completion");
+    wait_until(fixture_deadline, || {
+        fixture.completion_finished.exists().then_some(())
+    });
+    let detach = detach.join().expect("detach thread");
+
+    assert_eq!(state_during_delivery, "DONE");
+    assert_command_success(&detach);
+    let status = wait_for_terminal_status(&temp, &handle);
+    assert!(status.starts_with("DONE rc=0"), "{status}");
+    assert_eq!(read_meta(&meta_path(&json))["state"], "DONE");
+    assert_eq!(completion_helper_operation_count(&fixture.delivery_log), 1);
+    let meta = read_meta(&meta_path(&json));
+    assert_eq!(meta["delivery"]["attempted"], true);
+    assert_eq!(meta["delivery"]["exit_code"], 0);
+}
+
+#[test]
+fn consumed_marker_before_completion_marks_helper_operation_consumed() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
 
@@ -2744,12 +5322,12 @@ fn consumed_marker_before_completion_suppresses_async_delivery() {
     let final_status = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     assert!(final_status.contains("consumed\n"), "{final_status}");
     let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(6), || {
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
-        delivery_metadata_observed(&meta).then_some(meta)
+        delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     let delivery = fs::read_to_string(&delivery_log).expect("event commands");
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
     assert!(delivery.lines().any(|line| line == "--consumed"));
     assert_eq!(meta["delivery"]["attempted"], true);
     assert_eq!(meta["delivery"]["exit_code"], 0);
@@ -2757,21 +5335,19 @@ fn consumed_marker_before_completion_suppresses_async_delivery() {
 }
 
 #[test]
-fn consumed_marker_during_delivery_grace_suppresses_async_delivery() {
+fn consumed_marker_during_delivery_grace_marks_helper_operation_consumed() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
 
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
         .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
-        .env("AGENT_BASH_CONSUMER_GRACE_MS", "2000")
+        .env("AGENT_BASH_CONSUMER_GRACE_MS", "8000")
         .args(["run", "--", "bash", "-lc", "echo consumed-after-rc"])
         .output()
         .expect("run");
     let json = parse_run_output(&output);
-    wait_until(Duration::from_secs(2), || {
-        rc_path(&json).exists().then_some(())
-    });
+    wait_until(FIXTURE_DEADLINE, || rc_path(&json).exists().then_some(()));
     fs::write(state_dir_path(&json).join("consumed"), b"").expect("write consumed marker");
 
     let handle = json["handle"].as_str().expect("handle");
@@ -2780,50 +5356,92 @@ fn consumed_marker_during_delivery_grace_suppresses_async_delivery() {
         final_status.contains("consumed-after-rc\n"),
         "{final_status}"
     );
-    wait_until(Duration::from_secs(6), || {
-        (delivery_attempt_count(&delivery_log) == 1).then_some(())
+    wait_until(FIXTURE_DEADLINE, || {
+        (completion_helper_operation_count(&delivery_log) == 1).then_some(())
     });
     let delivery = fs::read_to_string(&delivery_log).expect("event commands");
-    assert_eq!(delivery_attempt_count(&delivery_log), 1);
+    assert_eq!(completion_helper_operation_count(&delivery_log), 1);
     assert!(delivery.lines().any(|line| line == "--consumed"));
     let meta_path = meta_path(&json);
-    let meta = wait_until(Duration::from_secs(6), || {
+    let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
-        delivery_metadata_observed(&meta).then_some(meta)
+        delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     assert_eq!(meta["delivery"]["attempted"], true);
     assert_eq!(meta["delivery"]["exit_code"], 0);
     assert!(meta["delivery"]["skipped"].is_null());
 }
 
-fn delivery_metadata_observed(meta: &Value) -> bool {
-    meta["delivery"]["attempted"] == true || meta["delivery"]["skipped"].is_string()
+fn delivery_lifecycle_is_closed(meta: &Value) -> bool {
+    matches!(
+        meta["delivery"]["lifecycle"].as_str(),
+        Some("non_replayable_unknown_transfer" | "admitted_outcome" | "legacy_skipped")
+    )
 }
 
 #[test]
 fn consumed_marker_after_delivery_does_not_rewrite_delivery_meta() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let release_workload = temp.path().join("release-workload");
     let (fake, delivery_log) = fake_agents(&temp);
 
     let mut cmd = agent_bash(&temp);
     cmd.env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
         .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
-        .args(["run", "--", "bash", "-lc", "echo delivered"]);
+        .env("RELEASE_WORKLOAD", &release_workload)
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            "for _ in {1..800}; do [ -e \"$RELEASE_WORKLOAD\" ] && { echo delivered; exit 0; }; sleep 0.01; done; exit 1",
+        ]);
     let output = cmd.output().expect("run");
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
-    let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
     let meta_path = meta_path(&json);
-    let before = wait_until(Duration::from_secs(2), || {
-        let meta = read_meta(&meta_path);
-        (meta["delivery"]["attempted"] == true).then_some(meta["delivery"].clone())
-    });
-    assert!(delivery_log.exists(), "delivery fixture should be invoked");
 
-    fs::write(state_dir_path(&json).join("consumed"), b"").expect("write consumed marker");
-    std::thread::sleep(Duration::from_millis(100));
-    let after = read_meta(&meta_path)["delivery"].clone();
-    assert_eq!(after, before);
+    fs::write(&release_workload, b"").expect("release workload");
+    let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
+    wait_until(FIXTURE_DEADLINE, || {
+        let meta = read_meta(&meta_path);
+        matches!(
+            meta["delivery"]["lifecycle"].as_str(),
+            Some("provisional_transfer" | "admitted_outcome")
+        )
+        .then_some(())
+    });
+
+    let state_dir = state_dir_path(&json);
+    let delivery_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state_dir.join("delivery.lock"))
+        .expect("open delivery lock");
+    wait_until(FIXTURE_DEADLINE, || {
+        let result =
+            unsafe { libc::flock(delivery_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Some(());
+        }
+        let error = std::io::Error::last_os_error();
+        assert_eq!(error.raw_os_error(), Some(libc::EWOULDBLOCK), "{error}");
+        None
+    });
+
+    let before_meta = read_meta(&meta_path);
+    assert_eq!(before_meta["state"], "DONE");
+    assert_eq!(before_meta["rc"], 0);
+    let before_delivery = before_meta["delivery"].clone();
+    assert_eq!(before_delivery["lifecycle"], "admitted_outcome");
+    assert_eq!(before_delivery["attempted"], true);
+    assert_eq!(before_delivery["exit_code"], 0);
+    assert!(before_delivery["error"].is_null());
+    assert!(before_delivery["skipped"].is_null());
+
+    write_consumed_marker(&state_dir);
+    let after_delivery = read_meta(&meta_path)["delivery"].clone();
+    assert_eq!(after_delivery, before_delivery);
 }
 
 #[test]
@@ -3049,8 +5667,12 @@ fn status_reconciles_conclusively_lost_supervisor_once_and_fails_closed() {
 fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
+    let retained_helper = temp.path().join("retained-guardian-helper");
+    let replacement_log = temp.path().join("guardian-replacement.log");
     let child_pid_path = temp.path().join("retained-child-pid");
     let allow_root_exit = temp.path().join("allow-root-exit");
+    let root_release_marker = ReleaseMarker::new(allow_root_exit.clone());
+    let fixture_deadline = FIXTURE_DEADLINE;
 
     let mut cmd = agent_bash(&temp);
     cmd.env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
@@ -3064,17 +5686,17 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
             "--",
             "bash",
             "-lc",
-            "sleep 10 >/dev/null 2>&1 & child=$!; printf '%s\\n' \"$child\" > \"$CHILD_PID_PATH\"; for _ in {1..200}; do [ -e \"$ALLOW_ROOT_EXIT\" ] && exit 0; sleep 0.01; done; exit 1",
+            "sleep 10 >/dev/null 2>&1 & child=$!; printf '%s\\n' \"$child\" > \"$CHILD_PID_PATH\"; for _ in {1..800}; do [ -e \"$ALLOW_ROOT_EXIT\" ] && exit 0; sleep 0.01; done; exit 1",
         ]);
     let output = cmd.output().expect("run");
     let json = parse_run_output(&output);
     let meta_path = meta_path(&json);
-    let initial_meta = wait_until(Duration::from_secs(2), || {
+    let initial_meta = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         meta["workload_pid"].is_number().then_some(meta)
     });
     let workload_pid = initial_meta["workload_pid"].as_i64().expect("workload pid") as libc::pid_t;
-    let child_pid = wait_until(Duration::from_secs(2), || {
+    let child_pid = wait_until(fixture_deadline, || {
         fs::read_to_string(&child_pid_path)
             .ok()?
             .trim()
@@ -3083,16 +5705,19 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
     });
     let retained_child =
         OwnedProcess::capture_current(child_pid, Some(workload_pid)).expect("capture child");
-    fs::write(&allow_root_exit, b"").expect("release workload root");
-    let running_meta = wait_until(Duration::from_secs(3), || {
+    root_release_marker.release();
+    let running_meta = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
         (meta["workload_rc"] == 0).then_some(meta)
     });
     let supervisor =
         OwnedProcess::capture_supervisor(&running_meta).expect("capture exact supervisor");
+    fs::rename(&fake, &retained_helper).expect("retain guardian helper source");
+    fs::write(&fake, fake_agents_script(&replacement_log)).expect("replace guardian helper");
+    set_executable(&fake);
 
     let supervisor_signaled = supervisor.signal(libc::SIGKILL);
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + fixture_deadline;
     while !delivery_log.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -3105,9 +5730,9 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
         delivery_log.exists(),
         "supervisor loss must deliver without a status poll"
     );
-    let terminal_meta = wait_until(Duration::from_secs(2), || {
+    let terminal_meta = wait_until(fixture_deadline, || {
         let meta = read_meta(&meta_path);
-        (meta["delivery"]["attempted"] == true).then_some(meta)
+        delivery_lifecycle_is_closed(&meta).then_some(meta)
     });
     assert_eq!(terminal_meta["state"], "ERROR");
     assert_eq!(terminal_meta["completion_reason"], "supervisor-lost");
@@ -3123,11 +5748,18 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
         notifications, 1,
         "supervisor loss must deliver exactly once"
     );
+    assert!(
+        !replacement_log.exists(),
+        "guardian executed replacement helper: {}",
+        fs::read_to_string(&replacement_log).unwrap_or_default()
+    );
 }
 
 #[test]
-fn list_all_reconciles_lost_supervisors_without_async_delivery() {
+fn list_all_observes_lost_supervisors_without_reconciling_or_delivery() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let (observer, observer_log) =
+        named_fake_agents(&temp, "list-observer-agents", "list-observer.log");
     let dead_supervisor = exact_identity(&terminated_process_identity());
     let dead_workload = exact_identity(&terminated_process_identity());
     let handle = "ab_list_lost_supervisor";
@@ -3139,15 +5771,17 @@ fn list_all_reconciles_lost_supervisors_without_async_delivery() {
         Some(dead_workload),
         false,
     );
+    write_delivery_helper_provenance(&temp.path().join("agent-bash").join(handle), &observer, &[]);
 
     let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &observer)
         .args(["list", "--all", "--json"])
         .output()
         .expect("list all");
     assert_command_success(&output);
     let summaries = parse_stdout_json(&output);
     assert_eq!(summaries[0]["handle"], handle);
-    assert_eq!(summaries[0]["state"], "ERROR");
+    assert_eq!(summaries[0]["state"], "RUNNING");
     let meta = read_meta(
         &temp
             .path()
@@ -3155,6 +5789,28 @@ fn list_all_reconciles_lost_supervisors_without_async_delivery() {
             .join(handle)
             .join("meta.json"),
     );
-    assert_eq!(meta["completion_reason"], "supervisor-lost");
+    assert!(meta["completion_reason"].is_null());
     assert_eq!(meta["delivery"]["attempted"], false);
+    assert!(
+        !observer_log.exists(),
+        "list executed observer-local helper: {}",
+        fs::read_to_string(&observer_log).unwrap_or_default()
+    );
+
+    let status = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &observer)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &observer_log)
+        .args(["status", "--full", handle])
+        .output()
+        .expect("status after list reconciliation");
+    assert_command_success(&status);
+    let delivered = read_meta(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(handle)
+            .join("meta.json"),
+    );
+    assert_eq!(delivered["delivery"]["attempted"], true);
+    assert_eq!(delivered["delivery"]["exit_code"], 0);
 }

@@ -1,6 +1,5 @@
 import { tool } from "@opencode-ai/plugin"
 import { createConnection } from "node:net"
-import { join } from "node:path"
 
 /**
  * opencode `bash` tool override. Workloads survive shell timeouts under agent-bash, but remain
@@ -14,7 +13,7 @@ const AGENTS = process.env.AGENT_BASH_AGENT_RUNNER_BIN || `${process.env.HOME}/.
 const POLL_MS = Number(process.env.AGENT_BASH_TOOL_POLL_MS || 500)
 const CONSUMER_GRACE_MS = Number(process.env.AGENT_BASH_CONSUMER_GRACE_MS || Math.max(POLL_MS * 3, 1500))
 const MAX_FOREGROUND_SLEEP_MS = Number(process.env.AGENT_BASH_TOOL_MAX_FOREGROUND_SLEEP_MS || 300000)
-const PROCESS_TIMEOUT_MS = Number(process.env.AGENT_BASH_TOOL_PROCESS_TIMEOUT_MS || 10000)
+const PROCESS_TIMEOUT_MS = Number(process.env.AGENT_BASH_TOOL_PROCESS_TIMEOUT_MS || 30000)
 const LIVE_SESSION_BIND_TIMEOUT_MS = 5000
 const MAX_LIVE_SESSION_RESPONSE_BYTES = 16 * 1024
 
@@ -23,12 +22,42 @@ type CompletionScope = "root" | "tree"
 
 type RunDispatch = {
   handle: string
-  stateDir: string | undefined
+  dispatchState: "running" | "registration-outcome-unknown"
 }
 
-type ShellCommand = {
+type StatusReadPolicy = {
+  detail: "header" | "full"
+  progression: "observe-only" | "request-progress"
+}
+
+type ConsumptionAttempt = "consumed" | "ineligible"
+
+type ShellCommandWithoutAdapterControls = {
   prefix: string
   body: string
+}
+
+type CommandPolicy = {
+  agentDispatch: boolean
+  delivery: DeliveryMode
+  ownerLease: boolean
+  completionScope: CompletionScope
+}
+
+type CommandAdmission = CommandPolicy &
+  (
+    | { kind: "ordinary"; command: string }
+    | { kind: "unsupported" }
+    | { kind: "direct"; argv: string[] }
+  )
+
+const RESERVED_SPOOLER_ASSIGNMENTS = new Set([
+  "AGENT_BASH_AGENT_RUNNER_BIN",
+  "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
+])
+
+function isReservedSpoolerAssignment(name: string): boolean {
+  return RESERVED_SPOOLER_ASSIGNMENTS.has(name)
 }
 
 type ProcessResult = {
@@ -173,15 +202,25 @@ function runEnv(ownerSessionId?: string) {
   }
 }
 
-async function runProcess(argv: string[], ownerSessionId?: string, abort?: AbortSignal): Promise<ProcessResult> {
-  const child = Bun.spawn(argv, { env: runEnv(ownerSessionId), stdout: "pipe", stderr: "pipe" })
+async function runProcess(
+  argv: string[],
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+  operation = "subprocess",
+  environment: Record<string, string> = {},
+): Promise<ProcessResult> {
+  const child = Bun.spawn(argv, {
+    env: { ...runEnv(ownerSessionId), ...environment },
+    stdout: "pipe",
+    stderr: "pipe",
+  })
   let timeout: ReturnType<typeof setTimeout> | undefined
   const stopped = new Promise<never>((_, reject) => {
     const stop = (message: string) => {
       child.kill()
       reject(new Error(message))
     }
-    timeout = setTimeout(() => stop(`subprocess timed out after ${PROCESS_TIMEOUT_MS}ms`), PROCESS_TIMEOUT_MS)
+    timeout = setTimeout(() => stop(`${operation} timed out after ${PROCESS_TIMEOUT_MS}ms`), PROCESS_TIMEOUT_MS)
     if (abort) {
       if (abort.aborted) stop("subprocess aborted")
       else abort.addEventListener("abort", () => stop("subprocess aborted"), { once: true })
@@ -209,40 +248,22 @@ async function checkedProcessText(
   operation: string,
   ownerSessionId?: string,
   abort?: AbortSignal,
+  environment?: Record<string, string>,
 ): Promise<string> {
-  const result = await runProcess(argv, ownerSessionId, abort)
+  const result = await runProcess(argv, ownerSessionId, abort, operation, environment)
   if (result.exitCode !== 0) throw processFailure(operation, result)
   return result.stdout.trim()
 }
 
-function stateRoot(): string | undefined {
-  if (process.env.XDG_STATE_HOME) return join(process.env.XDG_STATE_HOME, "agent-bash")
-  if (process.env.HOME) return join(process.env.HOME, ".local/state/agent-bash")
-  return undefined
-}
-
-function stateDirForHandle(handle: string): string | undefined {
-  const root = stateRoot()
-  return root ? join(root, handle) : undefined
-}
-
-async function markConsumed(stateDir: string | undefined) {
-  if (!stateDir) return
-  try {
-    await Bun.write(join(stateDir, "consumed"), "")
-  } catch {
-    // Best-effort: failure only risks a duplicate completion notification.
-  }
-}
-
 async function statusText(
   handle: string,
-  headerOnly = false,
+  policy: StatusReadPolicy,
   ownerSessionId?: string,
   abort?: AbortSignal,
 ): Promise<string> {
   const args = [AGENT_BASH, "status"]
-  if (headerOnly) args.push("--tail-bytes", "0")
+  if (policy.detail === "header") args.push("--tail-bytes", "0")
+  if (policy.progression === "observe-only") args.push("--observe-only")
   args.push(handle)
   const status = await checkedProcessText(args, "agent-bash status", ownerSessionId, abort)
   const header = status.split("\n", 1)[0]
@@ -252,16 +273,44 @@ async function statusText(
   return status
 }
 
-async function terminalStatus(
+async function observeVisibleHandle(
   handle: string,
-  stateDir: string | undefined,
+  runningDetail: "omit" | "full",
   ownerSessionId?: string,
   abort?: AbortSignal,
 ): Promise<string | undefined> {
-  const status = await statusText(handle, true, ownerSessionId, abort)
-  if (!isTerminalStatus(status)) return undefined
-  await markConsumed(stateDir)
-  return statusText(handle, false, ownerSessionId, abort)
+  const header = await statusText(
+    handle,
+    { detail: "header", progression: "observe-only" },
+    ownerSessionId,
+    abort,
+  )
+  if (isTerminalStatus(header)) {
+    await attemptTerminalConsumption(handle, ownerSessionId, abort)
+    return statusText(handle, { detail: "full", progression: "request-progress" }, ownerSessionId, abort)
+  }
+  if (runningDetail === "omit") return undefined
+
+  const status = await statusText(
+    handle,
+    { detail: "full", progression: "observe-only" },
+    ownerSessionId,
+    abort,
+  )
+  if (!isTerminalStatus(status)) return status
+  await attemptTerminalConsumption(handle, ownerSessionId, abort)
+  return statusText(handle, { detail: "full", progression: "request-progress" }, ownerSessionId, abort)
+}
+
+async function attemptTerminalConsumption(
+  handle: string,
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+): Promise<ConsumptionAttempt> {
+  const consume = await runProcess([AGENT_BASH, "consume", handle], ownerSessionId, abort, "agent-bash consume")
+  if (consume.exitCode === 0) return "consumed"
+  if (consume.exitCode === 77) return "ineligible"
+  throw processFailure("agent-bash consume", consume)
 }
 
 async function modeText(handle: string, ownerSessionId: string, abort?: AbortSignal): Promise<DeliveryMode> {
@@ -337,7 +386,7 @@ async function executeListControl(control: ListControl, ownerSessionId: string, 
   if (control.all) argv.push("--all")
   if (control.json) argv.push("--json")
 
-  const result = await runProcess(argv, ownerSessionId, abort)
+  const result = await runProcess(argv, ownerSessionId, abort, "agent-bash list")
   if (result.exitCode !== 0) throw processFailure("agent-bash list", result)
   return result.stdout
 }
@@ -345,8 +394,9 @@ async function executeListControl(control: ListControl, ownerSessionId: string, 
 function parseRunDispatch(runOut: string): RunDispatch | undefined {
   try {
     const parsed = JSON.parse(runOut)
-    return typeof parsed.handle === "string"
-      ? { handle: parsed.handle, stateDir: typeof parsed.state_dir === "string" ? parsed.state_dir : undefined }
+    return typeof parsed.handle === "string" &&
+      (parsed.dispatch_state === "running" || parsed.dispatch_state === "registration-outcome-unknown")
+      ? { handle: parsed.handle, dispatchState: parsed.dispatch_state }
       : undefined
   } catch {
     return undefined
@@ -357,6 +407,13 @@ function dispatchErrorResponse(runOut: string): string {
   return `agent-bash spooler error (could not dispatch): ${runOut}`
 }
 
+function registrationOutcomeUnknownResponse(handle: string): string {
+  return (
+    `Dispatch unresolved (handle=${handle}): completion registration was admitted but its outcome is unknown. ` +
+    "The retained handle is terminal, the workload was not started, and registration will not be replayed."
+  )
+}
+
 function startsWithToken(command: string, token: string): boolean {
   return command === token || command.startsWith(`${token} `)
 }
@@ -365,7 +422,10 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
-function splitShellCommand(command: string): ShellCommand {
+// Reserved spooler assignments are neutralized for classification and shell
+// rewriting. Ordinary assignments and shell semantics remain; direct execution
+// still requires parseStructuredExplicitRun admission.
+function stripReservedSpoolerAssignmentsForShellRouting(command: string): ShellCommandWithoutAdapterControls {
   const leadingWhitespace = command.match(/^\s*/)?.[0] || ""
   let body = command.slice(leadingWhitespace.length)
   let environmentPrefix = ""
@@ -373,23 +433,22 @@ function splitShellCommand(command: string): ShellCommand {
   while (true) {
     const matched = body.match(assignment)?.[0]
     if (!matched) break
-    environmentPrefix += matched
+    const name = matched.slice(0, matched.indexOf("="))
+    if (!isReservedSpoolerAssignment(name)) environmentPrefix += matched
     body = body.slice(matched.length)
   }
   return { prefix: leadingWhitespace + environmentPrefix, body }
 }
 
-function agentBashRunPrefix(command: string): string | undefined {
-  const { body } = splitShellCommand(command)
-  return [`${AGENT_BASH} run`, "agent-bash run"].find((prefix) => startsWithToken(body, prefix))
+// This intentionally broad recognizer routes potentially privileged input to structured
+// admission. The resulting admission record owns every semantic fact consumed by callers.
+function conservativelyRecognizesExplicitRun(command: string): boolean {
+  const { body } = stripReservedSpoolerAssignmentsForShellRouting(command)
+  return [`${AGENT_BASH} run`, "agent-bash run"].some((prefix) => startsWithToken(body, prefix))
 }
 
-function isAgentBashRun(command: string): boolean {
-  return agentBashRunPrefix(command) !== undefined
-}
-
-function isAgentDispatch(command: string): boolean {
-  const { body } = splitShellCommand(command)
+function recognizesAgentDispatchForAdmission(command: string): boolean {
+  const { body } = stripReservedSpoolerAssignmentsForShellRouting(command)
   if (
     startsWithToken(body, "agents") ||
     startsWithToken(body, AGENTS) ||
@@ -397,11 +456,14 @@ function isAgentDispatch(command: string): boolean {
   ) {
     return true
   }
-  return isAgentBashRun(body) && /\s--\s+(?:[^\s]+\/)?(?:agents|oulipoly-agent-runner)(?:\s|$)/.test(body)
+  return (
+    conservativelyRecognizesExplicitRun(body) &&
+    /\s--\s+(?:[^\s]+\/)?(?:agents|oulipoly-agent-runner)(?:\s|$)/.test(body)
+  )
 }
 
 function pinAgentRunnerBinary(command: string): string {
-  const shellCommand = splitShellCommand(command)
+  const shellCommand = stripReservedSpoolerAssignmentsForShellRouting(command)
   let body = shellCommand.body
   for (const token of ["agents", "oulipoly-agent-runner"]) {
     if (startsWithToken(body, token)) {
@@ -416,54 +478,137 @@ function isHeadlessCaller(): boolean {
   return process.stdin.isTTY !== true
 }
 
-function selectedDelivery(command: string, requested: string | undefined): DeliveryMode {
-  if (isAgentDispatch(command) && isHeadlessCaller()) return "async"
+function selectedDelivery(agentDispatch: boolean, requested: string | undefined): DeliveryMode {
+  if (agentDispatch && isHeadlessCaller()) return "async"
   if (validDeliveryMode(requested)) return requested
-  return isAgentDispatch(command) ? "async" : "sync"
+  return agentDispatch ? "async" : "sync"
 }
 
 function leaseToCaller(delivery: DeliveryMode): boolean {
   return delivery === "sync" || !isHeadlessCaller()
 }
 
-function selectedCompletionScope(command: string): CompletionScope {
-  return isAgentDispatch(command) ? "tree" : "root"
+function structuredShellWords(command: string): string[] | undefined {
+  const words: string[] = []
+  let word = ""
+  let started = false
+  let quote: "single" | "double" | undefined
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index]
+    if (quote === "single") {
+      if (character === "'") quote = undefined
+      else word += character
+      continue
+    }
+    if (quote === "double") {
+      if (character === '"') {
+        quote = undefined
+      } else if (character === "\\") {
+        index += 1
+        if (index >= command.length) return undefined
+        word += command[index]
+      } else if (character === "$" || character === "`") {
+        return undefined
+      } else {
+        word += character
+      }
+      continue
+    }
+    if (character === "\n" || character === "\r") return undefined
+    if (/\s/.test(character)) {
+      if (started) {
+        words.push(word)
+        word = ""
+        started = false
+      }
+    } else if (character === "'") {
+      quote = "single"
+      started = true
+    } else if (character === '"') {
+      quote = "double"
+      started = true
+    } else if (character === "\\") {
+      index += 1
+      if (index >= command.length) return undefined
+      word += command[index]
+      started = true
+    } else if ("$`;|&<>()".includes(character)) {
+      return undefined
+    } else {
+      word += character
+      started = true
+    }
+  }
+  if (quote) return undefined
+  if (started) words.push(word)
+  return words
 }
 
-function commandWithDelivery(command: string, delivery: DeliveryMode, ownerLease: boolean): string {
-  const shellCommand = splitShellCommand(command)
-  const prefix = agentBashRunPrefix(shellCommand.body)
-  if (!prefix) return command
-  const suffix = shellCommand.body.slice(prefix.length)
-  const normalizedSuffix = suffix.replace(/^\s+--delivery\s+(?:sync|async)\b/, "")
-  const lease = ownerLease ? ` --cancel-on-owner-exit --owner-pid ${process.pid}` : ""
-  return `${shellCommand.prefix}${prefix}${lease} --delivery ${delivery}${normalizedSuffix}`
-}
-
-async function dispatchCommand(
+function parseStructuredExplicitRun(
   command: string,
   delivery: DeliveryMode,
   ownerLease: boolean,
-  completionScope: CompletionScope,
+): string[] | undefined {
+  const words = structuredShellWords(command)
+  if (!words) return undefined
+  while (words[0]?.match(/^[A-Za-z_][A-Za-z0-9_]*=/)) {
+    const assignment = words.shift()!
+    const separator = assignment.indexOf("=")
+    const name = assignment.slice(0, separator)
+    if (!isReservedSpoolerAssignment(name)) return undefined
+  }
+  if ((words[0] !== AGENT_BASH && words[0] !== "agent-bash") || words[1] !== "run") return undefined
+  words[0] = AGENT_BASH
+  const separator = words.indexOf("--")
+  const optionsEnd = separator < 0 ? words.length : separator
+  for (let index = 2; index < optionsEnd; index += 1) {
+    if (words[index] === "--delivery") {
+      words.splice(index, 2)
+      break
+    }
+  }
+  const controls = ["--delivery", delivery]
+  if (ownerLease) controls.unshift("--cancel-on-owner-exit", "--owner-pid", String(process.pid))
+  words.splice(2, 0, ...controls)
+  const workload = words.indexOf("--") + 1
+  if (workload > 0 && ["agents", "oulipoly-agent-runner"].includes(words[workload])) words[workload] = AGENTS
+  return words
+}
+
+function admitCommand(command: string, requestedDelivery: string | undefined): CommandAdmission {
+  const agentDispatch = recognizesAgentDispatchForAdmission(command)
+  const delivery = selectedDelivery(agentDispatch, requestedDelivery)
+  const ownerLease = leaseToCaller(delivery)
+  const completionScope = agentDispatch ? "tree" : "root"
+  const policy = { agentDispatch, delivery, ownerLease, completionScope } as const
+  if (!conservativelyRecognizesExplicitRun(command)) return { ...policy, kind: "ordinary", command }
+  const argv = parseStructuredExplicitRun(command, delivery, ownerLease)
+  return argv ? { ...policy, kind: "direct", argv } : { ...policy, kind: "unsupported" }
+}
+
+async function dispatchCommand(
+  admission: CommandAdmission,
   ownerSessionId: string,
 ): Promise<string> {
-  command = pinAgentRunnerBinary(command)
-  if (isAgentBashRun(command)) {
-    const explicitRun = commandWithDelivery(command, delivery, ownerLease)
-    return checkedProcessText(["bash", "-lc", explicitRun], "agent-bash dispatch", ownerSessionId)
+  if (admission.kind === "unsupported") {
+    throw new Error("explicit agent-bash run requires structured arguments without shell expansion")
   }
+  if (admission.kind === "direct") {
+    return checkedProcessText(admission.argv, "agent-bash dispatch", ownerSessionId)
+  }
+  const command = pinAgentRunnerBinary(admission.command)
   const args = [AGENT_BASH, "run"]
-  if (!ownerLease) {
-    args.push("--completion-scope", completionScope, "--delivery", delivery)
+  if (!admission.ownerLease) {
+    args.push("--completion-scope", admission.completionScope, "--delivery", admission.delivery)
   } else {
     args.push(
       "--cancel-on-owner-exit",
       "--owner-pid",
       String(process.pid),
       "--completion-scope",
-      completionScope,
+      admission.completionScope,
       "--delivery",
-      delivery,
+      admission.delivery,
     )
   }
   args.push("--", "bash", "-lc", command)
@@ -481,7 +626,6 @@ async function cancelResult(handle: string, ownerSessionId: string): Promise<str
 
 async function waitForSyncResult(
   handle: string,
-  stateDir: string | undefined,
   abort: AbortSignal,
   ownerSessionId: string,
 ): Promise<string> {
@@ -492,7 +636,7 @@ async function waitForSyncResult(
   while (true) {
     if (abort.aborted) return cancelResult(handle, ownerSessionId)
     try {
-      const status = await terminalStatus(handle, stateDir, ownerSessionId, abort)
+      const status = await observeVisibleHandle(handle, "omit", ownerSessionId, abort)
       if (status !== undefined) return status
       if ((await modeText(handle, ownerSessionId, abort)) === "async") return asyncDispatchResponse(handle)
     } catch (error) {
@@ -526,10 +670,7 @@ export default tool({
   },
   async execute(args, context) {
     if (args.handle) {
-      return (
-        (await terminalStatus(args.handle, stateDirForHandle(args.handle), context.sessionID, context.abort)) ??
-        statusText(args.handle, false, context.sessionID, context.abort)
-      )
+      return observeVisibleHandle(args.handle, "full", context.sessionID, context.abort)
     }
     if (!commandProvided(args.command)) return missingCommandResponse()
     if (args.delivery !== undefined && !validDeliveryMode(args.delivery)) {
@@ -541,26 +682,23 @@ export default tool({
     }
 
     if (context.abort.aborted) return "Cancellation requested before dispatch."
-    const delivery = selectedDelivery(args.command, args.delivery)
+    const admission = admitCommand(args.command, args.delivery)
     const sleepMilliseconds = standaloneSleepMilliseconds(args.command)
-    if (delivery === "sync" && sleepMilliseconds !== undefined) {
+    if (admission.delivery === "sync" && sleepMilliseconds !== undefined) {
       return runStandaloneSleep(sleepMilliseconds)
     }
     const binding = ensureLiveSessionBinding(context.sessionID)
     if (binding) await binding
-    const runOut = await dispatchCommand(
-      args.command,
-      delivery,
-      leaseToCaller(delivery),
-      selectedCompletionScope(args.command),
-      context.sessionID,
-    )
+    const runOut = await dispatchCommand(admission, context.sessionID)
     const dispatch = parseRunDispatch(runOut)
     if (!dispatch) return dispatchErrorResponse(runOut)
-    if (context.abort.aborted) return cancelResult(dispatch.handle, context.sessionID)
-    if (delivery === "async") {
-      return asyncDispatchResponse(dispatch.handle, isAgentDispatch(args.command) && isHeadlessCaller())
+    if (dispatch.dispatchState === "registration-outcome-unknown") {
+      return registrationOutcomeUnknownResponse(dispatch.handle)
     }
-    return waitForSyncResult(dispatch.handle, dispatch.stateDir, context.abort, context.sessionID)
+    if (context.abort.aborted) return cancelResult(dispatch.handle, context.sessionID)
+    if (admission.delivery === "async") {
+      return asyncDispatchResponse(dispatch.handle, admission.agentDispatch && isHeadlessCaller())
+    }
+    return waitForSyncResult(dispatch.handle, context.abort, context.sessionID)
   },
 })
