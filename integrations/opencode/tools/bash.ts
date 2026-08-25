@@ -25,6 +25,11 @@ type RunDispatch = {
   dispatchState: "running" | "registration-outcome-unknown"
 }
 
+type StatusReadPolicy = {
+  detail: "header" | "full"
+  progression: "observe-only" | "progress"
+}
+
 type ShellCommandWithoutAdapterControls = {
   prefix: string
   body: string
@@ -250,14 +255,13 @@ async function checkedProcessText(
 
 async function statusText(
   handle: string,
-  headerOnly = false,
+  policy: StatusReadPolicy,
   ownerSessionId?: string,
   abort?: AbortSignal,
-  observeOnly = false,
 ): Promise<string> {
   const args = [AGENT_BASH, "status"]
-  if (headerOnly) args.push("--tail-bytes", "0")
-  if (observeOnly) args.push("--observe-only")
+  if (policy.detail === "header") args.push("--tail-bytes", "0")
+  if (policy.progression === "observe-only") args.push("--observe-only")
   args.push(handle)
   const status = await checkedProcessText(args, "agent-bash status", ownerSessionId, abort)
   const header = status.split("\n", 1)[0]
@@ -267,15 +271,33 @@ async function statusText(
   return status
 }
 
-async function terminalStatus(
+async function observeOwnedHandle(
   handle: string,
+  runningDetail: "omit" | "full",
   ownerSessionId?: string,
   abort?: AbortSignal,
 ): Promise<string | undefined> {
-  const status = await statusText(handle, true, ownerSessionId, abort, true)
-  if (!isTerminalStatus(status)) return undefined
+  const header = await statusText(
+    handle,
+    { detail: "header", progression: "observe-only" },
+    ownerSessionId,
+    abort,
+  )
+  if (isTerminalStatus(header)) {
+    await consumeTerminalStatus(handle, ownerSessionId, abort)
+    return statusText(handle, { detail: "full", progression: "progress" }, ownerSessionId, abort)
+  }
+  if (runningDetail === "omit") return undefined
+
+  const status = await statusText(
+    handle,
+    { detail: "full", progression: "observe-only" },
+    ownerSessionId,
+    abort,
+  )
+  if (!isTerminalStatus(status)) return status
   await consumeTerminalStatus(handle, ownerSessionId, abort)
-  return statusText(handle, false, ownerSessionId, abort)
+  return statusText(handle, { detail: "full", progression: "progress" }, ownerSessionId, abort)
 }
 
 async function consumeTerminalStatus(handle: string, ownerSessionId?: string, abort?: AbortSignal): Promise<void> {
@@ -606,7 +628,7 @@ async function waitForSyncResult(
   while (true) {
     if (abort.aborted) return cancelResult(handle, ownerSessionId)
     try {
-      const status = await terminalStatus(handle, ownerSessionId, abort)
+      const status = await observeOwnedHandle(handle, "omit", ownerSessionId, abort)
       if (status !== undefined) return status
       if ((await modeText(handle, ownerSessionId, abort)) === "async") return asyncDispatchResponse(handle)
     } catch (error) {
@@ -640,14 +662,7 @@ export default tool({
   },
   async execute(args, context) {
     if (args.handle) {
-      const terminal = await terminalStatus(args.handle, context.sessionID, context.abort)
-      if (terminal !== undefined) return terminal
-      const status = await statusText(args.handle, false, context.sessionID, context.abort, true)
-      if (isTerminalStatus(status)) {
-        await consumeTerminalStatus(args.handle, context.sessionID, context.abort)
-        return statusText(args.handle, false, context.sessionID, context.abort)
-      }
-      return status
+      return observeOwnedHandle(args.handle, "full", context.sessionID, context.abort)
     }
     if (!commandProvided(args.command)) return missingCommandResponse()
     if (args.delivery !== undefined && !validDeliveryMode(args.delivery)) {
