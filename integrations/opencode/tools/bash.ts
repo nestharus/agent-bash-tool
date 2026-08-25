@@ -29,10 +29,19 @@ type ShellCommandWithoutAdapterControls = {
   body: string
 }
 
-type ExplicitRunAdmission =
-  | { kind: "ordinary" }
-  | { kind: "unsupported" }
-  | { kind: "direct"; argv: string[] }
+type CommandPolicy = {
+  agentDispatch: boolean
+  delivery: DeliveryMode
+  ownerLease: boolean
+  completionScope: CompletionScope
+}
+
+type CommandAdmission = CommandPolicy &
+  (
+    | { kind: "ordinary"; command: string }
+    | { kind: "unsupported" }
+    | { kind: "direct"; argv: string[] }
+  )
 
 const RESERVED_SPOOLER_ASSIGNMENTS = new Set([
   "AGENT_BASH_AGENT_RUNNER_BIN",
@@ -392,14 +401,14 @@ function stripReservedSpoolerAssignmentsForShellRouting(command: string): ShellC
   return { prefix: leadingWhitespace + environmentPrefix, body }
 }
 
-// This intentionally broad recognizer only routes potentially privileged input to the
-// authoritative structured admission parser; it never authorizes direct execution itself.
+// This intentionally broad recognizer routes potentially privileged input to structured
+// admission. The resulting admission record owns every semantic fact consumed by callers.
 function conservativelyRecognizesExplicitRun(command: string): boolean {
   const { body } = stripReservedSpoolerAssignmentsForShellRouting(command)
   return [`${AGENT_BASH} run`, "agent-bash run"].some((prefix) => startsWithToken(body, prefix))
 }
 
-function isAgentDispatch(command: string): boolean {
+function recognizesAgentDispatchForAdmission(command: string): boolean {
   const { body } = stripReservedSpoolerAssignmentsForShellRouting(command)
   if (
     startsWithToken(body, "agents") ||
@@ -430,18 +439,14 @@ function isHeadlessCaller(): boolean {
   return process.stdin.isTTY !== true
 }
 
-function selectedDelivery(command: string, requested: string | undefined): DeliveryMode {
-  if (isAgentDispatch(command) && isHeadlessCaller()) return "async"
+function selectedDelivery(agentDispatch: boolean, requested: string | undefined): DeliveryMode {
+  if (agentDispatch && isHeadlessCaller()) return "async"
   if (validDeliveryMode(requested)) return requested
-  return isAgentDispatch(command) ? "async" : "sync"
+  return agentDispatch ? "async" : "sync"
 }
 
 function leaseToCaller(delivery: DeliveryMode): boolean {
   return delivery === "sync" || !isHeadlessCaller()
-}
-
-function selectedCompletionScope(command: string): CompletionScope {
-  return isAgentDispatch(command) ? "tree" : "root"
 }
 
 function structuredShellWords(command: string): string[] | undefined {
@@ -531,43 +536,40 @@ function parseStructuredExplicitRun(
   return words
 }
 
-function admitExplicitRun(
-  command: string,
-  delivery: DeliveryMode,
-  ownerLease: boolean,
-): ExplicitRunAdmission {
-  if (!conservativelyRecognizesExplicitRun(command)) return { kind: "ordinary" }
+function admitCommand(command: string, requestedDelivery: string | undefined): CommandAdmission {
+  const agentDispatch = recognizesAgentDispatchForAdmission(command)
+  const delivery = selectedDelivery(agentDispatch, requestedDelivery)
+  const ownerLease = leaseToCaller(delivery)
+  const completionScope = agentDispatch ? "tree" : "root"
+  const policy = { agentDispatch, delivery, ownerLease, completionScope } as const
+  if (!conservativelyRecognizesExplicitRun(command)) return { ...policy, kind: "ordinary", command }
   const argv = parseStructuredExplicitRun(command, delivery, ownerLease)
-  return argv ? { kind: "direct", argv } : { kind: "unsupported" }
+  return argv ? { ...policy, kind: "direct", argv } : { ...policy, kind: "unsupported" }
 }
 
 async function dispatchCommand(
-  command: string,
-  delivery: DeliveryMode,
-  ownerLease: boolean,
-  completionScope: CompletionScope,
+  admission: CommandAdmission,
   ownerSessionId: string,
 ): Promise<string> {
-  const explicitRun = admitExplicitRun(command, delivery, ownerLease)
-  if (explicitRun.kind === "unsupported") {
+  if (admission.kind === "unsupported") {
     throw new Error("explicit agent-bash run requires structured arguments without shell expansion")
   }
-  if (explicitRun.kind === "direct") {
-    return checkedProcessText(explicitRun.argv, "agent-bash dispatch", ownerSessionId)
+  if (admission.kind === "direct") {
+    return checkedProcessText(admission.argv, "agent-bash dispatch", ownerSessionId)
   }
-  command = pinAgentRunnerBinary(command)
+  const command = pinAgentRunnerBinary(admission.command)
   const args = [AGENT_BASH, "run"]
-  if (!ownerLease) {
-    args.push("--completion-scope", completionScope, "--delivery", delivery)
+  if (!admission.ownerLease) {
+    args.push("--completion-scope", admission.completionScope, "--delivery", admission.delivery)
   } else {
     args.push(
       "--cancel-on-owner-exit",
       "--owner-pid",
       String(process.pid),
       "--completion-scope",
-      completionScope,
+      admission.completionScope,
       "--delivery",
-      delivery,
+      admission.delivery,
     )
   }
   args.push("--", "bash", "-lc", command)
@@ -648,25 +650,19 @@ export default tool({
     }
 
     if (context.abort.aborted) return "Cancellation requested before dispatch."
-    const delivery = selectedDelivery(args.command, args.delivery)
+    const admission = admitCommand(args.command, args.delivery)
     const sleepMilliseconds = standaloneSleepMilliseconds(args.command)
-    if (delivery === "sync" && sleepMilliseconds !== undefined) {
+    if (admission.delivery === "sync" && sleepMilliseconds !== undefined) {
       return runStandaloneSleep(sleepMilliseconds)
     }
     const binding = ensureLiveSessionBinding(context.sessionID)
     if (binding) await binding
-    const runOut = await dispatchCommand(
-      args.command,
-      delivery,
-      leaseToCaller(delivery),
-      selectedCompletionScope(args.command),
-      context.sessionID,
-    )
+    const runOut = await dispatchCommand(admission, context.sessionID)
     const dispatch = parseRunDispatch(runOut)
     if (!dispatch) return dispatchErrorResponse(runOut)
     if (context.abort.aborted) return cancelResult(dispatch.handle, context.sessionID)
-    if (delivery === "async") {
-      return asyncDispatchResponse(dispatch.handle, isAgentDispatch(args.command) && isHeadlessCaller())
+    if (admission.delivery === "async") {
+      return asyncDispatchResponse(dispatch.handle, admission.agentDispatch && isHeadlessCaller())
     }
     return waitForSyncResult(dispatch.handle, context.abort, context.sessionID)
   },
