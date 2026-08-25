@@ -51,67 +51,103 @@ pub(crate) fn validate_argv(argv: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) struct PendingSupervisor {
-    child_pid: libc::pid_t,
-    admission: Option<File>,
-}
-
-impl PendingSupervisor {
-    pub(crate) fn admit(mut self) -> io::Result<()> {
-        let mut admission = self.admission.take().expect("pending supervisor admission");
-        admission.write_all(&[1])?;
-        Ok(())
-    }
-}
-
-impl Drop for PendingSupervisor {
-    fn drop(&mut self) {
-        let Some(mut admission) = self.admission.take() else {
-            return;
-        };
-        let _ = admission.write_all(&[0]);
-        drop(admission);
-        let mut status = 0;
-        let _ = unsafe { libc::waitpid(self.child_pid, &mut status, 0) };
-    }
-}
-
-pub(crate) fn fork_pending_supervisor(config: SupervisorConfig) -> io::Result<PendingSupervisor> {
-    let mut pipe = [0; 2];
-    if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+pub(crate) fn fork_registered_supervisor(
+    config: SupervisorConfig,
+    registration: delivery::DeliveryRegistration,
+) -> io::Result<()> {
+    let mut sockets = [0; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            sockets.as_mut_ptr(),
+        )
+    } < 0
+    {
         return Err(io::Error::last_os_error());
     }
     match unsafe { libc::fork() } {
         -1 => {
             let err = io::Error::last_os_error();
             unsafe {
-                libc::close(pipe[0]);
-                libc::close(pipe[1]);
+                libc::close(sockets[0]);
+                libc::close(sockets[1]);
             }
             Err(err)
         }
         0 => unsafe {
-            libc::close(pipe[1]);
-            await_supervisor_admission(pipe[0], config)
+            libc::close(sockets[0]);
+            register_and_start_supervisor(sockets[1], config, registration)
         },
         child_pid => {
-            unsafe { libc::close(pipe[0]) };
-            Ok(PendingSupervisor {
-                child_pid,
-                admission: Some(unsafe { File::from_raw_fd(pipe[1]) }),
-            })
+            unsafe { libc::close(sockets[1]) };
+            receive_registration_result(sockets[0], child_pid)
         }
     }
 }
 
-unsafe fn await_supervisor_admission(admission_fd: RawFd, config: SupervisorConfig) -> ! {
-    let mut admission = unsafe { File::from_raw_fd(admission_fd) };
-    let mut decision = [0];
-    if admission.read_exact(&mut decision).is_err() || decision[0] != 1 {
+fn receive_registration_result(socket: RawFd, child_pid: libc::pid_t) -> io::Result<()> {
+    let mut result = unsafe { File::from_raw_fd(socket) };
+    let mut outcome = [0];
+    result.read_exact(&mut outcome)?;
+    if outcome[0] == 1 {
+        return Ok(());
+    }
+    let mut detail = String::new();
+    result.read_to_string(&mut detail)?;
+    let mut status = 0;
+    let _ = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+    Err(io::Error::other(detail))
+}
+
+unsafe fn register_and_start_supervisor(
+    result_fd: RawFd,
+    config: SupervisorConfig,
+    registration: delivery::DeliveryRegistration,
+) -> ! {
+    if let Err(err) = delivery::register(&config.paths, &config.meta, registration) {
+        let detail = err.to_string();
+        let _ = record_pre_admission_registration_error(&config.paths, &config.meta, &detail);
+        send_registration_result(result_fd, false, detail.as_bytes());
+        unsafe { libc::close(result_fd) };
         unsafe { libc::_exit(EX_SOFTWARE) };
     }
-    drop(admission);
+    send_registration_result(result_fd, true, &[]);
+    unsafe { libc::close(result_fd) };
     unsafe { daemonization_child(config) }
+}
+
+fn send_registration_result(socket: RawFd, success: bool, detail: &[u8]) {
+    let mut result = Vec::with_capacity(detail.len() + 1);
+    result.push(u8::from(success));
+    result.extend_from_slice(detail);
+    let _ = unsafe {
+        libc::send(
+            socket,
+            result.as_ptr().cast(),
+            result.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    };
+}
+
+fn record_pre_admission_registration_error(
+    paths: &StatePaths,
+    initial_meta: &Meta,
+    detail: &str,
+) -> io::Result<()> {
+    let _lock = state::lock_completion(paths)?;
+    let mut meta = state::read_meta(paths).unwrap_or_else(|_| initial_meta.clone());
+    if !state::terminal(&meta) {
+        apply_supervisor_error_metadata(
+            &mut meta,
+            format!("completion event registration failed: {detail}"),
+        );
+        state::write_rc_atomic(paths, EX_SOFTWARE)?;
+        state::write_meta_atomic(paths, &meta)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn request_cancel(paths: &StatePaths) -> io::Result<bool> {

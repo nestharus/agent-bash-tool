@@ -265,21 +265,10 @@ fn run_command(
         completion_scope,
         ready_sentinel.clone(),
     );
-    let pending_supervisor = match supervisor::fork_pending_supervisor(config) {
-        Ok(supervisor) => supervisor,
-        Err(err) => {
-            let _ = fs::remove_dir_all(&paths.state_dir);
-            return Err(supervisor_bootstrap_error(err));
-        }
-    };
-    if let Err(err) = delivery::register(&paths, &meta, registration) {
-        drop(pending_supervisor);
+    if let Err(err) = supervisor::fork_registered_supervisor(config, registration) {
         let _ = fs::remove_dir_all(&paths.state_dir);
         return Err(completion_event_registration_error(err));
     }
-    pending_supervisor
-        .admit()
-        .map_err(supervisor_bootstrap_error)?;
 
     let output = run_output(paths, meta.caller_ppid, mode, delivery_mode, ready_sentinel);
     emit_run_output(&output)?;

@@ -267,6 +267,12 @@ detach, status, supervisor, or guardian process therefore
 cannot retain the registration capability or alter interpreter lookup, the agent-runner data
 namespace, or an explicitly declared helper input through its own environment.
 
+The forked startup child owns completion registration and transitions directly into daemonization
+after registration succeeds. The launcher waits only for that child's registration result. Launcher
+loss cannot strand a successful external registration before supervisor admission; the surviving
+child admits the workload, while a registration failure is terminally recorded by the child before
+it reports failure and exits.
+
 The helper cache lock serializes cache installation, per-handle linking, and removal of cache entries
 with no remaining handle links. Warm-cache content validation occurs before the lock; the critical
 section rechecks the validated file identity before linking it. This keeps one physical snapshot per

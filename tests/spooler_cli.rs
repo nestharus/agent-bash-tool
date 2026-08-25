@@ -441,6 +441,21 @@ fn fake_agents_script(delivery_log: &Path) -> String {
     )
 }
 
+fn registration_launcher_killing_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join("registration-launcher-killing-agents");
+    let log = temp.path().join("registration-launcher-killing.log");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nif [ \"${{2:-}}\" = agent-bash-register ]; then\n  launcher=$(ps -o ppid= -p \"$PPID\" | tr -d ' ')\n  kill -KILL \"$launcher\"\nfi\nexit 0\n",
+            shell_quote(&log)
+        ),
+    )
+    .expect("write registration-launcher-killing fake");
+    set_executable(&fake);
+    (fake, log)
+}
+
 fn interpreter_backed_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf) {
     let interpreter = temp.path().join("delivery-interpreter");
     let helper = temp.path().join("interpreter-backed-agents");
@@ -3687,6 +3702,53 @@ fn owner_resolution_and_registration_share_one_configured_helper() {
         !replacement_log.exists(),
         "replacement helper executed: {}",
         fs::read_to_string(&replacement_log).unwrap_or_default()
+    );
+}
+
+#[test]
+fn successful_registration_survives_launcher_loss_before_supervisor_startup() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = registration_launcher_killing_fake_agents(&temp);
+    let workload_marker = temp.path().join("workload-started-after-launcher-loss");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            &format!("touch {}", workload_marker.display()),
+        ])
+        .output()
+        .expect("run killed after successful registration");
+
+    assert_eq!(
+        output.status.code(),
+        None,
+        "launcher was not killed: {output:?}"
+    );
+    let state_root = temp.path().join("agent-bash");
+    wait_until(FIXTURE_DEADLINE, || {
+        let mut entries = fs::read_dir(&state_root).ok()?;
+        let state_dir = entries.next()?.ok()?.path();
+        let meta = read_meta(&state_dir.join("meta.json"));
+        (meta["state"] == "DONE").then_some(())
+    });
+    assert!(workload_marker.exists(), "workload was not admitted");
+    wait_until(FIXTURE_DEADLINE, || {
+        let operations = fs::read_to_string(&delivery_log).ok()?;
+        operations.contains("agent-bash-complete").then_some(())
+    });
+    let operations = fs::read_to_string(&delivery_log).expect("delivery operations");
+    assert_eq!(
+        operations.matches("agent-bash-register").count(),
+        1,
+        "{operations}"
+    );
+    assert_eq!(
+        operations.matches("agent-bash-complete").count(),
+        1,
+        "{operations}"
     );
 }
 
