@@ -277,7 +277,9 @@ child admits the workload. A conclusive helper pre-spawn failure is terminally r
 child reports rejection and exits. Once the helper process is admitted, any non-success is instead
 retained under the exact handle as terminal `registration-outcome-unknown`: no workload starts, the
 state is not deleted, and registration is not replayed because the opaque helper may already have
-committed its external effect.
+committed its external effect. The run result exposes that terminal disposition as
+`dispatch_state=registration-outcome-unknown`; adapters report it as unresolved and do not describe
+the workload as running or promise a completion wake-up.
 
 The helper cache lock serializes cache installation, per-handle linking, and removal of cache entries
 with no remaining handle links. Warm-cache content validation occurs before the lock; the critical

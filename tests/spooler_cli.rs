@@ -462,7 +462,7 @@ fn admitted_registration_failure_fake_agents(temp: &tempfile::TempDir) -> (PathB
     fs::write(
         &fake,
         format!(
-            "#!/bin/sh\nprintf '%s\n' \"$@\" >> {}\nif [ \"${{2:-}}\" = agent-bash-register ]; then\n  exit 19\nfi\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\n' \"$@\" >> {}\nif [ \"${{1:-}}\" = session ] && [ \"${{2:-}}\" = of-pid ]; then\n  printf '{{\"found\":true,\"invocation_uuid\":\"11111111-1111-4111-8111-111111111111\",\"session_id\":\"%s\"}}\\n' \"${{AGENT_BASH_FAKE_RESOLVED_SESSION:-ses_resolved}}\"\nelif [ \"${{2:-}}\" = agent-bash-register ]; then\n  exit 19\nfi\nexit 0\n",
             shell_quote(&log)
         ),
     )
@@ -3791,6 +3791,7 @@ fn admitted_registration_failure_retains_non_replayable_unknown_handle() {
     let json = parse_run_output(&output);
     let meta = read_meta(&meta_path(&json));
 
+    assert_eq!(json["dispatch_state"], "registration-outcome-unknown");
     assert_eq!(meta["state"], "ERROR");
     assert_eq!(meta["completion_reason"], "registration-outcome-unknown");
     assert_eq!(meta["rc"], 70);
@@ -3821,6 +3822,42 @@ fn admitted_registration_failure_retains_non_replayable_unknown_handle() {
         1,
         "unknown registration state was removed"
     );
+}
+
+#[test]
+fn adapter_reports_admitted_registration_uncertainty_without_running_promise() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+    let (fake, _) = admitted_registration_failure_fake_agents(&temp);
+    let request = json!({
+        "args": { "command": "printf 'must not start\\n'", "delivery": "async" }
+    })
+    .to_string();
+    let mut command = adapter_driver_command(&temp, &driver, "request", Some(&request));
+    let output = command
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+        .output()
+        .expect("adapter driver");
+    assert_command_success(&output);
+    let result = parse_stdout_json(&output);
+    let text = adapter_result_text(&result);
+
+    assert!(text.contains("Dispatch unresolved"), "{text}");
+    assert!(text.contains("workload was not started"), "{text}");
+    assert!(text.contains("registration will not be replayed"), "{text}");
+    assert!(!text.contains("Running asynchronously"), "{text}");
+    assert!(!text.contains("will be woken"), "{text}");
+    let handle = adapter_result_handle(&result);
+    let meta = read_meta(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(handle)
+            .join("meta.json"),
+    );
+    assert_eq!(meta["completion_reason"], "registration-outcome-unknown");
+    assert!(meta["workload_pid"].is_null());
 }
 
 #[test]
@@ -3896,6 +3933,7 @@ fn mismatched_resolved_owner_retains_admitted_registration_failure() {
 
     let json = parse_run_output(&output);
     let meta = read_meta(&meta_path(&json));
+    assert_eq!(json["dispatch_state"], "registration-outcome-unknown");
     assert!(
         resolver_log.exists(),
         "verified PID lookup was not attempted"

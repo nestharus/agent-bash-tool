@@ -33,6 +33,21 @@ pub(crate) struct SupervisorConfig {
     pub(crate) ready_sentinel: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum StartupOutcome {
+    Running,
+    RegistrationOutcomeUnknown,
+}
+
+impl StartupOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::RegistrationOutcomeUnknown => "registration-outcome-unknown",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompletionScope {
     Tree,
@@ -54,7 +69,7 @@ pub(crate) fn validate_argv(argv: &[String]) -> Result<(), String> {
 pub(crate) fn fork_registered_supervisor(
     config: SupervisorConfig,
     registration: delivery::DeliveryRegistration,
-) -> io::Result<()> {
+) -> io::Result<StartupOutcome> {
     let mut sockets = [0; 2];
     if unsafe {
         libc::socketpair(
@@ -87,17 +102,20 @@ pub(crate) fn fork_registered_supervisor(
     }
 }
 
-fn receive_registration_result(socket: RawFd, child_pid: libc::pid_t) -> io::Result<()> {
+fn receive_registration_result(
+    socket: RawFd,
+    child_pid: libc::pid_t,
+) -> io::Result<StartupOutcome> {
     let mut result = unsafe { File::from_raw_fd(socket) };
     let mut outcome = [0];
     result.read_exact(&mut outcome)?;
     if outcome[0] == 1 {
-        return Ok(());
+        return Ok(StartupOutcome::Running);
     }
     if outcome[0] == 2 {
         let mut status = 0;
         let _ = unsafe { libc::waitpid(child_pid, &mut status, 0) };
-        return Ok(());
+        return Ok(StartupOutcome::RegistrationOutcomeUnknown);
     }
     let mut detail = String::new();
     result.read_to_string(&mut detail)?;

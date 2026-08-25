@@ -265,12 +265,22 @@ fn run_command(
         completion_scope,
         ready_sentinel.clone(),
     );
-    if let Err(err) = supervisor::fork_registered_supervisor(config, registration) {
-        let _ = fs::remove_dir_all(&paths.state_dir);
-        return Err(completion_event_registration_error(err));
-    }
+    let startup_outcome = match supervisor::fork_registered_supervisor(config, registration) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&paths.state_dir);
+            return Err(completion_event_registration_error(err));
+        }
+    };
 
-    let output = run_output(paths, meta.caller_ppid, mode, delivery_mode, ready_sentinel);
+    let output = run_output(
+        paths,
+        meta.caller_ppid,
+        mode,
+        delivery_mode,
+        ready_sentinel,
+        startup_outcome,
+    );
     emit_run_output(&output)?;
     Ok(())
 }
@@ -571,8 +581,16 @@ fn run_output(
     mode: &str,
     delivery_mode: DeliveryMode,
     ready_sentinel: Option<String>,
+    startup_outcome: supervisor::StartupOutcome,
 ) -> RunOutput {
-    RunOutput::new(paths, caller_ppid, mode, delivery_mode, ready_sentinel)
+    RunOutput::new(
+        paths,
+        caller_ppid,
+        mode,
+        delivery_mode,
+        ready_sentinel,
+        startup_outcome.as_str(),
+    )
 }
 
 fn detach_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {

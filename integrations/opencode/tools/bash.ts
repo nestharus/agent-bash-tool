@@ -22,6 +22,7 @@ type CompletionScope = "root" | "tree"
 
 type RunDispatch = {
   handle: string
+  dispatchState: "running" | "registration-outcome-unknown"
 }
 
 type ShellCommandWithoutAdapterControls = {
@@ -363,8 +364,9 @@ async function executeListControl(control: ListControl, ownerSessionId: string, 
 function parseRunDispatch(runOut: string): RunDispatch | undefined {
   try {
     const parsed = JSON.parse(runOut)
-    return typeof parsed.handle === "string"
-      ? { handle: parsed.handle }
+    return typeof parsed.handle === "string" &&
+      (parsed.dispatch_state === "running" || parsed.dispatch_state === "registration-outcome-unknown")
+      ? { handle: parsed.handle, dispatchState: parsed.dispatch_state }
       : undefined
   } catch {
     return undefined
@@ -373,6 +375,13 @@ function parseRunDispatch(runOut: string): RunDispatch | undefined {
 
 function dispatchErrorResponse(runOut: string): string {
   return `agent-bash spooler error (could not dispatch): ${runOut}`
+}
+
+function registrationOutcomeUnknownResponse(handle: string): string {
+  return (
+    `Dispatch unresolved (handle=${handle}): completion registration was admitted but its outcome is unknown. ` +
+    "The retained handle is terminal, the workload was not started, and registration will not be replayed."
+  )
 }
 
 function startsWithToken(command: string, token: string): boolean {
@@ -660,6 +669,9 @@ export default tool({
     const runOut = await dispatchCommand(admission, context.sessionID)
     const dispatch = parseRunDispatch(runOut)
     if (!dispatch) return dispatchErrorResponse(runOut)
+    if (dispatch.dispatchState === "registration-outcome-unknown") {
+      return registrationOutcomeUnknownResponse(dispatch.handle)
+    }
     if (context.abort.aborted) return cancelResult(dispatch.handle, context.sessionID)
     if (admission.delivery === "async") {
       return asyncDispatchResponse(dispatch.handle, admission.agentDispatch && isHeadlessCaller())

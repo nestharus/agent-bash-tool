@@ -411,6 +411,7 @@ pub(crate) struct RunOutput {
     mode: String,
     delivery_mode: DeliveryMode,
     ready_sentinel: Option<String>,
+    dispatch_state: String,
 }
 
 impl RunOutput {
@@ -420,6 +421,7 @@ impl RunOutput {
         mode: &str,
         delivery_mode: DeliveryMode,
         ready_sentinel: Option<String>,
+        dispatch_state: &str,
     ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -432,6 +434,7 @@ impl RunOutput {
             mode: mode.to_string(),
             delivery_mode,
             ready_sentinel,
+            dispatch_state: dispatch_state.to_string(),
         }
     }
 }
