@@ -86,6 +86,9 @@ enum Command {
         /// Print the whole captured log.
         #[arg(long)]
         full: bool,
+        /// Observe current state without owner-triggered reconciliation or delivery progression.
+        #[arg(long)]
+        observe_only: bool,
         handle: String,
     },
     /// List spooled jobs owned by the calling agent's process tree.
@@ -181,11 +184,13 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
         Command::Status {
             tail_bytes,
             full,
+            observe_only,
             handle,
         } => status_command(
             handle,
             tail_bytes.unwrap_or(65_536),
             full,
+            observe_only,
             control_route_caller(&guard),
         ),
         Command::List { all, json } => list_command(control_route_caller(&guard), all, json),
@@ -630,11 +635,12 @@ fn status_command(
     handle: String,
     tail_bytes: u64,
     full: bool,
+    observe_only: bool,
     caller: ControlRouteCaller,
 ) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
     let meta = read_meta_for_handle(&paths, &handle)?;
-    let meta = if caller_is_control_eligible(&meta, &paths, &caller) {
+    let meta = if !observe_only && caller_is_control_eligible(&meta, &paths, &caller) {
         reconcile_status_meta(&paths, &handle, meta)?
     } else {
         meta

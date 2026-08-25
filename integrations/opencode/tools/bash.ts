@@ -243,9 +243,11 @@ async function statusText(
   headerOnly = false,
   ownerSessionId?: string,
   abort?: AbortSignal,
+  observeOnly = false,
 ): Promise<string> {
   const args = [AGENT_BASH, "status"]
   if (headerOnly) args.push("--tail-bytes", "0")
+  if (observeOnly) args.push("--observe-only")
   args.push(handle)
   const status = await checkedProcessText(args, "agent-bash status", ownerSessionId, abort)
   const header = status.split("\n", 1)[0]
@@ -260,7 +262,7 @@ async function terminalStatus(
   ownerSessionId?: string,
   abort?: AbortSignal,
 ): Promise<string | undefined> {
-  const status = await statusText(handle, true, ownerSessionId, abort)
+  const status = await statusText(handle, true, ownerSessionId, abort, true)
   if (!isTerminalStatus(status)) return undefined
   await consumeTerminalStatus(handle, ownerSessionId, abort)
   return statusText(handle, false, ownerSessionId, abort)
@@ -629,8 +631,11 @@ export default tool({
     if (args.handle) {
       const terminal = await terminalStatus(args.handle, context.sessionID, context.abort)
       if (terminal !== undefined) return terminal
-      const status = await statusText(args.handle, false, context.sessionID, context.abort)
-      if (isTerminalStatus(status)) await consumeTerminalStatus(args.handle, context.sessionID, context.abort)
+      const status = await statusText(args.handle, false, context.sessionID, context.abort, true)
+      if (isTerminalStatus(status)) {
+        await consumeTerminalStatus(args.handle, context.sessionID, context.abort)
+        return statusText(args.handle, false, context.sessionID, context.abort)
+      }
       return status
     }
     if (!commandProvided(args.command)) return missingCommandResponse()

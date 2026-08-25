@@ -633,6 +633,8 @@ if [ "${1:-}" = session ] && [ "${2:-}" = of-pid ]; then
         exit 1
     fi
     printf '{"found":true,"invocation_uuid":"11111111-1111-4111-8111-111111111111","session_id":"%s"}\n' "${AGENT_BASH_FAKE_RESOLVED_SESSION:-ses_resolved}"
+elif [ -n "${AGENT_BASH_FAKE_DELIVERY_LOG:-}" ]; then
+    printf '%s\n' "$@" >> "$AGENT_BASH_FAKE_DELIVERY_LOG"
 fi
 exit 0
 "#,
@@ -2567,7 +2569,13 @@ fn opencode_adapter_owner_poll_marks_terminal_result_consumed_without_mutating_d
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
 
-    let result = run_adapter_driver(&temp, &driver, "launch-poll", None);
+    let delivery_log = temp.path().join("adapter-owner-poll-delivery.log");
+    let output = adapter_driver_command(&temp, &driver, "launch-poll", None)
+        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
+        .output()
+        .expect("adapter driver");
+    assert_command_success(&output);
+    let result = parse_stdout_json(&output);
     let handle = result["handle"].as_str().expect("handle");
 
     assert_adapter_result_contains(&result, "adapter owner poll");
@@ -2579,6 +2587,9 @@ fn opencode_adapter_owner_poll_marks_terminal_result_consumed_without_mutating_d
             .join("consumed")
             .exists()
     );
+    let delivery = fs::read_to_string(&delivery_log).expect("completion helper invocation");
+    assert!(delivery.contains("agent-bash-complete"), "{delivery}");
+    assert!(delivery.contains("--consumed"), "{delivery}");
 }
 
 #[test]

@@ -157,8 +157,8 @@ transition but not the delivery-helper-operation role. A targeted eligible `stat
 delivery in its current process and synchronously waits for the local delivery transfer worker and helper
 outcome. An origin-session-scoped bulk `list` may publish the same terminal state for an accurate projection,
 but it never executes a helper as an incidental enumeration side effect; its disposition is
-`CompletionDeliveryAction::LeavePending`. Live terminal producers, targeted status, and the guardian
-use `CompletionDeliveryAction::ClaimPending`; the action names only who progresses delivery, not how
+`CompletionDeliveryDisposition::LeavePending`. Live terminal producers, targeted status, and the guardian
+use `CompletionDeliveryDisposition::ClaimPending`; the disposition names only who progresses delivery, not how
 the terminal state was reached. Cross-owner status and
 `list --all` remain observational and do not reconcile state. Cross-route `mode` is likewise a
 point-in-time read, but it still fails closed when the durable activation outcome is unsettled.
@@ -190,6 +190,12 @@ delivery, and therefore may wait for the bounded helper subprocess. This general
 `agents-bg{,-poll}` tmux helpers into an event-driven, cgroup-tracked tool. The supervisor's poll of
 the PID is **harness-code polling (cheap, no LLM tokens)** — not the LLM self-polling that is
 forbidden.
+
+`status --observe-only <handle>` suppresses owner-triggered reconciliation and delivery progression.
+The bundled adapter uses it to observe a terminal asynchronous result, records `consume`, and then
+issues progress-capable status. This ordering puts the in-call consumer decision ahead of the
+completion helper request so the helper receives `--consumed` rather than admitting a duplicate
+active mailbox publication.
 
 Handle observation and handle control are separate cooperative routing policies within the
 supported CLI. Default list visibility and control require the recorded owner session when one
