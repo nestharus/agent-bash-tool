@@ -15,8 +15,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const FIXTURE_DEADLINE: Duration = Duration::from_secs(30);
-const FAKE_HELPER_ENVIRONMENT: &str = "AGENT_BASH_FAKE_ACTIVATE_RELEASE,AGENT_BASH_FAKE_ACTIVATE_STARTED,AGENT_BASH_FAKE_COMPLETE_FINISHED,AGENT_BASH_FAKE_COMPLETE_RELEASE,AGENT_BASH_FAKE_COMPLETE_STARTED,AGENT_BASH_FAKE_DELIVERY_LOG,AGENT_BASH_FAKE_FIRST_MISS_MARKER,AGENT_BASH_FAKE_META_SNAPSHOT,AGENT_BASH_FAKE_RC_SNAPSHOT,AGENT_BASH_FAKE_RESOLVED_SESSION,AGENT_BASH_FAKE_RESOLVER_DELAY,AGENT_BASH_FAKE_RESOLVER_LOG,AGENT_BASH_FAKE_RESOLVER_RELEASE,AGENT_BASH_FAKE_RESOLVER_STARTED,AGENT_BASH_FAKE_ROUTE";
-
 #[derive(Debug, PartialEq, Eq)]
 struct ProcIdentity {
     pid: libc::pid_t,
@@ -27,10 +25,6 @@ fn agent_bash(temp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("agent-bash").expect("agent-bash binary");
     cmd.env("XDG_STATE_HOME", temp.path())
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
-        .env(
-            "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST",
-            FAKE_HELPER_ENVIRONMENT,
-        )
         .env_remove("AGENT_BASH_CONSUMER_GRACE_MS")
         .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
         .env_remove("AGENT_BASH_OWNER_SESSION_ID")
@@ -942,10 +936,6 @@ fn adapter_driver_command(
         .arg(mode)
         .arg(adapter_module_path())
         .env("AGENT_BASH_BIN", adapter_agent_bash)
-        .env(
-            "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST",
-            FAKE_HELPER_ENVIRONMENT,
-        )
         .env(
             "AGENT_BASH_AGENT_RUNNER_BIN",
             owner_resolving_fake_agents(temp),
@@ -2223,10 +2213,6 @@ fn explicit_cancel_wins_when_owner_exit_is_already_pollable() {
         .stdin(Stdio::piped())
         .env("XDG_STATE_HOME", temp.path())
         .env("AGENT_BASH_AGENT_RUNNER_BIN", helper)
-        .env(
-            "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST",
-            FAKE_HELPER_ENVIRONMENT,
-        )
         .env("AGENT_BASH_FAKE_ROUTE", route)
         .env("AGENT_BASH_OWNER_SESSION_ID", "ses_owner_race")
         .env(
@@ -3685,10 +3671,6 @@ fn owner_resolution_and_registration_share_one_configured_helper() {
     let run = StdCommand::new(assert_cmd::cargo::cargo_bin("agent-bash"))
         .env("XDG_STATE_HOME", temp.path())
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
-        .env(
-            "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST",
-            FAKE_HELPER_ENVIRONMENT,
-        )
         .env("AGENT_BASH_FAKE_RESOLVER_STARTED", &resolver_started)
         .env("AGENT_BASH_FAKE_RESOLVER_RELEASE", &resolver_release)
         .env_remove("AGENT_BASH_CONSUMER_GRACE_MS")

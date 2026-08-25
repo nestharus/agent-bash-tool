@@ -59,13 +59,13 @@ completion returns synchronously in-band or asynchronously through the agent mai
   (headless: `resume`) or forwards (PTY), while synchronous or already-consumed completion does not
   enter that mailbox. The spooler owns helper admission and process outcome, not mailbox closure.
 - **Pinned delivery helper.** Registration snapshots the selected helper into a content-addressed,
-  account-private cache and hard-links that exact version into the handle. It also records a small
-  execution environment and clears later callers' ambient environment before every helper launch.
-  Additional non-secret variables must be named at registration in
-  `AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST`; their values become durable handle provenance. A normal
-  helper upgrade or later caller environment therefore cannot substitute or strand operations for
-  handles already in flight. Registration-only authority and helper-selection controls are removed
-  before the workload starts.
+  account-private cache and hard-links that exact version into the handle. It also records the exact
+  initiating execution environment and clears later callers' ambient environment before every helper launch.
+  Registration captures the complete UTF-8 initiating environment because the opaque helper alone
+  knows which values it needs. Registration-only authority and the retired allowlist control are
+  removed first. The environment is stored as mode-0600 handle-private state; only its SHA-256 digest
+  appears in public handle provenance. A normal helper upgrade or later caller environment therefore
+  cannot substitute or strand operations for handles already in flight.
 
 The spooler is **general, provider-agnostic, and mailbox-agnostic**. It talks to agent-runner only
 over its CLI, asks that helper to resolve an opaque origin-session binding, and compares the recorded

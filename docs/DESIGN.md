@@ -253,13 +253,15 @@ handle-local paths, metadata, helper and interpreter digests, environment, and s
 exposing its operation command.
 
 Registration also pins the helper's execution environment. Helper commands clear the initiating
-process's ambient environment, run from `/`, and restore only a bounded baseline (`HOME`, locale,
-user, `PATH`, temporary-directory, and XDG/agent-runner data paths) plus non-secret variables named
-by `AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST` at registration. The explicit values are durable
-provenance and must not contain credentials. The caller-bound completion-registration authority is
-the sole transient exception: it is injected only into the immediate registration invocation and
-is neither persisted, replayed, nor inherited by the workload. The helper-selection override is also
-removed before workload execution. The OpenCode adapter invokes recognized explicit runs directly
+process's ambient environment, run from `/`, and restore the complete UTF-8 environment captured
+from the initiating process. The spooler cannot predict which values an opaque helper needs, so this
+capture has no variable-population or byte-size allowlist. Before capture, it removes the caller-bound
+completion-registration authority and the retired allowlist control. The captured map is stored in a
+mode-0600 handle-private file, bound by a SHA-256 digest in public provenance, and revalidated before
+every helper operation. The completion-registration authority is injected only into the immediate
+registration invocation and is neither persisted, replayed, nor inherited by the workload. The
+helper-selection override remains part of the captured helper context when explicitly configured.
+The OpenCode adapter invokes recognized explicit runs directly
 from conservatively parsed arguments and rejects shell expansion around that registration-capable
 launch. One explicit-run admission result distinguishes ordinary commands, conservatively
 recognized but unsupported explicit syntax, and validated direct invocations; only the last carries
@@ -267,8 +269,8 @@ normalized arguments to the launcher. Command-authored ordinary assignments make
 unsupported, while one reserved-name policy neutralizes spooler-control assignments in both command
 representations and supplies effective values only from adapter state. A later workload,
 detach, status, supervisor, or guardian process therefore
-cannot retain the registration capability or alter interpreter lookup, the agent-runner data
-namespace, or an explicitly declared helper input through its own environment.
+cannot retain the registration capability or alter the handle-bound interpreter lookup,
+agent-runner data namespace, or helper environment through its own ambient environment.
 
 The forked startup child owns completion registration and transitions directly into daemonization
 after registration succeeds. The launcher waits only for that child's registration result. Launcher
