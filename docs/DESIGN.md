@@ -109,12 +109,13 @@ without degradation because the subreaper remains authoritative. Process-group +
 stdout/stderr to a per-handle log, and records exit code. The `run` invocation itself returns
 the handle and exits — it does not `wait`.
 
-Supervisor creation is admitted in two phases around completion-event registration. The first
-fork creates a child blocked on a close-on-exec pipe before registration can gain external effects.
-Registration failure, caller loss, or local abandonment closes that pipe and the child exits
-without starting a workload. Only successful registration releases the child. A later daemon fork
-failure is published through the normal terminal-error and completion-delivery path rather than
-leaving a registered handle in an unowned `RUNNING` state.
+Supervisor creation is admitted around a socketpair registration-result handoff. The launcher forks
+one startup child and waits for its result. That child owns completion-event registration; on
+failure it records the terminal registration error, reports failure, and exits without starting a
+workload. On success it reports acceptance and continues directly into daemonization. Launcher loss
+cannot abandon an accepted registration because the startup child continues even if the result send
+has no receiver. A later daemon fork failure is published through the normal terminal-error and
+completion-delivery path rather than leaving a registered handle in an unowned `RUNNING` state.
 
 Captured output is bounded by `AGENT_BASH_LOG_MAX_BYTES` (16 MiB by default, clamped between
 64 KiB and 1 GiB). When the limit is crossed, the log records a truncation marker and retains the
