@@ -273,7 +273,13 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
 
     let mut recovered_cancel_escalation = None;
     loop {
-        let accepted_cancel = explicit_cancel_accepted(paths);
+        let accepted_cancel = match explicit_cancel_accepted(paths) {
+            Ok(accepted) => accepted,
+            Err(_) => {
+                std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                continue;
+            }
+        };
         if accepted_cancel {
             let escalation = recovered_cancel_escalation
                 .get_or_insert_with(CancellationEscalation::begin_guardian_takeover);
@@ -1355,7 +1361,7 @@ impl EventLoop {
     }
 
     fn check_explicit_cancel(&mut self) {
-        if explicit_cancel_accepted(&self.paths) {
+        if matches!(explicit_cancel_accepted(&self.paths), Ok(true)) {
             self.request_cancellation(CancellationCause::ExplicitRequest);
         }
     }
@@ -1379,8 +1385,10 @@ impl EventLoop {
     }
 
     fn request_cancellation(&mut self, proposed_cause: CancellationCause) {
-        let proposed_cause =
-            proposed_cause.with_observed_explicit_cancel(explicit_cancel_accepted(&self.paths));
+        let proposed_cause = proposed_cause.with_observed_explicit_cancel(matches!(
+            explicit_cancel_accepted(&self.paths),
+            Ok(true)
+        ));
         match self.cancellation.as_mut() {
             Some(cancellation) => {
                 cancellation.provisional_cause = cancellation
@@ -1403,7 +1411,10 @@ impl EventLoop {
         };
         cancellation.provisional_cause = cancellation
             .provisional_cause
-            .with_observed_explicit_cancel(explicit_cancel_accepted(&self.paths));
+            .with_observed_explicit_cancel(matches!(
+                explicit_cancel_accepted(&self.paths),
+                Ok(true)
+            ));
         signal_descendants(current_pid(), cancellation.escalation.signal());
     }
 
@@ -1901,7 +1912,7 @@ fn reconcile_lost_supervisor_with_delivery(
         }
         return Ok(meta);
     }
-    let guardian_settled_cancel = accepted_cancel_tree_empty && explicit_cancel_accepted(paths);
+    let guardian_settled_cancel = accepted_cancel_tree_empty && explicit_cancel_accepted(paths)?;
     if !guardian_settled_cancel && !state::exact_supervisor_and_workload_are_gone(&meta) {
         return Ok(meta);
     }
@@ -1980,7 +1991,7 @@ fn publish_terminal_with_delivery_disposition(
         return Ok(TerminalPublishResult::Published);
     }
     meta.delivery = current.delivery;
-    let proposal = match finalize_terminal_proposal(proposal, explicit_cancel_accepted(paths)) {
+    let proposal = match finalize_terminal_proposal(proposal, explicit_cancel_accepted(paths)?) {
         FinalizedTerminalProposal::Publish(proposal) => proposal,
         FinalizedTerminalProposal::DeferredForAcceptedCancel => {
             drop(completion_lock);
@@ -2012,8 +2023,8 @@ fn publish_terminal_with_delivery_disposition(
     Ok(TerminalPublishResult::Published)
 }
 
-fn explicit_cancel_accepted(paths: &StatePaths) -> bool {
-    paths.accepted_cancel.exists()
+fn explicit_cancel_accepted(paths: &StatePaths) -> io::Result<bool> {
+    state::durable_marker_exists(&paths.accepted_cancel)
 }
 
 impl Drop for EventLoop {
@@ -2036,6 +2047,8 @@ impl Drop for EventLoop {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::symlink;
+
     use super::*;
 
     #[test]
@@ -2071,6 +2084,53 @@ mod tests {
             finalize_terminal_proposal(TerminalProposal::ReadySentinel(1), true),
             FinalizedTerminalProposal::DeferredForAcceptedCancel
         ));
+    }
+
+    #[test]
+    fn cancel_marker_lookup_failure_blocks_competing_terminal_publication() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let handle = "ab_cancel_observation_error".to_string();
+        let paths = StatePaths::new(temp.path().join("agent-bash"), handle.clone());
+        state::create_handle_state(&paths).expect("create state");
+        state::create_log(&paths).expect("create log");
+        state::write_delivery_mode_atomic(&paths, state::DeliveryMode::Sync)
+            .expect("write delivery mode");
+        let mut meta = Meta::new(
+            handle,
+            unsafe { libc::getpid() },
+            unsafe { libc::getpid() },
+            vec!["true".to_string()],
+            std::path::PathBuf::from("/tmp"),
+            "exit",
+            state::DeliveryMode::Sync,
+            None,
+            Vec::new(),
+            None,
+        );
+        state::write_meta_atomic(&paths, &meta).expect("write running meta");
+        state::record_explicit_cancel_acceptance(&paths).expect("accept cancellation");
+        std::fs::rename(
+            &paths.accepted_cancel,
+            paths.state_dir.join("retained-cancel-requested"),
+        )
+        .expect("retain cancellation marker");
+        symlink(&paths.accepted_cancel, &paths.accepted_cancel)
+            .expect("make cancellation lookup fail");
+
+        assert!(
+            publish_terminal_with_delivery_disposition(
+                &paths,
+                &mut meta,
+                None,
+                TerminalProposal::SupervisorLost,
+                CompletionDeliveryDisposition::LeavePending,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            state::read_meta(&paths).expect("read meta").state,
+            "RUNNING"
+        );
     }
 
     #[test]

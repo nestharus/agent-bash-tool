@@ -1144,7 +1144,7 @@ pub(crate) fn reconcile_completion_delivery(
         persisted.caller_ppid,
         &persisted.handle,
         paths,
-        consumed_before_delivery(paths),
+        consumed_before_delivery(paths)?,
         persisted.delivery_helper.as_ref(),
     ) {
         Ok(request) => request,
@@ -1377,13 +1377,13 @@ fn detach_outcome(
     }
 }
 
-fn consumed_before_delivery(paths: &StatePaths) -> bool {
-    if paths.consumed.exists() {
-        return true;
+fn consumed_before_delivery(paths: &StatePaths) -> io::Result<bool> {
+    if state::durable_marker_exists(&paths.consumed)? {
+        return Ok(true);
     }
     let grace = consumer_grace();
     if grace.is_zero() {
-        return false;
+        return Ok(false);
     }
     wait_for_consumed_marker(paths, grace)
 }
@@ -1397,15 +1397,15 @@ fn consumer_grace() -> Duration {
     Duration::from_millis(millis)
 }
 
-fn wait_for_consumed_marker(paths: &StatePaths, grace: Duration) -> bool {
+fn wait_for_consumed_marker(paths: &StatePaths, grace: Duration) -> io::Result<bool> {
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(CONSUMER_GRACE_POLL_MS));
-        if paths.consumed.exists() {
-            return true;
+        if state::durable_marker_exists(&paths.consumed)? {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 struct DeliveryHelperRequest {
@@ -1700,6 +1700,7 @@ fn delivery_signal_error(status: ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
@@ -1764,5 +1765,18 @@ mod tests {
             .expect_err("replacement must fail closed");
         assert_eq!(err.code, DELIVERY_HELPER_CHANGED);
         assert!(err.detail.contains("contents changed"), "{}", err.detail);
+    }
+
+    #[test]
+    fn consumed_marker_lookup_failure_blocks_completion_decision() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_consumed_error".to_string());
+        state::create_handle_state(&paths).expect("create state");
+        state::record_consumed(&paths).expect("record consumed");
+        fs::rename(&paths.consumed, paths.state_dir.join("retained-consumed"))
+            .expect("retain consumed marker");
+        symlink(&paths.consumed, &paths.consumed).expect("make consumed lookup fail");
+
+        assert!(consumed_before_delivery(&paths).is_err());
     }
 }

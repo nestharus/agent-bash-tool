@@ -637,6 +637,18 @@ pub(crate) fn record_consumed(paths: &StatePaths) -> io::Result<bool> {
     record_durable_create_once_marker(&paths.consumed, &paths.state_dir)
 }
 
+pub(crate) fn durable_marker_exists(marker: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(marker) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("durable marker is not a regular file: {}", marker.display()),
+        )),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 fn write_activation_outcome(paths: &StatePaths, outcome: &str) -> io::Result<()> {
     atomic_write(&paths.activation_outcome, outcome.as_bytes())
 }
@@ -678,7 +690,7 @@ pub(crate) fn write_activation_transfer_outcome_unknown(paths: &StatePaths) -> i
 pub(crate) fn activation_transfer_state(paths: &StatePaths) -> io::Result<ActivationTransferState> {
     let mode = read_delivery_mode(paths)?;
     let outcome = match read_activation_outcome(paths)?.as_deref() {
-        None if paths.activation_attempted.exists() => {
+        None if durable_marker_exists(&paths.activation_attempted)? => {
             ActivationTransferOutcome::ClaimedWithoutOutcome
         }
         None => ActivationTransferOutcome::Unclaimed,
@@ -1590,6 +1602,28 @@ mod tests {
         rollback_activation_attempt(&paths).expect("rollback activation");
         assert!(!paths.activation_attempted.exists());
         assert!(record_activation_attempt(&paths).expect("retry activation"));
+    }
+
+    #[test]
+    fn decision_marker_lookup_failure_is_not_absence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_test".to_string());
+        create_handle_state(&paths).expect("create state");
+        write_delivery_mode_atomic(&paths, DeliveryMode::Async).expect("write mode");
+
+        assert!(!durable_marker_exists(&paths.activation_attempted).expect("absent marker"));
+        record_activation_attempt(&paths).expect("record activation");
+        assert!(durable_marker_exists(&paths.activation_attempted).expect("published marker"));
+        fs::rename(
+            &paths.activation_attempted,
+            paths.state_dir.join("retained-activation-attempted"),
+        )
+        .expect("retain marker");
+        std::os::unix::fs::symlink(&paths.activation_attempted, &paths.activation_attempted)
+            .expect("make marker lookup fail");
+
+        assert!(durable_marker_exists(&paths.activation_attempted).is_err());
+        assert!(activation_transfer_state(&paths).is_err());
     }
 
     #[test]

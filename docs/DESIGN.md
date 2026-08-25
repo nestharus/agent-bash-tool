@@ -146,11 +146,13 @@ accepted or observed. Guardian takeover intentionally starts a fresh grace clock
 durable marker carries no acceptance timestamp and the newly responsible process must first give
 the adopted tree a bounded `SIGTERM` opportunity before escalating.
 
-`cancel-requested` and `activation-attempted` use one state-layer durable create-once marker
-primitive. It opens the state directory before marker creation, syncs the created file and directory,
-and removes plus directory-syncs the marker if either publication sync fails. A failed publication
-therefore does not become an accepted cancellation or consumed activation claim on a later call.
-The activation lifecycle may also invoke the same durable rollback after a conclusive downstream
+`cancel-requested`, `activation-attempted`, and `consumed` use one state-layer durable create-once
+marker primitive. It opens the state directory before marker creation, syncs the created file and
+directory, and removes plus directory-syncs the marker if either publication sync fails. A failed
+publication therefore does not become an accepted decision on a later call. Settlement observes
+these markers through one fallible state operation: only `NotFound` means absence, while any other
+lookup failure leaves cancellation, activation mode, or completion delivery unsettled. The
+activation lifecycle may also invoke the same durable rollback after a conclusive downstream
 pre-admission failure.
 
 Control-route-eligible `status` and the default origin-session-scoped `list` share the lost-supervisor terminal
