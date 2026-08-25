@@ -273,8 +273,11 @@ namespace, or an explicitly declared helper input through its own environment.
 The forked startup child owns completion registration and transitions directly into daemonization
 after registration succeeds. The launcher waits only for that child's registration result. Launcher
 loss cannot strand a successful external registration before supervisor admission; the surviving
-child admits the workload, while a registration failure is terminally recorded by the child before
-it reports failure and exits.
+child admits the workload. A conclusive helper pre-spawn failure is terminally recorded before the
+child reports rejection and exits. Once the helper process is admitted, any non-success is instead
+retained under the exact handle as terminal `registration-outcome-unknown`: no workload starts, the
+state is not deleted, and registration is not replayed because the opaque helper may already have
+committed its external effect.
 
 The helper cache lock serializes cache installation, per-handle linking, and removal of cache entries
 with no remaining handle links. Warm-cache content validation occurs before the lock; the critical

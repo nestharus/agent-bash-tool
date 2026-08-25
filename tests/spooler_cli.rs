@@ -456,6 +456,21 @@ fn registration_launcher_killing_fake_agents(temp: &tempfile::TempDir) -> (PathB
     (fake, log)
 }
 
+fn admitted_registration_failure_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let fake = temp.path().join("admitted-registration-failure-agents");
+    let log = temp.path().join("admitted-registration-failure.log");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf '%s\n' \"$@\" >> {}\nif [ \"${{2:-}}\" = agent-bash-register ]; then\n  exit 19\nfi\nexit 0\n",
+            shell_quote(&log)
+        ),
+    )
+    .expect("write admitted-registration-failure fake");
+    set_executable(&fake);
+    (fake, log)
+}
+
 fn interpreter_backed_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf) {
     let interpreter = temp.path().join("delivery-interpreter");
     let helper = temp.path().join("interpreter-backed-agents");
@@ -3756,6 +3771,59 @@ fn successful_registration_survives_launcher_loss_before_supervisor_startup() {
 }
 
 #[test]
+fn admitted_registration_failure_retains_non_replayable_unknown_handle() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (fake, delivery_log) = admitted_registration_failure_fake_agents(&temp);
+    let workload_marker = temp
+        .path()
+        .join("workload-started-after-unknown-registration");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            &format!("touch {}", workload_marker.display()),
+        ])
+        .output()
+        .expect("run with admitted registration failure");
+    let json = parse_run_output(&output);
+    let meta = read_meta(&meta_path(&json));
+
+    assert_eq!(meta["state"], "ERROR");
+    assert_eq!(meta["completion_reason"], "registration-outcome-unknown");
+    assert_eq!(meta["rc"], 70);
+    assert!(meta["workload_pid"].is_null());
+    assert!(
+        meta["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("unknown after helper admission")),
+        "{meta}"
+    );
+    assert!(
+        !workload_marker.exists(),
+        "workload started after unknown registration"
+    );
+    let operations = fs::read_to_string(delivery_log).expect("delivery operations");
+    assert_eq!(
+        operations.matches("agent-bash-register").count(),
+        1,
+        "{operations}"
+    );
+    assert_eq!(
+        operations.matches("agent-bash-complete").count(),
+        0,
+        "{operations}"
+    );
+    assert_eq!(
+        state_dir_count(&temp),
+        1,
+        "unknown registration state was removed"
+    );
+}
+
+#[test]
 fn partial_explicit_owner_fails_closed_with_runner_detail() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, resolver_log) = registration_rejecting_fake_agents(&temp);
@@ -3803,7 +3871,7 @@ fn partial_explicit_owner_fails_closed_with_runner_detail() {
 }
 
 #[test]
-fn resolved_owner_must_match_parent_invocation_marker() {
+fn mismatched_resolved_owner_retains_admitted_registration_failure() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, resolver_log) = registration_rejecting_fake_agents(&temp);
     let workload_marker = temp.path().join("workload-started");
@@ -3826,19 +3894,24 @@ fn resolved_owner_must_match_parent_invocation_marker() {
         .output()
         .expect("run");
 
-    assert_eq!(output.status.code(), Some(74));
+    let json = parse_run_output(&output);
+    let meta = read_meta(&meta_path(&json));
     assert!(
         resolver_log.exists(),
         "verified PID lookup was not attempted"
     );
+    assert!(meta["owner_session_id"].is_null(), "{meta}");
+    assert!(meta["owner_invocation_uuid"].is_null(), "{meta}");
+    assert_eq!(meta["state"], "ERROR");
+    assert_eq!(meta["completion_reason"], "registration-outcome-unknown");
     assert!(
         !workload_marker.exists(),
         "workload launched with mismatched resolved owner"
     );
     assert_eq!(
         state_dir_count(&temp),
-        0,
-        "rejected registration leaked state"
+        1,
+        "admitted registration failure state was removed"
     );
 }
 

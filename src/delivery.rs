@@ -1101,17 +1101,26 @@ fn take_registration_authority() -> Option<OsString> {
     authority
 }
 
+pub(crate) enum RegistrationError {
+    NotStarted(io::Error),
+    Admitted(io::Error),
+}
+
 pub(crate) fn register(
     paths: &StatePaths,
     meta: &Meta,
     registration: DeliveryRegistration,
-) -> std::io::Result<()> {
-    run_required_delivery_helper_command(&register_request(
+) -> Result<(), RegistrationError> {
+    run_required_delivery_helper_command_detailed(&register_request(
         meta,
         paths,
         registration.helper,
         registration.authority,
     ))
+    .map_err(|err| match err {
+        DeliveryHelperCommandError::NotStarted(err) => RegistrationError::NotStarted(err),
+        DeliveryHelperCommandError::Admitted(err) => RegistrationError::Admitted(err),
+    })
 }
 
 pub(crate) fn reconcile_completion_delivery(
@@ -1531,14 +1540,6 @@ enum DeliveryHelperCommandError {
     Admitted(io::Error),
 }
 
-impl DeliveryHelperCommandError {
-    fn into_io_error(self) -> io::Error {
-        match self {
-            Self::NotStarted(err) | Self::Admitted(err) => err,
-        }
-    }
-}
-
 fn run_delivery_helper_command(
     request: &DeliveryHelperRequest,
 ) -> Result<ExitStatus, DeliveryHelperCommandError> {
@@ -1550,11 +1551,6 @@ fn run_delivery_helper_command(
         .spawn()
         .map_err(DeliveryHelperCommandError::NotStarted)?;
     child.wait().map_err(DeliveryHelperCommandError::Admitted)
-}
-
-fn run_required_delivery_helper_command(request: &DeliveryHelperRequest) -> std::io::Result<()> {
-    run_required_delivery_helper_command_detailed(request)
-        .map_err(DeliveryHelperCommandError::into_io_error)
 }
 
 fn run_required_delivery_helper_command_detailed(

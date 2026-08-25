@@ -94,6 +94,11 @@ fn receive_registration_result(socket: RawFd, child_pid: libc::pid_t) -> io::Res
     if outcome[0] == 1 {
         return Ok(());
     }
+    if outcome[0] == 2 {
+        let mut status = 0;
+        let _ = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+        return Ok(());
+    }
     let mut detail = String::new();
     result.read_to_string(&mut detail)?;
     let mut status = 0;
@@ -106,21 +111,31 @@ unsafe fn register_and_start_supervisor(
     config: SupervisorConfig,
     registration: delivery::DeliveryRegistration,
 ) -> ! {
-    if let Err(err) = delivery::register(&config.paths, &config.meta, registration) {
-        let detail = err.to_string();
-        let _ = record_pre_admission_registration_error(&config.paths, &config.meta, &detail);
-        send_registration_result(result_fd, false, detail.as_bytes());
-        unsafe { libc::close(result_fd) };
-        unsafe { libc::_exit(EX_SOFTWARE) };
+    match delivery::register(&config.paths, &config.meta, registration) {
+        Ok(()) => {}
+        Err(delivery::RegistrationError::NotStarted(err)) => {
+            let detail = err.to_string();
+            let _ = record_pre_admission_registration_error(&config.paths, &config.meta, &detail);
+            send_registration_result(result_fd, 0, detail.as_bytes());
+            unsafe { libc::close(result_fd) };
+            unsafe { libc::_exit(EX_SOFTWARE) };
+        }
+        Err(delivery::RegistrationError::Admitted(err)) => {
+            let detail = err.to_string();
+            let _ = record_admitted_registration_unknown(&config.paths, &config.meta, &detail);
+            send_registration_result(result_fd, 2, &[]);
+            unsafe { libc::close(result_fd) };
+            unsafe { libc::_exit(EX_SOFTWARE) };
+        }
     }
-    send_registration_result(result_fd, true, &[]);
+    send_registration_result(result_fd, 1, &[]);
     unsafe { libc::close(result_fd) };
     unsafe { daemonization_child(config) }
 }
 
-fn send_registration_result(socket: RawFd, success: bool, detail: &[u8]) {
+fn send_registration_result(socket: RawFd, outcome: u8, detail: &[u8]) {
     let mut result = Vec::with_capacity(detail.len() + 1);
-    result.push(u8::from(success));
+    result.push(outcome);
     result.extend_from_slice(detail);
     let _ = unsafe {
         libc::send(
@@ -144,6 +159,29 @@ fn record_pre_admission_registration_error(
             &mut meta,
             format!("completion event registration failed: {detail}"),
         );
+        state::write_rc_atomic(paths, EX_SOFTWARE)?;
+        state::write_meta_atomic(paths, &meta)?;
+    }
+    Ok(())
+}
+
+fn record_admitted_registration_unknown(
+    paths: &StatePaths,
+    initial_meta: &Meta,
+    detail: &str,
+) -> io::Result<()> {
+    let _lock = state::lock_completion(paths)?;
+    let mut meta = state::read_meta(paths).unwrap_or_else(|_| initial_meta.clone());
+    if !state::terminal(&meta) {
+        meta.state = "ERROR".to_string();
+        meta.completion_reason = Some("registration-outcome-unknown".to_string());
+        meta.rc = Some(EX_SOFTWARE);
+        meta.signal = None;
+        meta.completed_at_unix_ms = Some(state::unix_ms());
+        meta.error = Some(format!(
+            "completion event registration outcome is unknown after helper admission: {detail}"
+        ));
+        meta.touch();
         state::write_rc_atomic(paths, EX_SOFTWARE)?;
         state::write_meta_atomic(paths, &meta)?;
     }
