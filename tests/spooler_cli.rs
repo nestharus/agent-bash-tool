@@ -4672,11 +4672,30 @@ fn later_caller_cannot_substitute_registered_helper_environment() {
         .expect("run");
     let json = parse_run_output(&output);
     let handle = json["handle"].as_str().expect("handle");
-    let helper_environment = &read_meta(&meta_path(&json))["delivery_helper"]["environment"];
+    let meta = read_meta(&meta_path(&json));
+    assert!(meta["delivery_helper"]["environment"].is_null());
+    assert!(meta["delivery_helper"]["environment_sha256"].is_string());
+    let private_environment_path = json["state_dir"]
+        .as_str()
+        .map(Path::new)
+        .expect("state dir")
+        .join("delivery-helper-environment.json");
+    let helper_environment: serde_json::Value = serde_json::from_slice(
+        &fs::read(&private_environment_path).expect("private helper environment"),
+    )
+    .expect("parse private helper environment");
     assert_eq!(helper_environment["AGENT_BASH_FAKE_ROUTE"], "registered");
     assert!(
         helper_environment["OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY"].is_null(),
-        "transient registration authority was persisted: {helper_environment}"
+        "transient registration authority was persisted"
+    );
+    assert_eq!(
+        fs::metadata(&private_environment_path)
+            .expect("private helper environment metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
     );
 
     let detach = agent_bash(&temp)

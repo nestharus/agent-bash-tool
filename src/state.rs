@@ -33,6 +33,7 @@ pub(crate) struct StatePaths {
     pub(crate) delivery_mode: PathBuf,
     pub(crate) delivery_helper: PathBuf,
     pub(crate) delivery_helper_interpreter: PathBuf,
+    pub(crate) delivery_helper_environment: PathBuf,
     pub(crate) activation_attempted: PathBuf,
     pub(crate) activation_outcome: PathBuf,
     pub(crate) delivery_lock: PathBuf,
@@ -55,6 +56,7 @@ impl StatePaths {
             delivery_mode: state_dir.join("delivery-mode"),
             delivery_helper: state_dir.join("delivery-helper"),
             delivery_helper_interpreter: state_dir.join("delivery-helper-interpreter"),
+            delivery_helper_environment: state_dir.join("delivery-helper-environment.json"),
             activation_attempted: state_dir.join("activation-attempted"),
             activation_outcome: state_dir.join("activation-outcome"),
             delivery_lock: state_dir.join("delivery.lock"),
@@ -106,8 +108,10 @@ pub(crate) struct DeliveryHelperProvenance {
     pub(crate) mode: u32,
     #[serde(default)]
     pub(crate) sha256: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) environment_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) interpreter: Option<DeliveryHelperInterpreterProvenance>,
 }
@@ -1064,6 +1068,17 @@ pub(crate) fn write_delivery_mode_atomic(
     delivery_mode: DeliveryMode,
 ) -> io::Result<()> {
     atomic_write(&paths.delivery_mode, delivery_mode.as_str().as_bytes())
+}
+
+pub(crate) fn write_delivery_helper_environment_atomic(
+    paths: &StatePaths,
+    bytes: &[u8],
+) -> io::Result<()> {
+    atomic_write(&paths.delivery_helper_environment, bytes)
+}
+
+pub(crate) fn read_delivery_helper_environment(paths: &StatePaths) -> io::Result<Vec<u8>> {
+    read_file_bytes(&paths.delivery_helper_environment)
 }
 
 pub(crate) fn read_delivery_mode(paths: &StatePaths) -> io::Result<DeliveryMode> {
