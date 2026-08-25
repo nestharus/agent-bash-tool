@@ -4180,7 +4180,12 @@ fn delivery_transfer_worker_finishes_after_detach_caller_dies() {
         operation_count(&fixture.delivery_log, "agent-bash-activate"),
         1
     );
-    let _ = agent_bash(&temp).args(["cancel", handle]).output();
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel after detach transfer");
+    assert_command_success(&cancel);
+    wait_for_terminal_status(&temp, handle);
 }
 
 #[test]
@@ -4249,7 +4254,12 @@ fn admitted_activation_failure_is_durable_and_not_reported_as_settled() {
         fs::read_to_string(state_dir_path(&json).join("activation-outcome")).unwrap(),
         "failed: delivery helper exited with 19: activation rejected\n"
     );
-    let _ = agent_bash(&temp).args(["cancel", handle]).output();
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel after failed activation");
+    assert_command_success(&cancel);
+    wait_for_terminal_status(&temp, handle);
 }
 
 #[test]
@@ -4848,7 +4858,12 @@ fn detach_uses_pinned_interpreter_after_source_is_removed() {
     assert_command_success(&detached);
     assert_eq!(mode_text(&temp, handle), "async");
     assert!(state_dir.join("activation-attempted").exists());
-    let _ = agent_bash(&temp).args(["cancel", handle]).output();
+    let cancel = agent_bash(&temp)
+        .args(["cancel", handle])
+        .output()
+        .expect("cancel after pinned-interpreter detach");
+    assert_command_success(&cancel);
+    wait_for_terminal_status(&temp, handle);
 }
 
 #[test]
