@@ -1,7 +1,8 @@
 # agent-bash-tool — Design Baseline
 
-Status: **draft baseline** (owner-shaped; pre-implementation). This is the spec the
-implementation pipeline builds against. Course-correct here before code.
+Status: **implemented current baseline**. This is the authoritative behavioral design for the
+current implementation. Historical proposals under `planning/` are retained for decision lineage;
+when they differ, this baseline, the current component contract, source, and executable tests govern.
 
 ## Problem
 
