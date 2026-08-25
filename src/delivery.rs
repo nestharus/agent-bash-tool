@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt;
@@ -29,28 +29,10 @@ const MAX_CONSUMER_GRACE_MS: u64 = 10_000;
 const CONSUMER_GRACE_POLL_MS: u64 = 25;
 const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
 const OWNER_LOOKUP_POLL: Duration = Duration::from_millis(10);
-const DELIVERY_HELPER_SCHEMA_VERSION: u8 = 4;
+const DELIVERY_HELPER_SCHEMA_VERSION: u8 = 5;
+const LEGACY_INLINE_ENVIRONMENT_SCHEMA_VERSION: u8 = 4;
 const DELIVERY_HELPER_ENV_ALLOWLIST_ENV: &str = "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST";
 const COMPLETION_REGISTRATION_AUTHORITY_ENV: &str = "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY";
-const BASE_DELIVERY_HELPER_ENVIRONMENT: &[&str] = &[
-    "HOME",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "LOGNAME",
-    "OULIPOLY_DATA_DIR",
-    "PATH",
-    "SHELL",
-    "TMPDIR",
-    "TZ",
-    "USER",
-    "XDG_CACHE_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_RUNTIME_DIR",
-];
-const MAX_DELIVERY_HELPER_ENVIRONMENT_VARIABLES: usize = 64;
-const MAX_DELIVERY_HELPER_ENVIRONMENT_BYTES: usize = 64 * 1024;
 const DELIVERY_HELPER_CACHE_DIR: &str = ".delivery-helpers";
 const DELIVERY_HELPER_LEGACY_UNSUPPORTED: &str = "delivery_helper_legacy_unsupported";
 const DELIVERY_HELPER_UNAVAILABLE: &str = "delivery_helper_unavailable";
@@ -60,6 +42,7 @@ const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
 #[derive(Debug)]
 struct ConfiguredDeliveryHelper {
     provenance: DeliveryHelperProvenance,
+    environment: BTreeMap<String, String>,
     executable: File,
     interpreter: Option<File>,
 }
@@ -67,6 +50,7 @@ struct ConfiguredDeliveryHelper {
 #[derive(Debug)]
 struct HandleBoundDeliveryHelper {
     provenance: DeliveryHelperProvenance,
+    environment: BTreeMap<String, String>,
     executable: File,
     interpreter: Option<File>,
 }
@@ -264,9 +248,10 @@ impl ConfiguredDeliveryHelper {
                 path_text.to_string(),
                 &metadata,
                 sha256,
-                environment,
+                None,
                 interpreter_provenance,
             ),
+            environment,
             executable,
             interpreter: interpreter.map(|(_, executable, _)| executable),
         })
@@ -378,15 +363,17 @@ impl ConfiguredDeliveryHelper {
             }
             None => None,
         };
+        let environment_sha256 = persist_delivery_helper_environment(paths, &self.environment)?;
         let provenance = provenance_from_metadata(
             snapshot_path.to_string_lossy().into_owned(),
             &metadata,
             self.provenance.sha256,
-            self.provenance.environment,
+            Some(environment_sha256),
             interpreter_provenance,
         );
         Ok(HandleBoundDeliveryHelper {
             provenance,
+            environment: self.environment,
             executable: self.executable,
             interpreter: self.interpreter,
         })
@@ -395,6 +382,7 @@ impl ConfiguredDeliveryHelper {
     fn owner_lookup_command(&self) -> Command {
         delivery_helper_command(
             &self.provenance,
+            &self.environment,
             &self.executable,
             self.interpreter.as_ref(),
         )
@@ -412,13 +400,16 @@ impl HandleBoundDeliveryHelper {
                 paths.handle
             ))
         })?;
-        if provenance.schema_version != DELIVERY_HELPER_SCHEMA_VERSION {
+        if !matches!(
+            provenance.schema_version,
+            DELIVERY_HELPER_SCHEMA_VERSION | LEGACY_INLINE_ENVIRONMENT_SCHEMA_VERSION
+        ) {
             return Err(DeliveryHelperError::legacy(format!(
                 "registered delivery helper for {} has unsupported schema version {}",
                 paths.handle, provenance.schema_version
             )));
         }
-        validate_delivery_helper_environment(&provenance.environment)?;
+        let environment = load_delivery_helper_environment(provenance, paths)?;
         let path = PathBuf::from(&provenance.path);
         if !path.is_absolute() {
             return Err(DeliveryHelperError::invalid(format!(
@@ -489,6 +480,7 @@ impl HandleBoundDeliveryHelper {
         };
         Ok(Self {
             provenance: provenance.clone(),
+            environment,
             executable,
             interpreter,
         })
@@ -497,6 +489,7 @@ impl HandleBoundDeliveryHelper {
     fn operation_command(&self) -> Command {
         delivery_helper_command(
             &self.provenance,
+            &self.environment,
             &self.executable,
             self.interpreter.as_ref(),
         )
@@ -505,6 +498,7 @@ impl HandleBoundDeliveryHelper {
 
 fn delivery_helper_command(
     provenance: &DeliveryHelperProvenance,
+    environment: &BTreeMap<String, String>,
     executable: &File,
     interpreter: Option<&File>,
 ) -> Command {
@@ -518,10 +512,7 @@ fn delivery_helper_command(
     } else {
         Command::new(format!("/proc/self/fd/{fd}"))
     };
-    command
-        .env_clear()
-        .envs(&provenance.environment)
-        .current_dir("/");
+    command.env_clear().envs(environment).current_dir("/");
     unsafe {
         command.pre_exec(move || {
             let flags = libc::fcntl(fd, libc::F_GETFD);
@@ -711,7 +702,7 @@ fn provenance_from_metadata(
     path: String,
     metadata: &Metadata,
     sha256: String,
-    environment: BTreeMap<String, String>,
+    environment_sha256: Option<String>,
     interpreter: Option<DeliveryHelperInterpreterProvenance>,
 ) -> DeliveryHelperProvenance {
     DeliveryHelperProvenance {
@@ -724,42 +715,95 @@ fn provenance_from_metadata(
         modified_nanoseconds: metadata.mtime_nsec(),
         mode: metadata.mode(),
         sha256,
-        environment,
+        environment: BTreeMap::new(),
+        environment_sha256,
         interpreter,
     }
 }
 
-fn capture_delivery_helper_environment() -> Result<BTreeMap<String, String>, DeliveryHelperError> {
-    let mut names = BASE_DELIVERY_HELPER_ENVIRONMENT
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect::<BTreeSet<_>>();
-    if let Some(configured) = env::var_os(DELIVERY_HELPER_ENV_ALLOWLIST_ENV) {
-        let configured = configured.into_string().map_err(|_| {
-            DeliveryHelperError::invalid(format!(
-                "{DELIVERY_HELPER_ENV_ALLOWLIST_ENV} is not valid UTF-8"
-            ))
-        })?;
-        for name in configured
-            .split(',')
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            validate_delivery_helper_environment_name(name)?;
-            names.insert(name.to_string());
-        }
+fn persist_delivery_helper_environment(
+    paths: &StatePaths,
+    environment: &BTreeMap<String, String>,
+) -> Result<String, DeliveryHelperError> {
+    let mut bytes = serde_json::to_vec(environment).map_err(|error| {
+        DeliveryHelperError::invalid(format!(
+            "cannot encode delivery helper environment for {}: {error}",
+            paths.handle
+        ))
+    })?;
+    bytes.push(b'\n');
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    state::write_delivery_helper_environment_atomic(paths, &bytes).map_err(|error| {
+        DeliveryHelperError::unavailable(format!(
+            "cannot persist private delivery helper environment for {}: {error}",
+            paths.handle
+        ))
+    })?;
+    Ok(sha256)
+}
+
+fn load_delivery_helper_environment(
+    provenance: &DeliveryHelperProvenance,
+    paths: &StatePaths,
+) -> Result<BTreeMap<String, String>, DeliveryHelperError> {
+    if provenance.schema_version == LEGACY_INLINE_ENVIRONMENT_SCHEMA_VERSION {
+        validate_delivery_helper_environment(&provenance.environment)?;
+        return Ok(provenance.environment.clone());
     }
-    if names.len() > MAX_DELIVERY_HELPER_ENVIRONMENT_VARIABLES {
-        return Err(DeliveryHelperError::invalid(format!(
-            "delivery helper environment names exceed {MAX_DELIVERY_HELPER_ENVIRONMENT_VARIABLES}"
+    if !provenance.environment.is_empty() {
+        return Err(DeliveryHelperError::changed(format!(
+            "registered delivery helper environment for {} escaped private storage",
+            paths.handle
         )));
     }
+    let expected_sha256 = provenance.environment_sha256.as_deref().ok_or_else(|| {
+        DeliveryHelperError::invalid(format!(
+            "registered delivery helper environment digest is missing for {}",
+            paths.handle
+        ))
+    })?;
+    let bytes = state::read_delivery_helper_environment(paths).map_err(|error| {
+        DeliveryHelperError::unavailable(format!(
+            "private delivery helper environment for {} is unavailable: {error}",
+            paths.handle
+        ))
+    })?;
+    let observed_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if observed_sha256 != expected_sha256 {
+        return Err(DeliveryHelperError::changed(format!(
+            "private delivery helper environment digest changed for {}",
+            paths.handle
+        )));
+    }
+    let environment: BTreeMap<String, String> =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            DeliveryHelperError::changed(format!(
+                "private delivery helper environment for {} is invalid: {error}",
+                paths.handle
+            ))
+        })?;
+    validate_delivery_helper_environment(&environment)?;
+    Ok(environment)
+}
 
+fn capture_delivery_helper_environment() -> Result<BTreeMap<String, String>, DeliveryHelperError> {
+    collect_delivery_helper_environment(env::vars_os())
+}
+
+fn collect_delivery_helper_environment(
+    entries: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<BTreeMap<String, String>, DeliveryHelperError> {
     let mut environment = BTreeMap::new();
-    for name in names {
-        let Some(value) = env::var_os(&name) else {
+    for (name, value) in entries {
+        let name = name.into_string().map_err(|name| {
+            DeliveryHelperError::invalid(format!(
+                "delivery helper environment variable name {name:?} is not valid UTF-8"
+            ))
+        })?;
+        if delivery_helper_environment_name_is_transient(&name) {
             continue;
-        };
+        }
+        validate_delivery_helper_environment_name(&name)?;
         let value = value.into_string().map_err(|_| {
             DeliveryHelperError::invalid(format!(
                 "delivery helper environment variable {name} is not valid UTF-8"
@@ -774,12 +818,6 @@ fn capture_delivery_helper_environment() -> Result<BTreeMap<String, String>, Del
 fn validate_delivery_helper_environment(
     environment: &BTreeMap<String, String>,
 ) -> Result<(), DeliveryHelperError> {
-    if environment.len() > MAX_DELIVERY_HELPER_ENVIRONMENT_VARIABLES {
-        return Err(DeliveryHelperError::invalid(format!(
-            "registered delivery helper environment exceeds {MAX_DELIVERY_HELPER_ENVIRONMENT_VARIABLES} variables"
-        )));
-    }
-    let mut bytes = 0_usize;
     for (name, value) in environment {
         validate_delivery_helper_environment_name(name)?;
         if value.as_bytes().contains(&0) {
@@ -787,14 +825,15 @@ fn validate_delivery_helper_environment(
                 "registered delivery helper environment variable {name} contains NUL"
             )));
         }
-        bytes = bytes.saturating_add(name.len()).saturating_add(value.len());
-    }
-    if bytes > MAX_DELIVERY_HELPER_ENVIRONMENT_BYTES {
-        return Err(DeliveryHelperError::invalid(format!(
-            "registered delivery helper environment exceeds {MAX_DELIVERY_HELPER_ENVIRONMENT_BYTES} bytes"
-        )));
     }
     Ok(())
+}
+
+fn delivery_helper_environment_name_is_transient(name: &str) -> bool {
+    matches!(
+        name,
+        COMPLETION_REGISTRATION_AUTHORITY_ENV | DELIVERY_HELPER_ENV_ALLOWLIST_ENV
+    )
 }
 
 fn validate_delivery_helper_environment_name(name: &str) -> Result<(), DeliveryHelperError> {
@@ -807,12 +846,7 @@ fn validate_delivery_helper_environment_name(name: &str) -> Result<(), DeliveryH
             "delivery helper environment variable name {name:?} is invalid"
         )));
     }
-    if matches!(
-        name,
-        COMPLETION_REGISTRATION_AUTHORITY_ENV
-            | DELIVERY_HELPER_ENV_ALLOWLIST_ENV
-            | "AGENT_BASH_AGENT_RUNNER_BIN"
-    ) {
+    if delivery_helper_environment_name_is_transient(name) {
         return Err(DeliveryHelperError::invalid(format!(
             "delivery helper environment variable {name} is reserved"
         )));
@@ -1081,8 +1115,8 @@ pub(crate) fn resolve_handle_owner_binding(
 }
 
 pub(crate) fn prepare_registration() -> io::Result<DeliveryRegistrationCandidate> {
-    let helper = ConfiguredDeliveryHelper::from_environment().map_err(io::Error::other)?;
     let authority = take_registration_authority();
+    let helper = ConfiguredDeliveryHelper::from_environment().map_err(io::Error::other)?;
     Ok(DeliveryRegistrationCandidate { helper, authority })
 }
 
@@ -1702,6 +1736,130 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delivery_helper_preserves_the_complete_environment_without_a_population_cap() {
+        let mut entries = (0..300)
+            .map(|index| {
+                (
+                    OsString::from(format!("APPLICATION_CONTEXT_{index}")),
+                    OsString::from("x".repeat(512)),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.extend([
+            (
+                OsString::from("WU_D_WORK_DIR"),
+                OsString::from("/tmp/wake-work"),
+            ),
+            (
+                OsString::from("AGENT_BASH_AGENT_RUNNER_BIN"),
+                OsString::from("/opt/agents"),
+            ),
+            (
+                OsString::from(COMPLETION_REGISTRATION_AUTHORITY_ENV),
+                OsString::from("one-shot-secret"),
+            ),
+            (
+                OsString::from(DELIVERY_HELPER_ENV_ALLOWLIST_ENV),
+                OsString::from("WU_D_WORK_DIR"),
+            ),
+        ]);
+
+        let captured = collect_delivery_helper_environment(entries).unwrap();
+
+        assert_eq!(captured.len(), 302);
+        assert_eq!(captured["WU_D_WORK_DIR"], "/tmp/wake-work");
+        assert_eq!(captured["AGENT_BASH_AGENT_RUNNER_BIN"], "/opt/agents");
+        assert!(!captured.contains_key(COMPLETION_REGISTRATION_AUTHORITY_ENV));
+        assert!(!captured.contains_key(DELIVERY_HELPER_ENV_ALLOWLIST_ENV));
+        validate_delivery_helper_environment(&captured).unwrap();
+    }
+
+    #[test]
+    fn delivery_helper_reports_the_non_utf8_environment_variable_name() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let name = OsString::from_vec(b"BROKEN_\xff".to_vec());
+        let error =
+            collect_delivery_helper_environment([(name, OsString::from("value"))]).unwrap_err();
+
+        assert_eq!(error.code, DELIVERY_HELPER_INVALID);
+        assert!(
+            error.detail.contains("environment variable name")
+                && error.detail.contains("not valid UTF-8"),
+            "{}",
+            error.detail
+        );
+    }
+
+    #[test]
+    fn complete_environment_is_private_and_digest_bound_in_public_provenance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_private_env".to_string());
+        state::create_handle_state(&paths).expect("create state");
+        let environment = BTreeMap::from([
+            ("APPLICATION_CONTEXT".to_string(), "required".to_string()),
+            ("PRIVATE_VALUE".to_string(), "not-in-meta".to_string()),
+        ]);
+
+        let digest = persist_delivery_helper_environment(&paths, &environment).unwrap();
+        let helper = temp.path().join("helper");
+        fs::write(&helper, "helper").unwrap();
+        let metadata = fs::metadata(&helper).unwrap();
+        let provenance = provenance_from_metadata(
+            paths.delivery_helper.to_string_lossy().into_owned(),
+            &metadata,
+            "helper-digest".to_string(),
+            Some(digest),
+            None,
+        );
+
+        let public_json = serde_json::to_string(&provenance).unwrap();
+        assert!(!public_json.contains("APPLICATION_CONTEXT"));
+        assert!(!public_json.contains("not-in-meta"));
+        assert_eq!(
+            load_delivery_helper_environment(&provenance, &paths).unwrap(),
+            environment
+        );
+        assert_eq!(
+            fs::metadata(&paths.delivery_helper_environment)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        fs::write(&paths.delivery_helper_environment, b"{}\n").unwrap();
+        let error = load_delivery_helper_environment(&provenance, &paths).unwrap_err();
+        assert_eq!(error.code, DELIVERY_HELPER_CHANGED);
+        assert!(error.detail.contains("digest changed"), "{}", error.detail);
+    }
+
+    #[test]
+    fn schema_four_inline_environment_remains_recoverable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_legacy_env".to_string());
+        let helper = temp.path().join("helper");
+        fs::write(&helper, "helper").unwrap();
+        let metadata = fs::metadata(&helper).unwrap();
+        let mut provenance = provenance_from_metadata(
+            helper.to_string_lossy().into_owned(),
+            &metadata,
+            "helper-digest".to_string(),
+            None,
+            None,
+        );
+        provenance.schema_version = LEGACY_INLINE_ENVIRONMENT_SCHEMA_VERSION;
+        provenance.environment =
+            BTreeMap::from([("LEGACY_CONTEXT".to_string(), "preserved".to_string())]);
+
+        assert_eq!(
+            load_delivery_helper_environment(&provenance, &paths).unwrap(),
+            provenance.environment
+        );
+    }
+
+    #[test]
     fn changed_registered_helper_is_rejected_before_execution() {
         let temp = tempfile::tempdir().expect("tempdir");
         let helper_path = temp.path().join("helper");
@@ -1727,13 +1885,14 @@ mod tests {
         let snapshot_metadata = fs::metadata(&snapshot).expect("snapshot metadata");
         let (_, sha256) = sealed_execution_image(&File::open(&snapshot).expect("open snapshot"))
             .expect("snapshot digest");
-        let provenance = provenance_from_metadata(
+        let mut provenance = provenance_from_metadata(
             snapshot.to_string_lossy().into_owned(),
             &snapshot_metadata,
             sha256,
-            BTreeMap::new(),
+            None,
             None,
         );
+        provenance.schema_version = LEGACY_INLINE_ENVIRONMENT_SCHEMA_VERSION;
         let mut permissions = fs::metadata(&paths.delivery_helper)
             .expect("snapshot metadata")
             .permissions();
