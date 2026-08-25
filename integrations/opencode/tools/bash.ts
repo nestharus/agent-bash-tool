@@ -27,8 +27,10 @@ type RunDispatch = {
 
 type StatusReadPolicy = {
   detail: "header" | "full"
-  progression: "observe-only" | "progress"
+  progression: "observe-only" | "request-progress"
 }
+
+type ConsumptionAttempt = "consumed" | "ineligible"
 
 type ShellCommandWithoutAdapterControls = {
   prefix: string
@@ -271,7 +273,7 @@ async function statusText(
   return status
 }
 
-async function observeOwnedHandle(
+async function observeVisibleHandle(
   handle: string,
   runningDetail: "omit" | "full",
   ownerSessionId?: string,
@@ -284,8 +286,8 @@ async function observeOwnedHandle(
     abort,
   )
   if (isTerminalStatus(header)) {
-    await consumeTerminalStatus(handle, ownerSessionId, abort)
-    return statusText(handle, { detail: "full", progression: "progress" }, ownerSessionId, abort)
+    await attemptTerminalConsumption(handle, ownerSessionId, abort)
+    return statusText(handle, { detail: "full", progression: "request-progress" }, ownerSessionId, abort)
   }
   if (runningDetail === "omit") return undefined
 
@@ -296,13 +298,19 @@ async function observeOwnedHandle(
     abort,
   )
   if (!isTerminalStatus(status)) return status
-  await consumeTerminalStatus(handle, ownerSessionId, abort)
-  return statusText(handle, { detail: "full", progression: "progress" }, ownerSessionId, abort)
+  await attemptTerminalConsumption(handle, ownerSessionId, abort)
+  return statusText(handle, { detail: "full", progression: "request-progress" }, ownerSessionId, abort)
 }
 
-async function consumeTerminalStatus(handle: string, ownerSessionId?: string, abort?: AbortSignal): Promise<void> {
+async function attemptTerminalConsumption(
+  handle: string,
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+): Promise<ConsumptionAttempt> {
   const consume = await runProcess([AGENT_BASH, "consume", handle], ownerSessionId, abort, "agent-bash consume")
-  if (consume.exitCode !== 0 && consume.exitCode !== 77) throw processFailure("agent-bash consume", consume)
+  if (consume.exitCode === 0) return "consumed"
+  if (consume.exitCode === 77) return "ineligible"
+  throw processFailure("agent-bash consume", consume)
 }
 
 async function modeText(handle: string, ownerSessionId: string, abort?: AbortSignal): Promise<DeliveryMode> {
@@ -628,7 +636,7 @@ async function waitForSyncResult(
   while (true) {
     if (abort.aborted) return cancelResult(handle, ownerSessionId)
     try {
-      const status = await observeOwnedHandle(handle, "omit", ownerSessionId, abort)
+      const status = await observeVisibleHandle(handle, "omit", ownerSessionId, abort)
       if (status !== undefined) return status
       if ((await modeText(handle, ownerSessionId, abort)) === "async") return asyncDispatchResponse(handle)
     } catch (error) {
@@ -662,7 +670,7 @@ export default tool({
   },
   async execute(args, context) {
     if (args.handle) {
-      return observeOwnedHandle(args.handle, "full", context.sessionID, context.abort)
+      return observeVisibleHandle(args.handle, "full", context.sessionID, context.abort)
     }
     if (!commandProvided(args.command)) return missingCommandResponse()
     if (args.delivery !== undefined && !validDeliveryMode(args.delivery)) {
