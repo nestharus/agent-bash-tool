@@ -690,6 +690,9 @@ fn routed_owner_resolving_fake_agents(temp: &tempfile::TempDir) -> (PathBuf, Pat
         &fake,
         r#"#!/bin/sh
 if [ "${1:-}" = session ] && [ "${2:-}" = of-pid ]; then
+    if [ -n "${AGENT_BASH_FAKE_RESOLVER_LOG:-}" ]; then
+        printf 'session-of-pid\n' >> "$AGENT_BASH_FAKE_RESOLVER_LOG"
+    fi
     session=$(cat "$AGENT_BASH_FAKE_ROUTE")
     printf '{"found":true,"invocation_uuid":"11111111-1111-4111-8111-111111111111","session_id":"%s"}\n' "$session"
 fi
@@ -2895,6 +2898,8 @@ fn recorded_owner_session_requires_helper_attestation() {
     fs::write(&route, "ses_other\n").expect("route unrelated session");
 
     let forged_list = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env("AGENT_BASH_FAKE_ROUTE", &route)
         .env("AGENT_BASH_OWNER_SESSION_ID", "ses_owner")
         .args(["list", "--json"])
         .output()
@@ -2940,6 +2945,8 @@ fn recorded_owner_session_requires_helper_attestation() {
 
     fs::write(&route, "ses_owner\n").expect("route owning session");
     let owner_list = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env("AGENT_BASH_FAKE_ROUTE", &route)
         .env("AGENT_BASH_OWNER_SESSION_ID", "ses_other")
         .args(["list", "--json"])
         .output()
@@ -2979,6 +2986,8 @@ fn list_routes_handle_to_resumed_session_after_caller_pid_changes() {
 
     fs::write(&route, "ses_resumed\n").expect("route resumed session");
     let matching = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env("AGENT_BASH_FAKE_ROUTE", &route)
         .args(["list", "--json"])
         .output()
         .expect("matching list");
@@ -2989,6 +2998,8 @@ fn list_routes_handle_to_resumed_session_after_caller_pid_changes() {
 
     fs::write(&route, "ses_other\n").expect("route unrelated session");
     let other = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env("AGENT_BASH_FAKE_ROUTE", &route)
         .args(["list", "--json"])
         .output()
         .expect("other list");
@@ -3678,22 +3689,51 @@ fn rca_agent_bash_visibility_rejects_reused_pid_identity() {
 }
 
 #[test]
-fn rca_agent_bash_visibility_many_synthetic_entries_is_bounded() {
-    // Verifies that listing thousands of isolated state entries completes within a practical bound.
-    const ENTRY_COUNT: usize = 4096;
-    const LIST_BOUND: Duration = Duration::from_secs(5);
+fn rca_agent_bash_visibility_broad_session_inventory_resolves_owner_once() {
+    // Mirrors the production inventory size that exposed one helper process per state entry.
+    const ENTRY_COUNT: usize = 19_106;
+    const LIST_BOUND: Duration = Duration::from_secs(10);
     let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("agent-bash");
+    fs::create_dir(&root).expect("state root");
+    let now = unix_ms();
+    let mut meta = done_state_meta("ab_rca_scale_template", now);
+    meta["caller_chain"] = json!([]);
+    meta["owner_session_id"] = json!("ses_rca_scale");
+    meta["owner_invocation_uuid"] = json!("11111111-1111-4111-8111-111111111111");
     for index in 0..ENTRY_COUNT {
         let handle = format!("ab_rca_scale_{index:05}");
-        let meta = active_state_meta(&handle, 999_999, json!([]));
-        seed_active_state_dir(&temp, &handle, &meta);
+        let state_dir = root.join(&handle);
+        fs::create_dir(&state_dir).expect("state dir");
+        meta["handle"] = json!(handle);
+        fs::write(state_dir.join("meta.json"), format_seeded_meta(&meta)).expect("write meta");
+        fs::write(state_dir.join("delivery-mode"), b"async").expect("write delivery mode");
     }
+    let (helper, route) = routed_owner_resolving_fake_agents(&temp);
+    let resolver_log = temp.path().join("list-owner-resolver.log");
+    fs::write(&route, "ses_rca_scale\n").expect("route listing session");
 
     let start = Instant::now();
-    let listed = list_json(&temp, true);
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
+        .env("AGENT_BASH_FAKE_ROUTE", &route)
+        .env("AGENT_BASH_FAKE_RESOLVER_LOG", &resolver_log)
+        .args(["list", "--json"])
+        .output()
+        .expect("list command");
     let elapsed = start.elapsed();
+    assert_command_success(&output);
+    let listed: Vec<Value> = serde_json::from_slice(&output.stdout).expect("list JSON");
 
     assert_eq!(listed.len(), ENTRY_COUNT);
+    assert_eq!(
+        fs::read_to_string(&resolver_log)
+            .expect("resolver log")
+            .lines()
+            .count(),
+        1,
+        "broad list must attest its acting session only once"
+    );
     assert!(
         elapsed < LIST_BOUND,
         "listing {ENTRY_COUNT} synthetic entries took {elapsed:?}, bound is {LIST_BOUND:?}"

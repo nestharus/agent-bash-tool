@@ -390,6 +390,13 @@ fn load_state_root() -> Result<PathBuf, state::StateError> {
     state::state_root()
 }
 
+fn load_binary_config_and_state_root()
+-> Result<(Option<config::BinaryConfig>, PathBuf), state::StateError> {
+    let config = config::load().map_err(state::StateError::Configuration)?;
+    let root = state::state_root_with_config(config.as_ref())?;
+    Ok((config, root))
+}
+
 fn state_root_unavailable(err: state::StateError) -> AppError {
     AppError::new(
         EX_CANTCREAT,
@@ -902,8 +909,21 @@ fn read_open_status_log(mut file: std::fs::File) -> io::Result<Vec<u8>> {
 }
 
 fn list_command(caller: ControlRouteCaller, all: bool, json: bool) -> Result<(), AppError> {
-    let root = load_state_root().map_err(state_root_unavailable)?;
-    let mut summaries = list_summaries(&root, &caller.caller_chain, all)?;
+    let (config, root) = load_binary_config_and_state_root().map_err(state_root_unavailable)?;
+    let acting_session_id = if all {
+        None
+    } else {
+        delivery::resolve_list_owner_binding(config, &caller.caller_chain)
+            .ok()
+            .flatten()
+            .map(|(session_id, _)| session_id)
+    };
+    let mut summaries = list_summaries(
+        &root,
+        &caller.caller_chain,
+        acting_session_id.as_deref(),
+        all,
+    )?;
     sort_summaries(&mut summaries);
     emit_list_summaries(&summaries, json)?;
     Ok(())
@@ -912,6 +932,7 @@ fn list_command(caller: ControlRouteCaller, all: bool, json: bool) -> Result<(),
 fn list_summaries(
     root: &Path,
     caller_chain: &[state::CallerChainEntry],
+    acting_session_id: Option<&str>,
     all: bool,
 ) -> Result<Vec<ListSummary>, AppError> {
     if !root.exists() {
@@ -921,7 +942,9 @@ fn list_summaries(
     let mut summaries = Vec::new();
     for entry in entries {
         let entry = read_state_entry(entry)?;
-        if let Some(summary) = list_summary_for_entry(root, entry, caller_chain, all) {
+        if let Some(summary) =
+            list_summary_for_entry(root, entry, caller_chain, acting_session_id, all)
+        {
             summaries.push(summary);
         }
     }
@@ -957,6 +980,7 @@ fn list_summary_for_entry(
     root: &Path,
     entry: std::fs::DirEntry,
     caller_chain: &[state::CallerChainEntry],
+    acting_session_id: Option<&str>,
     all: bool,
 ) -> Option<ListSummary> {
     if !entry_is_state_dir(&entry) {
@@ -967,12 +991,33 @@ fn list_summary_for_entry(
     if all {
         return Some(list_summary_from_meta(&meta, &paths));
     }
-    let owned = handle_matches_control_route(&meta, &paths, caller_chain);
+    let owned = handle_is_visible_to_caller(&meta, &paths, caller_chain, acting_session_id);
     if !owned {
         return None;
     }
     let meta = reconcile_list_meta(&paths, meta)?;
     Some(list_summary_from_meta(&meta, &paths))
+}
+
+fn handle_is_visible_to_caller(
+    meta: &Meta,
+    paths: &StatePaths,
+    caller_chain: &[state::CallerChainEntry],
+    acting_session_id: Option<&str>,
+) -> bool {
+    if let Some(recorded_session_id) = meta.owner_session_id.as_deref() {
+        return acting_session_id == Some(recorded_session_id);
+    }
+    match state::read_owner(paths) {
+        Ok(owner) => {
+            if let Some(recorded_session_id) = owner.owner_session_id {
+                return acting_session_id == Some(recorded_session_id.as_str());
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return false,
+    }
+    caller_chain_matches_handle(meta, caller_chain)
 }
 
 fn reconcile_list_meta(paths: &StatePaths, meta: Meta) -> Option<Meta> {

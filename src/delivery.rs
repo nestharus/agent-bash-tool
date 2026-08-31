@@ -28,6 +28,7 @@ const CONSUMER_GRACE_MS_ENV: &str = "AGENT_BASH_CONSUMER_GRACE_MS";
 const MAX_CONSUMER_GRACE_MS: u64 = 10_000;
 const CONSUMER_GRACE_POLL_MS: u64 = 25;
 const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
+const LIST_OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const OWNER_LOOKUP_POLL: Duration = Duration::from_millis(100);
 const PENDING_OWNER_BINDING_TIMEOUT: Duration = Duration::from_secs(5);
 const DELIVERY_HELPER_SCHEMA_VERSION: u8 = 5;
@@ -1189,6 +1190,24 @@ pub(crate) fn resolve_handle_owner_binding(
     let helper =
         HandleBoundDeliveryHelper::from_provenance(provenance, paths).map_err(io::Error::other)?;
     resolve_owner_binding(caller_chain, None, || helper.operation_command())
+}
+
+pub(crate) fn resolve_list_owner_binding(
+    config: Option<crate::config::BinaryConfig>,
+    caller_chain: &[CallerChainEntry],
+) -> io::Result<Option<(String, String)>> {
+    let helper = ConfiguredDeliveryHelper::from_configuration(config).map_err(io::Error::other)?;
+    let deadline = Instant::now() + LIST_OWNER_LOOKUP_TIMEOUT;
+    for entry in caller_chain
+        .iter()
+        .filter(|entry| state::process_identity_is_live(entry))
+    {
+        match resolve_owner_for_pid(helper.owner_lookup_command(), entry.pid, None, deadline)? {
+            OwnerLookup::Resolved(owner) => return Ok(Some(owner)),
+            OwnerLookup::Pending | OwnerLookup::NotFound => {}
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn prepare_registration(
