@@ -360,12 +360,21 @@ type ListControl = {
   json: boolean
 }
 
-function classifyListControl(command: string): ListControl | undefined {
+type AgentBashControl =
+  | { kind: "list"; options: ListControl }
+  | { kind: "cancel"; handle: string }
+
+function classifyAgentBashControl(command: string): AgentBashControl | undefined {
   const trimmed = command.trim()
   if (!trimmed) return undefined
   const tokens = trimmed.split(/\s+/)
+  if (tokens[0] !== AGENT_BASH && tokens[0] !== "agent-bash") return undefined
+
+  if (tokens[1] === "cancel" && tokens.length === 3 && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(tokens[2])) {
+    return { kind: "cancel", handle: tokens[2] }
+  }
   if (tokens.length < 2 || tokens.length > 4) return undefined
-  if ((tokens[0] !== AGENT_BASH && tokens[0] !== "agent-bash") || tokens[1] !== "list") return undefined
+  if (tokens[1] !== "list") return undefined
 
   let all = false
   let json = false
@@ -378,13 +387,21 @@ function classifyListControl(command: string): ListControl | undefined {
       return undefined
     }
   }
-  return { all, json }
+  return { kind: "list", options: { all, json } }
 }
 
-async function executeListControl(control: ListControl, ownerSessionId: string, abort?: AbortSignal): Promise<string> {
+async function executeAgentBashControl(
+  control: AgentBashControl,
+  ownerSessionId: string,
+  abort?: AbortSignal,
+): Promise<string> {
+  if (control.kind === "cancel") {
+    return checkedProcessText([AGENT_BASH, "cancel", control.handle], "agent-bash cancel", ownerSessionId)
+  }
+
   const argv = [AGENT_BASH, "list"]
-  if (control.all) argv.push("--all")
-  if (control.json) argv.push("--json")
+  if (control.options.all) argv.push("--all")
+  if (control.options.json) argv.push("--json")
 
   const result = await runProcess(argv, ownerSessionId, abort, "agent-bash list")
   if (result.exitCode !== 0) throw processFailure("agent-bash list", result)
@@ -676,9 +693,13 @@ export default tool({
     if (args.delivery !== undefined && !validDeliveryMode(args.delivery)) {
       return invalidDeliveryResponse(args.delivery)
     }
-    const listControl = classifyListControl(args.command)
-    if (listControl) {
-      return executeListControl(listControl, context.sessionID, context.abort)
+    const agentBashControl = classifyAgentBashControl(args.command)
+    if (agentBashControl) {
+      if (agentBashControl.kind === "cancel") {
+        const binding = ensureLiveSessionBinding(context.sessionID)
+        if (binding) await binding
+      }
+      return executeAgentBashControl(agentBashControl, context.sessionID, context.abort)
     }
 
     if (context.abort.aborted) return "Cancellation requested before dispatch."

@@ -1,6 +1,7 @@
 //! `agent-bash` - general-purpose detached bash spooler for AI agents.
 
 mod cgroup;
+mod config;
 mod delivery;
 mod guard;
 mod state;
@@ -218,7 +219,13 @@ fn run_command(
     validate_ready_sentinel(ready_sentinel.as_deref())?;
     supervisor::validate_argv(&argv).map_err(workload_argv_error)?;
 
-    let state_root = load_state_root().map_err(state_root_unavailable)?;
+    let binary_config = config::load()
+        .map_err(state::StateError::Configuration)
+        .and_then(|config| {
+            state::state_root_with_config(config.as_ref()).map(|state_root| (config, state_root))
+        })
+        .map_err(state_root_unavailable)?;
+    let (binary_config, state_root) = binary_config;
     reap_state_dirs_at_startup(&state_root);
     let handle = state::generate_handle().map_err(supervisor_bootstrap_error)?;
     let paths = state_paths(state_root, handle.clone());
@@ -227,8 +234,8 @@ fn run_command(
     let cancel_owner = resolve_cancel_owner(&caller_chain, cancel_on_owner_exit, owner_pid)?;
     let cwd = current_directory().map_err(current_directory_error)?;
     let mode = run_mode(&ready_sentinel);
-    let registration_candidate =
-        delivery::prepare_registration().map_err(completion_event_registration_error)?;
+    let registration_candidate = delivery::prepare_registration(binary_config)
+        .map_err(completion_event_registration_error)?;
     let owner = owner_context(&caller_chain, &registration_candidate)?;
     create_run_state(&paths)?;
     let registration = match registration_candidate.bind_to_handle(&paths) {

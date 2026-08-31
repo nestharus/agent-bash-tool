@@ -482,6 +482,8 @@ impl ListSummary {
 pub(crate) enum StateError {
     #[error("HOME is not set and XDG_STATE_HOME is not set")]
     MissingHome,
+    #[error("agent-bash configuration failed: {0}")]
+    Configuration(String),
     #[error("getrandom failed: {0}")]
     GetRandom(io::Error),
 }
@@ -500,6 +502,16 @@ pub(crate) fn unix_ms() -> u64 {
 }
 
 pub(crate) fn state_root() -> Result<PathBuf, StateError> {
+    let config = crate::config::load().map_err(StateError::Configuration)?;
+    state_root_with_config(config.as_ref())
+}
+
+pub(crate) fn state_root_with_config(
+    config: Option<&crate::config::BinaryConfig>,
+) -> Result<PathBuf, StateError> {
+    if let Some(config) = config {
+        return Ok(config.state_root.clone());
+    }
     state_root_from_env_values(env::var_os("XDG_STATE_HOME"), env::var_os("HOME"))
 }
 

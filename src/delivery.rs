@@ -28,7 +28,8 @@ const CONSUMER_GRACE_MS_ENV: &str = "AGENT_BASH_CONSUMER_GRACE_MS";
 const MAX_CONSUMER_GRACE_MS: u64 = 10_000;
 const CONSUMER_GRACE_POLL_MS: u64 = 25;
 const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
-const OWNER_LOOKUP_POLL: Duration = Duration::from_millis(10);
+const OWNER_LOOKUP_POLL: Duration = Duration::from_millis(100);
+const PENDING_OWNER_BINDING_TIMEOUT: Duration = Duration::from_secs(5);
 const DELIVERY_HELPER_SCHEMA_VERSION: u8 = 5;
 const LEGACY_INLINE_ENVIRONMENT_SCHEMA_VERSION: u8 = 4;
 const DELIVERY_HELPER_ENV_ALLOWLIST_ENV: &str = "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST";
@@ -148,7 +149,19 @@ impl fmt::Display for DeliveryHelperError {
 impl std::error::Error for DeliveryHelperError {}
 
 impl ConfiguredDeliveryHelper {
-    fn from_environment() -> Result<Self, DeliveryHelperError> {
+    fn from_configuration(
+        config: Option<crate::config::BinaryConfig>,
+    ) -> Result<Self, DeliveryHelperError> {
+        if let Some(config) = config {
+            let mut helper = Self::from_configured_path(&config.agent_runner_bin)?;
+            if let Some(runtime) =
+                crate::config::load_agent_runner_runtime_config(Path::new(&helper.provenance.path))
+                    .map_err(DeliveryHelperError::invalid)?
+            {
+                helper.bind_runner_runtime_config(runtime)?;
+            }
+            return Ok(helper);
+        }
         let configured =
             env::var_os("AGENT_BASH_AGENT_RUNNER_BIN").unwrap_or_else(|| OsString::from("agents"));
         if configured.is_empty() {
@@ -160,6 +173,31 @@ impl ConfiguredDeliveryHelper {
             return Self::from_configured_path(Path::new(&configured));
         }
         Self::from_search_path(&configured)
+    }
+
+    fn bind_runner_runtime_config(
+        &mut self,
+        runtime: crate::config::AgentRunnerRuntimeConfig,
+    ) -> Result<(), DeliveryHelperError> {
+        let data_dir = runtime
+            .data_dir
+            .into_os_string()
+            .into_string()
+            .map_err(|_| {
+                DeliveryHelperError::invalid("agent runner data_dir is not valid UTF-8")
+            })?;
+        let config_home = runtime
+            .config_home
+            .into_os_string()
+            .into_string()
+            .map_err(|_| {
+                DeliveryHelperError::invalid("agent runner config_home is not valid UTF-8")
+            })?;
+        self.environment
+            .insert("OULIPOLY_DATA_DIR".to_string(), data_dir);
+        self.environment
+            .insert("OULIPOLY_CONFIG_HOME".to_string(), config_home);
+        Ok(())
     }
 
     fn from_configured_path(path: &Path) -> Result<Self, DeliveryHelperError> {
@@ -837,10 +875,7 @@ fn delivery_helper_environment_name_is_transient(name: &str) -> bool {
 }
 
 fn validate_delivery_helper_environment_name(name: &str) -> Result<(), DeliveryHelperError> {
-    let valid = !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric());
+    let valid = !name.is_empty() && !name.bytes().any(|byte| byte == 0 || byte == b'=');
     if !valid {
         return Err(DeliveryHelperError::invalid(format!(
             "delivery helper environment variable name {name:?} is invalid"
@@ -1017,6 +1052,12 @@ struct PidSessionResponse {
     session_id: Option<String>,
 }
 
+enum OwnerLookup {
+    Resolved((String, String)),
+    Pending,
+    NotFound,
+}
+
 fn resolve_owner_binding(
     caller_chain: &[CallerChainEntry],
     expected_invocation_uuid: Option<&str>,
@@ -1026,10 +1067,46 @@ fn resolve_owner_binding(
         .iter()
         .filter(|entry| state::process_identity_is_live(entry))
     {
-        if let Some(owner) =
-            resolve_owner_for_pid(owner_lookup_command(), entry.pid, expected_invocation_uuid)?
-        {
-            return Ok(Some(owner));
+        match resolve_owner_for_pid(
+            owner_lookup_command(),
+            entry.pid,
+            expected_invocation_uuid,
+            Instant::now() + OWNER_LOOKUP_TIMEOUT,
+        )? {
+            OwnerLookup::Resolved(owner) => return Ok(Some(owner)),
+            OwnerLookup::Pending => {
+                let Some(expected_invocation_uuid) = expected_invocation_uuid else {
+                    continue;
+                };
+                return wait_for_pending_owner_binding(
+                    entry,
+                    expected_invocation_uuid,
+                    &mut owner_lookup_command,
+                );
+            }
+            OwnerLookup::NotFound => {}
+        }
+    }
+    Ok(None)
+}
+
+fn wait_for_pending_owner_binding(
+    entry: &CallerChainEntry,
+    expected_invocation_uuid: &str,
+    owner_lookup_command: &mut impl FnMut() -> Command,
+) -> io::Result<Option<(String, String)>> {
+    let deadline = Instant::now() + PENDING_OWNER_BINDING_TIMEOUT;
+    while Instant::now() < deadline && state::process_identity_is_live(entry) {
+        thread::sleep(OWNER_LOOKUP_POLL);
+        match resolve_owner_for_pid(
+            owner_lookup_command(),
+            entry.pid,
+            Some(expected_invocation_uuid),
+            deadline,
+        )? {
+            OwnerLookup::Resolved(owner) => return Ok(Some(owner)),
+            OwnerLookup::Pending => {}
+            OwnerLookup::NotFound => return Ok(None),
         }
     }
     Ok(None)
@@ -1039,14 +1116,14 @@ fn resolve_owner_for_pid(
     mut command: Command,
     pid: libc::pid_t,
     expected_invocation_uuid: Option<&str>,
-) -> io::Result<Option<(String, String)>> {
+    deadline: Instant,
+) -> io::Result<OwnerLookup> {
     let mut child = command
         .args(["session", "of-pid", &pid.to_string(), "--json"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let deadline = Instant::now() + OWNER_LOOKUP_TIMEOUT;
     loop {
         if child.try_wait()?.is_some() {
             break;
@@ -1067,7 +1144,7 @@ fn resolve_owner_for_pid(
             && serde_json::from_slice::<PidSessionResponse>(&output.stdout)
                 .is_ok_and(|response| !response.found)
         {
-            return Ok(None);
+            return Ok(OwnerLookup::NotFound);
         }
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let fallback = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1093,15 +1170,15 @@ fn resolve_owner_for_pid(
         || expected_invocation_uuid
             .is_some_and(|expected| response.invocation_uuid.as_deref() != Some(expected))
     {
-        return Ok(None);
+        return Ok(OwnerLookup::NotFound);
     }
     let Some(session_id) = response.session_id.filter(|value| !value.is_empty()) else {
-        return Ok(None);
+        return Ok(OwnerLookup::Pending);
     };
     let Some(invocation_uuid) = response.invocation_uuid else {
-        return Ok(None);
+        return Ok(OwnerLookup::NotFound);
     };
-    Ok(Some((session_id, invocation_uuid)))
+    Ok(OwnerLookup::Resolved((session_id, invocation_uuid)))
 }
 
 pub(crate) fn resolve_handle_owner_binding(
@@ -1114,9 +1191,11 @@ pub(crate) fn resolve_handle_owner_binding(
     resolve_owner_binding(caller_chain, None, || helper.operation_command())
 }
 
-pub(crate) fn prepare_registration() -> io::Result<DeliveryRegistrationCandidate> {
+pub(crate) fn prepare_registration(
+    config: Option<crate::config::BinaryConfig>,
+) -> io::Result<DeliveryRegistrationCandidate> {
     let authority = take_registration_authority();
-    let helper = ConfiguredDeliveryHelper::from_environment().map_err(io::Error::other)?;
+    let helper = ConfiguredDeliveryHelper::from_configuration(config).map_err(io::Error::other)?;
     Ok(DeliveryRegistrationCandidate { helper, authority })
 }
 
@@ -1775,6 +1854,32 @@ mod tests {
     }
 
     #[test]
+    fn runner_adjacent_roots_override_ambient_values_in_the_sealed_environment() {
+        let mut helper = ConfiguredDeliveryHelper::from_resolved_path(Path::new("/bin/true"))
+            .expect("delivery helper");
+        helper
+            .environment
+            .insert("OULIPOLY_DATA_DIR".to_string(), "/ambient/data".to_string());
+        helper.environment.insert(
+            "OULIPOLY_CONFIG_HOME".to_string(),
+            "/ambient/config".to_string(),
+        );
+
+        helper
+            .bind_runner_runtime_config(crate::config::AgentRunnerRuntimeConfig {
+                data_dir: PathBuf::from("/configured/data"),
+                config_home: PathBuf::from("/configured/config"),
+            })
+            .unwrap();
+
+        assert_eq!(helper.environment["OULIPOLY_DATA_DIR"], "/configured/data");
+        assert_eq!(
+            helper.environment["OULIPOLY_CONFIG_HOME"],
+            "/configured/config"
+        );
+    }
+
+    #[test]
     fn delivery_helper_reports_the_non_utf8_environment_variable_name() {
         use std::os::unix::ffi::OsStringExt;
 
@@ -1789,6 +1894,17 @@ mod tests {
             "{}",
             error.detail
         );
+    }
+
+    #[test]
+    fn delivery_helper_preserves_valid_non_shell_environment_names() {
+        let captured = collect_delivery_helper_environment([(
+            OsString::from("CARGO_BIN_EXE_agent-bash"),
+            OsString::from("/tmp/agent-bash"),
+        )])
+        .unwrap();
+
+        assert_eq!(captured["CARGO_BIN_EXE_agent-bash"], "/tmp/agent-bash");
     }
 
     #[test]

@@ -246,15 +246,23 @@ pinned interpreter image explicitly with the pinned script image. Interpreter ch
 arguments are rejected because they would delegate execution to another unbound program.
 
 The source models that provenance transition explicitly. `ConfiguredDeliveryHelper` is resolved
-from the initiating environment and can perform only owner-session discovery or a consuming bind.
+from the single `agent-bash.toml` snapshot loaded for admission, or from the initiating environment
+when adjacent configuration is absent, and can perform only owner-session discovery or a consuming bind.
 Binding yields `HandleBoundDeliveryHelper`; registration and every later delivery-helper request
 accept only that handle-bound type. Reconstructing it from durable provenance revalidates the
 handle-local paths, metadata, helper and interpreter digests, environment, and sealed bytes before
 exposing its operation command.
 
+Owner resolution retries at most ten times per second for up to five seconds only when the helper
+has already matched the expected invocation on the exact caller PID but reports that its session
+binding is still pending. Each helper call shares that outer deadline. Missing or mismatched
+invocation identities continue to fail closed without that retry.
+
 Registration also pins the helper's execution environment. Helper commands clear the initiating
 process's ambient environment, run from `/`, and restore the complete UTF-8 environment captured
-from the initiating process. The spooler cannot predict which values an opaque helper needs, so this
+from the initiating process. When the helper has adjacent runner configuration, its `data_dir` and
+`config_home` replace the captured `OULIPOLY_DATA_DIR` and `OULIPOLY_CONFIG_HOME` values before the
+environment is sealed. The spooler cannot predict which other values an opaque helper needs, so this
 capture has no variable-population or byte-size allowlist. Before capture, it removes the caller-bound
 completion-registration authority and the retired allowlist control. The captured map is stored in a
 mode-0600 handle-private file, bound by a SHA-256 digest in public provenance, and revalidated before
