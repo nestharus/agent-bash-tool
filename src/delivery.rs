@@ -875,10 +875,7 @@ fn delivery_helper_environment_name_is_transient(name: &str) -> bool {
 }
 
 fn validate_delivery_helper_environment_name(name: &str) -> Result<(), DeliveryHelperError> {
-    let valid = !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric());
+    let valid = !name.is_empty() && !name.bytes().any(|byte| byte == 0 || byte == b'=');
     if !valid {
         return Err(DeliveryHelperError::invalid(format!(
             "delivery helper environment variable name {name:?} is invalid"
@@ -1897,6 +1894,17 @@ mod tests {
             "{}",
             error.detail
         );
+    }
+
+    #[test]
+    fn delivery_helper_preserves_valid_non_shell_environment_names() {
+        let captured = collect_delivery_helper_environment([(
+            OsString::from("CARGO_BIN_EXE_agent-bash"),
+            OsString::from("/tmp/agent-bash"),
+        )])
+        .unwrap();
+
+        assert_eq!(captured["CARGO_BIN_EXE_agent-bash"], "/tmp/agent-bash");
     }
 
     #[test]
