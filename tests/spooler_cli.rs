@@ -651,6 +651,21 @@ if [ "${1:-}" = session ] && [ "${2:-}" = of-pid ]; then
     if [ -n "${AGENT_BASH_FAKE_RESOLVER_DELAY:-}" ]; then
         sleep "$AGENT_BASH_FAKE_RESOLVER_DELAY"
     fi
+    if [ -n "${AGENT_BASH_FAKE_FIRST_PENDING_MARKER:-}" ]; then
+        pid="${3:-}"
+        if [ ! -e "$AGENT_BASH_FAKE_FIRST_PENDING_MARKER" ]; then
+            printf '%s\n' "$pid" > "$AGENT_BASH_FAKE_FIRST_PENDING_MARKER"
+            printf '{"found":true,"invocation_uuid":"11111111-1111-4111-8111-111111111111","session_id":null}\n'
+            exit 0
+        fi
+        if [ "$(cat "$AGENT_BASH_FAKE_FIRST_PENDING_MARKER")" != "$pid" ]; then
+            printf '{"found":false,"invocation_uuid":null,"session_id":null}\n'
+            exit 1
+        fi
+        if [ -n "${AGENT_BASH_FAKE_HANG_AFTER_PENDING:-}" ]; then
+            exec sleep "$AGENT_BASH_FAKE_HANG_AFTER_PENDING"
+        fi
+    fi
     if [ -n "${AGENT_BASH_FAKE_FIRST_MISS_MARKER:-}" ] && [ ! -e "$AGENT_BASH_FAKE_FIRST_MISS_MARKER" ]; then
         : > "$AGENT_BASH_FAKE_FIRST_MISS_MARKER"
         printf '{"found":false,"invocation_uuid":null,"session_id":null}\n'
@@ -829,6 +844,24 @@ if (mode === "joint") {
   process.exit(0)
 }
 
+if (mode === "joint-cancel") {
+  const launched = await mod.default.execute(
+    { command: "sleep 60", delivery: "async" },
+    context,
+  )
+  const launchedResult = typeof launched === "string" ? launched : String(launched)
+  const launchedHandle = launchedResult.match(/handle=([^\s)]+)/)?.[1]
+  if (!launchedHandle) throw new Error(`joint-cancel launch did not return a handle: ${launchedResult}`)
+
+  const cancelled = await mod.default.execute(
+    { command: `${process.env.AGENT_BASH_BIN} cancel ${launchedHandle}` },
+    context,
+  )
+  const cancelResult = typeof cancelled === "string" ? cancelled : String(cancelled)
+  console.log(JSON.stringify({ launchedResult, launchedHandle, cancelResult }))
+  process.exit(0)
+}
+
 if (mode === "parallel-live") {
   const results = await Promise.all([
     mod.default.execute({ command: "printf 'first live command\\n'" }, context),
@@ -890,10 +923,10 @@ const args = request
         ? { command: "agents --version", delivery: "sync" }
         : mode === "agent"
           ? { command: "agents --version" }
-          : mode === "control"
+        : mode === "control" || mode === "abort-control"
             ? { command: value }
             : { command: "printf 'adapter inline\\n'" }
-if (mode === "abort") setTimeout(() => controller.abort(), 100)
+if (mode === "abort" || mode === "abort-control") setTimeout(() => controller.abort(), 100)
 const result = await mod.default.execute(args, context)
 const text = typeof result === "string" ? result : String(result)
 const matched = text.match(/handle=([^\s)]+)/)
@@ -961,6 +994,8 @@ fn run_adapter_driver_with_live_binding(
     temp: &tempfile::TempDir,
     driver: &Path,
     mode: &str,
+    value: Option<&str>,
+    expected_state_dirs: usize,
 ) -> (Value, Value) {
     let socket_path = temp.path().join("live-session.sock");
     let state_root = temp.path().join("agent-bash");
@@ -973,13 +1008,21 @@ fn run_adapter_driver_with_live_binding(
             .expect("read live-session report");
         let report: Value =
             serde_json::from_str(line.trim_end()).expect("live-session report JSON");
-        assert!(
-            !state_root.exists()
-                || fs::read_dir(&state_root)
-                    .expect("read pre-binding state root")
-                    .next()
-                    .is_none(),
-            "agent-bash dispatched before live-session acknowledgement"
+        let observed_state_dirs = if state_root.exists() {
+            fs::read_dir(&state_root)
+                .expect("read pre-binding state root")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry.file_type().is_ok_and(|file_type| file_type.is_dir())
+                        && entry.file_name().to_string_lossy().starts_with("ab_")
+                })
+                .count()
+        } else {
+            0
+        };
+        assert_eq!(
+            observed_state_dirs, expected_state_dirs,
+            "agent-bash changed spool state before live-session acknowledgement"
         );
         writeln!(
             stream,
@@ -989,7 +1032,7 @@ fn run_adapter_driver_with_live_binding(
         .expect("write live-session response");
         report
     });
-    let mut command = adapter_driver_command(temp, driver, mode, None);
+    let mut command = adapter_driver_command(temp, driver, mode, value);
     let output = command
         .env("OULIPOLY_LIVE_SESSION_BIND_SOCKET", &socket_path)
         .env("OULIPOLY_LIVE_SESSION_BIND_TOKEN", "fixture-token")
@@ -2614,7 +2657,8 @@ fn opencode_adapter_binds_exact_live_session_once_before_parallel_dispatch() {
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
 
-    let (result, report) = run_adapter_driver_with_live_binding(&temp, &driver, "parallel-live");
+    let (result, report) =
+        run_adapter_driver_with_live_binding(&temp, &driver, "parallel-live", None, 0);
 
     assert_adapter_result_contains(&result, "first live command");
     assert_adapter_result_contains(&result, "second live command");
@@ -2633,7 +2677,8 @@ fn opencode_adapter_does_not_propagate_consumed_live_binding_to_workloads() {
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
 
-    let (result, report) = run_adapter_driver_with_live_binding(&temp, &driver, "binding-env");
+    let (result, report) =
+        run_adapter_driver_with_live_binding(&temp, &driver, "binding-env", None, 0);
 
     assert_adapter_result_contains(&result, "unset|unset");
     assert_eq!(report["provider_session_id"], "ses_adapter");
@@ -3258,6 +3303,79 @@ fn rca_agent_bash_visibility_persistent_adapter_lists_owned_active_workload() {
 }
 
 #[test]
+fn opencode_adapter_routes_exact_cancel_as_attached_owner_control() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+
+    let result = run_adapter_driver(&temp, &driver, "joint-cancel", None);
+    let handle = result["launchedHandle"]
+        .as_str()
+        .expect("joint-cancel launched handle");
+    let cancel: Value = serde_json::from_str(
+        result["cancelResult"]
+            .as_str()
+            .expect("joint-cancel result"),
+    )
+    .expect("cancel JSON");
+
+    assert_eq!(cancel["handle"], handle);
+    assert_eq!(cancel["requested"], true);
+    assert_eq!(
+        state_dir_count(&temp),
+        1,
+        "attached cancel must not create a nested spool workload"
+    );
+    let status = wait_for_terminal_status(&temp, handle);
+    assert!(status.contains("reason=cancel-request"), "{status}");
+}
+
+#[test]
+fn opencode_adapter_fresh_cancel_binds_session_and_settles_after_abort() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let driver = write_adapter_driver(&temp);
+    let helper = owner_resolving_fake_agents(&temp);
+    let launch = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", helper)
+        .env("AGENT_BASH_FAKE_RESOLVED_SESSION", "ses_adapter")
+        .env("AGENT_BASH_FAKE_RESOLVER_DELAY", "0.3")
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"source":"opencode","id":"11111111-1111-4111-8111-111111111111"}"#,
+        )
+        .args([
+            "run",
+            "--delivery",
+            "async",
+            "--",
+            "bash",
+            "-lc",
+            "sleep 60",
+        ])
+        .output()
+        .expect("launch cancellable workload");
+    let launch = parse_run_output(&launch);
+    let handle = launch["handle"].as_str().expect("launched handle");
+    let command = format!(
+        "{} cancel {handle}",
+        temp.path().join("adapter-agent-bash").display()
+    );
+
+    let (result, report) =
+        run_adapter_driver_with_live_binding(&temp, &driver, "abort-control", Some(&command), 1);
+    let cancel: Value =
+        serde_json::from_str(adapter_result_text(&result)).expect("cancel JSON result");
+
+    assert_eq!(report["provider_session_id"], "ses_adapter");
+    assert_eq!(cancel["handle"], handle);
+    assert_eq!(cancel["requested"], true);
+    assert_eq!(state_dir_count(&temp), 1);
+    let status = wait_for_terminal_status(&temp, handle);
+    assert!(status.contains("reason=cancel-request"), "{status}");
+}
+
+#[test]
 fn rca_agent_bash_visibility_non_list_only_commands_still_spool() {
     // Verifies that shell operators and incidental list text cannot enter the control path.
     assert_bun_available();
@@ -3658,6 +3776,70 @@ fn missing_explicit_owner_resolves_verified_parent_invocation() {
     assert_eq!(
         meta["owner_invocation_uuid"],
         "11111111-1111-4111-8111-111111111111"
+    );
+}
+
+#[test]
+fn owner_resolution_retries_a_matching_pending_session_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fake = owner_resolving_fake_agents(&temp);
+    let pending_marker = temp.path().join("pending-owner-binding");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+        .env("AGENT_BASH_FAKE_FIRST_PENDING_MARKER", &pending_marker)
+        .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"source":"opencode","id":"11111111-1111-4111-8111-111111111111"}"#,
+        )
+        .args(["run", "--", "true"])
+        .output()
+        .expect("run");
+    let json = parse_run_output(&output);
+    let meta = read_meta(&meta_path(&json));
+
+    assert!(pending_marker.exists());
+    assert_eq!(meta["owner_session_id"], "ses_resolved");
+    assert_eq!(
+        meta["owner_invocation_uuid"],
+        "11111111-1111-4111-8111-111111111111"
+    );
+}
+
+#[test]
+fn pending_owner_retry_bounds_a_hung_helper_to_the_shared_deadline() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fake = owner_resolving_fake_agents(&temp);
+    let pending_marker = temp.path().join("pending-owner-binding");
+    let started = Instant::now();
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+        .env("AGENT_BASH_FAKE_FIRST_PENDING_MARKER", &pending_marker)
+        .env("AGENT_BASH_FAKE_HANG_AFTER_PENDING", "60")
+        .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"source":"opencode","id":"11111111-1111-4111-8111-111111111111"}"#,
+        )
+        .args(["run", "--", "true"])
+        .output()
+        .expect("run");
+    let elapsed = started.elapsed();
+
+    assert!(
+        !output.status.success(),
+        "unexpected successful registration"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("timed out"),
+        "{}",
+        command_failure_message(&output)
+    );
+    assert!(
+        elapsed < Duration::from_secs(7),
+        "pending owner retry exceeded its shared deadline: {elapsed:?}"
     );
 }
 

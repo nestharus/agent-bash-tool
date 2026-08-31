@@ -91,6 +91,23 @@ status-triggered delivery retry.
 cargo build --release   # produces `agent-bash`
 ```
 
+## Installed configuration
+
+An installed binary can use an adjacent `agent-bash.toml` with absolute paths:
+
+```toml
+state_root = "/home/example/.local/state/agent-bash"
+agent_runner_bin = "/home/example/.config/oulipoly-agent-runner/runner/oulipoly-agent-runner"
+```
+
+The executable path is canonicalized before the file is located, so commands may enter through a
+symlink in `~/.local/bin` while configuration remains beside the real binary. If `agent-bash.toml` is
+absent, state-root selection falls back to `XDG_STATE_HOME`/`HOME` and helper selection falls back
+to `AGENT_BASH_AGENT_RUNNER_BIN`/`PATH`. A present but invalid file is an error and never falls back.
+When the configured runner has its own adjacent `config.toml`, its `data_dir` and `config_home` are
+bound into the sealed delivery-helper environment. This preserves the runner's authoritative roots
+when `agent-bash` executes its immutable snapshot from a Linux memfd.
+
 ## License
 
 MIT
