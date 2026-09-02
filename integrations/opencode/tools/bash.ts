@@ -208,9 +208,11 @@ async function runProcess(
   abort?: AbortSignal,
   operation = "subprocess",
   environment: Record<string, string> = {},
+  workdir?: string,
 ): Promise<ProcessResult> {
   const child = Bun.spawn(argv, {
     env: { ...runEnv(ownerSessionId), ...environment },
+    cwd: workdir,
     stdout: "pipe",
     stderr: "pipe",
   })
@@ -249,8 +251,9 @@ async function checkedProcessText(
   ownerSessionId?: string,
   abort?: AbortSignal,
   environment?: Record<string, string>,
+  workdir?: string,
 ): Promise<string> {
-  const result = await runProcess(argv, ownerSessionId, abort, operation, environment)
+  const result = await runProcess(argv, ownerSessionId, abort, operation, environment, workdir)
   if (result.exitCode !== 0) throw processFailure(operation, result)
   return result.stdout.trim()
 }
@@ -273,6 +276,18 @@ async function statusText(
   return status
 }
 
+function observeVisibleHandle(
+  handle: string,
+  runningDetail: "full",
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+): Promise<string>
+function observeVisibleHandle(
+  handle: string,
+  runningDetail: "omit",
+  ownerSessionId?: string,
+  abort?: AbortSignal,
+): Promise<string | undefined>
 async function observeVisibleHandle(
   handle: string,
   runningDetail: "omit" | "full",
@@ -606,12 +621,13 @@ function admitCommand(command: string, requestedDelivery: string | undefined): C
 async function dispatchCommand(
   admission: CommandAdmission,
   ownerSessionId: string,
+  workdir?: string,
 ): Promise<string> {
   if (admission.kind === "unsupported") {
     throw new Error("explicit agent-bash run requires structured arguments without shell expansion")
   }
   if (admission.kind === "direct") {
-    return checkedProcessText(admission.argv, "agent-bash dispatch", ownerSessionId)
+    return checkedProcessText(admission.argv, "agent-bash dispatch", ownerSessionId, undefined, undefined, workdir)
   }
   const command = pinAgentRunnerBinary(admission.command)
   const args = [AGENT_BASH, "run"]
@@ -629,7 +645,7 @@ async function dispatchCommand(
     )
   }
   args.push("--", "bash", "-lc", command)
-  return checkedProcessText(args, "agent-bash dispatch", ownerSessionId)
+  return checkedProcessText(args, "agent-bash dispatch", ownerSessionId, undefined, undefined, workdir)
 }
 
 async function cancelResult(handle: string, ownerSessionId: string): Promise<string> {
@@ -679,11 +695,13 @@ export default tool({
     "to override either default. Headless child-agent dispatches remain asynchronous so their caller can end its turn. " +
     "A synchronous call can be detached externally without terminating its workload. Exact " +
     "`agent-bash list [--all] [--json]` observations and bounded standalone sleeps run attached without creating a " +
-    `workload handle. Leading agent-runner commands are pinned to ${AGENTS}.`,
+    `workload handle. Leading agent-runner commands are pinned to ${AGENTS}. An optional workdir sets the supervised ` +
+    "process working directory.",
   args: {
     command: tool.schema.string().describe("the shell command to run").optional(),
     handle: tool.schema.string().describe("poll an existing asynchronous command by its handle").optional(),
     delivery: tool.schema.string().describe('completion delivery: "sync" or "async"').optional(),
+    workdir: tool.schema.string().describe("working directory for the supervised process").optional(),
   },
   async execute(args, context) {
     if (args.handle) {
@@ -710,7 +728,7 @@ export default tool({
     }
     const binding = ensureLiveSessionBinding(context.sessionID)
     if (binding) await binding
-    const runOut = await dispatchCommand(admission, context.sessionID)
+    const runOut = await dispatchCommand(admission, context.sessionID, args.workdir)
     const dispatch = parseRunDispatch(runOut)
     if (!dispatch) return dispatchErrorResponse(runOut)
     if (dispatch.dispatchState === "registration-outcome-unknown") {

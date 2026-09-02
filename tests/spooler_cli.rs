@@ -2743,6 +2743,31 @@ fn opencode_adapter_ordinary_command_completes_in_band_in_sync_mode() {
 }
 
 #[test]
+fn opencode_adapter_runs_supervised_command_in_requested_workdir() {
+    assert_bun_available();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workdir = temp.path().join("requested-workdir");
+    fs::create_dir(&workdir).expect("create requested workdir");
+    let driver = write_adapter_driver(&temp);
+    let request = json!({
+        "args": {
+            "command": "pwd",
+            "workdir": workdir,
+        }
+    })
+    .to_string();
+
+    let result = run_adapter_driver(&temp, &driver, "request", Some(&request));
+
+    assert_adapter_result_contains(
+        &result,
+        workdir
+            .to_str()
+            .expect("requested workdir must be valid UTF-8"),
+    );
+}
+
+#[test]
 fn opencode_adapter_initial_dispatch_uses_verified_parent_session() {
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
