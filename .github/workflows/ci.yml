@@ -7,7 +7,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # The test-only AppArmor allowance below targets Ubuntu 24.04 / ABI 4.0.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -19,4 +20,45 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          # Ubuntu 24.04 otherwise denies capabilities inside unprivileged user
+          # namespaces, including the uid_map write by --map-current-user.
+          # Allow only this executable on this disposable hosted VM; do not
+          # disable AppArmor/sysctls or grant host capabilities to test processes.
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$(id -u)" -ne 0
+          profile=$(mktemp "$RUNNER_TEMP/agent-bash-userns.XXXXXX")
+          cat > "$profile" <<'PROFILE'
+          abi <abi/4.0>,
+          profile agent-bash-ci-unshare /usr/bin/unshare flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          loaded=false
+          cleanup() {
+            status=$?
+            if "$loaded"; then
+              sudo apparmor_parser --remove --skip-cache "$profile" || status=1
+            fi
+            rm -f "$profile"
+            exit "$status"
+          }
+          trap cleanup EXIT
+          sudo apparmor_parser --add --skip-cache "$profile"
+          loaded=true
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          AGENT_BASH_CI_PARENT_NET=$(readlink /proc/self/ns/net)
+          export AGENT_BASH_CI_PARENT_NET
+          # shellcheck disable=SC2016 # Expand only in the namespace child.
+          unshare --user --map-current-user --net -- sh -ec '
+            test "$(id -u)" -ne 0
+            test "$(readlink /proc/self/ns/net)" != "$AGENT_BASH_CI_PARENT_NET"
+            grep -Eq "^CapEff:[[:space:]]+0+$" /proc/self/status
+            grep -Eq "^CapPrm:[[:space:]]+0+$" /proc/self/status
+            id
+            cat /proc/self/uid_map
+            grep -F agent-bash-ci-unshare /proc/self/attr/current
+            printf "parent=%s child=%s\n" "$AGENT_BASH_CI_PARENT_NET" "$(readlink /proc/self/ns/net)"
+          '
+          cargo test --workspace

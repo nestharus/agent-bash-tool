@@ -1372,7 +1372,11 @@ fn read_proc_stat_result(pid: libc::pid_t) -> io::Result<ProcStat> {
 }
 
 fn read_boot_id() -> String {
-    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+    read_boot_id_from(Path::new("/proc/sys/kernel/random/boot_id"))
+}
+
+fn read_boot_id_from(path: &Path) -> String {
+    fs::read_to_string(path)
         .map(|value| value.trim().to_string())
         .unwrap_or_default()
 }
@@ -1390,15 +1394,25 @@ pub(crate) fn process_parent_pid(pid: libc::pid_t) -> Option<libc::pid_t> {
 }
 
 pub(crate) fn process_identity_is_live(identity: &CallerChainEntry) -> bool {
-    let current_boot_id = read_boot_id();
     matches!(
-        inspect_process_identity(
-            Some(identity.pid),
-            Some(identity.starttime_ticks),
-            Some(identity.boot_id.as_str()),
-            &current_boot_id,
-        ),
+        process_identity_evidence(identity),
         ProcessIdentityEvidence::Live
+    )
+}
+
+pub(crate) fn process_identity_evidence(identity: &CallerChainEntry) -> ProcessIdentityEvidence {
+    process_identity_evidence_from_boot_path(identity, Path::new("/proc/sys/kernel/random/boot_id"))
+}
+
+fn process_identity_evidence_from_boot_path(
+    identity: &CallerChainEntry,
+    boot_path: &Path,
+) -> ProcessIdentityEvidence {
+    inspect_process_identity(
+        Some(identity.pid),
+        Some(identity.starttime_ticks),
+        Some(identity.boot_id.as_str()),
+        &read_boot_id_from(boot_path),
     )
 }
 
@@ -1437,7 +1451,7 @@ pub(crate) fn exact_supervisor_and_workload_are_gone(meta: &Meta) -> bool {
     )
 }
 
-enum ProcessIdentityEvidence {
+pub(crate) enum ProcessIdentityEvidence {
     Live,
     Gone,
     Mismatch,
@@ -1455,7 +1469,11 @@ fn inspect_process_identity(
     else {
         return ProcessIdentityEvidence::Unavailable;
     };
-    if pid <= 1 || expected_starttime_ticks == 0 || expected_boot_id.is_empty() {
+    if pid <= 1
+        || expected_starttime_ticks == 0
+        || expected_boot_id.is_empty()
+        || current_boot_id.is_empty()
+    {
         return ProcessIdentityEvidence::Unavailable;
     }
     if expected_boot_id != current_boot_id {
@@ -1497,6 +1515,44 @@ fn parse_proc_stat(contents: &str) -> Option<ProcStat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_identity_boot_read_producer_distinguishes_unavailable_and_mismatch() {
+        let temp = tempfile::tempdir().expect("private boot source");
+        let path = temp.path().join("boot-id");
+        let pid = std::process::id() as libc::pid_t;
+        let identity = CallerChainEntry {
+            pid,
+            starttime_ticks: process_starttime_ticks(pid).expect("own stat"),
+            boot_id: "fixture-boot".to_string(),
+        };
+        // Actual filesystem read error, not an injected evidence enum.
+        assert!(matches!(
+            process_identity_evidence_from_boot_path(&identity, &path),
+            ProcessIdentityEvidence::Unavailable
+        ));
+        for (contents, expected) in [
+            ("  \n", ProcessIdentityEvidence::Unavailable),
+            ("fixture-boot\n", ProcessIdentityEvidence::Live),
+            ("another-boot\n", ProcessIdentityEvidence::Mismatch),
+        ] {
+            fs::write(&path, contents).expect("write private boot source");
+            let actual = process_identity_evidence_from_boot_path(&identity, &path);
+            assert_eq!(
+                std::mem::discriminant(&actual),
+                std::mem::discriminant(&expected)
+            );
+        }
+        fs::write(&path, "fixture-boot").expect("matching boot");
+        let wrong_start = CallerChainEntry {
+            starttime_ticks: identity.starttime_ticks + 1,
+            ..identity
+        };
+        assert!(matches!(
+            process_identity_evidence_from_boot_path(&wrong_start, &path),
+            ProcessIdentityEvidence::Mismatch
+        ));
+    }
 
     #[test]
     fn completion_delivery_lifecycle_classifies_existing_metadata_protocol() {
@@ -2010,6 +2066,9 @@ mod tests {
 
     #[test]
     fn reaper_keeps_settled_state_while_delivery_lock_is_held() {
+        if crate::test_support::private_case() {
+            return;
+        }
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_delivery_owned", "DONE", now - 20_000, true);
@@ -2017,12 +2076,87 @@ mod tests {
         let delivery_lock = lock_delivery(&paths).expect("lock delivery");
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
-
-        assert_eq!(stats.reaped, 0);
+        assert_eq!(stats.reaped, 0, "parent-held: {stats:?}");
+        assert_eq!(stats.errors, 0, "parent-held: {stats:?}");
         assert!(paths.state_dir.exists());
+
+        // This exact test runs in a fresh process, not alongside fork-using unit
+        // tests. Model deliberate fork inheritance, not an assumed release on
+        // parent close. The child uses only async-signal-safe calls before _exit.
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let (mut parent, child) = UnixStream::pair().expect("acknowledgment socket");
+        parent
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let lock_fd = delivery_lock.as_raw_fd();
+        let parent_fd = parent.as_raw_fd();
+        let child_fd = child.as_raw_fd();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                libc::close(parent_fd);
+                libc::alarm(5);
+                let mut byte = 0u8;
+                if libc::write(child_fd, b"H".as_ptr().cast(), 1) != 1
+                    || libc::read(child_fd, (&mut byte as *mut u8).cast(), 1) != 1
+                    || byte != b'R'
+                    || libc::close(lock_fd) != 0
+                    || libc::write(child_fd, b"C".as_ptr().cast(), 1) != 1
+                {
+                    libc::_exit(1);
+                }
+                libc::_exit(0);
+            }
+        }
+        struct ForkOwner(libc::pid_t);
+        impl Drop for ForkOwner {
+            fn drop(&mut self) {
+                if self.0 > 0 {
+                    unsafe {
+                        libc::kill(self.0, libc::SIGKILL);
+                        libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+        }
+        let mut owner = ForkOwner(pid);
+        drop(child);
+        let mut ack = [0];
+        parent
+            .read_exact(&mut ack)
+            .expect("child holds inherited lock");
+        assert_eq!(ack, *b"H");
         drop(delivery_lock);
+        assert!(
+            try_lock_delivery(&paths).unwrap().is_none(),
+            "child still owns flock"
+        );
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
-        assert_eq!(stats.reaped, 1);
+        assert_eq!(stats.reaped, 0, "child-held after parent close: {stats:?}");
+        assert_eq!(stats.errors, 0, "child-held: {stats:?}");
+        assert!(paths.state_dir.exists());
+
+        parent
+            .write_all(b"R")
+            .expect("release exact inherited owner");
+        parent
+            .read_exact(&mut ack)
+            .expect("child closed inherited descriptor");
+        assert_eq!(ack, *b"C");
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        owner.0 = 0;
+        assert_eq!(status, 0, "child close acknowledgment exit");
+        assert!(
+            try_lock_delivery(&paths).unwrap().is_some(),
+            "all owners released flock"
+        );
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+        assert_eq!(stats.reaped, 1, "acknowledged release: {stats:?}");
+        assert_eq!(stats.errors, 0, "acknowledged release: {stats:?}");
         assert!(!paths.state_dir.exists());
     }
 

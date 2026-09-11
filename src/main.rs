@@ -7,6 +7,8 @@ mod guard;
 mod image;
 mod state;
 mod supervisor;
+#[cfg(test)]
+mod test_support;
 
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -326,11 +328,12 @@ fn resolve_cancel_owner(
 fn cancel_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
     require_control_eligibility(&paths, &handle, &caller)?;
-    let requested =
+    let outcome =
         supervisor::request_cancel(&paths).map_err(|err| cancel_request_error(&handle, err))?;
     serde_json::to_writer(
         io::stdout(),
-        &serde_json::json!({ "handle": handle, "requested": requested }),
+        &serde_json::json!({ "handle": handle, "requested": outcome.requested,
+            "wake": outcome.wake, "wake_error": outcome.wake_error }),
     )
     .map_err(json_write_error)?;
     io::stdout().write_all(b"\n").map_err(json_write_error)

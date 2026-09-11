@@ -1,3 +1,6 @@
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 use std::process::Command;
 
 #[test]
@@ -23,6 +26,9 @@ fn external_completion_and_activation_retain_uncertain_custody() {
 }
 
 fn run_private_fixture(seconds: &str, fixture: &str) {
+    if test_support::private_case() {
+        return;
+    }
     let output = Command::new("timeout")
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .args([
