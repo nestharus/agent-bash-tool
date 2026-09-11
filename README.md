@@ -75,6 +75,9 @@ architecture and ownership boundary.
 
 The spooler transfers each helper operation to a local delivery transfer worker before persisting its
 write-ahead claim and guarantees at most one admitted helper invocation per handle operation.
+Live supervisors acquire completion images and run the helper in that worker asynchronously, so
+image recovery and child reaping continue during delivery. Pending delivery retains the supervisor
+even for Root scope; ready-mode workload exit metadata is merged after the transfer lock releases.
 Conclusive process-launch failures remain pre-admission. Automatic completion progression permits
 one bounded status-triggered retry; activation instead restores sync mode and requires another
 explicit control-route-eligible `detach` request before retrying. Agent-runner is the authority for
@@ -111,3 +114,11 @@ when `agent-bash` executes its immutable snapshot from a Linux memfd.
 ## License
 
 MIT
+
+### Sealed delivery-helper image reuse
+
+Managed trees share verified sealed helper images through a tree-owned, image-only
+custodian. Independent roots may duplicate images; no host-wide memory bound is
+claimed. Uncertain external helper transfers and lost founding custody retain handle
+artifacts rather than treating logical settlement as physical cessation; no global
+retention bound is claimed. See [ownership, budgets, tree lifetime and recovery behavior](docs/helper-image-custody.md).

@@ -38,6 +38,9 @@ pub(crate) struct StatePaths {
     pub(crate) activation_outcome: PathBuf,
     pub(crate) delivery_lock: PathBuf,
     pub(crate) accepted_cancel: PathBuf,
+    pub(crate) cancellation_drained: PathBuf,
+    pub(crate) physical_custody: PathBuf,
+    pub(crate) external_transfer_custody: PathBuf,
     pub(crate) completion_lock: PathBuf,
     pub(crate) reconciliation_lock: PathBuf,
 }
@@ -61,6 +64,9 @@ impl StatePaths {
             activation_outcome: state_dir.join("activation-outcome"),
             delivery_lock: state_dir.join("delivery.lock"),
             accepted_cancel: state_dir.join("cancel-requested"),
+            cancellation_drained: state_dir.join("cancel-workload-drained"),
+            physical_custody: state_dir.join("physical-custody"),
+            external_transfer_custody: state_dir.join("external-transfer-custody"),
             completion_lock: state_dir.join("completion.lock"),
             reconciliation_lock: state_dir.join("reconciliation.lock"),
             state_dir,
@@ -648,6 +654,116 @@ pub(crate) fn record_explicit_cancel_acceptance(paths: &StatePaths) -> io::Resul
     record_durable_create_once_marker(&paths.accepted_cancel, &paths.state_dir)
 }
 
+// Published before any supervised child can exist. Only an adopting reaper's
+// empty-tree observation discharges this obligation; process death is not proof.
+pub(crate) fn begin_physical_custody(paths: &StatePaths) -> io::Result<()> {
+    atomic_write(&paths.physical_custody, current_boot_id().as_bytes())
+}
+
+pub(crate) fn end_physical_custody(paths: &StatePaths) -> io::Result<()> {
+    let _lock = match lock_delivery(paths) {
+        Ok(lock) => lock,
+        // Another empty-tree observer already discharged custody and cleanup
+        // removed the directory after the supervisor exited.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    rollback_created_marker(&paths.physical_custody, &File::open(&paths.state_dir)?)
+}
+
+// Caller holds the delivery lock across acquisition, helper execution and discharge.
+// Never replace or discharge an earlier uncertain external attempt's evidence.
+pub(crate) fn begin_external_transfer_custody(paths: &StatePaths) -> io::Result<bool> {
+    let boot = current_boot_id();
+    if durable_marker_exists(&paths.external_transfer_custody)?
+        && boot_custody_may_remain(&paths.external_transfer_custody, &boot)
+    {
+        return Ok(false);
+    }
+    // A valid prior boot ended the old attempt, but must not exempt a new one.
+    atomic_write(&paths.external_transfer_custody, boot.as_bytes())?;
+    Ok(true)
+}
+
+pub(crate) fn end_external_transfer_custody(paths: &StatePaths) -> io::Result<()> {
+    end_external_transfer_custody_with(paths, |path| fs::remove_file(path), File::sync_all)
+}
+
+// The injected operations also exercise the unlink-before-sync boundary in tests.
+pub(crate) fn end_external_transfer_custody_with(
+    paths: &StatePaths,
+    unlink: impl FnOnce(&Path) -> io::Result<()>,
+    sync: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
+    let directory = File::open(&paths.state_dir)
+        .map_err(|err| io::Error::other(format!("open custody directory before unlink: {err}")))?;
+    match unlink(&paths.external_transfer_custody) {
+        Ok(()) => sync(&directory).map_err(|err| {
+            io::Error::other(format!(
+                "custody marker unlinked; directory sync failed; crash durability uncertain: {err}"
+            ))
+        }),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(io::Error::other(format!(
+            "custody marker unlink failed: {err}"
+        ))),
+    }
+}
+
+// One bounded last-failure record, separate from admission/outcome and custody.
+// Caller holds the delivery lock. This diagnostic never acts as a retention veto.
+pub(crate) fn record_external_custody_cleanup_error(
+    paths: &StatePaths,
+    error: &io::Error,
+) -> io::Result<()> {
+    let detail: String = error.to_string().chars().take(512).collect();
+    // Diagnostic-only overwrite: interruption can leave a partial record, but
+    // repeated write failures must not accumulate uniquely named temp files.
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(paths.state_dir.join("external-transfer-cleanup-error"))?;
+    writeln!(
+        file,
+        "external custody cleanup failed; helper result unchanged: {detail}"
+    )?;
+    file.sync_all()?;
+    File::open(&paths.state_dir)?.sync_all()
+}
+
+pub(crate) fn record_cancellation_drained(paths: &StatePaths) -> io::Result<()> {
+    record_durable_create_once_marker(&paths.cancellation_drained, &paths.state_dir).map(|_| ())
+}
+
+fn physical_custody_may_remain(paths: &StatePaths, boot_id: &str) -> bool {
+    boot_custody_may_remain(&paths.physical_custody, boot_id)
+        || boot_custody_may_remain(&paths.external_transfer_custody, boot_id)
+}
+
+fn boot_custody_may_remain(marker: &Path, boot_id: &str) -> bool {
+    match fs::read_to_string(marker) {
+        // A reboot ends the entire former tree, unlike loss of either reaper.
+        Ok(recorded_boot) => {
+            !valid_boot_id(&recorded_boot) || !valid_boot_id(boot_id) || recorded_boot == boot_id
+        }
+        Err(err) => err.kind() != io::ErrorKind::NotFound,
+    }
+}
+
+fn valid_boot_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, byte)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 pub(crate) fn record_activation_attempt(paths: &StatePaths) -> io::Result<bool> {
     record_durable_create_once_marker(&paths.activation_attempted, &paths.state_dir)
 }
@@ -898,7 +1014,7 @@ fn reap_state_entry(
         root.to_path_buf(),
         entry.file_name().to_string_lossy().into_owned(),
     );
-    let _delivery_lock = match try_lock_delivery_for_reap(&paths) {
+    let _delivery_lock = match try_lock_delivery(&paths) {
         Ok(Some(lock)) => lock,
         Ok(None) => return,
         Err(_) => {
@@ -916,7 +1032,7 @@ fn reap_state_entry(
     }
 }
 
-fn try_lock_delivery_for_reap(paths: &StatePaths) -> io::Result<Option<File>> {
+pub(crate) fn try_lock_delivery(paths: &StatePaths) -> io::Result<Option<File>> {
     use std::os::fd::AsRawFd;
 
     let file = OpenOptions::new()
@@ -951,6 +1067,21 @@ fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig, boot_id: &str
     let Ok(meta) = read_meta(paths) else {
         return false;
     };
+    if physical_custody_may_remain(paths, boot_id) {
+        return false;
+    }
+    // An empty-tree marker may be removed immediately before the supervisor's
+    // final resource teardown. Do not race that live (or uncertain) identity.
+    if meta.supervisor_pid.is_some()
+        && !process_is_gone_or_reused(
+            meta.supervisor_pid,
+            meta.supervisor_pid_starttime_ticks,
+            meta.process_boot_id.as_deref(),
+            boot_id,
+        )
+    {
+        return false;
+    }
     let age_ms = state_dir_reap_age_ms(paths, &meta, config.now_unix_ms);
     if age_ms < config.ttl_ms() {
         return false;
@@ -1677,6 +1808,109 @@ mod tests {
 
         assert_eq!(stats.reaped, 1);
         assert!(!paths.state_dir.exists());
+    }
+
+    #[test]
+    fn reaper_requires_physical_discharge_even_after_unknown_logical_settlement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = write_reap_state(temp.path(), "ab_custody", "DONE", 1, false);
+        let mut meta = read_meta(&paths).unwrap();
+        meta.delivery.attempted = true;
+        meta.delivery.error_code = Some("transfer_outcome_unknown".into());
+        meta.delivery.retryable = Some(false);
+        write_meta_atomic(&paths, &meta).unwrap();
+        begin_physical_custody(&paths).unwrap();
+        let config = test_reap_config(100_000, 10, 10);
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 0);
+        // No exact process death was invented to permit deletion: a reaper
+        // must explicitly discharge the physical obligation.
+        end_physical_custody(&paths).unwrap();
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 1);
+    }
+
+    #[test]
+    fn custody_boot_evidence_is_conservative_but_reboot_is_finite() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = write_reap_state(temp.path(), "ab_custody_boot", "DONE", 1, true);
+        let boot = current_boot_id();
+        begin_physical_custody(&paths).unwrap();
+        assert!(physical_custody_may_remain(&paths, &boot));
+        assert!(!physical_custody_may_remain(
+            &paths,
+            "00000000-0000-0000-0000-000000000000"
+        ));
+        assert!(physical_custody_may_remain(&paths, ""));
+        fs::write(&paths.physical_custody, "corrupted").unwrap();
+        assert!(physical_custody_may_remain(&paths, &boot));
+        fs::remove_file(&paths.physical_custody).unwrap();
+        fs::create_dir(&paths.physical_custody).unwrap();
+        assert!(physical_custody_may_remain(&paths, &boot));
+    }
+
+    #[test]
+    fn external_custody_vetoes_ttl_independently_of_activation_and_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = write_reap_state(temp.path(), "ab_external", "DONE", 1, true);
+        settle_reap_delivery(&paths);
+        let config = test_reap_config(100_000, 10, 10);
+        assert!(begin_external_transfer_custody(&paths).unwrap());
+        write_activation_pending(&paths).unwrap();
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 0);
+        write_activation_transfer_outcome_unknown(&paths).unwrap();
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 0);
+        write_activation_failed(&paths, "wait error converted to failure").unwrap();
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 0);
+        assert!(!begin_external_transfer_custody(&paths).unwrap());
+        assert!(physical_custody_may_remain(&paths, &current_boot_id()));
+        assert!(!physical_custody_may_remain(
+            &paths,
+            "00000000-0000-0000-0000-000000000000"
+        ));
+        fs::write(&paths.external_transfer_custody, "corrupt").unwrap();
+        assert!(physical_custody_may_remain(&paths, &current_boot_id()));
+        end_external_transfer_custody(&paths).unwrap();
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 1);
+    }
+
+    #[test]
+    fn new_external_attempt_requalifies_conclusively_old_boot_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = write_reap_state(temp.path(), "ab_external_reboot", "DONE", 1, true);
+        fs::write(
+            &paths.external_transfer_custody,
+            "00000000-0000-0000-0000-000000000000",
+        )
+        .unwrap();
+        assert!(begin_external_transfer_custody(&paths).unwrap());
+        assert_eq!(
+            fs::read_to_string(&paths.external_transfer_custody).unwrap(),
+            current_boot_id()
+        );
+        assert!(physical_custody_may_remain(&paths, &current_boot_id()));
+        assert!(!begin_external_transfer_custody(&paths).unwrap());
+    }
+
+    #[test]
+    fn reaper_keeps_settled_live_supervisor_until_exact_exit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = write_reap_state(temp.path(), "ab_live_custody", "DONE", 1, true);
+        settle_reap_delivery(&paths);
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let mut meta = read_meta(&paths).unwrap();
+        let pid = child.id() as libc::pid_t;
+        meta.supervisor_pid = Some(pid);
+        meta.supervisor_pid_starttime_ticks = process_starttime_ticks(pid);
+        meta.process_boot_id = Some(current_boot_id());
+        write_meta_atomic(&paths, &meta).unwrap();
+        let config = test_reap_config(100_000, 10, 10);
+        let before = reap_state_dirs(temp.path(), config);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(before.reaped, 0);
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 1);
     }
 
     #[test]

@@ -292,9 +292,13 @@ unsafe fn daemonization_child(config: SupervisorConfig) -> ! {
         );
         unsafe { libc::_exit(EX_SOFTWARE) };
     }
+    if state::begin_physical_custody(&config.paths).is_err() {
+        unsafe { libc::_exit(EX_SOFTWARE) };
+    }
     let guardian_paths = config.paths.clone();
     match unsafe { libc::fork() } {
         -1 => {
+            let _ = state::end_physical_custody(&config.paths);
             let mut meta = config.meta.clone();
             let _ = record_supervisor_error(
                 &config.paths,
@@ -323,10 +327,9 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
         Ok(status) => status,
         Err(_) => return EX_SOFTWARE,
     };
-    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
-        return 0;
-    }
-
+    // A normal Root completion may still leave adopted descendants. Logical
+    // completion does not discharge this guardian's physical reaping custody.
+    let mut completion_reconciled = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
     let mut recovered_cancel_escalation = None;
     loop {
         let accepted_cancel = match explicit_cancel_accepted(paths) {
@@ -336,20 +339,50 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
                 continue;
             }
         };
-        if accepted_cancel {
+        let cancellation_drained = match state::durable_marker_exists(&paths.cancellation_drained) {
+            Ok(drained) => drained,
+            Err(_) => {
+                std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                continue;
+            }
+        };
+        // This proof precedes cancellation publication/admission. It protects
+        // only the new cancellation notification, not an existing ready transfer
+        // or descendants merely associated with some terminal metadata.
+        let cancel_workload = accepted_cancel && !cancellation_drained;
+        if cancel_workload {
             let escalation = recovered_cancel_escalation
                 .get_or_insert_with(CancellationEscalation::begin_guardian_takeover);
-            signal_descendants(current_pid(), escalation.signal());
+            signal_descendants(current_pid(), escalation.signal(), None);
         }
         let adopted_tree_empty = reap_adopted_children();
-        if accepted_cancel && !adopted_tree_empty {
+        // Durable helper handback can precede the worker's _exit. After abnormal
+        // supervisor loss this guardian is its sole adopting reaper. Do not
+        // orphan it (or other adopted descendants) merely because metadata is
+        // terminal, and do not progress an already reconciled delivery again.
+        if completion_reconciled && adopted_tree_empty {
+            return state::end_physical_custody(paths)
+                .map(|()| 0)
+                .unwrap_or(EX_SOFTWARE);
+        }
+        if cancel_workload
+            && adopted_tree_empty
+            && state::record_cancellation_drained(paths).is_err()
+        {
             std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
             continue;
         }
-        match reconcile_lost_supervisor_after_guardian(paths, accepted_cancel && adopted_tree_empty)
-        {
-            Ok(meta) if state::terminal(&meta) => return 0,
-            Ok(meta) if !state::running_exit_mode(&meta) => return 0,
+        if completion_reconciled || (cancel_workload && !adopted_tree_empty) {
+            std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+            continue;
+        }
+        match reconcile_lost_supervisor_after_guardian(
+            paths,
+            accepted_cancel && (adopted_tree_empty || cancellation_drained),
+        ) {
+            Ok(meta) if state::terminal(&meta) || !state::running_exit_mode(&meta) => {
+                completion_reconciled = true;
+            }
             Ok(_) => std::thread::sleep(SUPERVISOR_RECOVERY_POLL),
             Err(_) => return EX_SOFTWARE,
         }
@@ -443,6 +476,19 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
     };
     persist_supervisor_meta_best_effort(&config.paths, &meta);
 
+    let image_owner = match crate::image::Owner::start() {
+        Ok(owner) => owner,
+        Err(err) => {
+            let _ = record_supervisor_error(
+                &config.paths,
+                &mut meta,
+                format!("image custodian bootstrap failed: {err}"),
+                Some(&mut log),
+            );
+            return EX_SOFTWARE;
+        }
+    };
+
     let cgroup_setup = cgroup::setup(&meta.handle);
     apply_cgroup_setup_meta(&mut meta, cgroup_setup.meta.clone());
     persist_supervisor_meta_best_effort(&config.paths, &meta);
@@ -499,6 +545,7 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
         owner_pidfd,
         completion_scope: config.completion_scope,
         sentinel,
+        image_owner,
     });
     event_loop_exit_code(event_loop(loop_state))
 }
@@ -663,6 +710,7 @@ fn map_sentinel_matcher(regex: Regex, pattern: &str) -> SentinelMatcher {
 }
 
 struct EventLoopSeed {
+    image_owner: crate::image::Owner,
     paths: StatePaths,
     meta: Meta,
     log: BoundedLog,
@@ -677,6 +725,7 @@ struct EventLoopSeed {
 
 fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
     EventLoop {
+        image_owner: seed.image_owner,
         paths: seed.paths,
         meta: seed.meta,
         log: seed.log,
@@ -692,6 +741,10 @@ fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
         root_status: None,
         tree_empty: false,
         completion_recorded: false,
+        completion_transfer: None,
+        completion_delivery_settled: false,
+        completion_tree_pending: false,
+        root_status_pending: false,
         sentinel: seed.sentinel,
         spawn_error: None,
         cancellation: None,
@@ -844,8 +897,11 @@ fn current_pid() -> libc::pid_t {
     unsafe { libc::getpid() }
 }
 
-fn signal_descendants(root_pid: libc::pid_t, signal: i32) {
+fn signal_descendants(root_pid: libc::pid_t, signal: i32, infrastructure: Option<libc::pid_t>) {
     for pid in descendant_pids(root_pid) {
+        if infrastructure == Some(pid) {
+            continue;
+        }
         unsafe {
             libc::kill(pid, signal);
         }
@@ -1135,6 +1191,7 @@ impl SentinelMatcher {
 }
 
 struct EventLoop {
+    image_owner: crate::image::Owner,
     paths: StatePaths,
     meta: Meta,
     log: BoundedLog,
@@ -1150,6 +1207,10 @@ struct EventLoop {
     root_status: Option<RootStatus>,
     tree_empty: bool,
     completion_recorded: bool,
+    completion_transfer: Option<delivery::CompletionTransfer>,
+    completion_delivery_settled: bool,
+    completion_tree_pending: bool,
+    root_status_pending: bool,
     sentinel: Option<SentinelMatcher>,
     spawn_error: Option<String>,
     cancellation: Option<Cancellation>,
@@ -1276,8 +1337,18 @@ fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
         loop_state.check_explicit_cancel();
         loop_state.check_polled_owner();
         loop_state.drive_cancellation();
+        // Recovery is single-flight under this owner, never under acquiring clients.
+        // Spawn failures remain bounded by backoff; image RPCs fail truthfully meanwhile.
+        loop_state.recover_image_service();
         loop_state.maybe_finish()?;
+        loop_state.drive_completion_delivery()?;
+        loop_state.flush_root_status()?;
         if loop_state.should_exit() {
+            // Also discharges custody when the guardian itself was lost. If
+            // Root descendants remain, only the guardian can later prove empty.
+            if loop_state.tree_empty {
+                state::end_physical_custody(&loop_state.paths)?;
+            }
             return Ok(());
         }
 
@@ -1404,6 +1475,13 @@ impl EventLoop {
         self.reap_children()
     }
 
+    fn recover_image_service(&mut self) {
+        if let Err(error) = self.image_owner.recover() {
+            let message = format!("image custodian recovery spawn failed (will retry): {error}\n");
+            let _ = self.log.write_all(message.as_bytes());
+        }
+    }
+
     fn poll_timeout(&self) -> Option<Duration> {
         if self.cancellation.is_some() {
             Some(CANCEL_POLL)
@@ -1462,6 +1540,19 @@ impl EventLoop {
     }
 
     fn drive_cancellation(&mut self) {
+        // A published cancellation has already drained the workload tree. Its
+        // completion transfer is new delivery responsibility, not more workload
+        // to terminate. A ready-sentinel transfer remains cancellable on owner loss.
+        if self.completion_recorded
+            && self
+                .meta
+                .completion_reason
+                .as_deref()
+                .and_then(CancellationCause::from_completion_reason)
+                .is_some()
+        {
+            return;
+        }
         let Some(cancellation) = self.cancellation.as_mut() else {
             return;
         };
@@ -1471,7 +1562,11 @@ impl EventLoop {
                 explicit_cancel_accepted(&self.paths),
                 Ok(true)
             ));
-        signal_descendants(current_pid(), cancellation.escalation.signal());
+        signal_descendants(
+            current_pid(),
+            cancellation.escalation.signal(),
+            self.image_owner.pid(),
+        );
     }
 
     fn handle_cgroup_event(&self) {
@@ -1588,13 +1683,15 @@ impl EventLoop {
             let mut status = 0;
             let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
             if pid > 0 {
+                self.image_owner.reaped(pid);
+                self.integrate_completion_transfer(pid, status)?;
                 if pid == self.root_pid {
                     self.record_root_status(status)?;
                 }
                 continue;
             }
             if pid == 0 {
-                self.tree_empty = false;
+                self.tree_empty = self.image_owner.only_child();
                 return Ok(());
             }
             let err = io::Error::last_os_error();
@@ -1612,18 +1709,71 @@ impl EventLoop {
     fn record_root_status(&mut self, status: i32) -> io::Result<()> {
         let root_status = status_to_root_status(status);
         self.root_status = Some(root_status);
-        apply_root_status_metadata(&mut self.meta, root_status);
-        if self.completion_recorded {
-            let _delivery_lock = state::lock_delivery(&self.paths)?;
-            let mut persisted = state::read_meta(&self.paths)?;
-            apply_root_status_metadata(&mut persisted, root_status);
-            state::write_meta_atomic(&self.paths, &persisted)?;
-            self.meta = persisted;
-        } else {
-            state::write_meta_atomic(&self.paths, &self.meta)?;
-        }
+        self.root_status_pending = true;
         self.close_root_pidfd();
+        self.flush_root_status()
+    }
+
+    fn flush_root_status(&mut self) -> io::Result<()> {
+        if !self.root_status_pending || self.completion_transfer.is_some() {
+            return Ok(());
+        }
+        // A ready completion or detach may still own metadata. Never block the
+        // image recovery loop on its flock; retain and merge the root observation.
+        let Some(_lock) = state::try_lock_delivery(&self.paths)? else {
+            return Ok(());
+        };
+        let mut persisted = state::read_meta(&self.paths)?;
+        apply_root_status_metadata(
+            &mut persisted,
+            self.root_status.expect("pending root status"),
+        );
+        state::write_meta_atomic(&self.paths, &persisted)?;
+        self.meta = persisted;
+        self.root_status_pending = false;
         Ok(())
+    }
+
+    fn drive_completion_delivery(&mut self) -> io::Result<()> {
+        if !self.completion_recorded
+            || self.completion_delivery_settled
+            || self.completion_transfer.is_some()
+        {
+            return Ok(());
+        }
+        match delivery::try_start_completion_delivery(&self.paths, &mut self.meta)? {
+            delivery::CompletionStart::Busy => {}
+            delivery::CompletionStart::Settled => self.mark_completion_delivery_settled(),
+            delivery::CompletionStart::Running(transfer) => {
+                self.completion_transfer = Some(transfer);
+                self.tree_empty = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn integrate_completion_transfer(&mut self, pid: libc::pid_t, status: i32) -> io::Result<()> {
+        if self
+            .completion_transfer
+            .as_ref()
+            .map(delivery::CompletionTransfer::pid)
+            != Some(pid)
+        {
+            return Ok(());
+        }
+        let transfer = self.completion_transfer.take().expect("matched transfer");
+        transfer.finish(&self.paths, &mut self.meta, status)?;
+        self.mark_completion_delivery_settled();
+        Ok(())
+    }
+
+    fn mark_completion_delivery_settled(&mut self) {
+        // A dead worker may have left its admitted helper among adopted children.
+        // Unknown settles replay eligibility, not physical custody. Without a
+        // conclusive helper handback retain the adopted tree even in Root scope.
+        self.completion_tree_pending = self.meta.delivery.completion_lifecycle()
+            == state::CompletionDeliveryLifecycle::NonReplayableUnknownTransfer;
+        self.completion_delivery_settled = true;
     }
 
     fn close_root_pidfd(&mut self) {
@@ -1650,25 +1800,35 @@ impl EventLoop {
 
     fn should_exit(&self) -> bool {
         self.completion_recorded
+            && self.completion_delivery_settled
+            && (!self.completion_tree_pending || self.tree_empty)
+            && !self.root_status_pending
             && self.root_status.is_some()
             && self.completion_scope.is_complete(self.tree_empty)
             && self.output_closed()
     }
 
     fn record_ready_sentinel(&mut self) -> io::Result<()> {
-        match publish_terminal_with_delivery_disposition(
+        let result = publish_terminal_with_delivery_disposition(
             &self.paths,
             &mut self.meta,
             Some(&mut self.log),
             TerminalProposal::ReadySentinel(state::unix_ms()),
-            CompletionDeliveryDisposition::ClaimPending,
-        )? {
+            CompletionDeliveryDisposition::LiveLoop {
+                tree_empty: self.tree_empty,
+            },
+        )?;
+        self.integrate_terminal_publication(result);
+        Ok(())
+    }
+
+    fn integrate_terminal_publication(&mut self, result: TerminalPublishResult) {
+        match result {
             TerminalPublishResult::Published => self.completion_recorded = true,
             TerminalPublishResult::DeferredForAcceptedCancel => {
                 self.request_cancellation(CancellationCause::ExplicitRequest);
             }
         }
-        Ok(())
     }
 
     fn record_exit_completion(
@@ -1676,7 +1836,7 @@ impl EventLoop {
         root_status: RootStatus,
         reason: ExitCompletionReason,
     ) -> io::Result<()> {
-        publish_terminal_with_delivery_disposition(
+        let result = publish_terminal_with_delivery_disposition(
             &self.paths,
             &mut self.meta,
             Some(&mut self.log),
@@ -1684,21 +1844,25 @@ impl EventLoop {
                 root_status,
                 reason,
             },
-            CompletionDeliveryDisposition::ClaimPending,
+            CompletionDeliveryDisposition::LiveLoop {
+                tree_empty: self.tree_empty,
+            },
         )?;
-        self.completion_recorded = true;
+        self.integrate_terminal_publication(result);
         Ok(())
     }
 
     fn record_supervisor_error_in_loop(&mut self, message: String) -> io::Result<()> {
-        publish_terminal_with_delivery_disposition(
+        let result = publish_terminal_with_delivery_disposition(
             &self.paths,
             &mut self.meta,
             Some(&mut self.log),
             TerminalProposal::SupervisorError(message),
-            CompletionDeliveryDisposition::ClaimPending,
+            CompletionDeliveryDisposition::LiveLoop {
+                tree_empty: self.tree_empty,
+            },
         )?;
-        self.completion_recorded = true;
+        self.integrate_terminal_publication(result);
         Ok(())
     }
 }
@@ -1803,6 +1967,9 @@ fn spawn_error_message_for_completion(loop_state: &EventLoop) -> String {
 }
 
 fn exit_completion_ready(loop_state: &EventLoop) -> bool {
+    if loop_state.cancellation.is_some() {
+        return loop_state.tree_empty && loop_state.output_closed();
+    }
     loop_state
         .completion_scope
         .is_complete(loop_state.tree_empty)
@@ -1953,6 +2120,7 @@ fn reconcile_lost_supervisor_after_guardian(
 enum CompletionDeliveryDisposition {
     ClaimPending,
     LeavePending,
+    LiveLoop { tree_empty: bool },
 }
 
 fn reconcile_lost_supervisor_with_delivery(
@@ -2047,13 +2215,36 @@ fn publish_terminal_with_delivery_disposition(
         return Ok(TerminalPublishResult::Published);
     }
     meta.delivery = current.delivery;
-    let proposal = match finalize_terminal_proposal(proposal, explicit_cancel_accepted(paths)?) {
+    let accepted_cancel = explicit_cancel_accepted(paths)?;
+    // The durable request can arrive after the live loop's last cancellation
+    // check. Resolve it under the same publication lock, without claiming that
+    // Root-scope descendants were drained merely because the root exited.
+    if accepted_cancel
+        && delivery_disposition == (CompletionDeliveryDisposition::LiveLoop { tree_empty: false })
+    {
+        return Ok(TerminalPublishResult::DeferredForAcceptedCancel);
+    }
+    let proposal = match finalize_terminal_proposal(proposal, accepted_cancel) {
         FinalizedTerminalProposal::Publish(proposal) => proposal,
         FinalizedTerminalProposal::DeferredForAcceptedCancel => {
             drop(completion_lock);
             return Ok(TerminalPublishResult::DeferredForAcceptedCancel);
         }
     };
+    if matches!(
+        delivery_disposition,
+        CompletionDeliveryDisposition::LiveLoop { tree_empty: true }
+    ) && (accepted_cancel
+        || matches!(
+            &proposal,
+            TerminalProposal::Exit {
+                reason: ExitCompletionReason::Cancellation(_),
+                ..
+            } | TerminalProposal::Cancellation(_)
+        ))
+    {
+        state::record_cancellation_drained(paths)?;
+    }
     sync_optional_log(log)?;
     match proposal {
         TerminalProposal::ReadySentinel(now) => apply_ready_sentinel_metadata(meta, now),
@@ -2140,6 +2331,66 @@ mod tests {
             finalize_terminal_proposal(TerminalProposal::ReadySentinel(1), true),
             FinalizedTerminalProposal::DeferredForAcceptedCancel
         ));
+    }
+
+    #[test]
+    fn late_accepted_cancel_defers_live_publication_until_adopted_tree_drains() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let handle = "ab_late_cancel".to_string();
+        let paths = StatePaths::new(temp.path().join("agent-bash"), handle.clone());
+        state::create_handle_state(&paths).expect("create state");
+        let mut meta = Meta::new(
+            handle,
+            current_pid(),
+            current_pid(),
+            vec!["true".to_string()],
+            std::path::PathBuf::from("/tmp"),
+            "exit",
+            state::DeliveryMode::Sync,
+            None,
+            Vec::new(),
+            None,
+        );
+        state::write_meta_atomic(&paths, &meta).expect("write running meta");
+        state::record_explicit_cancel_acceptance(&paths).expect("late accepted request");
+        let proposal = || TerminalProposal::Exit {
+            root_status: RootStatus {
+                rc: 0,
+                signal: None,
+            },
+            reason: ExitCompletionReason::Exit,
+        };
+        let deferred = publish_terminal_with_delivery_disposition(
+            &paths,
+            &mut meta,
+            None,
+            proposal(),
+            CompletionDeliveryDisposition::LiveLoop { tree_empty: false },
+        )
+        .expect("defer publication");
+        assert!(matches!(
+            deferred,
+            TerminalPublishResult::DeferredForAcceptedCancel
+        ));
+        assert_eq!(state::read_meta(&paths).unwrap().state, "RUNNING");
+        assert!(!paths.rc.exists());
+        assert!(!paths.cancellation_drained.exists());
+        let published = publish_terminal_with_delivery_disposition(
+            &paths,
+            &mut meta,
+            None,
+            proposal(),
+            CompletionDeliveryDisposition::LiveLoop { tree_empty: true },
+        )
+        .expect("publish after drain");
+        assert!(matches!(published, TerminalPublishResult::Published));
+        assert!(state::durable_marker_exists(&paths.cancellation_drained).unwrap());
+        assert_eq!(meta.rc, Some(143));
+        assert_eq!(meta.completion_reason.as_deref(), Some("cancel-request"));
+        assert_eq!(
+            meta.delivery.completion_lifecycle(),
+            state::CompletionDeliveryLifecycle::Unclaimed
+        );
     }
 
     #[test]

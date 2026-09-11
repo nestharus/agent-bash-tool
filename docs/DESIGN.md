@@ -121,12 +121,16 @@ Captured output is bounded by `AGENT_BASH_LOG_MAX_BYTES` (16 MiB by default, cla
 64 KiB and 1 GiB). When the limit is crossed, the log records a truncation marker and retains the
 newest output rather than allowing an unbounded state-directory file.
 
-The intermediate daemon process remains as a guardian for the exact supervisor child. A clean
-supervisor exit ends the guardian. After an abnormal exit, including `SIGKILL`, the guardian uses
+The intermediate daemon process remains as a guardian for the exact supervisor child. After a clean
+supervisor exit, the guardian drains adopted descendants before exiting. After an abnormal exit,
+including `SIGKILL`, the guardian uses
 the persisted PID/start-time/boot-ID identities and per-handle reconciliation lock to wait until
 supervisor loss is conclusive, record `supervisor-lost`, and run any pending async delivery. A
 persisted root exit code remains diagnostic evidence; supervisor loss is still `ERROR rc=70`
-because full process-tree completion can no longer be proven.
+because full process-tree completion can no longer be proven. After delivery reconciliation,
+the guardian continues reaping adopted children until they exit; a durable terminal handback
+is not evidence that the transfer worker itself has exited. It does not retry that reconciled
+delivery while draining children or terminate surviving descendants without accepted cancellation.
 
 The guardian becomes a subreaper before it forks the supervisor. If explicit cancellation was
 accepted before abnormal supervisor exit, the synchronized `cancel-requested` marker is the
@@ -161,9 +165,14 @@ transition but not the delivery-helper-operation role. A targeted eligible `stat
 delivery in its current process and synchronously waits for the local delivery transfer worker and helper
 outcome. An origin-session-scoped bulk `list` may publish the same terminal state for an accurate projection,
 but it never executes a helper as an incidental enumeration side effect; its disposition is
-`CompletionDeliveryDisposition::LeavePending`. Live terminal producers, targeted status, and the guardian
-use `CompletionDeliveryDisposition::ClaimPending`; the disposition names only who progresses delivery, not how
-the terminal state was reached. Cross-owner status and
+`CompletionDeliveryDisposition::LeavePending`. Live event-loop terminal producers publish with
+`LiveLoop { tree_empty }`, then retain the delivery obligation in the event loop and progress it
+asynchronously. A durable cancellation arriving after the loop's last check defers publication under
+`completion.lock` until the adopted tree has drained; it cannot prematurely publish a cancelled
+Root-scope completion and exempt surviving workload descendants from termination.
+Targeted status, bootstrap-error publication and guardian reconciliation use
+`CompletionDeliveryDisposition::ClaimPending` and wait synchronously for an exact transfer child.
+The disposition names who progresses delivery, not how the terminal state was reached. Cross-owner status and
 `list --all` remain observational and do not reconcile state. Cross-route `mode` is likewise a
 point-in-time read, but it still fails closed when the durable activation outcome is unsettled.
 List projections represent that state as `delivery_mode: null` with `delivery_mode_error` in JSON
@@ -353,6 +362,22 @@ Detach and completion first fork a local delivery transfer worker while retainin
 persists `activation-attempted` plus canonical `async` mode, or `attempted=true` plus
 `error_code="delivery_attempt_in_progress"`, immediately before it launches the helper. The worker
 retains the lock and persists the observed outcome even if the initiating CLI or supervisor dies.
+The live supervisor acquires the lock nonblocking and places completion image acquisition inside
+that same worker, before the claim. It does not wait for the worker: its sole event-loop reaper
+integrates the exact PID's result while continuing image-service recovery. Pending delivery keeps
+both Root- and Tree-scope supervisors alive. Ready-mode root-exit observations are deferred while
+a transfer or detach holds the lock, then merged from current persisted metadata. Targeted control
+callers remain synchronous exact-child waiters. Workers are fork-then-Rust children of single-threaded
+processes, not background-thread forks; completion workers close unrelated inherited descriptors.
+Cancellation waits for the workload tree to drain before publishing its own completion notification,
+which is not signalled as workload again. Owner loss after readiness can still terminate an active
+ready transfer; an unresolved admitted outcome remains unknown and cannot be replayed.
+After worker loss with an unknown admitted outcome, the live supervisor conservatively retains
+all adopted children even in Root scope: the surviving helper cannot be distinguished conclusively
+from other adopted descendants. Terminal metadata is available, but physical custody lasts until
+that tree drains (or authorized cancellation terminates it). Normal successful Root delivery does
+not acquire this conservative Tree-custody obligation.
+
 These are write-ahead transfer claims: once present, a successor never hands the same one-shot
 obligation to the helper again, including after a nonzero exit or unknown admitted outcome.
 Conclusive helper-resolution, fork, spawn, or pre-exec failures remain `attempted=false`; detach
@@ -412,7 +437,7 @@ expired `ERROR` handle or `RUNNING` handle whose exact supervisor and workload i
 conclusively gone or reused. Missing or unreadable process identity evidence fails closed and keeps
 the state directory.
 
-All terminal handles use the configured state TTL. Retryable pre-invocation helper failures do not
+Terminal handles use the configured state TTL only after physical-retention vetoes are discharged. Retryable pre-invocation helper failures do not
 receive a multiplied retention window, so failed delivery does not create a sevenfold retained-state
 population. Each control-route-eligible status observer may perform at most one helper-resolution retry
 for the handle it observes. The adapter requests the durable `consumed` marker through the
@@ -421,6 +446,37 @@ origin session's pending delivery. `retry_count` bounds each handle to one
 observer-triggered retry in total. The delivery lock serializes concurrently admitted eligible
 observers; the first persists either an attempt claim or a closed retry result, and later observers
 cannot repeat it.
+
+### Physical retention is independent of logical settlement
+
+The founding guardian publishes boot-qualified `physical-custody` before forking the supervisor.
+Only the founding adopting reapers' empty-tree observations discharge it under the delivery lock;
+TTL and known-dead supervisor identity cannot stand in for unseen descendants. Normal Root
+completion may leave the guardian draining even though completion is already visible.
+
+Synchronous completion reconciliation (including external status retry) and detach activation
+publish a separate boot-qualified `external-transfer-custody` before helper spawn. The shared
+delivery lock serializes publication and cleanup. Only the attempt that created this marker may
+remove it, after confirmed non-admission or a returned helper wait result. A nonzero helper exit
+still supplies that direct-process result; an I/O wait error does not. Activation performs this
+distinction before converting a nonzero exit into a logical failure. Worker/caller loss leaves
+evidence in place through pending-to-unknown successor reconciliation. Founding reapers cannot
+clear this separate marker, nor can a later successful operation discharge an older uncertainty.
+This adds evidence, not another monitor, proxy, reaper or retry path.
+
+Both markers veto startup deletion on the current boot regardless of logical delivery outcomes.
+Malformed/unreadable evidence is conservative; a valid different boot ID removes its veto, not
+other cleanup predicates. Confirmed ordinary helper exits/non-admissions clear their own external
+marker and remain eligible for eventual scan/TTL cleanup. Waiting for a direct helper is not an
+inventory or proof of cessation of arbitrary helper-created descendants.
+
+Loss of the guardian plus **normal Root supervisor exit with descendants remaining** can strand
+founding custody even after those descendants later end under an outer reaper. Simultaneous
+abnormal loss of both founding reapers is not necessary. Likewise an external worker can lose
+its discharge witness even if its helper subsequently ends. These uncertain current-boot states
+are deliberately retained pending separate authorized recovery (or real cross-boot evidence),
+not discharged by timers or a dead-supervisor guess. This accepted storage cost has no global
+retention bound, and the markers do not establish all-path physical quiescence.
 
 ## agent-runner additions
 

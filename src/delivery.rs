@@ -3,10 +3,10 @@ use std::env;
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -267,7 +267,13 @@ impl ConfiguredDeliveryHelper {
             ))
         })?;
         validate_delivery_helper_metadata(path, &metadata).map_err(DeliveryHelperError::invalid)?;
-        let interpreter = configured_interpreter(&source)?;
+        let (executable, sha256) = sealed_execution_image(&source).map_err(|err| {
+            DeliveryHelperError::unavailable(format!(
+                "cannot snapshot delivery helper {}: {err}",
+                path.display()
+            ))
+        })?;
+        let interpreter = configured_interpreter(&executable)?;
         let interpreter_provenance =
             interpreter
                 .as_ref()
@@ -275,12 +281,6 @@ impl ConfiguredDeliveryHelper {
                     path: path.to_string_lossy().into_owned(),
                     sha256: sha256.clone(),
                 });
-        let (executable, sha256) = sealed_execution_image(&source).map_err(|err| {
-            DeliveryHelperError::unavailable(format!(
-                "cannot snapshot delivery helper {}: {err}",
-                path.display()
-            ))
-        })?;
         let environment = capture_delivery_helper_environment()?;
         Ok(Self {
             provenance: provenance_from_metadata(
@@ -501,6 +501,18 @@ impl HandleBoundDeliveryHelper {
                 path.display()
             )));
         }
+        let observed = crate::image::digest(&executable).map_err(|err| {
+            DeliveryHelperError::unavailable(format!(
+                "cannot validate registered delivery helper for {}: {err}",
+                paths.handle
+            ))
+        })?;
+        if observed != provenance.sha256 {
+            return Err(DeliveryHelperError::changed(format!(
+                "registered delivery helper contents changed for {}",
+                paths.handle
+            )));
+        }
         let (executable, sha256) = sealed_execution_image(&executable).map_err(|err| {
             DeliveryHelperError::unavailable(format!(
                 "cannot load registered delivery helper for {}: {err}",
@@ -610,14 +622,8 @@ fn validate_delivery_helper_metadata(path: &Path, metadata: &Metadata) -> Result
 fn configured_interpreter(
     source: &File,
 ) -> Result<Option<(PathBuf, File, String)>, DeliveryHelperError> {
-    let mut reader = source.try_clone().map_err(|err| {
-        DeliveryHelperError::unavailable(format!("cannot inspect delivery helper: {err}"))
-    })?;
-    reader.seek(SeekFrom::Start(0)).map_err(|err| {
-        DeliveryHelperError::unavailable(format!("cannot inspect delivery helper: {err}"))
-    })?;
     let mut prefix = [0_u8; 4096];
-    let read = reader.read(&mut prefix).map_err(|err| {
+    let read = crate::image::read_prefix(source, &mut prefix).map_err(|err| {
         DeliveryHelperError::unavailable(format!("cannot inspect delivery helper: {err}"))
     })?;
     if !prefix[..read].starts_with(b"#!") {
@@ -679,14 +685,8 @@ fn configured_interpreter(
 }
 
 fn execution_image_is_script(executable: &File) -> Result<bool, DeliveryHelperError> {
-    let mut reader = executable.try_clone().map_err(|err| {
-        DeliveryHelperError::unavailable(format!("cannot inspect execution image: {err}"))
-    })?;
-    reader.seek(SeekFrom::Start(0)).map_err(|err| {
-        DeliveryHelperError::unavailable(format!("cannot inspect execution image: {err}"))
-    })?;
     let mut prefix = [0_u8; 2];
-    let read = reader.read(&mut prefix).map_err(|err| {
+    let read = crate::image::read_prefix(executable, &mut prefix).map_err(|err| {
         DeliveryHelperError::unavailable(format!("cannot inspect execution image: {err}"))
     })?;
     Ok(read == prefix.len() && prefix == *b"#!")
@@ -716,6 +716,18 @@ fn load_bound_interpreter(
             paths.handle
         ))
     })?;
+    let observed = crate::image::digest(&source).map_err(|err| {
+        DeliveryHelperError::unavailable(format!(
+            "cannot validate registered interpreter for {}: {err}",
+            paths.handle
+        ))
+    })?;
+    if observed != provenance.sha256 {
+        return Err(DeliveryHelperError::changed(format!(
+            "registered delivery helper interpreter contents changed for {}",
+            paths.handle
+        )));
+    }
     let (executable, sha256) = sealed_execution_image(&source).map_err(|err| {
         DeliveryHelperError::unavailable(format!(
             "cannot load registered delivery helper interpreter for {}: {err}",
@@ -891,37 +903,7 @@ fn validate_delivery_helper_environment_name(name: &str) -> Result<(), DeliveryH
 }
 
 fn sealed_execution_image(source: &File) -> io::Result<(File, String)> {
-    let name = CString::new("agent-bash-delivery-helper").expect("static memfd name");
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_memfd_create,
-            name.as_ptr(),
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut image = unsafe { File::from_raw_fd(i32::try_from(fd).map_err(io::Error::other)?) };
-    let mut reader = source.try_clone()?;
-    reader.seek(SeekFrom::Start(0))?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-        image.write_all(&buffer[..read])?;
-    }
-    image.set_permissions(fs::Permissions::from_mode(0o500))?;
-    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
-    if unsafe { libc::fcntl(image.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    image.seek(SeekFrom::Start(0))?;
-    Ok((image, format!("{:x}", digest.finalize())))
+    crate::image::acquire(source)
 }
 
 fn create_helper_cache_dir(path: &Path) -> io::Result<()> {
@@ -985,9 +967,7 @@ fn install_cached_helper(
         .write(true)
         .mode(0o500)
         .open(&temp)?;
-    let mut input = image.try_clone()?;
-    input.seek(SeekFrom::Start(0))?;
-    io::copy(&mut input, &mut output)?;
+    crate::image::copy(image, &mut output)?;
     output.sync_all()?;
     drop(output);
     match fs::hard_link(&temp, cached) {
@@ -1007,7 +987,7 @@ fn validate_cached_helper(path: &Path, expected_sha256: &str) -> io::Result<Meta
     let metadata = file.metadata()?;
     validate_delivery_helper_metadata(path, &metadata)
         .map_err(|detail| io::Error::new(io::ErrorKind::InvalidData, detail))?;
-    let (_, observed_sha256) = sealed_execution_image(&file)?;
+    let observed_sha256 = crate::image::digest(&file)?;
     if observed_sha256 == expected_sha256 {
         Ok(metadata)
     } else {
@@ -1243,26 +1223,71 @@ pub(crate) fn register(
     meta: &Meta,
     registration: DeliveryRegistration,
 ) -> Result<(), RegistrationError> {
-    run_required_delivery_helper_command_detailed(&register_request(
-        meta,
-        paths,
-        registration.helper,
-        registration.authority,
-    ))
+    run_required_delivery_helper_command_detailed(
+        &register_request(meta, paths, registration.helper, registration.authority),
+        None,
+    )
     .map_err(|err| match err {
         DeliveryHelperCommandError::NotStarted(err) => RegistrationError::NotStarted(err),
         DeliveryHelperCommandError::Admitted(err) => RegistrationError::Admitted(err),
     })
 }
 
-pub(crate) fn reconcile_completion_delivery(
+// Completion has one active transfer process. The supervisor owns its exact reap
+// through the event loop; synchronous control callers wait for that same exact PID.
+// The shared flock survives parent loss and serializes both acquisition and admission.
+pub(crate) struct CompletionTransfer {
+    pid: libc::pid_t,
+    _lock: DeliveryLockGuard,
+    retry_count: u8,
+}
+
+pub(crate) enum CompletionStart {
+    Busy,
+    Settled,
+    Running(CompletionTransfer),
+}
+
+impl CompletionTransfer {
+    pub(crate) fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
+    // Caller has already reaped this PID. Never wait here: the supervisor's
+    // wildcard reaper and a competing exact waiter must not own the same child.
+    pub(crate) fn finish(self, paths: &StatePaths, meta: &mut Meta, status: i32) -> io::Result<()> {
+        integrate_completion_transfer(paths, meta, transfer_status(status), self.retry_count)
+    }
+}
+
+pub(crate) fn try_start_completion_delivery(
     paths: &StatePaths,
     meta: &mut Meta,
-) -> std::io::Result<()> {
-    let delivery_lock = DeliveryLockGuard::acquire(paths)?;
+) -> io::Result<CompletionStart> {
+    let Some(file) = state::try_lock_delivery(paths)? else {
+        return Ok(CompletionStart::Busy);
+    };
+    start_completion_delivery(paths, meta, DeliveryLockGuard { _file: file }, false)
+}
+
+pub(crate) fn reconcile_completion_delivery(paths: &StatePaths, meta: &mut Meta) -> io::Result<()> {
+    let lock = DeliveryLockGuard::acquire(paths)?;
+    if let CompletionStart::Running(transfer) = start_completion_delivery(paths, meta, lock, true)?
+    {
+        let result = wait_for_delivery_transfer_worker(transfer.pid);
+        integrate_completion_transfer(paths, meta, result, transfer.retry_count)?;
+    }
+    Ok(())
+}
+
+fn start_completion_delivery(
+    paths: &StatePaths,
+    meta: &mut Meta,
+    lock: DeliveryLockGuard,
+    external: bool,
+) -> io::Result<CompletionStart> {
     let mut persisted = state::read_meta(paths)?;
-    let mode = state::read_delivery_mode(paths)?;
-    persisted.delivery_mode = mode;
+    persisted.delivery_mode = state::read_delivery_mode(paths)?;
     let lifecycle = persisted.delivery.completion_lifecycle();
     if lifecycle == CompletionDeliveryLifecycle::ProvisionalTransfer {
         persisted.delivery = completion_delivery_meta_from_unknown_transfer(
@@ -1271,16 +1296,54 @@ pub(crate) fn reconcile_completion_delivery(
         );
         persisted.touch();
         state::write_meta_atomic(paths, &persisted)?;
-        *meta = persisted;
-        return Ok(());
     }
+    *meta = persisted.clone();
     if !lifecycle.permits_attempt() {
-        *meta = persisted;
-        return Ok(());
+        return Ok(CompletionStart::Settled);
     }
     let retry_count = persisted.delivery.retry_count.saturating_add(u8::from(
         lifecycle == CompletionDeliveryLifecycle::RetryablePreAdmissionFailure,
     ));
+    // Single-threaded callers only, matching the existing transfer-worker fork
+    // contract. No image acquisition occurs before this ownership boundary.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        integrate_completion_transfer(paths, meta, Err(io::Error::last_os_error()), retry_count)?;
+        return Ok(CompletionStart::Settled);
+    }
+    if pid == 0 {
+        let result = prepare_completion_worker(lock._file.as_raw_fd())
+            .and_then(|()| execute_completion_transfer(paths, persisted, retry_count, external));
+        unsafe { libc::_exit(if result.is_ok() { 0 } else { 70 }) };
+    }
+    Ok(CompletionStart::Running(CompletionTransfer {
+        pid,
+        _lock: lock,
+        retry_count,
+    }))
+}
+
+fn prepare_completion_worker(lock_fd: i32) -> io::Result<()> {
+    // Do not retain the founding listener, signalfd, output pipes or unrelated
+    // locks while acquiring an image or after supervisor loss. Only the delivery
+    // flock is inherited by this worker (and is CLOEXEC for the helper).
+    for (first, last) in [
+        (3u32, (lock_fd as u32).saturating_sub(1)),
+        ((lock_fd as u32 + 1).max(3), u32::MAX),
+    ] {
+        if first <= last && unsafe { libc::syscall(libc::SYS_close_range, first, last, 0u32) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn execute_completion_transfer(
+    paths: &StatePaths,
+    mut persisted: Meta,
+    retry_count: u8,
+    external: bool,
+) -> io::Result<()> {
     let request = match completion_request(
         persisted.caller_ppid,
         &persisted.handle,
@@ -1292,31 +1355,34 @@ pub(crate) fn reconcile_completion_delivery(
         Err(err) => {
             persisted.delivery = completion_delivery_meta_from_helper_error(err, retry_count);
             persisted.touch();
-            state::write_meta_atomic(paths, &persisted)?;
-            *meta = persisted;
-            return Ok(());
+            return state::write_meta_atomic(paths, &persisted);
         }
     };
-    let worker_result = run_delivery_transfer_worker_holding_lock(&delivery_lock, || {
-        persisted.delivery = provisional_completion_delivery_transfer_meta();
-        persisted.touch();
-        state::write_meta_atomic(paths, &persisted)?;
-        persisted.delivery = match run_delivery_helper_command(&request) {
-            Ok(status) => completion_delivery_meta_from_status(status),
-            Err(DeliveryHelperCommandError::NotStarted(err)) => {
-                completion_delivery_meta_from_launch_error(err, retry_count)
-            }
-            Err(DeliveryHelperCommandError::Admitted(err)) => {
-                completion_delivery_meta_from_error(err)
-            }
-        };
-        persisted.touch();
-        state::write_meta_atomic(paths, &persisted)
-    });
+    persisted.delivery = provisional_completion_delivery_transfer_meta();
+    persisted.touch();
+    state::write_meta_atomic(paths, &persisted)?;
+    persisted.delivery = match run_delivery_helper_command(&request, external.then_some(paths)) {
+        Ok(status) => completion_delivery_meta_from_status(status),
+        Err(DeliveryHelperCommandError::NotStarted(err)) => {
+            completion_delivery_meta_from_launch_error(err, retry_count)
+        }
+        Err(DeliveryHelperCommandError::Admitted(err)) => completion_delivery_meta_from_error(err),
+    };
+    persisted.touch();
+    state::write_meta_atomic(paths, &persisted)
+}
+
+fn integrate_completion_transfer(
+    paths: &StatePaths,
+    meta: &mut Meta,
+    worker_result: io::Result<()>,
+    retry_count: u8,
+) -> io::Result<()> {
     let mut observed = state::read_meta(paths)?;
     if let Err(err) = worker_result {
         observed.delivery = match observed.delivery.completion_lifecycle() {
-            CompletionDeliveryLifecycle::Unclaimed => {
+            CompletionDeliveryLifecycle::Unclaimed
+            | CompletionDeliveryLifecycle::RetryablePreAdmissionFailure => {
                 completion_delivery_meta_from_owner_launch_error(err, retry_count)
             }
             CompletionDeliveryLifecycle::ProvisionalTransfer => {
@@ -1332,6 +1398,14 @@ pub(crate) fn reconcile_completion_delivery(
     }
     *meta = observed;
     Ok(())
+}
+
+fn transfer_status(status: i32) -> io::Result<()> {
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::other("delivery transfer worker failed"))
+    }
 }
 
 fn completion_delivery_meta_from_unknown_transfer(
@@ -1375,7 +1449,7 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
                 settle_orphaned_activation(paths)?;
                 return Err(err);
             }
-            run_required_delivery_helper_command_detailed(&request)
+            run_required_delivery_helper_command_detailed(&request, Some(paths))
         } else {
             require_settled_activation(paths)?;
             Ok(())
@@ -1479,10 +1553,7 @@ fn wait_for_delivery_transfer_worker(pid: libc::pid_t) -> io::Result<()> {
         let mut status = 0;
         let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
         if waited == pid {
-            if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
-                return Ok(());
-            }
-            return Err(io::Error::other("delivery transfer worker failed"));
+            return transfer_status(status);
         }
         if waited < 0 {
             let err = io::Error::last_os_error();
@@ -1667,12 +1738,63 @@ fn path_arg(path: &Path) -> OsString {
     path.as_os_str().to_os_string()
 }
 
+#[derive(Debug)]
 enum DeliveryHelperCommandError {
     NotStarted(io::Error),
     Admitted(io::Error),
 }
 
+// Only the raw spawn/wait result supplies cessation evidence. In particular,
+// activation's later nonzero-exit conversion and successor logical settlement
+// must neither erase a wait error nor discharge an abandoned worker's marker.
+fn with_external_transfer_custody<T>(
+    paths: Option<&StatePaths>,
+    operation: impl FnOnce() -> Result<T, DeliveryHelperCommandError>,
+) -> Result<T, DeliveryHelperCommandError> {
+    with_external_transfer_custody_cleanup(paths, operation, state::end_external_transfer_custody)
+}
+
+fn with_external_transfer_custody_cleanup<T>(
+    paths: Option<&StatePaths>,
+    operation: impl FnOnce() -> Result<T, DeliveryHelperCommandError>,
+    cleanup: impl FnOnce(&StatePaths) -> io::Result<()>,
+) -> Result<T, DeliveryHelperCommandError> {
+    let Some(paths) = paths else {
+        return operation();
+    };
+    let owned = state::begin_external_transfer_custody(paths)
+        .map_err(DeliveryHelperCommandError::NotStarted)?;
+    let result = operation();
+    if owned && !matches!(result, Err(DeliveryHelperCommandError::Admitted(_))) {
+        report_external_custody_cleanup(paths, cleanup(paths));
+    }
+    result
+}
+
+fn report_external_custody_cleanup(paths: &StatePaths, cleanup: io::Result<()>) {
+    let Err(error) = cleanup else { return };
+    if let Err(record_error) = state::record_external_custody_cleanup_error(paths, &error) {
+        use std::io::Write;
+        // Even diagnostics I/O cannot replace an established helper result. stderr
+        // is the last-resort channel; it too may be unavailable in a lost worker.
+        let detail: String = error.to_string().chars().take(512).collect();
+        let record_detail: String = record_error.to_string().chars().take(512).collect();
+        let _ = writeln!(
+            io::stderr(),
+            "external custody cleanup failed for {}; helper result unchanged: {detail}; diagnostic persistence failed: {record_detail}",
+            paths.handle,
+        );
+    }
+}
+
 fn run_delivery_helper_command(
+    request: &DeliveryHelperRequest,
+    custody: Option<&StatePaths>,
+) -> Result<ExitStatus, DeliveryHelperCommandError> {
+    with_external_transfer_custody(custody, || wait_delivery_helper(request))
+}
+
+fn wait_delivery_helper(
     request: &DeliveryHelperRequest,
 ) -> Result<ExitStatus, DeliveryHelperCommandError> {
     let mut child = request
@@ -1687,7 +1809,16 @@ fn run_delivery_helper_command(
 
 fn run_required_delivery_helper_command_detailed(
     request: &DeliveryHelperRequest,
+    custody: Option<&StatePaths>,
 ) -> Result<(), DeliveryHelperCommandError> {
+    let output =
+        with_external_transfer_custody(custody, || wait_required_delivery_helper(request))?;
+    require_helper_success(output)
+}
+
+fn wait_required_delivery_helper(
+    request: &DeliveryHelperRequest,
+) -> Result<std::process::Output, DeliveryHelperCommandError> {
     let child = request
         .command()
         .stdin(Stdio::null())
@@ -1695,9 +1826,12 @@ fn run_required_delivery_helper_command_detailed(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(DeliveryHelperCommandError::NotStarted)?;
-    let output = child
+    child
         .wait_with_output()
-        .map_err(DeliveryHelperCommandError::Admitted)?;
+        .map_err(DeliveryHelperCommandError::Admitted)
+}
+
+fn require_helper_success(output: std::process::Output) -> Result<(), DeliveryHelperCommandError> {
     if output.status.success() {
         return Ok(());
     }
@@ -1832,6 +1966,228 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
+
+    #[derive(Clone, Copy, Debug)]
+    enum CleanupFault {
+        Unlink,
+        Sync,
+    }
+
+    fn injected_custody_cleanup(paths: &StatePaths, fault: CleanupFault) -> io::Result<()> {
+        state::end_external_transfer_custody_with(
+            paths,
+            |path| match fault {
+                CleanupFault::Unlink => Err(io::Error::from_raw_os_error(libc::EACCES)),
+                CleanupFault::Sync => fs::remove_file(path),
+            },
+            |_| Err(io::Error::from_raw_os_error(libc::EIO)),
+        )
+    }
+
+    fn bookkeeping_case(fault: CleanupFault, exit: Option<i32>) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_bookkeeping".into());
+        fs::create_dir(&paths.state_dir).unwrap();
+        let _lock = DeliveryLockGuard::acquire(&paths).unwrap();
+        let result = with_external_transfer_custody_cleanup(
+            Some(&paths),
+            || actual_bookkeeping_operation(temp.path(), exit),
+            |paths| injected_custody_cleanup(paths, fault),
+        );
+        assert_eq!(
+            paths.external_transfer_custody.exists(),
+            matches!(fault, CleanupFault::Unlink)
+        );
+        let diagnostic =
+            fs::read_to_string(paths.state_dir.join("external-transfer-cleanup-error")).unwrap();
+        assert!(diagnostic.contains("helper result unchanged"));
+        match fault {
+            CleanupFault::Unlink => assert!(diagnostic.contains("unlink failed: Permission denied")),
+            CleanupFault::Sync => assert!(diagnostic.contains("marker unlinked; directory sync failed; crash durability uncertain: Input/output error")),
+        }
+        println!("{fault:?} {exit:?}: {}", diagnostic.trim());
+        assert_bookkeeping_result(result, exit);
+    }
+
+    fn actual_bookkeeping_operation(
+        root: &Path,
+        exit: Option<i32>,
+    ) -> Result<std::process::Output, DeliveryHelperCommandError> {
+        let Some(exit) = exit else {
+            return Command::new(root.join("missing-helper"))
+                .output()
+                .map_err(DeliveryHelperCommandError::NotStarted);
+        };
+        Command::new("/bin/sh")
+            .args(["-c", &format!("exit {exit}")])
+            .spawn()
+            .map_err(DeliveryHelperCommandError::NotStarted)?
+            .wait_with_output()
+            .map_err(DeliveryHelperCommandError::Admitted)
+    }
+
+    fn assert_bookkeeping_result(
+        result: Result<std::process::Output, DeliveryHelperCommandError>,
+        exit: Option<i32>,
+    ) {
+        let Some(exit) = exit else {
+            let Err(DeliveryHelperCommandError::NotStarted(error)) = result else {
+                panic!("non-admission changed: {result:?}");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            let meta = completion_delivery_meta_from_launch_error(error, 0);
+            assert!(!meta.attempted);
+            assert_eq!(meta.retryable, Some(true));
+            return;
+        };
+        let output = result.unwrap();
+        assert_eq!(output.status.code(), Some(exit));
+        let meta = completion_delivery_meta_from_status(output.status);
+        assert!(meta.attempted);
+        assert_eq!(meta.exit_code, Some(exit));
+        assert_eq!(
+            meta.completion_lifecycle(),
+            CompletionDeliveryLifecycle::AdmittedOutcome
+        );
+        assert!(!meta.completion_lifecycle().needs_progress());
+        let required = require_helper_success(output);
+        if exit == 0 {
+            assert!(required.is_ok());
+            return;
+        }
+        let Err(DeliveryHelperCommandError::Admitted(error)) = required else {
+            panic!("nonzero exit changed: {required:?}");
+        };
+        assert_eq!(
+            error.to_string(),
+            format!("delivery helper exited with {exit}")
+        );
+    }
+
+    #[test]
+    fn external_bookkeeping_unlink_preserves_nonadmission_and_actual_wait_results() {
+        for exit in [None, Some(0), Some(23)] {
+            bookkeeping_case(CleanupFault::Unlink, exit);
+        }
+    }
+
+    #[test]
+    fn external_bookkeeping_sync_preserves_nonadmission_and_actual_wait_results() {
+        for exit in [None, Some(0), Some(23)] {
+            bookkeeping_case(CleanupFault::Sync, exit);
+        }
+    }
+
+    #[test]
+    fn external_bookkeeping_wait_uncertainty_never_attempts_faulting_cleanup() {
+        for fault in [CleanupFault::Unlink, CleanupFault::Sync] {
+            uncertain_bookkeeping_case(fault);
+        }
+    }
+
+    fn uncertain_bookkeeping_case(fault: CleanupFault) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_uncertain".into());
+        fs::create_dir(&paths.state_dir).unwrap();
+        let _lock = DeliveryLockGuard::acquire(&paths).unwrap();
+        let called = std::cell::Cell::new(false);
+        let result: Result<(), _> = with_external_transfer_custody_cleanup(
+            Some(&paths),
+            || {
+                Err(DeliveryHelperCommandError::Admitted(
+                    io::Error::from_raw_os_error(libc::ECHILD),
+                ))
+            },
+            |paths| {
+                called.set(true);
+                injected_custody_cleanup(paths, fault)
+            },
+        );
+        let Err(DeliveryHelperCommandError::Admitted(error)) = result else {
+            panic!("uncertainty changed")
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+        assert!(!called.get());
+        assert!(paths.external_transfer_custody.exists());
+        assert!(
+            !paths
+                .state_dir
+                .join("external-transfer-cleanup-error")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn external_bookkeeping_diagnostic_is_bounded_and_failure_cannot_replace_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_diagnostic".into());
+        fs::create_dir(&paths.state_dir).unwrap();
+        let _lock = DeliveryLockGuard::acquire(&paths).unwrap();
+        let diagnostic = paths.state_dir.join("external-transfer-cleanup-error");
+        state::record_external_custody_cleanup_error(&paths, &io::Error::other("x".repeat(4096)))
+            .unwrap();
+        assert!(fs::metadata(&diagnostic).unwrap().len() < 2200);
+        state::record_external_custody_cleanup_error(&paths, &io::Error::other("latest failure"))
+            .unwrap();
+        assert!(
+            fs::read_to_string(&diagnostic)
+                .unwrap()
+                .ends_with("latest failure\n")
+        );
+        fs::remove_file(&diagnostic).unwrap();
+        fs::create_dir(&diagnostic).unwrap();
+        let result = with_external_transfer_custody_cleanup(
+            Some(&paths),
+            || Ok(ExitStatus::from_raw(0)),
+            |paths| injected_custody_cleanup(paths, CleanupFault::Sync),
+        );
+        assert!(result.unwrap().success());
+        assert!(!paths.external_transfer_custody.exists());
+    }
+
+    #[test]
+    fn external_wait_uncertainty_survives_later_conclusive_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_external".into());
+        fs::create_dir(&paths.state_dir).unwrap();
+        let _lock = DeliveryLockGuard::acquire(&paths).unwrap();
+        let result: Result<(), _> = with_external_transfer_custody(Some(&paths), || {
+            Err(DeliveryHelperCommandError::Admitted(io::Error::other(
+                "wait failed",
+            )))
+        });
+        assert!(result.is_err());
+        let evidence = fs::read(&paths.external_transfer_custody).unwrap();
+        assert!(with_external_transfer_custody(Some(&paths), || Ok(())).is_ok());
+        assert_eq!(
+            fs::read(&paths.external_transfer_custody).unwrap(),
+            evidence
+        );
+        // A founding reaper cannot discharge external work it never adopted.
+        drop(_lock);
+        state::end_physical_custody(&paths).unwrap();
+        assert_eq!(
+            fs::read(&paths.external_transfer_custody).unwrap(),
+            evidence
+        );
+    }
+
+    #[test]
+    fn external_known_nonadmission_and_wait_success_discharge_own_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_external".into());
+        fs::create_dir(&paths.state_dir).unwrap();
+        let _lock = DeliveryLockGuard::acquire(&paths).unwrap();
+        let result: Result<(), _> = with_external_transfer_custody(Some(&paths), || {
+            Err(DeliveryHelperCommandError::NotStarted(io::Error::other(
+                "spawn failed",
+            )))
+        });
+        assert!(result.is_err());
+        assert!(!paths.external_transfer_custody.exists());
+        assert!(with_external_transfer_custody(Some(&paths), || Ok(())).is_ok());
+        assert!(!paths.external_transfer_custody.exists());
+    }
 
     #[test]
     fn delivery_helper_preserves_the_complete_environment_without_a_population_cap() {
