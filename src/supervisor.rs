@@ -292,9 +292,13 @@ unsafe fn daemonization_child(config: SupervisorConfig) -> ! {
         );
         unsafe { libc::_exit(EX_SOFTWARE) };
     }
+    if state::begin_physical_custody(&config.paths).is_err() {
+        unsafe { libc::_exit(EX_SOFTWARE) };
+    }
     let guardian_paths = config.paths.clone();
     match unsafe { libc::fork() } {
         -1 => {
+            let _ = state::end_physical_custody(&config.paths);
             let mut meta = config.meta.clone();
             let _ = record_supervisor_error(
                 &config.paths,
@@ -323,12 +327,10 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
         Ok(status) => status,
         Err(_) => return EX_SOFTWARE,
     };
-    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
-        return 0;
-    }
-
+    // A normal Root completion may still leave adopted descendants. Logical
+    // completion does not discharge this guardian's physical reaping custody.
+    let mut completion_reconciled = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
     let mut recovered_cancel_escalation = None;
-    let mut completion_reconciled = false;
     loop {
         let accepted_cancel = match explicit_cancel_accepted(paths) {
             Ok(accepted) => accepted,
@@ -337,7 +339,18 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
                 continue;
             }
         };
-        if accepted_cancel {
+        let cancellation_drained = match state::durable_marker_exists(&paths.cancellation_drained) {
+            Ok(drained) => drained,
+            Err(_) => {
+                std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                continue;
+            }
+        };
+        // This proof precedes cancellation publication/admission. It protects
+        // only the new cancellation notification, not an existing ready transfer
+        // or descendants merely associated with some terminal metadata.
+        let cancel_workload = accepted_cancel && !cancellation_drained;
+        if cancel_workload {
             let escalation = recovered_cancel_escalation
                 .get_or_insert_with(CancellationEscalation::begin_guardian_takeover);
             signal_descendants(current_pid(), escalation.signal(), None);
@@ -348,14 +361,25 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
         // orphan it (or other adopted descendants) merely because metadata is
         // terminal, and do not progress an already reconciled delivery again.
         if completion_reconciled && adopted_tree_empty {
-            return 0;
+            return state::end_physical_custody(paths)
+                .map(|()| 0)
+                .unwrap_or(EX_SOFTWARE);
         }
-        if completion_reconciled || (accepted_cancel && !adopted_tree_empty) {
+        if cancel_workload
+            && adopted_tree_empty
+            && state::record_cancellation_drained(paths).is_err()
+        {
             std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
             continue;
         }
-        match reconcile_lost_supervisor_after_guardian(paths, accepted_cancel && adopted_tree_empty)
-        {
+        if completion_reconciled || (cancel_workload && !adopted_tree_empty) {
+            std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+            continue;
+        }
+        match reconcile_lost_supervisor_after_guardian(
+            paths,
+            accepted_cancel && (adopted_tree_empty || cancellation_drained),
+        ) {
             Ok(meta) if state::terminal(&meta) || !state::running_exit_mode(&meta) => {
                 completion_reconciled = true;
             }
@@ -1320,6 +1344,11 @@ fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
         loop_state.drive_completion_delivery()?;
         loop_state.flush_root_status()?;
         if loop_state.should_exit() {
+            // Also discharges custody when the guardian itself was lost. If
+            // Root descendants remain, only the guardian can later prove empty.
+            if loop_state.tree_empty {
+                state::end_physical_custody(&loop_state.paths)?;
+            }
             return Ok(());
         }
 
@@ -2202,6 +2231,20 @@ fn publish_terminal_with_delivery_disposition(
             return Ok(TerminalPublishResult::DeferredForAcceptedCancel);
         }
     };
+    if matches!(
+        delivery_disposition,
+        CompletionDeliveryDisposition::LiveLoop { tree_empty: true }
+    ) && (accepted_cancel
+        || matches!(
+            &proposal,
+            TerminalProposal::Exit {
+                reason: ExitCompletionReason::Cancellation(_),
+                ..
+            } | TerminalProposal::Cancellation(_)
+        ))
+    {
+        state::record_cancellation_drained(paths)?;
+    }
     sync_optional_log(log)?;
     match proposal {
         TerminalProposal::ReadySentinel(now) => apply_ready_sentinel_metadata(meta, now),
@@ -2331,6 +2374,7 @@ mod tests {
         ));
         assert_eq!(state::read_meta(&paths).unwrap().state, "RUNNING");
         assert!(!paths.rc.exists());
+        assert!(!paths.cancellation_drained.exists());
         let published = publish_terminal_with_delivery_disposition(
             &paths,
             &mut meta,
@@ -2340,6 +2384,7 @@ mod tests {
         )
         .expect("publish after drain");
         assert!(matches!(published, TerminalPublishResult::Published));
+        assert!(state::durable_marker_exists(&paths.cancellation_drained).unwrap());
         assert_eq!(meta.rc, Some(143));
         assert_eq!(meta.completion_reason.as_deref(), Some("cancel-request"));
         assert_eq!(
