@@ -2,7 +2,9 @@ use std::process::Command;
 
 #[test]
 fn tiny_private_tree_custody_and_delivery_processes() {
-    run_private_fixture("45", "tests/fixtures/image_custody.py");
+    // Two readiness rounds (76s each), 10s compile, six 10s teardown/control
+    // allowances and 18s cleanup/scheduling headroom. Inner deadlines still apply.
+    run_private_fixture("240", "tests/fixtures/image_custody.py");
 }
 
 #[test]

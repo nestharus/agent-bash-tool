@@ -17,6 +17,49 @@ import time
 SCRIPT = str(Path(__file__).resolve())
 BIN = str(Path(sys.argv[2]).resolve())
 SEALS = 15
+# Seven validation phases each get the existing 10s fixture scheduling allowance,
+# plus three intentional 1s unavailable controls and the 1s + 2s recovery backoff.
+# This is a bounded test budget, not a product SLA or a reset-on-progress timeout.
+READY_PHASES = ("clean-exec", "clients", "routing", "tamper", "malformed", "busy-controls", "recovery")
+READY_SECONDS = len(READY_PHASES) * 10 + 3 * 1 + 1 + 2
+
+
+def phase(directory, name):
+    record = dict(phase=name, pid=os.getpid(), at=time.monotonic())
+    (directory / "phase").write_text(json.dumps(record))
+    print("FIXTURE_PHASE", json.dumps(record), flush=True)
+
+
+def process_evidence(pids):
+    evidence = {}
+    for pid in pids:
+        info = {}
+        for leaf in ["stat", "wchan"]:
+            try:
+                info[leaf] = Path(f"/proc/{pid}/{leaf}").read_text()
+            except OSError as error:
+                info[leaf] = str(error)
+        evidence[pid] = info
+    return evidence
+
+
+def wait_ready(directories, items, seconds=READY_SECONDS):
+    try:
+        def ready():
+            records = [read_json(directory / "ready") for directory in directories]
+            return records if all(records) else None
+        return wait(ready, seconds)
+    except Exception:
+        print("READINESS TIMEOUT/FAILURE", seconds,
+              {str(d): read_json(d / "phase") for d in directories},
+              process_evidence(descendants(os.getpid())), file=sys.stderr, flush=True)
+        for item in items:
+            for key in ["log", "meta"]:
+                try:
+                    print(key, Path(item[key]).read_text(), file=sys.stderr, flush=True)
+                except OSError as error:
+                    print(key, str(error), file=sys.stderr, flush=True)
+        raise
 
 
 def stat(pid):
@@ -101,6 +144,7 @@ def run(env, *args):
 
 def workload(directory, helper):
     directory = Path(directory)
+    phase(directory, "clean-exec")
     owner = next(pid for pid in reversed(ancestors()) if probe(pid))
     custodian = wait(lambda: next((int(p) for p in Path(f"/proc/{owner}/task/{owner}/children").read_text().split()
                                   if b"--internal-image-custodian-v1" in Path(f"/proc/{p}/cmdline").read_bytes()), None))
@@ -108,6 +152,7 @@ def workload(directory, helper):
     descriptors = wait(lambda: (fds if len(fds := list(Path(f"/proc/{custodian}/fd").iterdir())) == 4 else None))
     assert {p.name for p in descriptors} == {"0", "1", "2", "3"}, descriptors
     assert all(os.readlink(f"/proc/{custodian}/fd/{i}") == "/dev/null" for i in range(3))
+    phase(directory, "clients")
     # Two simultaneously held, independently requested SCM_RIGHTS references.
     clients = [subprocess.Popen([sys.executable, SCRIPT, "client", BIN, str(owner), helper, str(i + 7)],
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) for i in range(2)]
@@ -121,6 +166,7 @@ def workload(directory, helper):
         for p in clients:
             if p.poll() is None: p.kill()
             p.wait()
+    phase(directory, "routing")
     # Actual independent handles preserve their environments and registration-only token.
     records = []
     for i in range(2):
@@ -137,6 +183,7 @@ def workload(directory, helper):
         assert all(line.split()[0] == str(inodes[0]) for line in lines), lines
         assert all("authority" not in line or "register" in line or "no-authority" in line for line in lines)
         records.append(lines)
+    phase(directory, "tamper")
     # A warm content hit must not hide in-place handle tampering with restored metadata.
     release = directory / "tamper-release"
     env = os.environ.copy(); env["AGENT_BASH_AGENT_RUNNER_BIN"] = helper; env["XDG_STATE_HOME"] = str(directory / "tamper-spool")
@@ -161,6 +208,7 @@ def workload(directory, helper):
     except Exception:
         print("TAMPER META", Path(item["meta"]).read_text(), flush=True)
         raise
+    phase(directory, "malformed")
     # Malformed/extra/truncated requests close their received descriptors, then recover.
     for extra, size in [(0, 72), (2, 72), (1, 513)]:
         with open(helper, "rb") as f, connection(owner) as sock:
@@ -171,11 +219,14 @@ def workload(directory, helper):
     wait(lambda: len(list(Path(f"/proc/{custodian}/fd").iterdir())) == 5)
     images = [os.readlink(p) for p in Path(f"/proc/{custodian}/fd").iterdir()]
     assert sum("memfd:agent-bash-delivery-helper" in p for p in images) == 1, images
+    phase(directory, "busy-controls")
     busy_startup_and_controls(directory, helper, owner, custodian)
+    phase(directory, "recovery")
     custodian, inodes[0] = recovery(directory, helper, owner, custodian, inodes[0])
     (directory / "ready").write_text(json.dumps(dict(owner=owner, custodian=custodian, inode=inodes[0], records=records)))
     # Parent cancels one independent root while the other remains usable.
-    end = time.monotonic() + 12
+    # A ready root must outlive its peer's remaining validation plus parent controls.
+    end = time.monotonic() + READY_SECONDS + 30
     while not (directory / "release").exists():
         assert time.monotonic() < end
         if (directory / "again").exists() and not (directory / "again-result").exists():
@@ -422,13 +473,7 @@ def suite():
                 directory = root / name; directory.mkdir()
                 item = json.loads(run(env, "run", "--delivery", "sync", "--", sys.executable, SCRIPT, "workload", BIN, str(directory), str(helper)))
                 items.append(item)
-            try:
-                a, b = [wait(lambda name=name: read_json(root / name / "ready")) for name in ["a", "b"]]
-            except Exception:
-                for item in items:
-                    print(Path(item["log"]).read_text(), file=sys.stderr)
-                    print(Path(item["meta"]).read_text(), file=sys.stderr)
-                raise
+            a, b = wait_ready([root / name for name in ["a", "b"]], items)
             assert a["owner"] != b["owner"] and a["custodian"] != b["custodian"]
             assert a["inode"] != b["inode"], "independent roots must not borrow founding service"
             # Knowing another tree's socket name is not acquisition authority.
@@ -453,7 +498,7 @@ def suite():
             # when the guardian is also lost; no host session is targeted.
             directory = root / "loss"; directory.mkdir()
             item = json.loads(run(env, "run", "--delivery", "sync", "--", sys.executable, SCRIPT, "workload", BIN, str(directory), str(helper)))
-            lost = wait(lambda: read_json(directory / "ready"))
+            lost, = wait_ready([directory], [item])
             guardian = stat(lost["owner"])[0]
             os.kill(guardian, signal.SIGKILL)
             assert Path(f"/proc/{lost['custodian']}").exists()

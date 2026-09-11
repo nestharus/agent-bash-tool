@@ -95,6 +95,27 @@ def locked(item):
             return True
 
 
+def wait_settled(item, identity, guardian, transfer, helper_pid, guardian_reaped=False, seconds=10):
+    # Publication precedes worker exit and guardian reconciliation. Reap the exact
+    # private guardian before probing freedom, so its later lock acquisition cannot
+    # race the assertion. Metadata (including absence) is not a settlement witness.
+    def settled():
+        nonlocal guardian_reaped
+        if not guardian_reaped:
+            guardian_reaped = os.waitpid(guardian, os.WNOHANG)[0] == guardian
+        return (guardian_reaped
+                and all(not Path(f"/proc/{pid}").exists()
+                        for pid in [identity['owner'], transfer, helper_pid])
+                and not locked(item))
+    try:
+        f.wait(settled, seconds)
+    except Exception:
+        print("SETTLEMENT TIMEOUT/FAILURE", dict(seconds=seconds, guardian_reaped=guardian_reaped,
+              processes=f.process_evidence([identity['owner'], guardian, transfer, helper_pid]),
+              locked=locked(item), meta=f.read_json(item['meta'])), file=sys.stderr, flush=True)
+        raise
+
+
 def acquiring_worker(identity):
     for pid in children(identity['owner']):
         if pid in [identity['custodian'], identity['root']] or children(pid):
@@ -235,6 +256,8 @@ def suite():
                     f.wait(lambda: os.waitpid(identity['owner'], os.WNOHANG)[0] == identity['owner'])
                 else:
                     f.wait(lambda: not Path(f"/proc/{identity['owner']}").exists())
+                wait_settled(item, identity, guardian, transfer, helper_pid,
+                             guardian_reaped=mode.endswith('guardian-loss'))
                 final = f.read_json(item['meta'])
                 if mode in ['ready-root-exit', 'lock-busy']:
                     assert final['workload_rc'] == 0 and final['rc'] == 0, final
@@ -244,9 +267,6 @@ def suite():
                 assert not locked(item), 'settled transfer retained delivery lock'
                 f.run(env, 'status', item['handle'])
                 assert count(d) == 1
-                # Guardians are private direct/adopted children of this harness.
-                if not mode.endswith('guardian-loss'):
-                    f.wait(lambda: os.waitpid(guardian, os.WNOHANG)[0] == guardian)
                 if mode.startswith('worker-loss-aged'):
                     expire_and_scan(env, item)
                     assert not Path(item['state_dir']).exists(), 'ended custody leaked expired state'
