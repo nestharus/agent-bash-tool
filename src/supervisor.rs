@@ -2836,6 +2836,9 @@ for line in sys.stdin:
 
     #[test]
     fn guardian_settles_accepted_startup_cancel_without_workload_identity() {
+        if crate::test_support::private_case() {
+            return;
+        }
         let temp = tempfile::tempdir().expect("tempdir");
         let handle = "ab_guardian_startup_cancel".to_string();
         let paths = StatePaths::new(temp.path().join("agent-bash"), handle.clone());

@@ -7,6 +7,8 @@ mod guard;
 mod image;
 mod state;
 mod supervisor;
+#[cfg(test)]
+mod test_support;
 
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};

@@ -2352,6 +2352,9 @@ mod tests {
 
     #[test]
     fn changed_registered_helper_is_rejected_before_execution() {
+        if crate::test_support::private_case() {
+            return;
+        }
         let temp = tempfile::tempdir().expect("tempdir");
         let helper_path = temp.path().join("helper");
         fs::write(&helper_path, "#!/bin/sh\nexit 0\n").expect("write helper");

@@ -2013,6 +2013,9 @@ mod tests {
 
     #[test]
     fn reaper_keeps_settled_state_while_delivery_lock_is_held() {
+        if crate::test_support::private_case() {
+            return;
+        }
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_delivery_owned", "DONE", now - 20_000, true);
@@ -2020,12 +2023,87 @@ mod tests {
         let delivery_lock = lock_delivery(&paths).expect("lock delivery");
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
-
-        assert_eq!(stats.reaped, 0);
+        assert_eq!(stats.reaped, 0, "parent-held: {stats:?}");
+        assert_eq!(stats.errors, 0, "parent-held: {stats:?}");
         assert!(paths.state_dir.exists());
+
+        // This exact test runs in a fresh process, not alongside fork-using unit
+        // tests. Model deliberate fork inheritance, not an assumed release on
+        // parent close. The child uses only async-signal-safe calls before _exit.
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let (mut parent, child) = UnixStream::pair().expect("acknowledgment socket");
+        parent
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let lock_fd = delivery_lock.as_raw_fd();
+        let parent_fd = parent.as_raw_fd();
+        let child_fd = child.as_raw_fd();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                libc::close(parent_fd);
+                libc::alarm(5);
+                let mut byte = 0u8;
+                if libc::write(child_fd, b"H".as_ptr().cast(), 1) != 1
+                    || libc::read(child_fd, (&mut byte as *mut u8).cast(), 1) != 1
+                    || byte != b'R'
+                    || libc::close(lock_fd) != 0
+                    || libc::write(child_fd, b"C".as_ptr().cast(), 1) != 1
+                {
+                    libc::_exit(1);
+                }
+                libc::_exit(0);
+            }
+        }
+        struct ForkOwner(libc::pid_t);
+        impl Drop for ForkOwner {
+            fn drop(&mut self) {
+                if self.0 > 0 {
+                    unsafe {
+                        libc::kill(self.0, libc::SIGKILL);
+                        libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+        }
+        let mut owner = ForkOwner(pid);
+        drop(child);
+        let mut ack = [0];
+        parent
+            .read_exact(&mut ack)
+            .expect("child holds inherited lock");
+        assert_eq!(ack, *b"H");
         drop(delivery_lock);
+        assert!(
+            try_lock_delivery(&paths).unwrap().is_none(),
+            "child still owns flock"
+        );
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
-        assert_eq!(stats.reaped, 1);
+        assert_eq!(stats.reaped, 0, "child-held after parent close: {stats:?}");
+        assert_eq!(stats.errors, 0, "child-held: {stats:?}");
+        assert!(paths.state_dir.exists());
+
+        parent
+            .write_all(b"R")
+            .expect("release exact inherited owner");
+        parent
+            .read_exact(&mut ack)
+            .expect("child closed inherited descriptor");
+        assert_eq!(ack, *b"C");
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        owner.0 = 0;
+        assert_eq!(status, 0, "child close acknowledgment exit");
+        assert!(
+            try_lock_delivery(&paths).unwrap().is_some(),
+            "all owners released flock"
+        );
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+        assert_eq!(stats.reaped, 1, "acknowledged release: {stats:?}");
+        assert_eq!(stats.errors, 0, "acknowledged release: {stats:?}");
         assert!(!paths.state_dir.exists());
     }
 

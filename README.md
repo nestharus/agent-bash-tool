@@ -98,6 +98,8 @@ status-triggered delivery retry.
 cargo build --release   # produces `agent-bash`
 ```
 
+See [private parallel test execution](docs/testing.md) for test prerequisites and isolation.
+
 ## Installed configuration
 
 An installed binary can use an adjacent `agent-bash.toml` with absolute paths:

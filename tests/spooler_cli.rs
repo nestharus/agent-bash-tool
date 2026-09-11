@@ -1,3 +1,6 @@
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -24,6 +27,7 @@ struct ProcIdentity {
 fn agent_bash(temp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("agent-bash").expect("agent-bash binary");
     cmd.env("XDG_STATE_HOME", temp.path())
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
         .env_remove("AGENT_BASH_CONSUMER_GRACE_MS")
         .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
@@ -37,6 +41,42 @@ fn run_cmd(temp: &tempfile::TempDir, args: &[&str]) -> (Output, Duration) {
     let start = Instant::now();
     let output = agent_bash(temp).args(args).output().expect("run command");
     (output, start.elapsed())
+}
+
+fn completion_evidence(path: &Path, meta: &Value) -> Value {
+    let root = path.parent().expect("metadata directory");
+    json!({
+        "state": meta["state"], "completion_reason": meta["completion_reason"],
+        "rc": meta["rc"], "signal": meta["signal"],
+        "cancel_requested": root.join("cancel-requested").exists(),
+        "cancel_drained": root.join("cancel-workload-drained").exists(),
+        "delivery": {
+            "attempted": meta["delivery"]["attempted"],
+            "exit_code": meta["delivery"]["exit_code"],
+            "retryable": meta["delivery"]["retryable"],
+            "retry_count": meta["delivery"]["retry_count"],
+            "error_code": meta["delivery"]["error_code"].as_str().map(|s| s.chars().take(128).collect::<String>()),
+            "error": meta["delivery"]["error"].as_str().map(|s| s.chars().take(512).collect::<String>()),
+        },
+    })
+}
+
+#[track_caller]
+fn wait_cancel_delivery(path: &Path, workload: &OwnedProcess, timeout: Duration) -> Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let meta = read_meta(path);
+        if meta["completion_reason"] == "cancel-request" && meta["delivery"]["exit_code"] == 0 {
+            return meta;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cancel/delivery timeout: workload_exited={} evidence={}",
+            workload.exited(),
+            completion_evidence(path, &meta)
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn parse_run_output(output: &Output) -> Value {
@@ -1647,6 +1687,9 @@ fn workload_meta(identity: &ProcIdentity) -> Value {
 
 #[test]
 fn process_cleanup_rejects_mismatched_workload_identity() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let ready = temp.path().join("mismatch-ready");
     let check = temp.path().join("mismatch-check");
@@ -1681,6 +1724,9 @@ fn process_cleanup_rejects_mismatched_workload_identity() {
 
 #[test]
 fn process_cleanup_skips_escalation_after_termination() {
+    if test_support::private_case() {
+        return;
+    }
     let mut workload = StdCommand::new("sleep")
         .arg("2")
         .spawn()
@@ -1702,6 +1748,9 @@ fn process_cleanup_skips_escalation_after_termination() {
 
 #[test]
 fn process_cleanup_escalates_for_owned_group_members_and_reaps_descendant() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let child_pid_path = temp.path().join("cleanup-child.pid");
     let ready_path = temp.path().join("cleanup-ready");
@@ -1746,6 +1795,9 @@ fn process_cleanup_escalates_for_owned_group_members_and_reaps_descendant() {
 
 #[test]
 fn list_attached_empty_state_is_json_array() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let output = agent_bash(&temp)
         .args(["list", "--json"])
@@ -1757,6 +1809,9 @@ fn list_attached_empty_state_is_json_array() {
 
 #[test]
 fn attached_guard_rejects_detached_invocation() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let out = temp.path().join("out");
     let err = temp.path().join("err");
@@ -1790,6 +1845,9 @@ fn attached_guard_rejects_detached_invocation() {
 
 #[test]
 fn run_returns_immediately_and_later_completes() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let started = temp.path().join("run-immediate-started");
     let release = temp.path().join("run-immediate-release");
@@ -1812,6 +1870,9 @@ fn run_returns_immediately_and_later_completes() {
 
 #[test]
 fn cancel_terminates_the_entire_adopted_process_tree() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
     let child_pid_path = temp.path().join("child.pid");
@@ -1863,6 +1924,9 @@ fn cancel_terminates_the_entire_adopted_process_tree() {
 
 #[test]
 fn cancel_immediately_after_run_is_not_lost_during_supervisor_startup() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (output, _) = run_cmd(&temp, &["run", "--", "sleep", "60"]);
     let json = parse_run_output(&output);
@@ -1880,6 +1944,9 @@ fn cancel_immediately_after_run_is_not_lost_during_supervisor_startup() {
 
 #[test]
 fn supervisor_finishes_durable_cancel_without_wakeup_signal() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (output, _) = run_cmd(&temp, &["run", "--", "sleep", "60"]);
     let json = parse_run_output(&output);
@@ -1904,6 +1971,9 @@ fn supervisor_finishes_durable_cancel_without_wakeup_signal() {
 
 #[test]
 fn supervisor_cancel_signal_is_wake_only_without_durable_acceptance() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (output, _) = run_cmd(&temp, &["run", "--", "sleep", "60"]);
     let json = parse_run_output(&output);
@@ -1932,6 +2002,9 @@ fn supervisor_cancel_signal_is_wake_only_without_durable_acceptance() {
 
 #[test]
 fn cancel_without_a_live_exact_supervisor_is_an_idempotent_noop() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let handle = "ab_cancel_missing_supervisor";
     let (caller_identity, _) = proc_identity(unsafe { libc::getpid() }).expect("caller identity");
@@ -1958,6 +2031,9 @@ fn cancel_without_a_live_exact_supervisor_is_an_idempotent_noop() {
 
 #[test]
 fn cancel_rejects_a_live_pid_with_stale_supervisor_identity() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let ready = temp.path().join("stale-supervisor-ready");
     let signaled = temp.path().join("stale-supervisor-signaled");
@@ -2007,6 +2083,9 @@ fn cancel_rejects_a_live_pid_with_stale_supervisor_identity() {
 
 #[test]
 fn accepted_cancel_is_owned_by_guardian_after_supervisor_loss() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
     let (fake, delivery_log) = fake_agents(&temp);
@@ -2036,11 +2115,7 @@ fn accepted_cancel_is_owned_by_guardian_after_supervisor_loss() {
     assert!(supervisor.signal(libc::SIGKILL), "kill exact supervisor");
     drop(stopped);
 
-    let terminal = wait_until(fixture_deadline, || {
-        let meta = read_meta(&meta_path);
-        (meta["completion_reason"] == "cancel-request" && meta["delivery"]["exit_code"] == 0)
-            .then_some(meta)
-    });
+    let terminal = wait_cancel_delivery(&meta_path, &workload, fixture_deadline);
     assert_eq!(terminal["state"], "DONE");
     assert_eq!(terminal["rc"], 143);
     assert_eq!(terminal["signal"], libc::SIGTERM);
@@ -2050,6 +2125,9 @@ fn accepted_cancel_is_owned_by_guardian_after_supervisor_loss() {
 
 #[test]
 fn accepted_sentinel_cancel_is_owned_by_guardian_after_supervisor_loss() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
     let (fake, delivery_log) = fake_agents(&temp);
@@ -2079,11 +2157,7 @@ fn accepted_sentinel_cancel_is_owned_by_guardian_after_supervisor_loss() {
     assert!(supervisor.signal(libc::SIGKILL), "kill exact supervisor");
     drop(stopped);
 
-    let terminal = wait_until(fixture_deadline, || {
-        let meta = read_meta(&meta_path);
-        (meta["completion_reason"] == "cancel-request" && meta["delivery"]["exit_code"] == 0)
-            .then_some(meta)
-    });
+    let terminal = wait_cancel_delivery(&meta_path, &workload, fixture_deadline);
     assert_eq!(terminal["state"], "DONE");
     assert_eq!(terminal["rc"], 143);
     assert_eq!(terminal["signal"], libc::SIGTERM);
@@ -2093,6 +2167,9 @@ fn accepted_sentinel_cancel_is_owned_by_guardian_after_supervisor_loss() {
 
 #[test]
 fn accepted_cancel_precedes_already_pending_workload_completion() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
     let release = temp.path().join("cancel-completion-release");
@@ -2140,6 +2217,9 @@ fn accepted_cancel_precedes_already_pending_workload_completion() {
 
 #[test]
 fn guardian_escalates_accepted_cancel_for_term_resistant_tree() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
     let child_pid_path = temp.path().join("term-resistant-child.pid");
@@ -2187,6 +2267,9 @@ fn guardian_escalates_accepted_cancel_for_term_resistant_tree() {
 
 #[test]
 fn owner_exit_cancels_opted_in_workload_and_descendants() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
     let child_pid_path = temp.path().join("owner-child.pid");
@@ -2244,6 +2327,9 @@ fn owner_exit_cancels_opted_in_workload_and_descendants() {
 
 #[test]
 fn explicit_cancel_wins_when_owner_exit_is_already_pollable() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (helper, route) = routed_owner_resolving_fake_agents(&temp);
     fs::write(&route, "ses_owner_race\n").expect("route owner race session");
@@ -2324,6 +2410,9 @@ fn explicit_cancel_wins_when_owner_exit_is_already_pollable() {
 
 #[test]
 fn run_startup_reaps_old_consumed_state_dir_without_stdout_pollution() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let old = seed_done_state_dir(&temp, "ab_old_consumed", unix_ms() - 2_000, true);
     let meta_path = old.join("meta.json");
@@ -2350,6 +2439,9 @@ fn run_startup_reaps_old_consumed_state_dir_without_stdout_pollution() {
 
 #[test]
 fn exit_mode_completion_rc_and_captured_output() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (output, _) = run_cmd(
         &temp,
@@ -2396,6 +2488,9 @@ fn exit_mode_completion_rc_and_captured_output() {
 
 #[test]
 fn captured_log_is_bounded_and_retains_newest_output() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let output = agent_bash(&temp)
         .env("AGENT_BASH_LOG_MAX_BYTES", "65536")
@@ -2423,6 +2518,9 @@ fn captured_log_is_bounded_and_retains_newest_output() {
 
 #[test]
 fn ready_sentinel_reports_done_without_killing_workload() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let child_pid_path = temp.path().join("sentinel-child.pid");
     let workload_release = temp.path().join("sentinel-workload-release");
@@ -2477,6 +2575,9 @@ fn ready_sentinel_reports_done_without_killing_workload() {
 
 #[test]
 fn tree_capture_waits_for_setsid_detached_grandchild_via_subreaper() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let marker = temp.path().join("grandchild-marker");
     let script =
@@ -2516,6 +2617,9 @@ fn tree_capture_waits_for_setsid_detached_grandchild_via_subreaper() {
 
 #[test]
 fn root_completion_does_not_wait_for_setsid_detached_grandchild() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let marker = temp.path().join("root-completion-grandchild-marker");
     let ready = temp.path().join("root-completion-grandchild-ready");
@@ -2563,6 +2667,9 @@ fn root_completion_does_not_wait_for_setsid_detached_grandchild() {
 
 #[test]
 fn cgroup_v2_live_set_path_runs_when_delegated_and_skips_otherwise() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (output, _) = run_cmd(&temp, &["run", "--", "bash", "-lc", "sleep 1.5"]);
     let json = parse_run_output(&output);
@@ -2588,6 +2695,9 @@ fn cgroup_v2_live_set_path_runs_when_delegated_and_skips_otherwise() {
 
 #[test]
 fn cgroup_disable_uses_subreaper_only_without_degradation() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let mut cmd = agent_bash(&temp);
     cmd.env("AGENT_BASH_DISABLE_CGROUP", "1")
@@ -2604,6 +2714,9 @@ fn cgroup_disable_uses_subreaper_only_without_degradation() {
 
 #[test]
 fn opencode_adapter_cross_owner_poll_cannot_mark_terminal_result_consumed() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let handle = "ab_cross_owner_adapter_poll";
@@ -2628,6 +2741,9 @@ fn opencode_adapter_cross_owner_poll_cannot_mark_terminal_result_consumed() {
 
 #[test]
 fn opencode_adapter_owner_poll_marks_terminal_result_consumed_without_mutating_delivery_mode() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -2657,6 +2773,9 @@ fn opencode_adapter_owner_poll_marks_terminal_result_consumed_without_mutating_d
 
 #[test]
 fn opencode_adapter_binds_exact_live_session_once_before_parallel_dispatch() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -2677,6 +2796,9 @@ fn opencode_adapter_binds_exact_live_session_once_before_parallel_dispatch() {
 
 #[test]
 fn opencode_adapter_does_not_propagate_consumed_live_binding_to_workloads() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -2690,6 +2812,9 @@ fn opencode_adapter_does_not_propagate_consumed_live_binding_to_workloads() {
 
 #[test]
 fn opencode_adapter_recovers_from_inherited_removed_live_binding() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -2701,6 +2826,9 @@ fn opencode_adapter_recovers_from_inherited_removed_live_binding() {
 
 #[test]
 fn opencode_adapter_ordinary_command_completes_in_band_in_sync_mode() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -2745,6 +2873,9 @@ fn opencode_adapter_ordinary_command_completes_in_band_in_sync_mode() {
 
 #[test]
 fn opencode_adapter_initial_dispatch_uses_verified_parent_session() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -2778,6 +2909,9 @@ fn opencode_adapter_initial_dispatch_uses_verified_parent_session() {
 
 #[test]
 fn opencode_adapter_initial_dispatch_preserves_inherited_environment() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -2801,6 +2935,9 @@ fn opencode_adapter_initial_dispatch_preserves_inherited_environment() {
 
 #[test]
 fn opencode_adapter_neutralizes_reserved_registration_helper_assignment() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -2825,6 +2962,9 @@ fn opencode_adapter_neutralizes_reserved_registration_helper_assignment() {
 
 #[test]
 fn opencode_adapter_rejects_shell_copy_of_registration_authority() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -2852,6 +2992,9 @@ fn opencode_adapter_rejects_shell_copy_of_registration_authority() {
 
 #[test]
 fn opencode_adapter_polling_stops_when_helper_path_disappears() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -2869,6 +3012,9 @@ fn opencode_adapter_polling_stops_when_helper_path_disappears() {
 
 #[test]
 fn opencode_adapter_standalone_sleep_does_not_create_spool_state() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -2884,6 +3030,9 @@ fn opencode_adapter_standalone_sleep_does_not_create_spool_state() {
 
 #[test]
 fn recorded_owner_session_requires_helper_attestation() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let handle = "ab_session_precedence";
     let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
@@ -2969,6 +3118,9 @@ fn recorded_owner_session_requires_helper_attestation() {
 
 #[test]
 fn list_routes_handle_to_resumed_session_after_caller_pid_changes() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let state_dir = seed_done_state_dir(&temp, "ab_resumed_owner", unix_ms(), false);
     let (helper, route) = routed_owner_resolving_fake_agents(&temp);
@@ -3032,6 +3184,9 @@ fn list_routes_handle_to_resumed_session_after_caller_pid_changes() {
 
 #[test]
 fn opencode_adapter_explicit_async_returns_handle_immediately() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -3075,6 +3230,9 @@ fn opencode_adapter_explicit_async_returns_handle_immediately() {
 
 #[test]
 fn opencode_adapter_abort_signal_cancels_sync_workload() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -3097,6 +3255,9 @@ fn opencode_adapter_abort_signal_cancels_sync_workload() {
 
 #[test]
 fn opencode_adapter_agent_dispatch_defaults_to_async() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -3124,6 +3285,9 @@ fn opencode_adapter_agent_dispatch_defaults_to_async() {
 
 #[test]
 fn opencode_adapter_explicit_agent_bash_run_is_not_nested() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -3136,6 +3300,9 @@ fn opencode_adapter_explicit_agent_bash_run_is_not_nested() {
 
 #[test]
 fn opencode_adapter_rejects_command_environment_on_registration_launcher() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -3165,6 +3332,9 @@ fn opencode_adapter_rejects_command_environment_on_registration_launcher() {
 
 #[test]
 fn opencode_adapter_headless_agent_dispatch_forces_async_delivery() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -3187,6 +3357,9 @@ fn opencode_adapter_headless_agent_dispatch_forces_async_delivery() {
 
 #[test]
 fn opencode_adapter_sync_wait_returns_when_handle_is_detached() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -3245,6 +3418,9 @@ fn opencode_adapter_sync_wait_returns_when_handle_is_detached() {
 
 #[test]
 fn rca_agent_bash_visibility_opencode_list_control_does_not_spool() {
+    if test_support::private_case() {
+        return;
+    }
     // Verifies that OpenCode executes agent-bash list as a control command without creating a workload.
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
@@ -3278,6 +3454,9 @@ fn rca_agent_bash_visibility_opencode_list_control_does_not_spool() {
 
 #[test]
 fn rca_agent_bash_visibility_persistent_adapter_lists_owned_active_workload() {
+    if test_support::private_case() {
+        return;
+    }
     // Verifies launch and direct default-list ownership through one persistent adapter process.
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
@@ -3316,6 +3495,9 @@ fn rca_agent_bash_visibility_persistent_adapter_lists_owned_active_workload() {
 
 #[test]
 fn opencode_adapter_routes_exact_cancel_as_attached_owner_control() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -3344,6 +3526,9 @@ fn opencode_adapter_routes_exact_cancel_as_attached_owner_control() {
 
 #[test]
 fn opencode_adapter_fresh_cancel_binds_session_and_settles_after_abort() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -3389,6 +3574,9 @@ fn opencode_adapter_fresh_cancel_binds_session_and_settles_after_abort() {
 
 #[test]
 fn rca_agent_bash_visibility_non_list_only_commands_still_spool() {
+    if test_support::private_case() {
+        return;
+    }
     // Verifies that shell operators and incidental list text cannot enter the control path.
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
@@ -3430,6 +3618,9 @@ fn rca_agent_bash_visibility_non_list_only_commands_still_spool() {
 
 #[test]
 fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
+    if test_support::private_case() {
+        return;
+    }
     // Verifies owner-tree visibility and unrelated-caller isolation at the real CLI/process seam.
     let temp = tempfile::tempdir().expect("tempdir");
     let mut owner = spawn_releasable_owner_scenario(&temp);
@@ -3499,6 +3690,9 @@ fn rca_agent_bash_visibility_process_tree_owner_isolated_unless_all() {
 
 #[test]
 fn unrelated_observer_cannot_cancel_or_detach_visible_handle() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let mut owner = spawn_releasable_owner_scenario(&temp);
     wait_until(FIXTURE_DEADLINE, || owner.ready.exists().then_some(()));
@@ -3577,6 +3771,9 @@ fn unrelated_observer_cannot_cancel_or_detach_visible_handle() {
 
 #[test]
 fn owner_scenario_drop_terminates_and_reaps_polling_shell() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let owner = spawn_owner_scenario(&temp, "1");
     wait_until(FIXTURE_DEADLINE, || owner.ready.exists().then_some(()));
@@ -3597,6 +3794,9 @@ fn owner_scenario_drop_terminates_and_reaps_polling_shell() {
 
 #[test]
 fn rca_agent_bash_visibility_rejects_reused_pid_identity() {
+    if test_support::private_case() {
+        return;
+    }
     // Verifies that stale, absent, or invalid nearest ownership identities fail closed.
     let temp = tempfile::tempdir().expect("tempdir");
     let pid = unsafe { libc::getpid() };
@@ -3691,6 +3891,9 @@ fn rca_agent_bash_visibility_rejects_reused_pid_identity() {
 
 #[test]
 fn rca_agent_bash_visibility_broad_session_inventory_resolves_owner_once() {
+    if test_support::private_case() {
+        return;
+    }
     // Mirrors the production inventory size that exposed one helper process per state entry.
     const ENTRY_COUNT: usize = 19_106;
     const LIST_BOUND: Duration = Duration::from_secs(10);
@@ -3744,6 +3947,9 @@ fn rca_agent_bash_visibility_broad_session_inventory_resolves_owner_once() {
 
 #[test]
 fn concurrent_registrations_share_warm_cache_within_declared_bound() {
+    if test_support::private_case() {
+        return;
+    }
     const CONCURRENCY: usize = 8;
     const ADMISSION_BOUND: Duration = Duration::from_secs(8);
 
@@ -3797,6 +4003,9 @@ fn concurrent_registrations_share_warm_cache_within_declared_bound() {
 
 #[test]
 fn missing_explicit_owner_resolves_verified_parent_invocation() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fake = owner_resolving_fake_agents(&temp);
     let output = agent_bash(&temp)
@@ -3822,6 +4031,9 @@ fn missing_explicit_owner_resolves_verified_parent_invocation() {
 
 #[test]
 fn owner_resolution_retries_a_matching_pending_session_binding() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fake = owner_resolving_fake_agents(&temp);
     let pending_marker = temp.path().join("pending-owner-binding");
@@ -3850,6 +4062,9 @@ fn owner_resolution_retries_a_matching_pending_session_binding() {
 
 #[test]
 fn pending_owner_retry_bounds_a_hung_helper_to_the_shared_deadline() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fake = owner_resolving_fake_agents(&temp);
     let pending_marker = temp.path().join("pending-owner-binding");
@@ -3886,6 +4101,9 @@ fn pending_owner_retry_bounds_a_hung_helper_to_the_shared_deadline() {
 
 #[test]
 fn owner_resolution_and_registration_share_one_configured_helper() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let helper = owner_resolving_fake_agents(&temp);
     let resolver_started = temp.path().join("resolver-started");
@@ -3927,6 +4145,9 @@ fn owner_resolution_and_registration_share_one_configured_helper() {
 
 #[test]
 fn successful_registration_survives_launcher_loss_before_supervisor_startup() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = registration_launcher_killing_fake_agents(&temp);
     let workload_marker = temp.path().join("workload-started-after-launcher-loss");
@@ -3977,6 +4198,9 @@ fn successful_registration_survives_launcher_loss_before_supervisor_startup() {
 
 #[test]
 fn admitted_registration_failure_retains_non_replayable_unknown_handle() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = admitted_registration_failure_fake_agents(&temp);
     let workload_marker = temp
@@ -4031,6 +4255,9 @@ fn admitted_registration_failure_retains_non_replayable_unknown_handle() {
 
 #[test]
 fn adapter_reports_admitted_registration_uncertainty_without_running_promise() {
+    if test_support::private_case() {
+        return;
+    }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
     let driver = write_adapter_driver(&temp);
@@ -4067,6 +4294,9 @@ fn adapter_reports_admitted_registration_uncertainty_without_running_promise() {
 
 #[test]
 fn partial_explicit_owner_fails_closed_with_runner_detail() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, resolver_log) = registration_rejecting_fake_agents(&temp);
     let workload_marker = temp.path().join("workload-started");
@@ -4114,6 +4344,9 @@ fn partial_explicit_owner_fails_closed_with_runner_detail() {
 
 #[test]
 fn mismatched_resolved_owner_retains_admitted_registration_failure() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, resolver_log) = registration_rejecting_fake_agents(&temp);
     let workload_marker = temp.path().join("workload-started");
@@ -4160,6 +4393,9 @@ fn mismatched_resolved_owner_retains_admitted_registration_failure() {
 
 #[test]
 fn delivery_seam_records_invocation_outcome() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
 
@@ -4242,6 +4478,9 @@ fn delivery_seam_records_invocation_outcome() {
 
 #[test]
 fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
     let (fake, delivery_log) = parent_killing_fake_agents(&temp, "agent-bash-complete");
@@ -4275,6 +4514,9 @@ fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
 
 #[test]
 fn delivery_transfer_worker_finishes_after_supervisor_dies() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
     let fixture = blocking_delivery_fake_agents(&temp);
@@ -4335,6 +4577,9 @@ fn delivery_transfer_worker_finishes_after_supervisor_dies() {
 
 #[test]
 fn failed_delivery_transfer_worker_closes_unknown_transfer_without_replay() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = delivery_transfer_worker_killing_fake_agents(&temp);
     let output = agent_bash(&temp)
@@ -4367,6 +4612,9 @@ fn failed_delivery_transfer_worker_closes_unknown_transfer_without_replay() {
 
 #[test]
 fn successor_closes_orphaned_completion_transfer_without_replay() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = delivery_handoff_killing_fake_agents(&temp, "agent-bash-complete");
     let output = agent_bash(&temp)
@@ -4399,6 +4647,9 @@ fn successor_closes_orphaned_completion_transfer_without_replay() {
 
 #[test]
 fn successor_closes_orphaned_activation_transfer_without_replay() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = delivery_handoff_killing_fake_agents(&temp, "agent-bash-activate");
     let output = agent_bash(&temp)
@@ -4442,6 +4693,9 @@ fn successor_closes_orphaned_activation_transfer_without_replay() {
 
 #[test]
 fn delivery_transfer_worker_finishes_after_detach_caller_dies() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
     let fixture = blocking_delivery_fake_agents(&temp);
@@ -4506,6 +4760,9 @@ fn delivery_transfer_worker_finishes_after_detach_caller_dies() {
 
 #[test]
 fn admitted_activation_failure_is_durable_and_not_reported_as_settled() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = nonzero_activation_fake_agents(&temp);
     let output = agent_bash(&temp)
@@ -4580,6 +4837,9 @@ fn admitted_activation_failure_is_durable_and_not_reported_as_settled() {
 
 #[test]
 fn attempted_activation_without_pending_outcome_restores_sync_before_clearing_claim() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let handle = "ab_unknown_activation";
     let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
@@ -4603,6 +4863,9 @@ fn attempted_activation_without_pending_outcome_restores_sync_before_clearing_cl
 
 #[test]
 fn interrupted_pre_admission_activation_rollback_restores_sync_before_clearing_claim() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let handle = "ab_pre_admission_rollback";
     let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
@@ -4631,6 +4894,9 @@ fn interrupted_pre_admission_activation_rollback_restores_sync_before_clearing_c
 
 #[test]
 fn concurrent_status_after_nonzero_helper_exit_does_not_repeat_delivery() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = nonzero_completion_fake_agents(&temp);
     let output = agent_bash(&temp)
@@ -4670,6 +4936,9 @@ fn concurrent_status_after_nonzero_helper_exit_does_not_repeat_delivery() {
 
 #[test]
 fn legacy_helperless_handles_fail_closed_without_retry() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let handle = "ab_legacy_helperless";
     let state_dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
@@ -4711,6 +4980,9 @@ fn legacy_helperless_handles_fail_closed_without_retry() {
 
 #[test]
 fn caller_death_after_activation_handoff_does_not_repeat_or_split_detach() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
     let (fake, delivery_log) = parent_killing_fake_agents(&temp, "agent-bash-activate");
@@ -4769,6 +5041,9 @@ fn caller_death_after_activation_handoff_does_not_repeat_or_split_detach() {
 
 #[test]
 fn observer_cannot_substitute_registered_delivery_helper() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (helper_a, log_a) = named_fake_agents(&temp, "helper-a", "helper-a.log");
     let (helper_b, log_b) = named_fake_agents(&temp, "helper-b", "helper-b.log");
@@ -4843,6 +5118,9 @@ fn observer_cannot_substitute_registered_delivery_helper() {
 
 #[test]
 fn later_caller_cannot_substitute_registered_helper_environment() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let helper = temp.path().join("environment-bound-agents");
     let log = temp.path().join("environment-bound.log");
@@ -4943,6 +5221,9 @@ fn later_caller_cannot_substitute_registered_helper_environment() {
 
 #[test]
 fn registered_helper_snapshot_survives_source_replacement_without_polling() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
     let (helper, delivery_log) = fake_agents(&temp);
@@ -5001,6 +5282,9 @@ fn registered_helper_snapshot_survives_source_replacement_without_polling() {
 
 #[test]
 fn unavailable_pinned_helper_allows_one_bounded_pre_execution_retry() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
     let (observer, observer_log) =
@@ -5069,6 +5353,9 @@ fn unavailable_pinned_helper_allows_one_bounded_pre_execution_retry() {
 
 #[test]
 fn sentinel_root_exit_preserves_settled_delivery_retry() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
     let workload_started = temp.path().join("sentinel-retry-started");
@@ -5130,6 +5417,9 @@ fn sentinel_root_exit_preserves_settled_delivery_retry() {
 
 #[test]
 fn completion_uses_pinned_interpreter_after_source_is_replaced() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (helper, interpreter, delivery_log) = interpreter_backed_fake_agents(&temp);
     let retained_interpreter = temp.path().join("retained-delivery-interpreter");
@@ -5173,6 +5463,9 @@ fn completion_uses_pinned_interpreter_after_source_is_replaced() {
 
 #[test]
 fn detach_uses_pinned_interpreter_after_source_is_removed() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (helper, interpreter, _) = interpreter_backed_fake_agents(&temp);
     let retained_interpreter = temp.path().join("retained-delivery-interpreter");
@@ -5203,6 +5496,9 @@ fn detach_uses_pinned_interpreter_after_source_is_removed() {
 
 #[test]
 fn changed_handle_helper_fails_closed_through_completion_boundary() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
     let release = temp.path().join("changed-helper-release");
@@ -5245,6 +5541,9 @@ fn changed_handle_helper_fails_closed_through_completion_boundary() {
 
 #[test]
 fn product_state_and_helper_cache_are_account_private() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
     let output = agent_bash(&temp)
@@ -5268,6 +5567,9 @@ fn product_state_and_helper_cache_are_account_private() {
 
 #[test]
 fn sync_completion_triggers_its_inactive_completion_event() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
     let output = agent_bash(&temp)
@@ -5308,6 +5610,9 @@ fn sync_completion_triggers_its_inactive_completion_event() {
 
 #[test]
 fn detach_after_sync_completion_admits_each_helper_operation_once() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
     let output = agent_bash(&temp)
@@ -5353,6 +5658,9 @@ fn detach_after_sync_completion_admits_each_helper_operation_once() {
 
 #[test]
 fn concurrent_detach_and_completion_admit_each_helper_operation_once() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
     let output = agent_bash(&temp)
@@ -5418,6 +5726,9 @@ fn concurrent_detach_and_completion_admit_each_helper_operation_once() {
 
 #[test]
 fn detach_does_not_rewrite_terminal_metadata_after_activation() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let fixture_deadline = FIXTURE_DEADLINE;
     let fixture = blocking_delivery_fake_agents(&temp);
@@ -5531,6 +5842,9 @@ fn detach_does_not_rewrite_terminal_metadata_after_activation() {
 
 #[test]
 fn consumed_marker_before_completion_marks_helper_operation_consumed() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
 
@@ -5560,6 +5874,9 @@ fn consumed_marker_before_completion_marks_helper_operation_consumed() {
 
 #[test]
 fn consumed_marker_during_delivery_grace_marks_helper_operation_consumed() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
 
@@ -5605,6 +5922,9 @@ fn delivery_lifecycle_is_closed(meta: &Value) -> bool {
 
 #[test]
 fn consumed_marker_after_delivery_does_not_rewrite_delivery_meta() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let release_workload = temp.path().join("release-workload");
     let (fake, delivery_log) = fake_agents(&temp);
@@ -5670,6 +5990,9 @@ fn consumed_marker_after_delivery_does_not_rewrite_delivery_meta() {
 
 #[test]
 fn status_reconciles_conclusively_lost_supervisor_once_and_fails_closed() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log, meta_snapshot, rc_snapshot) = observing_fake_agents(&temp);
     let dead_supervisor = terminated_process_identity();
@@ -5889,6 +6212,9 @@ fn status_reconciles_conclusively_lost_supervisor_once_and_fails_closed() {
 
 #[test]
 fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (fake, delivery_log) = fake_agents(&temp);
     let retained_helper = temp.path().join("retained-guardian-helper");
@@ -5981,6 +6307,9 @@ fn supervisor_sigkill_reconciles_and_delivers_without_status_polling() {
 
 #[test]
 fn list_all_observes_lost_supervisors_without_reconciling_or_delivery() {
+    if test_support::private_case() {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let (observer, observer_log) =
         named_fake_agents(&temp, "list-observer-agents", "list-observer.log");
@@ -6035,6 +6364,14 @@ fn list_all_observes_lost_supervisors_without_reconciling_or_delivery() {
             .join(handle)
             .join("meta.json"),
     );
-    assert_eq!(delivered["delivery"]["attempted"], true);
-    assert_eq!(delivered["delivery"]["exit_code"], 0);
+    let evidence = completion_evidence(
+        &temp
+            .path()
+            .join("agent-bash")
+            .join(handle)
+            .join("meta.json"),
+        &delivered,
+    );
+    assert_eq!(delivered["delivery"]["attempted"], true, "{evidence}");
+    assert_eq!(delivered["delivery"]["exit_code"], 0, "{evidence}");
 }
