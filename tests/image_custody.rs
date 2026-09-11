@@ -15,6 +15,11 @@ fn asynchronous_completion_retains_transfer_and_cleanup_ownership() {
     run_private_fixture("65", "tests/fixtures/completion_ownership.py");
 }
 
+#[test]
+fn external_completion_and_activation_retain_uncertain_custody() {
+    run_private_fixture("65", "tests/fixtures/external_transfer_custody.py");
+}
+
 fn run_private_fixture(seconds: &str, fixture: &str) {
     let output = Command::new("timeout")
         .env("PYTHONDONTWRITEBYTECODE", "1")

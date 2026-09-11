@@ -40,6 +40,7 @@ pub(crate) struct StatePaths {
     pub(crate) accepted_cancel: PathBuf,
     pub(crate) cancellation_drained: PathBuf,
     pub(crate) physical_custody: PathBuf,
+    pub(crate) external_transfer_custody: PathBuf,
     pub(crate) completion_lock: PathBuf,
     pub(crate) reconciliation_lock: PathBuf,
 }
@@ -65,6 +66,7 @@ impl StatePaths {
             accepted_cancel: state_dir.join("cancel-requested"),
             cancellation_drained: state_dir.join("cancel-workload-drained"),
             physical_custody: state_dir.join("physical-custody"),
+            external_transfer_custody: state_dir.join("external-transfer-custody"),
             completion_lock: state_dir.join("completion.lock"),
             reconciliation_lock: state_dir.join("reconciliation.lock"),
             state_dir,
@@ -669,12 +671,38 @@ pub(crate) fn end_physical_custody(paths: &StatePaths) -> io::Result<()> {
     rollback_created_marker(&paths.physical_custody, &File::open(&paths.state_dir)?)
 }
 
+// Caller holds the delivery lock across acquisition, helper execution and discharge.
+// Never replace or discharge an earlier uncertain external attempt's evidence.
+pub(crate) fn begin_external_transfer_custody(paths: &StatePaths) -> io::Result<bool> {
+    let boot = current_boot_id();
+    if durable_marker_exists(&paths.external_transfer_custody)?
+        && boot_custody_may_remain(&paths.external_transfer_custody, &boot)
+    {
+        return Ok(false);
+    }
+    // A valid prior boot ended the old attempt, but must not exempt a new one.
+    atomic_write(&paths.external_transfer_custody, boot.as_bytes())?;
+    Ok(true)
+}
+
+pub(crate) fn end_external_transfer_custody(paths: &StatePaths) -> io::Result<()> {
+    rollback_created_marker(
+        &paths.external_transfer_custody,
+        &File::open(&paths.state_dir)?,
+    )
+}
+
 pub(crate) fn record_cancellation_drained(paths: &StatePaths) -> io::Result<()> {
     record_durable_create_once_marker(&paths.cancellation_drained, &paths.state_dir).map(|_| ())
 }
 
 fn physical_custody_may_remain(paths: &StatePaths, boot_id: &str) -> bool {
-    match fs::read_to_string(&paths.physical_custody) {
+    boot_custody_may_remain(&paths.physical_custody, boot_id)
+        || boot_custody_may_remain(&paths.external_transfer_custody, boot_id)
+}
+
+fn boot_custody_may_remain(marker: &Path, boot_id: &str) -> bool {
+    match fs::read_to_string(marker) {
         // A reboot ends the entire former tree, unlike loss of either reaper.
         Ok(recorded_boot) => {
             !valid_boot_id(&recorded_boot) || !valid_boot_id(boot_id) || recorded_boot == boot_id
@@ -1775,6 +1803,49 @@ mod tests {
         fs::remove_file(&paths.physical_custody).unwrap();
         fs::create_dir(&paths.physical_custody).unwrap();
         assert!(physical_custody_may_remain(&paths, &boot));
+    }
+
+    #[test]
+    fn external_custody_vetoes_ttl_independently_of_activation_and_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = write_reap_state(temp.path(), "ab_external", "DONE", 1, true);
+        settle_reap_delivery(&paths);
+        let config = test_reap_config(100_000, 10, 10);
+        assert!(begin_external_transfer_custody(&paths).unwrap());
+        write_activation_pending(&paths).unwrap();
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 0);
+        write_activation_transfer_outcome_unknown(&paths).unwrap();
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 0);
+        write_activation_failed(&paths, "wait error converted to failure").unwrap();
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 0);
+        assert!(!begin_external_transfer_custody(&paths).unwrap());
+        assert!(physical_custody_may_remain(&paths, &current_boot_id()));
+        assert!(!physical_custody_may_remain(
+            &paths,
+            "00000000-0000-0000-0000-000000000000"
+        ));
+        fs::write(&paths.external_transfer_custody, "corrupt").unwrap();
+        assert!(physical_custody_may_remain(&paths, &current_boot_id()));
+        end_external_transfer_custody(&paths).unwrap();
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 1);
+    }
+
+    #[test]
+    fn new_external_attempt_requalifies_conclusively_old_boot_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = write_reap_state(temp.path(), "ab_external_reboot", "DONE", 1, true);
+        fs::write(
+            &paths.external_transfer_custody,
+            "00000000-0000-0000-0000-000000000000",
+        )
+        .unwrap();
+        assert!(begin_external_transfer_custody(&paths).unwrap());
+        assert_eq!(
+            fs::read_to_string(&paths.external_transfer_custody).unwrap(),
+            current_boot_id()
+        );
+        assert!(physical_custody_may_remain(&paths, &current_boot_id()));
+        assert!(!begin_external_transfer_custody(&paths).unwrap());
     }
 
     #[test]

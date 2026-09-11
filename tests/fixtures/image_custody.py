@@ -307,8 +307,10 @@ def busy_startup_and_controls(directory, helper, owner, custodian):
         sockets.clear()
         os.kill(custodian, signal.SIGCONT)
         wait(spawned.exists)
+        # The child can touch spawned before its parent publishes spawn metadata.
+        # Wait for that last startup write before editing the private authority fixture.
+        meta = wait(lambda: (m if (m := read_json(item["meta"])) and m.get("workload_pid") else None))
         # Session authority is in persisted state, never inferred from caller ancestry.
-        meta = read_json(item["meta"])
         meta["owner_session_id"] = "ses_other"
         meta["owner_invocation_uuid"] = "11111111-1111-4111-8111-111111111111"
         Path(item["meta"]).write_text(json.dumps(meta))

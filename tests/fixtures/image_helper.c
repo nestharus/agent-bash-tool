@@ -31,13 +31,17 @@ int main(int argc, char **argv) {
         printf("{\"found\":true,\"session_id\":\"%s\",\"invocation_uuid\":\"11111111-1111-4111-8111-111111111111\"}\n", session);
     }
     const char *hold = getenv("IMAGE_FIXTURE_HOLD");
-    if (hold && argc > 2 && !strcmp(argv[2], "agent-bash-complete")) {
+    const char *hold_operation = getenv("IMAGE_FIXTURE_HOLD_OPERATION");
+    if (!hold_operation) hold_operation = "agent-bash-complete";
+    if (hold && argc > 2 && !strcmp(argv[2], hold_operation)) {
         char marker[4096]; snprintf(marker, sizeof(marker), "%s.admitted", hold);
         int fd = open(marker, O_WRONLY | O_CREAT, 0600);
         if (fd < 0) return 96;
         close(fd);
         for (int i = 0; i < 1000 && access(hold, F_OK); i++) usleep(10000);
         if (access(hold, F_OK)) return 97;
+        const char *exit_code = getenv("IMAGE_FIXTURE_EXIT_CODE");
+        if (exit_code) return atoi(exit_code);
     }
     /* A wake-like self-exec pins the same image after the original custodian dies. */
     if (argc == 3 && !strcmp(argv[1], "self-exec")) {

@@ -119,4 +119,6 @@ MIT
 
 Managed trees share verified sealed helper images through a tree-owned, image-only
 custodian. Independent roots may duplicate images; no host-wide memory bound is
-claimed. See [ownership, budgets, tree lifetime and recovery behavior](docs/helper-image-custody.md).
+claimed. Uncertain external helper transfers and lost founding custody retain handle
+artifacts rather than treating logical settlement as physical cessation; no global
+retention bound is claimed. See [ownership, budgets, tree lifetime and recovery behavior](docs/helper-image-custody.md).

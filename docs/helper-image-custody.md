@@ -213,3 +213,37 @@ caller was proven ineligible (`EX_NOPERM`). Neither outcome authorizes mutation.
 Status with `--observe-only` remains available without an eligibility lookup;
 ordinary status/mode no longer silently turn lookup errors into observational
 success. A successfully attested mismatching session still gets no control rights.
+
+### External transfer uncertainty and retained state
+
+External status/retry completion and detach activation do not inherit the founding
+reapers' adoption. Their synchronous transfer workers now publish a separate
+`external-transfer-custody` boot marker before spawning the helper. Confirmed
+non-admission or a raw helper wait result clears only the creating attempt's marker;
+a wait error or worker loss leaves it. Activation distinguishes nonzero helper exit
+from wait uncertainty before both become logical errors. Successor reconciliation
+may close replay but cannot remove the marker. A later successful transfer cannot
+discharge older external uncertainty, and founding-tree discharge is independent.
+
+Startup cleanup retains current-boot or unreadable/malformed evidence despite
+expired logical timestamps. Normal ended controls remain eligible for eventual
+ordinary cleanup after their own marker is removed; a different valid boot removes
+the marker veto without bypassing other retention checks. This is a conservative
+retention measure, not another custody topology or arbitrary orphan attribution.
+It does not prove that waiting for a helper inventories all descendants it may create.
+
+Founding custody also has an accepted loss case: the guardian can die and the
+supervisor can **exit normally under Root semantics with descendants remaining**.
+When those descendants later end under an outer reaper, nobody discharges this
+handle's marker. This does not require simultaneous abnormal loss of both reapers.
+External worker-loss evidence similarly remains after the helper actually ends
+without a production discharge witness. No timer or known-dead supervisor guess
+clears either uncertainty. Retained storage on a long-lived boot is an accepted cost
+pending separately authorized recovery, not globally bounded retention.
+
+The private external fixture exercises admitted completion and activation worker
+loss, caller-plus-worker loss followed by successor reconciliation, aged startup
+scans while the helper survives, and retention after harness-observed helper exit.
+Normal zero and nonzero exits provide finite-cleanup controls for each operation.
+These are bounded tiny-process experiments, not production mailbox/wake evidence,
+arbitrary descendant tracking, large-fanout tests or a multiday soak.

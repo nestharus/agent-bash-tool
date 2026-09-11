@@ -121,8 +121,9 @@ Captured output is bounded by `AGENT_BASH_LOG_MAX_BYTES` (16 MiB by default, cla
 64 KiB and 1 GiB). When the limit is crossed, the log records a truncation marker and retains the
 newest output rather than allowing an unbounded state-directory file.
 
-The intermediate daemon process remains as a guardian for the exact supervisor child. A clean
-supervisor exit ends the guardian. After an abnormal exit, including `SIGKILL`, the guardian uses
+The intermediate daemon process remains as a guardian for the exact supervisor child. After a clean
+supervisor exit, the guardian drains adopted descendants before exiting. After an abnormal exit,
+including `SIGKILL`, the guardian uses
 the persisted PID/start-time/boot-ID identities and per-handle reconciliation lock to wait until
 supervisor loss is conclusive, record `supervisor-lost`, and run any pending async delivery. A
 persisted root exit code remains diagnostic evidence; supervisor loss is still `ERROR rc=70`
@@ -436,7 +437,7 @@ expired `ERROR` handle or `RUNNING` handle whose exact supervisor and workload i
 conclusively gone or reused. Missing or unreadable process identity evidence fails closed and keeps
 the state directory.
 
-All terminal handles use the configured state TTL. Retryable pre-invocation helper failures do not
+Terminal handles use the configured state TTL only after physical-retention vetoes are discharged. Retryable pre-invocation helper failures do not
 receive a multiplied retention window, so failed delivery does not create a sevenfold retained-state
 population. Each control-route-eligible status observer may perform at most one helper-resolution retry
 for the handle it observes. The adapter requests the durable `consumed` marker through the
@@ -445,6 +446,37 @@ origin session's pending delivery. `retry_count` bounds each handle to one
 observer-triggered retry in total. The delivery lock serializes concurrently admitted eligible
 observers; the first persists either an attempt claim or a closed retry result, and later observers
 cannot repeat it.
+
+### Physical retention is independent of logical settlement
+
+The founding guardian publishes boot-qualified `physical-custody` before forking the supervisor.
+Only the founding adopting reapers' empty-tree observations discharge it under the delivery lock;
+TTL and known-dead supervisor identity cannot stand in for unseen descendants. Normal Root
+completion may leave the guardian draining even though completion is already visible.
+
+Synchronous completion reconciliation (including external status retry) and detach activation
+publish a separate boot-qualified `external-transfer-custody` before helper spawn. The shared
+delivery lock serializes publication and cleanup. Only the attempt that created this marker may
+remove it, after confirmed non-admission or a returned helper wait result. A nonzero helper exit
+still supplies that direct-process result; an I/O wait error does not. Activation performs this
+distinction before converting a nonzero exit into a logical failure. Worker/caller loss leaves
+evidence in place through pending-to-unknown successor reconciliation. Founding reapers cannot
+clear this separate marker, nor can a later successful operation discharge an older uncertainty.
+This adds evidence, not another monitor, proxy, reaper or retry path.
+
+Both markers veto startup deletion on the current boot regardless of logical delivery outcomes.
+Malformed/unreadable evidence is conservative; a valid different boot ID removes its veto, not
+other cleanup predicates. Confirmed ordinary helper exits/non-admissions clear their own external
+marker and remain eligible for eventual scan/TTL cleanup. Waiting for a direct helper is not an
+inventory or proof of cessation of arbitrary helper-created descendants.
+
+Loss of the guardian plus **normal Root supervisor exit with descendants remaining** can strand
+founding custody even after those descendants later end under an outer reaper. Simultaneous
+abnormal loss of both founding reapers is not necessary. Likewise an external worker can lose
+its discharge witness even if its helper subsequently ends. These uncertain current-boot states
+are deliberately retained pending separate authorized recovery (or real cross-boot evidence),
+not discharged by timers or a dead-supervisor guess. This accepted storage cost has no global
+retention bound, and the markers do not establish all-path physical quiescence.
 
 ## agent-runner additions
 

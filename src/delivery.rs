@@ -1223,12 +1223,10 @@ pub(crate) fn register(
     meta: &Meta,
     registration: DeliveryRegistration,
 ) -> Result<(), RegistrationError> {
-    run_required_delivery_helper_command_detailed(&register_request(
-        meta,
-        paths,
-        registration.helper,
-        registration.authority,
-    ))
+    run_required_delivery_helper_command_detailed(
+        &register_request(meta, paths, registration.helper, registration.authority),
+        None,
+    )
     .map_err(|err| match err {
         DeliveryHelperCommandError::NotStarted(err) => RegistrationError::NotStarted(err),
         DeliveryHelperCommandError::Admitted(err) => RegistrationError::Admitted(err),
@@ -1269,12 +1267,13 @@ pub(crate) fn try_start_completion_delivery(
     let Some(file) = state::try_lock_delivery(paths)? else {
         return Ok(CompletionStart::Busy);
     };
-    start_completion_delivery(paths, meta, DeliveryLockGuard { _file: file })
+    start_completion_delivery(paths, meta, DeliveryLockGuard { _file: file }, false)
 }
 
 pub(crate) fn reconcile_completion_delivery(paths: &StatePaths, meta: &mut Meta) -> io::Result<()> {
     let lock = DeliveryLockGuard::acquire(paths)?;
-    if let CompletionStart::Running(transfer) = start_completion_delivery(paths, meta, lock)? {
+    if let CompletionStart::Running(transfer) = start_completion_delivery(paths, meta, lock, true)?
+    {
         let result = wait_for_delivery_transfer_worker(transfer.pid);
         integrate_completion_transfer(paths, meta, result, transfer.retry_count)?;
     }
@@ -1285,6 +1284,7 @@ fn start_completion_delivery(
     paths: &StatePaths,
     meta: &mut Meta,
     lock: DeliveryLockGuard,
+    external: bool,
 ) -> io::Result<CompletionStart> {
     let mut persisted = state::read_meta(paths)?;
     persisted.delivery_mode = state::read_delivery_mode(paths)?;
@@ -1313,7 +1313,7 @@ fn start_completion_delivery(
     }
     if pid == 0 {
         let result = prepare_completion_worker(lock._file.as_raw_fd())
-            .and_then(|()| execute_completion_transfer(paths, persisted, retry_count));
+            .and_then(|()| execute_completion_transfer(paths, persisted, retry_count, external));
         unsafe { libc::_exit(if result.is_ok() { 0 } else { 70 }) };
     }
     Ok(CompletionStart::Running(CompletionTransfer {
@@ -1342,6 +1342,7 @@ fn execute_completion_transfer(
     paths: &StatePaths,
     mut persisted: Meta,
     retry_count: u8,
+    external: bool,
 ) -> io::Result<()> {
     let request = match completion_request(
         persisted.caller_ppid,
@@ -1360,7 +1361,7 @@ fn execute_completion_transfer(
     persisted.delivery = provisional_completion_delivery_transfer_meta();
     persisted.touch();
     state::write_meta_atomic(paths, &persisted)?;
-    persisted.delivery = match run_delivery_helper_command(&request) {
+    persisted.delivery = match run_delivery_helper_command(&request, external.then_some(paths)) {
         Ok(status) => completion_delivery_meta_from_status(status),
         Err(DeliveryHelperCommandError::NotStarted(err)) => {
             completion_delivery_meta_from_launch_error(err, retry_count)
@@ -1448,7 +1449,7 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
                 settle_orphaned_activation(paths)?;
                 return Err(err);
             }
-            run_required_delivery_helper_command_detailed(&request)
+            run_required_delivery_helper_command_detailed(&request, Some(paths))
         } else {
             require_settled_activation(paths)?;
             Ok(())
@@ -1742,7 +1743,34 @@ enum DeliveryHelperCommandError {
     Admitted(io::Error),
 }
 
+// Only the raw spawn/wait result supplies cessation evidence. In particular,
+// activation's later nonzero-exit conversion and successor logical settlement
+// must neither erase a wait error nor discharge an abandoned worker's marker.
+fn with_external_transfer_custody<T>(
+    paths: Option<&StatePaths>,
+    operation: impl FnOnce() -> Result<T, DeliveryHelperCommandError>,
+) -> Result<T, DeliveryHelperCommandError> {
+    let Some(paths) = paths else {
+        return operation();
+    };
+    let owned = state::begin_external_transfer_custody(paths)
+        .map_err(DeliveryHelperCommandError::NotStarted)?;
+    let result = operation();
+    if owned && !matches!(result, Err(DeliveryHelperCommandError::Admitted(_))) {
+        state::end_external_transfer_custody(paths)
+            .map_err(DeliveryHelperCommandError::Admitted)?;
+    }
+    result
+}
+
 fn run_delivery_helper_command(
+    request: &DeliveryHelperRequest,
+    custody: Option<&StatePaths>,
+) -> Result<ExitStatus, DeliveryHelperCommandError> {
+    with_external_transfer_custody(custody, || wait_delivery_helper(request))
+}
+
+fn wait_delivery_helper(
     request: &DeliveryHelperRequest,
 ) -> Result<ExitStatus, DeliveryHelperCommandError> {
     let mut child = request
@@ -1757,7 +1785,16 @@ fn run_delivery_helper_command(
 
 fn run_required_delivery_helper_command_detailed(
     request: &DeliveryHelperRequest,
+    custody: Option<&StatePaths>,
 ) -> Result<(), DeliveryHelperCommandError> {
+    let output =
+        with_external_transfer_custody(custody, || wait_required_delivery_helper(request))?;
+    require_helper_success(output)
+}
+
+fn wait_required_delivery_helper(
+    request: &DeliveryHelperRequest,
+) -> Result<std::process::Output, DeliveryHelperCommandError> {
     let child = request
         .command()
         .stdin(Stdio::null())
@@ -1765,9 +1802,12 @@ fn run_required_delivery_helper_command_detailed(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(DeliveryHelperCommandError::NotStarted)?;
-    let output = child
+    child
         .wait_with_output()
-        .map_err(DeliveryHelperCommandError::Admitted)?;
+        .map_err(DeliveryHelperCommandError::Admitted)
+}
+
+fn require_helper_success(output: std::process::Output) -> Result<(), DeliveryHelperCommandError> {
     if output.status.success() {
         return Ok(());
     }
@@ -1902,6 +1942,50 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn external_wait_uncertainty_survives_later_conclusive_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_external".into());
+        fs::create_dir(&paths.state_dir).unwrap();
+        let _lock = DeliveryLockGuard::acquire(&paths).unwrap();
+        let result: Result<(), _> = with_external_transfer_custody(Some(&paths), || {
+            Err(DeliveryHelperCommandError::Admitted(io::Error::other(
+                "wait failed",
+            )))
+        });
+        assert!(result.is_err());
+        let evidence = fs::read(&paths.external_transfer_custody).unwrap();
+        assert!(with_external_transfer_custody(Some(&paths), || Ok(())).is_ok());
+        assert_eq!(
+            fs::read(&paths.external_transfer_custody).unwrap(),
+            evidence
+        );
+        // A founding reaper cannot discharge external work it never adopted.
+        drop(_lock);
+        state::end_physical_custody(&paths).unwrap();
+        assert_eq!(
+            fs::read(&paths.external_transfer_custody).unwrap(),
+            evidence
+        );
+    }
+
+    #[test]
+    fn external_known_nonadmission_and_wait_success_discharge_own_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_external".into());
+        fs::create_dir(&paths.state_dir).unwrap();
+        let _lock = DeliveryLockGuard::acquire(&paths).unwrap();
+        let result: Result<(), _> = with_external_transfer_custody(Some(&paths), || {
+            Err(DeliveryHelperCommandError::NotStarted(io::Error::other(
+                "spawn failed",
+            )))
+        });
+        assert!(result.is_err());
+        assert!(!paths.external_transfer_custody.exists());
+        assert!(with_external_transfer_custody(Some(&paths), || Ok(())).is_ok());
+        assert!(!paths.external_transfer_custody.exists());
+    }
 
     #[test]
     fn delivery_helper_preserves_the_complete_environment_without_a_population_cap() {
