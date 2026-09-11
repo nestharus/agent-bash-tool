@@ -1390,15 +1390,18 @@ pub(crate) fn process_parent_pid(pid: libc::pid_t) -> Option<libc::pid_t> {
 }
 
 pub(crate) fn process_identity_is_live(identity: &CallerChainEntry) -> bool {
-    let current_boot_id = read_boot_id();
     matches!(
-        inspect_process_identity(
-            Some(identity.pid),
-            Some(identity.starttime_ticks),
-            Some(identity.boot_id.as_str()),
-            &current_boot_id,
-        ),
+        process_identity_evidence(identity),
         ProcessIdentityEvidence::Live
+    )
+}
+
+pub(crate) fn process_identity_evidence(identity: &CallerChainEntry) -> ProcessIdentityEvidence {
+    inspect_process_identity(
+        Some(identity.pid),
+        Some(identity.starttime_ticks),
+        Some(identity.boot_id.as_str()),
+        &read_boot_id(),
     )
 }
 
@@ -1437,7 +1440,7 @@ pub(crate) fn exact_supervisor_and_workload_are_gone(meta: &Meta) -> bool {
     )
 }
 
-enum ProcessIdentityEvidence {
+pub(crate) enum ProcessIdentityEvidence {
     Live,
     Gone,
     Mismatch,

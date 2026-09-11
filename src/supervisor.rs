@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 use regex::bytes::Regex;
@@ -206,51 +206,150 @@ fn record_admitted_registration_unknown(
     Ok(())
 }
 
-pub(crate) fn request_cancel(paths: &StatePaths) -> io::Result<bool> {
+/// `requested` reports durable acceptance, never successful signal delivery.
+#[derive(Debug)]
+pub(crate) struct CancelOutcome {
+    pub(crate) requested: bool,
+    pub(crate) wake: CancelWake,
+    pub(crate) wake_error: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CancelWake {
+    NotRequested,
+    Sent,
+    SupervisorGone,
+    Failed,
+}
+
+impl CancelOutcome {
+    fn not_requested() -> Self {
+        Self {
+            requested: false,
+            wake: CancelWake::NotRequested,
+            wake_error: None,
+        }
+    }
+}
+
+pub(crate) fn request_cancel(paths: &StatePaths) -> io::Result<CancelOutcome> {
+    request_cancel_using(paths, capture_cancel_supervisor, signal_cancel_supervisor)
+}
+
+fn request_cancel_using(
+    paths: &StatePaths,
+    capture: impl FnOnce(&state::CallerChainEntry) -> io::Result<Option<OwnedFd>>,
+    wake: impl FnOnce(&OwnedFd) -> io::Result<()>,
+) -> io::Result<CancelOutcome> {
     let meta = wait_for_supervisor_metadata(paths)?;
     if state::terminal(&meta) {
-        return Ok(false);
-    }
-    let Some(identity) = supervisor_identity(&meta) else {
-        reconcile_lost_supervisor(paths)?;
-        return Ok(false);
-    };
-    if !state::process_identity_is_live(&identity) {
-        reconcile_lost_supervisor(paths)?;
-        return Ok(false);
+        return Ok(CancelOutcome::not_requested());
     }
     let completion_lock = state::lock_completion(paths)?;
     let current = state::read_meta(paths)?;
     if state::terminal(&current) {
-        return Ok(false);
+        return Ok(CancelOutcome::not_requested());
     }
-    let Some(identity) = supervisor_identity(&current) else {
-        drop(completion_lock);
-        reconcile_lost_supervisor(paths)?;
-        return Ok(false);
+    let captured = match supervisor_identity(&current) {
+        Some(identity) => capture(&identity)?,
+        None => None,
     };
-    if !state::process_identity_is_live(&identity) {
+    let Some(supervisor) = captured else {
         drop(completion_lock);
         reconcile_lost_supervisor(paths)?;
-        return Ok(false);
-    }
+        return Ok(CancelOutcome::not_requested());
+    };
     // Durability is the acceptance boundary. SIGUSR1 only wakes the supervisor;
     // it also polls the marker so requester death cannot abandon the request.
     state::record_explicit_cancel_acceptance(paths)?;
-    let rc = unsafe { libc::kill(identity.pid, libc::SIGUSR1) };
-    if rc == 0 {
-        Ok(true)
-    } else {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            drop(completion_lock);
-            reconcile_lost_supervisor(paths)?;
-            Ok(true)
-        } else {
-            // The accepted marker remains authoritative even when the wake-up
-            // signal fails; the live supervisor polls it.
-            Ok(true)
+    let (wake, wake_error) = match wake(&supervisor) {
+        Ok(()) => (CancelWake::Sent, None),
+        Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {
+            (CancelWake::SupervisorGone, Some(err.to_string()))
         }
+        Err(err) => (CancelWake::Failed, Some(err.to_string())),
+    };
+    drop(completion_lock);
+    if wake == CancelWake::SupervisorGone {
+        // Exit of this supervisor is not proof of workload/tree cessation.
+        // Preserve acceptance even if reconciliation itself cannot complete.
+        if let Err(err) = reconcile_lost_supervisor(paths) {
+            return Ok(CancelOutcome {
+                requested: true,
+                wake,
+                wake_error: Some(format!("supervisor gone; reconciliation failed: {err}")),
+            });
+        }
+    }
+    Ok(CancelOutcome {
+        requested: true,
+        wake,
+        wake_error,
+    })
+}
+
+fn capture_cancel_supervisor(identity: &state::CallerChainEntry) -> io::Result<Option<OwnedFd>> {
+    capture_cancel_supervisor_using(identity, open_pidfd, state::process_identity_evidence)
+}
+
+fn capture_cancel_supervisor_using(
+    identity: &state::CallerChainEntry,
+    open: impl FnOnce(libc::pid_t) -> io::Result<OwnedFd>,
+    observe: impl FnOnce(&state::CallerChainEntry) -> state::ProcessIdentityEvidence,
+) -> io::Result<Option<OwnedFd>> {
+    // Open BEFORE inspecting /proc: a reused numeric slot must be validated
+    // against metadata after capture, not used to signal after validation.
+    let fd = match open(identity.pid) {
+        Ok(fd) => fd,
+        Err(err) if err.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+        Err(err) => return Err(err), // Includes unsupported/denied pidfds: no fallback.
+    };
+    match observe(identity) {
+        state::ProcessIdentityEvidence::Gone | state::ProcessIdentityEvidence::Mismatch => {
+            return Ok(None);
+        }
+        state::ProcessIdentityEvidence::Unavailable => {
+            return Err(io::Error::other(
+                "supervisor identity unavailable after pidfd capture",
+            ));
+        }
+        state::ProcessIdentityEvidence::Live => {}
+    }
+    // /proc is numeric. If the captured process exited during observation, do
+    // not attribute a later occupant's identity to this descriptor.
+    let mut event = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut event, 1, 0) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if event.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        return Err(io::Error::other("supervisor pidfd observation failed"));
+    }
+    if event.revents != 0 {
+        return Ok(None);
+    }
+    Ok(Some(fd))
+}
+
+fn signal_cancel_supervisor(supervisor: &OwnedFd) -> io::Result<()> {
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            supervisor.as_raw_fd(),
+            libc::SIGUSR1,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -1132,13 +1231,18 @@ impl Drop for Sigchld {
     }
 }
 
-fn pidfd_open(pid: libc::pid_t) -> Option<RawFd> {
+fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if fd >= 0 {
-        Some(i32::try_from(fd).ok()?)
+    if fd < 0 {
+        Err(io::Error::last_os_error())
     } else {
-        None
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
     }
+}
+
+fn pidfd_open(pid: libc::pid_t) -> Option<RawFd> {
+    use std::os::fd::IntoRawFd;
+    open_pidfd(pid).ok().map(IntoRawFd::into_raw_fd)
 }
 
 #[derive(Clone, Copy)]
@@ -2297,6 +2401,279 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    /// Private child with an acknowledged signal counter. No models, shared
+    /// signal handlers, host PID reuse, or production fixture knobs.
+    struct CancelSentinel {
+        child: std::process::Child,
+        output: std::io::BufReader<std::process::ChildStdout>,
+    }
+
+    impl CancelSentinel {
+        fn new() -> Self {
+            use std::process::{Command, Stdio};
+            let mut child = Command::new("/usr/bin/python3")
+                .env_clear()
+                .args([
+                    "-u",
+                    "-c",
+                    r#"
+import signal, sys
+count = 0
+def received(*_):
+    global count
+    count += 1
+signal.signal(signal.SIGUSR1, received)
+print('ready', flush=True)
+for line in sys.stdin:
+    print(count, flush=True)
+"#,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut sentinel = Self { child, output };
+            assert_eq!(sentinel.line(), "ready");
+            sentinel
+        }
+
+        fn line(&mut self) -> String {
+            use std::io::BufRead;
+            let mut event = libc::pollfd {
+                fd: self.output.get_ref().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(
+                unsafe { libc::poll(&mut event, 1, 5000) },
+                1,
+                "fixture response deadline"
+            );
+            let mut line = String::new();
+            assert!(self.output.read_line(&mut line).unwrap() > 0);
+            line.trim().to_owned()
+        }
+
+        fn count(&mut self) -> usize {
+            self.child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"count\n")
+                .unwrap();
+            self.line().parse().unwrap()
+        }
+
+        fn identity(&self) -> state::CallerChainEntry {
+            let pid = self.child.id() as libc::pid_t;
+            state::CallerChainEntry {
+                pid,
+                starttime_ticks: state::process_starttime_ticks(pid).unwrap(),
+                boot_id: state::current_boot_id(),
+            }
+        }
+
+        fn stop(&mut self) {
+            self.child.kill().unwrap();
+            self.child.wait().unwrap();
+        }
+    }
+
+    impl Drop for CancelSentinel {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn cancel_fixture(identity: &state::CallerChainEntry) -> (tempfile::TempDir, StatePaths) {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = "ab_exact_cancel".to_owned();
+        let paths = StatePaths::new(temp.path().join("agent-bash"), handle.clone());
+        state::create_handle_state(&paths).unwrap();
+        let mut meta = Meta::new(
+            handle,
+            unsafe { libc::getpid() },
+            unsafe { libc::getpid() },
+            vec!["private fixture".to_owned()],
+            temp.path().to_path_buf(),
+            "exit",
+            state::DeliveryMode::Sync,
+            None,
+            Vec::new(),
+            None,
+        );
+        meta.supervisor_pid = Some(identity.pid);
+        meta.supervisor_pid_starttime_ticks = Some(identity.starttime_ticks);
+        meta.process_boot_id = Some(identity.boot_id.clone());
+        state::write_meta_atomic(&paths, &meta).unwrap();
+        (temp, paths)
+    }
+
+    #[test]
+    fn exact_cancel_capture_revalidates_replaced_slot_and_never_signals_sentinel() {
+        let mut original = CancelSentinel::new();
+        let prior = original.identity();
+        assert!(state::process_identity_is_live(&prior));
+        // Distinct real start ticks, without attempting actual PID reuse.
+        std::thread::sleep(Duration::from_millis(25));
+        let mut sentinel = CancelSentinel::new();
+        let replacement = sentinel.identity();
+        assert_ne!(prior.starttime_ticks, replacement.starttime_ticks);
+        let (_temp, paths) = cancel_fixture(&prior);
+        let opened = std::cell::Cell::new(false);
+        let result = request_cancel_using(
+            &paths,
+            |identity| {
+                capture_cancel_supervisor_using(
+                    identity,
+                    |pid| {
+                        assert_eq!(pid, prior.pid);
+                        original.stop();
+                        opened.set(true);
+                        // Model the logical PID slot changing at capture, using a
+                        // real unrelated pidfd rather than forcing kernel reuse.
+                        open_pidfd(replacement.pid)
+                    },
+                    |identity| {
+                        assert!(opened.get(), "identity observation must follow capture");
+                        let mapped = state::CallerChainEntry {
+                            pid: replacement.pid,
+                            ..identity.clone()
+                        };
+                        state::process_identity_evidence(&mapped)
+                    },
+                )
+            },
+            signal_cancel_supervisor,
+        )
+        .unwrap();
+        assert!(!result.requested);
+        assert_eq!(result.wake, CancelWake::NotRequested);
+        assert!(!paths.accepted_cancel.exists());
+        assert_eq!(sentinel.count(), 0);
+        assert_eq!(state::read_meta(&paths).unwrap().state, "RUNNING");
+    }
+
+    #[test]
+    fn exact_cancel_exit_during_capture_rejects_stale_live_observation() {
+        let mut supervisor = CancelSentinel::new();
+        let mut unrelated = CancelSentinel::new();
+        let identity = supervisor.identity();
+        let (_temp, paths) = cancel_fixture(&identity);
+        let result = request_cancel_using(
+            &paths,
+            |identity| {
+                capture_cancel_supervisor_using(identity, open_pidfd, |_| {
+                    supervisor.stop();
+                    // A /proc observation cannot revive a captured, exited pidfd.
+                    state::ProcessIdentityEvidence::Live
+                })
+            },
+            signal_cancel_supervisor,
+        )
+        .unwrap();
+        assert!(!result.requested);
+        assert_eq!(result.wake, CancelWake::NotRequested);
+        assert!(!paths.accepted_cancel.exists());
+        assert_eq!(unrelated.count(), 0);
+    }
+
+    #[test]
+    fn exact_cancel_exit_before_signal_preserves_acceptance_not_delivery_or_tree_proof() {
+        let mut supervisor = CancelSentinel::new();
+        let mut unrelated = CancelSentinel::new();
+        let (_temp, paths) = cancel_fixture(&supervisor.identity());
+        let result = request_cancel_using(&paths, capture_cancel_supervisor, |fd| {
+            assert!(explicit_cancel_accepted(&paths).unwrap());
+            supervisor.stop();
+            let err = signal_cancel_supervisor(fd).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::ESRCH));
+            Err(err)
+        })
+        .unwrap();
+        assert!(result.requested);
+        assert_eq!(result.wake, CancelWake::SupervisorGone);
+        assert!(result.wake_error.is_some());
+        assert!(paths.accepted_cancel.exists());
+        assert_eq!(unrelated.count(), 0);
+        // Missing workload identity leaves cessation unknown, not DONE.
+        assert_eq!(state::read_meta(&paths).unwrap().state, "RUNNING");
+        let repeated = request_cancel(&paths).unwrap();
+        assert!(!repeated.requested);
+        assert!(paths.accepted_cancel.exists());
+    }
+
+    #[test]
+    fn exact_cancel_capture_unavailable_fails_before_acceptance_without_numeric_fallback() {
+        let mut sentinel = CancelSentinel::new();
+        for errno in [libc::ENOSYS, libc::EPERM, libc::EMFILE] {
+            let (_temp, paths) = cancel_fixture(&sentinel.identity());
+            let error = request_cancel_using(
+                &paths,
+                |identity| {
+                    capture_cancel_supervisor_using(
+                        identity,
+                        |_| Err(io::Error::from_raw_os_error(errno)),
+                        |_| panic!("must not observe after failed capture"),
+                    )
+                },
+                |_| panic!("must not signal after failed capture"),
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+            assert!(!paths.accepted_cancel.exists());
+            assert_eq!(state::read_meta(&paths).unwrap().state, "RUNNING");
+        }
+        let (_temp, paths) = cancel_fixture(&sentinel.identity());
+        assert!(
+            request_cancel_using(
+                &paths,
+                |identity| {
+                    capture_cancel_supervisor_using(identity, open_pidfd, |_| {
+                        state::ProcessIdentityEvidence::Unavailable
+                    })
+                },
+                |_| panic!("must not signal unknown identity")
+            )
+            .is_err()
+        );
+        assert!(!paths.accepted_cancel.exists());
+        assert_eq!(sentinel.count(), 0);
+    }
+
+    #[test]
+    fn exact_cancel_wake_failure_retains_durable_acceptance() {
+        let mut sentinel = CancelSentinel::new();
+        let (_temp, paths) = cancel_fixture(&sentinel.identity());
+        let outcome = request_cancel_using(&paths, capture_cancel_supervisor, |_| {
+            Err(io::Error::from_raw_os_error(libc::EPERM))
+        })
+        .unwrap();
+        assert!(outcome.requested);
+        assert_eq!(outcome.wake, CancelWake::Failed);
+        assert!(outcome.wake_error.is_some());
+        assert!(paths.accepted_cancel.exists());
+        assert_eq!(sentinel.count(), 0);
+    }
+
+    #[test]
+    fn exact_cancel_live_pidfd_wake_has_positive_signal_control() {
+        let mut sentinel = CancelSentinel::new();
+        let (_temp, paths) = cancel_fixture(&sentinel.identity());
+        let outcome = request_cancel(&paths).unwrap();
+        assert!(outcome.requested);
+        assert_eq!(outcome.wake, CancelWake::Sent);
+        assert!(outcome.wake_error.is_none());
+        assert!(paths.accepted_cancel.exists());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sentinel.count() == 0 {
+            assert!(Instant::now() < deadline, "signal counter deadline");
+        }
+        assert_eq!(sentinel.count(), 1);
+    }
 
     #[test]
     fn explicit_cancellation_has_one_precedence_and_persistence_policy() {

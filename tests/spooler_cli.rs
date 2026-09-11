@@ -1844,6 +1844,7 @@ fn cancel_terminates_the_entire_adopted_process_tree() {
         .expect("cancel command");
     assert_command_success(&cancel);
     assert_eq!(parse_stdout_json(&cancel)["requested"], true);
+    assert_eq!(parse_stdout_json(&cancel)["wake"], "sent");
     let status = wait_for_terminal_status(&temp, handle);
     assert!(
         status.starts_with(&format!(
