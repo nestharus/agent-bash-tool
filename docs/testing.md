@@ -27,6 +27,13 @@ live ancestors without changing production discovery, service budgets or deadlin
 The process trees *inside* each fixture still use production ancestry checks,
 service creation, sharing and recovery. Each image-custody scenario gets one such
 boundary, keeping its deliberate concurrent shared-service clients together.
+The eight-registration warm-cache case launches its client workload beneath a
+private production supervisor, so warmup and all eight concurrent registrations
+have a common live ancestor image owner. Its tiny compiled native fake helper
+(`cc` required) logs its executing image inode. Each registration must match the
+independently acquired and retained ancestor-store image, not merely finish within
+the unchanged eight-second admission bound. Per-registration state roots remain
+separate; production image capacity and deadlines are not overridden.
 This is not coverage of host networking or delegated cgroups; cgroup tests retain
 their existing unavailable-delegation behavior.
 

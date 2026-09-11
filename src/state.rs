@@ -1372,7 +1372,11 @@ fn read_proc_stat_result(pid: libc::pid_t) -> io::Result<ProcStat> {
 }
 
 fn read_boot_id() -> String {
-    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+    read_boot_id_from(Path::new("/proc/sys/kernel/random/boot_id"))
+}
+
+fn read_boot_id_from(path: &Path) -> String {
+    fs::read_to_string(path)
         .map(|value| value.trim().to_string())
         .unwrap_or_default()
 }
@@ -1397,11 +1401,18 @@ pub(crate) fn process_identity_is_live(identity: &CallerChainEntry) -> bool {
 }
 
 pub(crate) fn process_identity_evidence(identity: &CallerChainEntry) -> ProcessIdentityEvidence {
+    process_identity_evidence_from_boot_path(identity, Path::new("/proc/sys/kernel/random/boot_id"))
+}
+
+fn process_identity_evidence_from_boot_path(
+    identity: &CallerChainEntry,
+    boot_path: &Path,
+) -> ProcessIdentityEvidence {
     inspect_process_identity(
         Some(identity.pid),
         Some(identity.starttime_ticks),
         Some(identity.boot_id.as_str()),
-        &read_boot_id(),
+        &read_boot_id_from(boot_path),
     )
 }
 
@@ -1458,7 +1469,11 @@ fn inspect_process_identity(
     else {
         return ProcessIdentityEvidence::Unavailable;
     };
-    if pid <= 1 || expected_starttime_ticks == 0 || expected_boot_id.is_empty() {
+    if pid <= 1
+        || expected_starttime_ticks == 0
+        || expected_boot_id.is_empty()
+        || current_boot_id.is_empty()
+    {
         return ProcessIdentityEvidence::Unavailable;
     }
     if expected_boot_id != current_boot_id {
@@ -1500,6 +1515,44 @@ fn parse_proc_stat(contents: &str) -> Option<ProcStat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_identity_boot_read_producer_distinguishes_unavailable_and_mismatch() {
+        let temp = tempfile::tempdir().expect("private boot source");
+        let path = temp.path().join("boot-id");
+        let pid = std::process::id() as libc::pid_t;
+        let identity = CallerChainEntry {
+            pid,
+            starttime_ticks: process_starttime_ticks(pid).expect("own stat"),
+            boot_id: "fixture-boot".to_string(),
+        };
+        // Actual filesystem read error, not an injected evidence enum.
+        assert!(matches!(
+            process_identity_evidence_from_boot_path(&identity, &path),
+            ProcessIdentityEvidence::Unavailable
+        ));
+        for (contents, expected) in [
+            ("  \n", ProcessIdentityEvidence::Unavailable),
+            ("fixture-boot\n", ProcessIdentityEvidence::Live),
+            ("another-boot\n", ProcessIdentityEvidence::Mismatch),
+        ] {
+            fs::write(&path, contents).expect("write private boot source");
+            let actual = process_identity_evidence_from_boot_path(&identity, &path);
+            assert_eq!(
+                std::mem::discriminant(&actual),
+                std::mem::discriminant(&expected)
+            );
+        }
+        fs::write(&path, "fixture-boot").expect("matching boot");
+        let wrong_start = CallerChainEntry {
+            starttime_ticks: identity.starttime_ticks + 1,
+            ..identity
+        };
+        assert!(matches!(
+            process_identity_evidence_from_boot_path(&wrong_start, &path),
+            ProcessIdentityEvidence::Mismatch
+        ));
+    }
 
     #[test]
     fn completion_delivery_lifecycle_classifies_existing_metadata_protocol() {

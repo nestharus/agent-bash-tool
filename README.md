@@ -41,7 +41,9 @@ completion returns synchronously in-band or asynchronously through the agent mai
   a bounded grace period. A direct cancel is accepted when its durable marker is synchronized;
   signaling only wakes the supervisor, which also observes the marker independently. Cancellation
   captures and validates an exact supervisor pidfd, with no numeric-signal fallback; unavailable
-  capture fails before acceptance. Cancel JSON `requested` reports durable acceptance, while `wake`
+  capture fails before acceptance. Cancel JSON `requested` reports durable acceptance by this attempt,
+  not whether a prior accepted cancellation obligation remains pending (`false` does not mean none
+  is pending). `wake`
   separately reports `not-requested`, `sent`, `supervisor-gone`, or `failed` (`wake_error` gives detail).
   A sent wake is not proof of completed cancellation or tree cessation. Direct CLI
   runs remain detached unless they explicitly request a lease. Direct cancel and detach require

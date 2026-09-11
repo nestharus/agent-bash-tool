@@ -3950,55 +3950,25 @@ fn concurrent_registrations_share_warm_cache_within_declared_bound() {
     if test_support::private_case() {
         return;
     }
-    const CONCURRENCY: usize = 8;
-    const ADMISSION_BOUND: Duration = Duration::from_secs(8);
-
-    let temp = tempfile::tempdir().expect("tempdir");
-    let (fake, delivery_log) = fake_agents(&temp);
-    let helper_size = fs::metadata(&fake).expect("helper metadata").len();
-    let warmup = agent_bash(&temp)
-        .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
-        .env("AGENT_BASH_FAKE_DELIVERY_LOG", &delivery_log)
-        .args(["run", "--", "true"])
+    let output = StdCommand::new("timeout")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .args([
+            "--kill-after=5s",
+            "60s",
+            "python3",
+            "tests/fixtures/warm_registrations.py",
+            "suite",
+            env!("CARGO_BIN_EXE_agent-bash"),
+        ])
         .output()
-        .expect("warm helper cache");
-    let _ = parse_run_output(&warmup);
-
-    let started = Instant::now();
-    let mut registrations = Vec::new();
-    for _ in 0..CONCURRENCY {
-        let binary = assert_cmd::cargo::cargo_bin("agent-bash");
-        let root = temp.path().to_path_buf();
-        let fake = fake.clone();
-        let delivery_log = delivery_log.clone();
-        registrations.push(std::thread::spawn(move || {
-            StdCommand::new(binary)
-                .env("XDG_STATE_HOME", root)
-                .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
-                .env("AGENT_BASH_FAKE_DELIVERY_LOG", delivery_log)
-                .env_remove("AGENT_BASH_OWNER_SESSION_ID")
-                .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
-                .env_remove("OULIPOLY_PARENT_INVOCATION")
-                .env_remove("OULIPOLY_DATA_DIR")
-                .args(["run", "--", "true"])
-                .output()
-                .expect("parallel registration")
-        }));
-    }
-    for output in registrations
-        .into_iter()
-        .map(|registration| registration.join().expect("registration thread"))
-    {
-        let _ = parse_run_output(&output);
-    }
-    let elapsed = started.elapsed();
+        .expect("private shared registration fixture");
     assert!(
-        elapsed < ADMISSION_BOUND,
-        "{CONCURRENCY} warm-cache registrations of a {helper_size}-byte helper took {elapsed:?}, bound is {ADMISSION_BOUND:?}"
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    eprintln!(
-        "{CONCURRENCY} warm-cache registrations of a {helper_size}-byte helper completed in {elapsed:?}"
-    );
+    print!("{}", String::from_utf8_lossy(&output.stdout));
 }
 
 #[test]

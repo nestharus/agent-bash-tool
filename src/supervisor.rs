@@ -206,7 +206,8 @@ fn record_admitted_registration_unknown(
     Ok(())
 }
 
-/// `requested` reports durable acceptance, never successful signal delivery.
+/// `requested` reports durable acceptance by this attempt, never signal delivery
+/// or whether a previously accepted cancellation obligation remains pending.
 #[derive(Debug)]
 pub(crate) struct CancelOutcome {
     pub(crate) requested: bool,
