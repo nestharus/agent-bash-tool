@@ -82,7 +82,6 @@ SLO or a large-fanout capacity result.
 | `AGENT_BASH_IMAGE_BYTES` | 268435456 (256 MiB) | 1..1073741824 | Aggregate newly published bytes per owning epoch; maximum source size for operation-local loads |
 | `AGENT_BASH_IMAGE_COUNT` | 8 | 1..64 | Distinct retained images per epoch, including interpreters |
 | `AGENT_BASH_IMAGE_DEADLINE_MS` | 10000 | 1..60000 | Client acquisition and each accepted server request deadline |
-| `AGENT_BASH_IMAGE_EPOCH_MS` | 86400000 (24 h) | 1..86400000 | Nonrenewable maximum server epoch lifetime |
 
 256 MiB accommodates one observed ~128 MiB debug image plus an interpreter, or
 several observed ~32 MiB release images, without promising capacity for every
@@ -94,14 +93,39 @@ adjust/double them), one client is processed at a time, and request/response
 payloads are at most 512 bytes with bounded ancillary reception. Queue-full
 nonblocking connect rejects immediately instead of opening an unbounded queue.
 
-The server retires on epoch timeout. **No automatic restart in the same owner is
-implemented.** Its supervisor keeps the namespace bound until teardown, including
-after a crash, so a missing server cannot silently trigger unlimited private
-reconstruction. New acquisitions then time out or reject at the queue bound; an
-already admitted helper retains its original outcome uncertainty. A new managed
-root can establish a new epoch. Long-lived server workloads therefore need an
-explicit availability decision before using a 24-hour service lifetime; increasing
-past 24 hours is not accepted by this implementation.
+### Lifetime and bounded recovery
+
+Normal lifetime follows the actual owning supervisor, with **no maximum session
+age**. The former `AGENT_BASH_IMAGE_EPOCH_MS` setting is removed and has no effect.
+Idle/request deadline expiry does not retire the store. A live epoch means one
+custodian's retained store, not a time allowance. Byte/count exhaustion rejects
+new content without evicting existing images or restarting a healthy custodian.
+
+The founding supervisor alone restarts a dead custodian, and only after its exact
+previous child has been reaped. It retains the same bound listener and finite
+queue through recovery; clients cannot elect competing owners or fall back to
+private resealing while this tree is alive. Each new child uses the same clean
+exec, exact running binary, pinned limits and parent-death custody as startup.
+The existing supervisor event loop drives recovery; there is no new host service,
+background thread or runner responsibility. Shutdown kills/reaps the current child
+and drops the listener; recovery does not keep a completed tree alive.
+
+Recovery waits 1 second after the first observed death, doubling subsequent
+short-lived-crash backoff to a 30-second cap. At least 60 seconds of child uptime
+resets the next death's backoff to 1 second. Spawn failures also consume a
+rate-limited attempt and are logged best-effort in the bounded workload log. There
+is at most one spawn attempt per backoff interval, never a permanent crash-count
+poison state. Actual launch may be later due to event-loop scheduling/blocking.
+Recovery does not kill a healthy child on any timer. Each replacement starts
+empty and allocates only for acquisitions, within the same per-live-epoch budgets.
+
+A client makes one RPC, under its original deadline; recovery grants **no RPC or
+helper-command replay**. Connections still queued in the retained listener can be
+accepted by the replacement. Connections accepted by the dead child fail; callers
+may also time out before recovery, particularly at higher backoff. These are real
+acquisition failures, not successful delivery or notification retry authority.
+Later independent acquisitions can succeed once recovery runs. Existing admitted
+helpers keep their original execution/outcome semantics even across service loss.
 
 Deadlines are checked between positional reads and in socket polling, not a claim
 that Linux can preempt a stuck regular-file/FUSE/kernel syscall. Provenance
@@ -117,15 +141,19 @@ no retained custodian epoch.
 
 Per-epoch byte limits do **not** bound host-wide shmem across independent roots,
 retired epochs, crashes or opaque descendants. An executable mapping and a wake
-that reopens `/proc/self/exe` can outlive every original FD or custodian. Explicit
-restart can create another inode for the same digest while the old mapping lives.
-There is no lease ledger, durable cross-crash accounting or universal freed-image
-claim. There is also no correction here to the runner's detached wake custody.
+that reopens `/proc/self/exe` can outlive every original FD or custodian. Automatic
+recovery can create another inode for the same digest while the old mapping lives.
+Backoff limits replacement frequency, and per-epoch budgets limit each
+replacement's retained allocation; neither bounds cumulative surviving mappings
+across an unlimited session. There is no lease ledger, durable cross-crash
+accounting or universal freed-image claim. There is also no correction here to
+the runner's detached wake custody.
 
 The deterministic tests use tiny native images, two concurrent clients, private
 process trees, and explicit fixture cleanup. They cover sharing, clean bootstrap,
 per-handle routing/authority, malformed requests, positional I/O, sealing failures,
-capacity, retirement/self-exec retention, independent-root cancellation and
-founding supervisor/guardian loss. They are **not** the retained 420-producer
+capacity, repeated recovery/self-exec retention, no admitted-command replay,
+independent-root cancellation during recovery backoff and founding
+supervisor/guardian loss. They are **not** the retained 420-producer
 failure rerun, the 10,100-producer AGE-353 goal, a real runner wake test, or evidence
 that the historical EBUSY page-reference holder has been identified.

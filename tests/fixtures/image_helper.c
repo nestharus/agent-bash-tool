@@ -17,6 +17,15 @@ int main(int argc, char **argv) {
                 getenv("OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY") ? "authority" : "no-authority");
         fclose(f);
     }
+    const char *hold = getenv("IMAGE_FIXTURE_HOLD");
+    if (hold && argc > 2 && !strcmp(argv[2], "agent-bash-complete")) {
+        char marker[4096]; snprintf(marker, sizeof(marker), "%s.admitted", hold);
+        int fd = open(marker, O_WRONLY | O_CREAT, 0600);
+        if (fd < 0) return 96;
+        close(fd);
+        for (int i = 0; i < 1000 && access(hold, F_OK); i++) usleep(10000);
+        if (access(hold, F_OK)) return 97;
+    }
     /* A wake-like self-exec pins the same image after the original custodian dies. */
     if (argc == 3 && !strcmp(argv[1], "self-exec")) {
         int fd = open("/proc/self/exe", O_RDONLY);

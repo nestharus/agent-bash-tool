@@ -1296,6 +1296,9 @@ fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
         loop_state.check_explicit_cancel();
         loop_state.check_polled_owner();
         loop_state.drive_cancellation();
+        // Recovery is single-flight under this owner, never under acquiring clients.
+        // Spawn failures remain bounded by backoff; image RPCs fail truthfully meanwhile.
+        loop_state.recover_image_service();
         loop_state.maybe_finish()?;
         if loop_state.should_exit() {
             return Ok(());
@@ -1422,6 +1425,13 @@ impl EventLoop {
             self.check_explicit_cancel();
         }
         self.reap_children()
+    }
+
+    fn recover_image_service(&mut self) {
+        if let Err(error) = self.image_owner.recover() {
+            let message = format!("image custodian recovery spawn failed (will retry): {error}\n");
+            let _ = self.log.write_all(message.as_bytes());
+        }
     }
 
     fn poll_timeout(&self) -> Option<Duration> {

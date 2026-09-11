@@ -23,7 +23,6 @@ struct Limits {
     bytes: u64,
     count: usize,
     deadline: Duration,
-    epoch: Duration,
 }
 impl Limits {
     fn from_env() -> io::Result<Self> {
@@ -31,7 +30,6 @@ impl Limits {
             bytes: setting("BYTES", 256 * 1024 * 1024, 1, 1024 * 1024 * 1024)?,
             count: setting("COUNT", 8, 1, 64)? as usize,
             deadline: Duration::from_millis(setting("DEADLINE_MS", 10_000, 1, 60_000)?),
-            epoch: Duration::from_millis(setting("EPOCH_MS", 86_400_000, 1, 86_400_000)?),
         })
     }
 }
@@ -460,14 +458,22 @@ fn authorized(socket: &File, owner: i32, start: u64) -> bool {
             .any(|p| p.pid == owner && p.starttime_ticks == start)
 }
 fn server(listener: File, owner: i32, start: u64, limits: Limits) -> io::Result<()> {
-    let end = Instant::now() + limits.epoch;
     let mut store = Store {
         images: HashMap::new(),
         bytes: 0,
         limits,
     };
     loop {
-        ready(listener.as_raw_fd(), libc::POLLIN, end)?;
+        // No age limit: kernel parent-death custody and Owner::drop end service.
+        // A periodic poll timeout is only an idle wait, never epoch retirement.
+        match ready(
+            listener.as_raw_fd(),
+            libc::POLLIN,
+            Instant::now() + limits.deadline,
+        ) {
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+            result => result?,
+        }
         let raw = unsafe {
             libc::accept4(
                 listener.as_raw_fd(),
@@ -483,7 +489,7 @@ fn server(listener: File, owner: i32, start: u64, limits: Limits) -> io::Result<
         if !authorized(&client, owner, start) {
             continue;
         }
-        let deadline = end.min(Instant::now() + limits.deadline);
+        let deadline = Instant::now() + limits.deadline;
         if let Err(e) = store.serve(&client, deadline) {
             let text = e.to_string();
             let _ = send(raw, &text.as_bytes()[..text.len().min(512)], None, deadline);
@@ -498,7 +504,7 @@ pub(crate) fn internal_main() -> Option<i32> {
         return None;
     }
     let run = || -> io::Result<()> {
-        if args.len() != 8 {
+        if args.len() != 7 {
             return Err(invalid("invalid custodian bootstrap"));
         }
         let number = |i: usize| -> io::Result<u64> {
@@ -519,7 +525,6 @@ pub(crate) fn internal_main() -> Option<i32> {
             bytes: number(4)?,
             count: number(5)? as usize,
             deadline: Duration::from_millis(number(6)?),
-            epoch: Duration::from_millis(number(7)?),
         };
         if limits.bytes == 0
             || limits.bytes > 1024 * 1024 * 1024
@@ -527,8 +532,6 @@ pub(crate) fn internal_main() -> Option<i32> {
             || limits.count > 64
             || limits.deadline.is_zero()
             || limits.deadline > Duration::from_secs(60)
-            || limits.epoch.is_zero()
-            || limits.epoch > Duration::from_secs(86400)
         {
             return Err(invalid("invalid custodian limits"));
         }
@@ -544,15 +547,46 @@ pub(crate) fn internal_main() -> Option<i32> {
 
 pub(crate) struct Owner {
     child: Option<Child>,
-    // Keep namespace bound after epoch expiry/crash: no silent fallback allocation.
-    _listener: Option<File>,
+    // Keep the same queue/namespace through recovery: clients never fall back locally.
+    listener: Option<File>,
+    limits: Limits,
+    recovery: Recovery,
+}
+
+/// Rate limit spawn attempts, not session lifetime. Saturation never disables recovery.
+struct Recovery {
+    next: Instant,
+    delay: Duration,
+    launched: Instant,
+}
+impl Recovery {
+    fn new(now: Instant) -> Self {
+        Self {
+            next: now,
+            delay: Duration::from_secs(1),
+            launched: now,
+        }
+    }
+    fn lost(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.launched) >= Duration::from_secs(60) {
+            self.delay = Duration::from_secs(1);
+        }
+        self.next = now + self.delay;
+    }
+    fn attempted(&mut self, now: Instant) {
+        self.launched = now;
+        self.next = now + self.delay;
+        self.delay = (self.delay * 2).min(Duration::from_secs(30));
+    }
 }
 impl Owner {
     pub(crate) fn start() -> io::Result<Self> {
         if tree_endpoint()?.is_some() {
             return Ok(Self {
                 child: None,
-                _listener: None,
+                listener: None,
+                limits: Limits::from_env()?,
+                recovery: Recovery::new(Instant::now()),
             });
         }
         Self::launch()
@@ -575,6 +609,18 @@ impl Owner {
         {
             return Err(io::Error::last_os_error());
         }
+        let child = Self::spawn(&listener, limits)?;
+        Ok(Self {
+            child: Some(child),
+            listener: Some(listener),
+            limits,
+            recovery: Recovery::new(Instant::now()),
+        })
+    }
+    fn spawn(listener: &File, limits: Limits) -> io::Result<Child> {
+        let owner = unsafe { libc::getpid() };
+        let start = crate::state::process_starttime_ticks(owner)
+            .ok_or_else(|| invalid("missing owner identity"))?;
         let fd = listener.as_raw_fd();
         // Exec the exact running agent-bash image, not a replaceable installation path.
         let mut command = Command::new("/proc/self/exe");
@@ -585,7 +631,6 @@ impl Owner {
             limits.bytes.to_string(),
             limits.count.to_string(),
             limits.deadline.as_millis().to_string(),
-            limits.epoch.as_millis().to_string(),
         ]);
         command
             .env_clear()
@@ -618,10 +663,20 @@ impl Owner {
                 Ok(())
             });
         }
-        Ok(Self {
-            child: Some(command.spawn()?),
-            _listener: Some(listener),
-        })
+        command.spawn()
+    }
+    /// Sole supervisor event-loop caller; never spawn until the previous child was reaped.
+    /// No request or helper command is retried here. Pending connections keep their deadlines.
+    pub(crate) fn recover(&mut self) -> io::Result<()> {
+        if self.child.is_some() || Instant::now() < self.recovery.next {
+            return Ok(());
+        }
+        let Some(listener) = &self.listener else {
+            return Ok(());
+        };
+        self.recovery.attempted(Instant::now());
+        self.child = Some(Self::spawn(listener, self.limits)?);
+        Ok(())
     }
     pub(crate) fn pid(&self) -> Option<i32> {
         self.child.as_ref().map(|c| c.id() as i32)
@@ -629,6 +684,7 @@ impl Owner {
     pub(crate) fn reaped(&mut self, pid: i32) {
         if self.child.as_ref().is_some_and(|c| c.id() as i32 == pid) {
             self.child = None;
+            self.recovery.lost(Instant::now());
         }
     }
     /// Only this exact unreaped clean-exec child is infrastructure, never its descendants.
@@ -678,6 +734,58 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn recovery_backoff_saturates_without_poison_and_resets_after_stability() {
+        let mut now = Instant::now();
+        let mut recovery = Recovery::new(now);
+        for expected in [1, 2, 4, 8, 16, 30, 30, 30] {
+            recovery.lost(now);
+            assert_eq!(recovery.next - now, Duration::from_secs(expected));
+            now = recovery.next;
+            recovery.attempted(now);
+        }
+        // Days of uptime are stability, not exhaustion of a lifetime allowance.
+        now += Duration::from_secs(86400 * 365);
+        recovery.lost(now);
+        assert_eq!(recovery.next - now, Duration::from_secs(1));
+        recovery.attempted(recovery.next);
+        assert_eq!(recovery.delay, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn failed_spawn_attempts_remain_rate_limited_without_a_terminal_count() {
+        let mut now = Instant::now();
+        let mut recovery = Recovery::new(now);
+        for seconds in [1, 2, 4, 8, 16, 30, 30, 30] {
+            // A failed spawn has no child to reap: only attempted advances its retry gate.
+            recovery.attempted(now);
+            assert_eq!(recovery.next - now, Duration::from_secs(seconds));
+            now = recovery.next;
+        }
+        assert_eq!(recovery.delay, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn live_child_is_not_replaced_even_after_former_maximum_age() {
+        let now = Instant::now();
+        let child = Command::new("/bin/sleep").arg("10").spawn().unwrap();
+        let pid = child.id();
+        let mut owner = Owner {
+            child: Some(child),
+            listener: Some(socket().unwrap()),
+            limits: Limits {
+                bytes: 4,
+                count: 1,
+                deadline: Duration::from_millis(20),
+            },
+            recovery: Recovery::new(now - Duration::from_secs(86400 * 365)),
+        };
+        owner.recover().unwrap();
+        assert_eq!(owner.pid(), Some(pid as i32));
+        assert!(owner.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        // Owner::drop terminates and reaps this private fixture child.
+    }
+
     #[test]
     fn positional_copy_and_independent_readonly_aliases() {
         let bytes = b"#!/bin/sh\necho positional\n";
@@ -817,7 +925,6 @@ mod tests {
             bytes: 4,
             count: 1,
             deadline: Duration::from_secs(2),
-            epoch: Duration::from_secs(3),
         };
         let mut store = Store {
             images: HashMap::new(),

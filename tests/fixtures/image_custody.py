@@ -159,6 +159,7 @@ def workload(directory, helper):
     wait(lambda: len(list(Path(f"/proc/{custodian}/fd").iterdir())) == 5)
     images = [os.readlink(p) for p in Path(f"/proc/{custodian}/fd").iterdir()]
     assert sum("memfd:agent-bash-delivery-helper" in p for p in images) == 1, images
+    custodian, inodes[0] = recovery(directory, helper, owner, custodian, inodes[0])
     (directory / "ready").write_text(json.dumps(dict(owner=owner, custodian=custodian, inode=inodes[0], records=records)))
     # Parent cancels one independent root while the other remains usable.
     end = time.monotonic() + 12
@@ -224,52 +225,97 @@ def cleanup():
     raise AssertionError("fixture cleanup did not reap private tree")
 
 
-def retired_epoch(root, helper):
+def retained_epoch(root, helper):
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     listener.bind(endpoint(os.getpid())); listener.listen(4)
     def bootstrap():
         if listener.fileno() != 3:
             os.dup2(listener.fileno(), 3)
             os.set_inheritable(listener.fileno(), False)
-    def launch(epoch):
-        return subprocess.Popen([BIN, "--internal-image-custodian-v1", str(os.getpid()),
-                                 str(stat(os.getpid())[1]), str(1024*1024), "1", "1000", str(epoch)],
-                                env={}, pass_fds=tuple({3, listener.fileno()}), preexec_fn=bootstrap, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    server = launch(1000)
-    wake = None
+    server = subprocess.Popen([BIN, "--internal-image-custodian-v1", str(os.getpid()),
+                               str(stat(os.getpid())[1]), str(1024*1024), "1", "20"],
+                              env={}, pass_fds=tuple({3, listener.fileno()}), preexec_fn=bootstrap,
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        fd = acquire(os.getpid(), helper)
-        old_inode = os.fstat(fd).st_ino
-        wake = subprocess.Popen([f"/proc/self/fd/{fd}", "self-exec", "fixture"], pass_fds=(fd,),
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env={})
-        assert int(wake.stdout.readline()) == old_inode
-        os.close(fd)
-        assert server.wait(timeout=3) == 70  # bounded epoch retirement, not a delivery outcome
-        assert os.stat(f"/proc/{wake.pid}/exe").st_ino == old_inode
-        server = launch(10000)
-        fd = acquire(os.getpid(), helper)
-        assert os.fstat(fd).st_ino != old_inode
-        os.close(fd)
-        # Distinct version cannot evict the retained image or wait for an opaque helper.
+        fd = acquire(os.getpid(), helper); inode = os.fstat(fd).st_ino; os.close(fd)
+        # Many request/idle deadlines are not an upper bound on live service lifetime.
+        time.sleep(.15)
+        assert server.poll() is None
+        fd = acquire(os.getpid(), helper); assert os.fstat(fd).st_ino == inode; os.close(fd)
         other = root / "other"; other.write_bytes(b"other"); other.chmod(0o500)
         try:
             acquire(os.getpid(), other)
             raise AssertionError("expected capacity rejection")
         except AssertionError as error:
             assert "capacity exhausted" in str(error), str(error)
-        server.kill(); server.wait(timeout=3)
-        # Existing held executable still works; failed acquisition is not retried as notify.
-        assert os.stat(f"/proc/{wake.pid}/exe").st_ino == old_inode
+    finally:
+        server.kill(); server.wait(timeout=3); listener.close()
+    print("PASS: live service survives idle/request deadlines; capacity rejects without eviction")
+
+
+def recovery(directory, helper, owner, custodian, old_inode):
+    # Hold an actually admitted completion through service loss. It must run once only.
+    release = directory / "admitted-release"
+    log = directory / "admitted-log"
+    env = os.environ.copy()
+    env.update(XDG_STATE_HOME=str(directory / "admitted-spool"), AGENT_BASH_AGENT_RUNNER_BIN=helper,
+               IMAGE_FIXTURE_HOLD=str(release), IMAGE_FIXTURE_LOG=str(log))
+    item = json.loads(run(env, "run", "--", "/bin/true"))
+    wait(lambda: Path(str(release) + ".admitted").exists())
+    fd = acquire(owner, helper)
+    wake = subprocess.Popen([f"/proc/self/fd/{fd}", "self-exec", "fixture"], pass_fds=(fd,),
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env={})
+    os.close(fd)
+    assert int(wake.stdout.readline()) == old_inode
+    try:
+        for delay in [1, 2]:
+            dead = custodian
+            # Kill after accept but before consumption: the interrupted RPC must fail,
+            # not manufacture a descriptor or silently replay its acquisition.
+            with connection(owner) as interrupted, open(helper, "rb") as source:
+                wait(lambda: len(list(Path(f"/proc/{dead}/fd").iterdir())) == 6)
+                os.kill(dead, signal.SIGSTOP)
+                data = source.read()
+                interrupted.sendmsg([struct.pack("<Q", len(data)) + hashlib.sha256(data).hexdigest().encode()],
+                                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [source.fileno()]))])
+                killed_at = time.monotonic()
+                os.kill(dead, signal.SIGKILL)
+                try:
+                    assert interrupted.recv(512) == b""
+                except ConnectionResetError:
+                    pass
+            wait(lambda: not Path(f"/proc/{dead}").exists())
+            # Queue both acquisitions during the outage; only the supervisor may restart.
+            clients = [subprocess.Popen([sys.executable, SCRIPT, "client", BIN, str(owner), helper, str(i)],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) for i in range(2)]
+            try:
+                inodes = [int(p.stdout.readline()) for p in clients]
+                assert time.monotonic() - killed_at >= delay - .05
+                assert inodes[0] == inodes[1] and inodes[0] != old_inode
+                current = [int(p) for p in Path(f"/proc/{owner}/task/{owner}/children").read_text().split()
+                           if b"--internal-image-custodian-v1" in Path(f"/proc/{p}/cmdline").read_bytes()]
+                assert len(current) == 1 and current[0] != dead, current
+                custodian = current[0]
+                for p in clients:
+                    p.communicate("release", timeout=4); assert p.returncode == 0
+            finally:
+                for p in clients:
+                    if p.poll() is None: p.kill()
+                    p.wait()
+            assert os.stat(f"/proc/{wake.pid}/exe").st_ino == old_inode
+        release.touch()
+        meta = wait(lambda: terminal_delivery(item["meta"]))
+        assert meta["delivery"].get("error") is None, meta
+        run(env, "status", item["handle"])
+        lines = log.read_text().splitlines()
+        assert sum("agent-bash-complete" in line for line in lines) == 1, lines
+        assert next(line for line in lines if "agent-bash-complete" in line).split()[0] == str(old_inode)
         wake.communicate("release", timeout=3); assert wake.returncode == 0
     finally:
-        if server.poll() is None: server.kill()
-        server.wait()
-        if wake is not None:
-            if wake.poll() is None: wake.kill()
-            wake.wait()
-        listener.close()
-    print("PASS: finite epoch, retained self-exec mapping, explicit restart duplicate, capacity rejection, custodian death after receipt")
+        release.touch()
+        if wake.poll() is None: wake.kill()
+        wake.wait()
+    return custodian, inodes[0]
 
 
 def suite():
@@ -285,7 +331,7 @@ def suite():
             env = {k: v for k, v in os.environ.items() if not k.startswith(("AGENT_BASH_", "OULIPOLY_", "IMAGE_FIXTURE_"))}
             env.update(XDG_STATE_HOME=str(root / "state"), XDG_CONFIG_HOME=str(root / "config"),
                        AGENT_BASH_AGENT_RUNNER_BIN="/bin/true", AGENT_BASH_IMAGE_BYTES=str(1024*1024),
-                       AGENT_BASH_IMAGE_DEADLINE_MS="3000")
+                       AGENT_BASH_IMAGE_DEADLINE_MS="3000", AGENT_BASH_IMAGE_EPOCH_MS="1")
             items = []
             for name in ["a", "b"]:
                 directory = root / name; directory.mkdir()
@@ -307,8 +353,11 @@ def suite():
                     assert outsider.recv(512) == b""
                 except ConnectionResetError:
                     pass
+            # Teardown during recovery backoff must not wait for or orphan a replacement.
+            os.kill(a["custodian"], signal.SIGKILL)
             run(env, "cancel", items[0]["handle"])
             wait(lambda: not Path(f"/proc/{a['custodian']}").exists())
+            wait(lambda: not Path(f"/proc/{a['owner']}").exists())
             (root / "b" / "again").touch()
             observed = wait(lambda: (root / "b" / "again-result").read_text() if (root / "b" / "again-result").exists() else None)
             assert int(observed) == b["inode"]
@@ -332,8 +381,8 @@ def suite():
             wait(reap_fixture_zombies)
             (directory / "release").touch()
             cleanup()
-            retired_epoch(root, str(helper))
-            print("PASS: clean exec; two-client inode/offset sharing; per-handle authority/routing; one retained image; independent-root cancellation; exact infrastructure cleanup")
+            retained_epoch(root, str(helper))
+            print("PASS: clean exec; two-client inode/offset sharing; per-handle authority/routing; single-flight recovery; no admitted replay; retained old mapping; independent-root cancellation; exact infrastructure cleanup")
     finally:
         cleanup()
 
