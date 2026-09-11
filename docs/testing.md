@@ -49,3 +49,32 @@ The two guardian cancellation/delivery waits and the list/status delivery checks
 include bounded failure metadata, separating cancellation/drain evidence from
 helper admission, retry and delivery failure. A passing isolated run does not
 retroactively turn an earlier shared-ancestor or serial run into parallel success.
+
+## Hosted CI namespace allowance
+
+CI is pinned to the standard disposable `ubuntu-24.04` hosted VM. Ubuntu 24.04
+[restricts capabilities inside unprivileged user namespaces](https://discourse.ubuntu.com/t/ubuntu-24-04-lts-noble-numbat-release-notes/39890),
+so even `--map-current-user` (already non-root) can fail writing `uid_map`.
+The CI test step temporarily loads a named AppArmor ABI 4.0 profile attached to
+`/usr/bin/unshare`, using Ubuntu's documented `flags=(unconfined)` plus `userns,`
+allowance. It does not disable AppArmor or change any sysctl. This is not a
+workstation setup script and must not be applied to a persistent/shared runner.
+
+Only profile loading/removal uses `sudo apparmor_parser` (kernel policy
+administration). Cargo, tests and `unshare` run as the ordinary runner user:
+no sudo test execution, setuid executable, file capabilities, or mapped UID 0.
+The preflight requires a different network namespace and zero effective/permitted
+capabilities after exec. Each actual case still re-executes separately and asserts
+its namespace differs from its parent's; normal parallel coverage is unchanged.
+
+The exception permits user-namespace creation by **all `/usr/bin/unshare`
+invocations on that VM during the test step**, with the profile inherited by
+otherwise-unconfined descendants. It is not a sandbox for hostile PR code or a
+per-case AppArmor boundary; the per-case boundary remains the network namespace.
+Using the existing executable avoids a privileged custom launcher or a test
+launcher override. An EXIT trap removes the profile, treating removal failure as
+a failed step; VM disposal is the final cleanup for forced termination. No policy
+file or cache is installed. Setup/preflight failures fail the step, and launcher
+failures still fail tests without a shared-namespace fallback. Hosted execution
+must confirm profile loading, uid mapping, capability drop and the full suite;
+local tests on a kernel without this Ubuntu policy cannot validate that part.
