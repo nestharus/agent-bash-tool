@@ -45,9 +45,18 @@ A single-threaded, one-request-at-a-time custodian serializes cold publication.
 The key is protocol v1 + exact length + raw SHA-256. A miss checks retained plus
 new byte/count budgets **before** allocating, copies/hashes a bounded source,
 rejects changed length or digest, and adds WRITE, GROW, SHRINK and SEAL seals.
-Published entries are never evicted within the epoch. Script and native
-interpreter acquisitions use the same store; capacity failure is immediate, not
-a wait while indefinitely holding the first half of a script pair.
+Cold misses retire least-recently-used store references until the new image fits.
+Retirement never signals a workload or invalidates an already handed-out FD/mapping.
+Script and native interpreter acquisitions use the same store, and held script
+images survive interpreter admission even when that admission retires their store
+entry. An image larger than the byte budget still fails closed.
+
+Cold allocation attempts have a token bucket: an initial burst equal to the count
+budget, refilling one token per second up to that count. Attempts consume tokens
+even if materialization fails. With no token the server replies with explicit
+image-only backpressure (`B1`, no FD), leaving its store unchanged. Warm requests
+need no token. The client retries this response within its original acquisition
+deadline against the same endpoint. No helper has been admitted by an image RPC.
 
 The receiver requires one complete packet and one FD; truncated/extra/malformed
 ancillary data is rejected and all received descriptors are closed. It checks
@@ -79,27 +88,31 @@ SLO or a large-fanout capacity result.
 
 | Setting | Default | Accepted range | Meaning |
 |---|---:|---:|---|
-| `AGENT_BASH_IMAGE_BYTES` | 268435456 (256 MiB) | 1..1073741824 | Aggregate newly published bytes per owning epoch; maximum source size for operation-local loads |
-| `AGENT_BASH_IMAGE_COUNT` | 8 | 1..64 | Distinct retained images per epoch, including interpreters |
+| `AGENT_BASH_IMAGE_BYTES` | 268435456 (256 MiB) | 1..1073741824 | Retained store bytes plus in-progress cold allocation; maximum source size for operation-local loads |
+| `AGENT_BASH_IMAGE_COUNT` | 8 | 1..64 | Distinct retained images, including interpreters; cold-attempt burst size |
 | `AGENT_BASH_IMAGE_DEADLINE_MS` | 10000 | 1..60000 | Client acquisition and each accepted server request deadline |
 
 256 MiB accommodates one observed ~128 MiB debug image plus an interpreter, or
 several observed ~32 MiB release images, without promising capacity for every
-version combination. One version at capacity rejects another: there is no LRU,
-implicit fallback or unlimited resealing retry. Zero-length executable sources
+version combination. LRU retirement permits legitimate version turnover without
+permanently excluding new content. Rate-limited attempts may still exhaust a
+client deadline; there is no implicit fallback or unlimited acquisition retry.
+Zero-length executable sources
 still consume the count budget. A 64 KiB streaming buffer bounds copy workspace.
 Socket listen backlog is 16; send/receive buffers request 4096 bytes (Linux may
 adjust/double them), one client is processed at a time, and request/response
 payloads are at most 512 bytes with bounded ancillary reception. Queue-full
-nonblocking connect rejects immediately instead of opening an unbounded queue.
+nonblocking connections retry every 20 ms under the same acquisition deadline,
+including the nested-owner presence probe after registration. This is bounded
+client backpressure, not an unbounded server queue or a helper-command retry.
 
 ### Lifetime and bounded recovery
 
 Normal lifetime follows the actual owning supervisor, with **no maximum session
 age**. The former `AGENT_BASH_IMAGE_EPOCH_MS` setting is removed and has no effect.
 Idle/request deadline expiry does not retire the store. A live epoch means one
-custodian's retained store, not a time allowance. Byte/count exhaustion rejects
-new content without evicting existing images or restarting a healthy custodian.
+custodian's retained store, not a time allowance. Byte/count pressure retires LRU
+store references without restarting a healthy custodian or killing image holders.
 
 The founding supervisor alone restarts a dead custodian, and only after its exact
 previous child has been reaped. It retains the same bound listener and finite
@@ -119,8 +132,9 @@ poison state. Actual launch may be later due to event-loop scheduling/blocking.
 Recovery does not kill a healthy child on any timer. Each replacement starts
 empty and allocates only for acquisitions, within the same per-live-epoch budgets.
 
-A client makes one RPC, under its original deadline; recovery grants **no RPC or
-helper-command replay**. Connections still queued in the retained listener can be
+A client retries queue pressure and explicit cold-creation backpressure under its
+original deadline. Recovery grants **no helper-command replay**, and interrupted
+accepted RPCs are not retried. Connections still queued in the retained listener can be
 accepted by the replacement. Connections accepted by the dead child fail; callers
 may also time out before recovery, particularly at higher backoff. These are real
 acquisition failures, not successful delivery or notification retry authority.
@@ -143,9 +157,10 @@ Per-epoch byte limits do **not** bound host-wide shmem across independent roots,
 retired epochs, crashes or opaque descendants. An executable mapping and a wake
 that reopens `/proc/self/exe` can outlive every original FD or custodian. Automatic
 recovery can create another inode for the same digest while the old mapping lives.
-Backoff limits replacement frequency, and per-epoch budgets limit each
-replacement's retained allocation; neither bounds cumulative surviving mappings
-across an unlimited session. There is no lease ledger, durable cross-crash
+Backoff limits replacement frequency; cold-attempt tokens limit creation within
+each store, and per-store budgets bound retained plus in-progress allocations.
+Retirement as well as crashes can leave old client mappings alive. Neither these
+limits nor LRU bound cumulative surviving mappings across an unlimited session. There is no lease ledger, durable cross-crash
 accounting or universal freed-image claim. There is also no correction here to
 the runner's detached wake custody.
 
@@ -157,3 +172,22 @@ independent-root cancellation during recovery backoff and founding
 supervisor/guardian loss. They are **not** the retained 420-producer
 failure rerun, the 10,100-producer AGE-353 goal, a real runner wake test, or evidence
 that the historical EBUSY page-reference holder has been identified.
+
+## Unresolved founding-owner continuity (correction 2)
+
+The founding supervisor still synchronously acquires its own completion image and
+waits for the admitted delivery transfer worker. Its recovery loop cannot run
+during either wait. A private fixture establishes failed image acquisition for
+founding exit and ready completion after service death, and failed descendant
+acquisition while the founding helper is admitted and held. **This correction does
+not resolve notification restoration or the retained 420-case outage.** No second
+recovery loop or recovery thread has been added. Moving recovery to another process
+requires explicit custody/teardown integration; threading the current supervisor
+would cross delivery's fork-then-Rust execution boundary.
+
+Session-bound control lookup now propagates inability to determine eligibility
+(`EX_IOERR`, preserving the image-service error), rather than reporting that the
+caller was proven ineligible (`EX_NOPERM`). Neither outcome authorizes mutation.
+Status with `--observe-only` remains available without an eligibility lookup;
+ordinary status/mode no longer silently turn lookup errors into observational
+success. A successfully attested mismatching session still gets no control rights.

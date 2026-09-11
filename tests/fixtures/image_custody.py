@@ -45,11 +45,23 @@ def connection(owner):
 
 
 def acquire(owner, source):
+    deadline = time.monotonic() + 3
+    while True:
+        fd = acquire_once(owner, source)
+        if fd is not None:
+            return fd
+        assert time.monotonic() < deadline, "creation backpressure deadline"
+        time.sleep(.02)
+
+
+def acquire_once(owner, source):
     with open(source, "rb") as f, connection(owner) as s:
         data = f.read()
         s.sendmsg([struct.pack("<Q", len(data)) + hashlib.sha256(data).hexdigest().encode()],
                   [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [f.fileno()]))])
         payload, control, flags, _ = s.recvmsg(512, socket.CMSG_SPACE(4), socket.MSG_CMSG_CLOEXEC)
+        if payload == b"B1" and not control:
+            return None
         assert payload == b"I1" and flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) == 0, (payload, flags)
         assert len(control) == 1
         fds = array.array("i"); fds.frombytes(control[0][2])
@@ -159,6 +171,7 @@ def workload(directory, helper):
     wait(lambda: len(list(Path(f"/proc/{custodian}/fd").iterdir())) == 5)
     images = [os.readlink(p) for p in Path(f"/proc/{custodian}/fd").iterdir()]
     assert sum("memfd:agent-bash-delivery-helper" in p for p in images) == 1, images
+    busy_startup_and_controls(directory, helper, owner, custodian)
     custodian, inodes[0] = recovery(directory, helper, owner, custodian, inodes[0])
     (directory / "ready").write_text(json.dumps(dict(owner=owner, custodian=custodian, inode=inodes[0], records=records)))
     # Parent cancels one independent root while the other remains usable.
@@ -243,14 +256,84 @@ def retained_epoch(root, helper):
         assert server.poll() is None
         fd = acquire(os.getpid(), helper); assert os.fstat(fd).st_ino == inode; os.close(fd)
         other = root / "other"; other.write_bytes(b"other"); other.chmod(0o500)
-        try:
-            acquire(os.getpid(), other)
-            raise AssertionError("expected capacity rejection")
-        except AssertionError as error:
-            assert "capacity exhausted" in str(error), str(error)
+        held = acquire(os.getpid(), helper)
+        new = acquire(os.getpid(), other)
+        assert os.pread(held, 4, 0) == b"\x7fELF"
+        assert os.pread(new, 5, 0) == b"other"
+        assert server.poll() is None
+        os.close(new); os.close(held)
+
     finally:
         server.kill(); server.wait(timeout=3); listener.close()
-    print("PASS: live service survives idle/request deadlines; capacity rejects without eviction")
+    print("PASS: live service survives idle/request deadlines; bounded turnover leaves held old images alive")
+
+
+def busy_startup_and_controls(directory, helper, owner, custodian):
+    # Fill the queue only AFTER native registration executes, before Owner::start.
+    release = directory / "register-release"
+    spawned = directory / "busy-spawned"
+    env = os.environ.copy()
+    env.update(XDG_STATE_HOME=str(directory / "busy-spool"), AGENT_BASH_AGENT_RUNNER_BIN=helper,
+               IMAGE_FIXTURE_REGISTER_HOLD=str(release), IMAGE_FIXTURE_SESSION="ses_fixture",
+               AGENT_BASH_IMAGE_DEADLINE_MS="1000")
+    launch = subprocess.Popen([BIN, "run", "--", "/bin/sh", "-c",
+                               'touch "$1"; while [ ! -f "$2" ]; do sleep .02; done',
+                               "fixture", str(spawned), str(directory / "busy-end")],
+                              env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    sockets = []
+    try:
+        wait(lambda: Path(str(release) + ".registered").exists())
+        os.kill(custodian, signal.SIGSTOP)
+        # The hard bound is the kernel's finite backlog, not a load experiment.
+        for _ in range(20):
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            sock.setblocking(False)
+            try:
+                sock.connect(endpoint(owner)); sockets.append(sock)
+            except BlockingIOError:
+                sock.close(); break
+        else:
+            raise AssertionError("expected finite queue pressure")
+        release.touch()
+        time.sleep(.1)
+        assert not spawned.exists(), "workload bypassed the busy owner endpoint"
+        # CLI admission precedes daemon bootstrap; a returned handle is not ready.
+        out, err = launch.communicate(timeout=4)
+        assert launch.returncode == 0, (out, err)
+        item = json.loads(out)
+        waiting = read_json(item["meta"])
+        assert waiting["state"] != "ERROR", waiting
+        for sock in sockets: sock.close()
+        sockets.clear()
+        os.kill(custodian, signal.SIGCONT)
+        wait(spawned.exists)
+        # Session authority is in persisted state, never inferred from caller ancestry.
+        meta = read_json(item["meta"])
+        meta["owner_session_id"] = "ses_other"
+        meta["owner_invocation_uuid"] = "11111111-1111-4111-8111-111111111111"
+        Path(item["meta"]).write_text(json.dumps(meta))
+        denied = subprocess.run([BIN, "cancel", item["handle"]], env=env, capture_output=True, timeout=4)
+        assert denied.returncode == 77 and b"not eligible" in denied.stderr, (denied.returncode, denied.stderr)
+        meta["owner_session_id"] = "ses_fixture"
+        Path(item["meta"]).write_text(json.dumps(meta))
+        os.kill(custodian, signal.SIGSTOP)
+        for args in [["cancel", item["handle"]], ["detach", item["handle"]], ["status", item["handle"]]]:
+            unavailable = subprocess.run([BIN, *args], env=env, capture_output=True, timeout=4)
+            assert unavailable.returncode == 74, (args, unavailable.returncode, unavailable.stderr)
+            assert b"cannot determine control eligibility" in unavailable.stderr and b"image service unavailable" in unavailable.stderr, unavailable.stderr
+            assert not Path(item["state_dir"], "cancel-requested").exists()
+        observed = subprocess.run([BIN, "status", "--observe-only", item["handle"]], env=env, capture_output=True, timeout=4)
+        assert observed.returncode == 0, observed.stderr
+        os.kill(custodian, signal.SIGCONT)
+        run(env, "cancel", item["handle"])
+        wait(lambda: not Path(f"/proc/{meta['supervisor_pid']}").exists())
+    finally:
+        release.touch(); (directory / "busy-end").touch()
+        for sock in sockets: sock.close()
+        os.kill(custodian, signal.SIGCONT)
+        if launch.poll() is None: launch.kill()
+        launch.wait()
+    print("PASS: post-registration busy startup waits; unauthorized != unavailable; controls fail closed", flush=True)
 
 
 def recovery(directory, helper, owner, custodian, old_inode):

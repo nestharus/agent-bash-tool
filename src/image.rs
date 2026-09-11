@@ -1,6 +1,6 @@
 //! Tree-local immutable image custody. No helper commands or delivery authority cross this API.
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -218,26 +218,24 @@ fn address(pid: i32, start: u64) -> (libc::sockaddr_un, libc::socklen_t) {
     let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len();
     (addr, len as _)
 }
-fn connect(pid: i32, start: u64) -> io::Result<File> {
-    let socket = socket()?;
-    let (addr, len) = address(pid, start);
-    if unsafe {
-        libc::connect(
-            socket.as_raw_fd(),
-            (&addr as *const libc::sockaddr_un).cast(),
-            len,
-        )
-    } < 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(socket)
+// Retrying an unconnected image socket never admits or replays a helper command.
+fn connect_until(pid: i32, start: u64, deadline: Instant) -> io::Result<File> {
+    let (peer, len) = address(pid, start);
+    reconnect(&peer, len, deadline)
 }
-fn tree_endpoint() -> io::Result<Option<File>> {
+fn acquisition_pause(deadline: Instant) -> io::Result<()> {
+    check_time(deadline)?;
+    std::thread::sleep(
+        Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+    );
+    check_time(deadline)
+}
+
+fn tree_endpoint(deadline: Instant) -> io::Result<Option<File>> {
     // Search outermost first. No caller-supplied socket or ambient routing identity.
     let chain = crate::state::capture_caller_chain(unsafe { libc::getpid() });
     for entry in chain.iter().rev() {
-        match connect(entry.pid, entry.starttime_ticks) {
+        match connect_until(entry.pid, entry.starttime_ticks, deadline) {
             Ok(s) => return Ok(Some(s)),
             Err(e) if matches!(e.raw_os_error(), Some(libc::ECONNREFUSED | libc::ENOENT)) => {}
             Err(e) => return Err(e),
@@ -373,11 +371,72 @@ pub(crate) fn acquire(source: &File) -> io::Result<(File, String)> {
     let deadline = Instant::now() + limits.deadline;
     let len = source_size(source, limits.bytes)?;
     let digest = stream(source, len, deadline, |_| Ok(()))?;
-    let Some(socket) = tree_endpoint()? else {
+    let Some(socket) = tree_endpoint(deadline).map_err(service_unavailable)? else {
         return Ok((materialize(source, len, &digest, deadline)?, digest));
     };
-    let image = request(&socket, source, len, &digest, deadline)?;
+    let image = request_with_backpressure(socket, source, len, &digest, deadline)
+        .map_err(service_unavailable)?;
     Ok((image, digest))
+}
+fn service_unavailable(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("image service unavailable: {error}"))
+}
+fn request_with_backpressure(
+    mut socket: File,
+    source: &File,
+    len: u64,
+    digest: &str,
+    deadline: Instant,
+) -> io::Result<File> {
+    // Pin the discovered endpoint. Never rediscover/fall back after service selection.
+    let mut peer: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let mut peer_len = std::mem::size_of_val(&peer) as libc::socklen_t;
+    if unsafe {
+        libc::getpeername(
+            socket.as_raw_fd(),
+            (&mut peer as *mut libc::sockaddr_un).cast(),
+            &mut peer_len,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    loop {
+        match request(&socket, source, len, digest, deadline) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            result => return result,
+        }
+        acquisition_pause(deadline)?;
+        socket = reconnect(&peer, peer_len, deadline)?;
+    }
+}
+fn reconnect(
+    peer: &libc::sockaddr_un,
+    len: libc::socklen_t,
+    deadline: Instant,
+) -> io::Result<File> {
+    loop {
+        check_time(deadline)?;
+        let socket = socket()?;
+        if unsafe {
+            libc::connect(
+                socket.as_raw_fd(),
+                (peer as *const libc::sockaddr_un).cast(),
+                len,
+            )
+        } == 0
+        {
+            return Ok(socket);
+        }
+        let e = io::Error::last_os_error();
+        if !matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ) {
+            return Err(e);
+        }
+        acquisition_pause(deadline)?;
+    }
 }
 fn request(
     socket: &File,
@@ -390,6 +449,12 @@ fn request(
     request.extend_from_slice(digest.as_bytes());
     send(socket.as_raw_fd(), &request, Some(source), deadline)?;
     let (reply, mut files) = receive(socket.as_raw_fd(), deadline)?;
+    if reply == b"B1" && files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "image creation backpressure",
+        ));
+    }
     if reply != b"I1" || files.len() != 1 {
         return Err(invalid(format!(
             "image custodian rejected acquisition: {}",
@@ -405,8 +470,60 @@ struct Store {
     images: HashMap<(u64, String), File>,
     bytes: u64,
     limits: Limits,
+    recency: VecDeque<(u64, String)>,
+    creation: CreationRate,
+}
+// A bounded initial burst, then at most one cold allocation attempt per second.
+// This is a creation-rate limit, not accounting for mappings retained by clients.
+struct CreationRate {
+    available: usize,
+    refill: Instant,
+}
+impl CreationRate {
+    fn new(count: usize) -> Self {
+        Self {
+            available: count,
+            refill: Instant::now(),
+        }
+    }
+    fn take(&mut self, now: Instant, count: usize) -> bool {
+        let elapsed = now.saturating_duration_since(self.refill).as_secs();
+        if elapsed > 0 {
+            self.available = self
+                .available
+                .saturating_add(elapsed.min(count as u64) as usize)
+                .min(count);
+            self.refill += Duration::from_secs(elapsed);
+        }
+        if self.available == 0 {
+            return false;
+        }
+        self.available -= 1;
+        true
+    }
 }
 impl Store {
+    fn new(limits: Limits) -> Self {
+        Self {
+            images: HashMap::new(),
+            bytes: 0,
+            limits,
+            recency: VecDeque::new(),
+            creation: CreationRate::new(limits.count),
+        }
+    }
+    fn make_room(&mut self, len: u64) {
+        while self.images.len() >= self.limits.count
+            || len > self.limits.bytes.saturating_sub(self.bytes)
+        {
+            let key = self
+                .recency
+                .pop_front()
+                .expect("retained image has recency");
+            self.images.remove(&key);
+            self.bytes -= key.0;
+        }
+    }
     fn serve(&mut self, socket: &File, deadline: Instant) -> io::Result<()> {
         let (request, mut files) = receive(socket.as_raw_fd(), deadline)?;
         if request.len() != REQUEST_SIZE || files.len() != 1 {
@@ -427,15 +544,17 @@ impl Store {
         }
         let key = (len, digest);
         if !self.images.contains_key(&key) {
-            if self.images.len() >= self.limits.count
-                || len > self.limits.bytes.saturating_sub(self.bytes)
-            {
-                return Err(invalid("image epoch capacity exhausted (no eviction)"));
+            if !self.creation.take(Instant::now(), self.limits.count) {
+                return send(socket.as_raw_fd(), b"B1", None, deadline);
             }
+            // Drop store references before allocation; holders and mappings remain valid.
+            self.make_room(len);
             let image = materialize(&files.pop().unwrap(), len, &key.1, deadline)?;
             self.images.insert(key.clone(), image);
             self.bytes += len;
         }
+        self.recency.retain(|retained| retained != &key);
+        self.recency.push_back(key.clone());
         send(socket.as_raw_fd(), b"I1", self.images.get(&key), deadline)
     }
 }
@@ -458,11 +577,7 @@ fn authorized(socket: &File, owner: i32, start: u64) -> bool {
             .any(|p| p.pid == owner && p.starttime_ticks == start)
 }
 fn server(listener: File, owner: i32, start: u64, limits: Limits) -> io::Result<()> {
-    let mut store = Store {
-        images: HashMap::new(),
-        bytes: 0,
-        limits,
-    };
+    let mut store = Store::new(limits);
     loop {
         // No age limit: kernel parent-death custody and Owner::drop end service.
         // A periodic poll timeout is only an idle wait, never epoch retirement.
@@ -581,7 +696,11 @@ impl Recovery {
 }
 impl Owner {
     pub(crate) fn start() -> io::Result<Self> {
-        if tree_endpoint()?.is_some() {
+        let limits = Limits::from_env()?;
+        if tree_endpoint(Instant::now() + limits.deadline)
+            .map_err(service_unavailable)?
+            .is_some()
+        {
             return Ok(Self {
                 child: None,
                 listener: None,
@@ -786,6 +905,93 @@ mod tests {
         // Owner::drop terminates and reaps this private fixture child.
     }
 
+    fn private_listener() -> (File, i32, u64) {
+        let listener = socket().unwrap();
+        let pid = unsafe { libc::getpid() };
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 63);
+        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (addr, len) = address(pid, unique);
+        assert_eq!(
+            unsafe {
+                libc::bind(
+                    listener.as_raw_fd(),
+                    (&addr as *const libc::sockaddr_un).cast(),
+                    len,
+                )
+            },
+            0
+        );
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        (listener, pid, unique)
+    }
+    fn accept(listener: &File) -> File {
+        ready(listener.as_raw_fd(), libc::POLLIN, until()).unwrap();
+        let fd = unsafe {
+            libc::accept4(
+                listener.as_raw_fd(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            )
+        };
+        assert!(fd >= 0);
+        unsafe { File::from_raw_fd(fd) }
+    }
+    #[test]
+    fn busy_connect_waits_for_capacity_and_keeps_its_deadline() {
+        let (listener, pid, unique) = private_listener();
+        let a = connect_until(pid, unique, until()).unwrap();
+        let b = connect_until(pid, unique, until()).unwrap();
+        // listen(1) admits two Linux queued connections; neither is accepted yet.
+        let start = Instant::now();
+        let error = connect_until(pid, unique, start + Duration::from_millis(60)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= Duration::from_millis(60));
+        let waiter = std::thread::spawn(move || connect_until(pid, unique, until()));
+        drop(accept(&listener));
+        let admitted = waiter.join().unwrap().unwrap();
+        drop((a, b, admitted));
+    }
+    #[test]
+    fn explicit_creation_backpressure_retries_only_image_request() {
+        let (listener, pid, unique) = private_listener();
+        let socket = connect_until(pid, unique, until()).unwrap();
+        let responder = std::thread::spawn(move || {
+            let first = accept(&listener);
+            let initial = receive(first.as_raw_fd(), until()).unwrap();
+            send(first.as_raw_fd(), b"B1", None, until()).unwrap();
+            drop(first);
+            let second = accept(&listener);
+            let repeated = receive(second.as_raw_fd(), until()).unwrap();
+            assert_eq!(initial.0, repeated.0);
+            assert_eq!(
+                initial.1[0].metadata().unwrap().ino(),
+                repeated.1[0].metadata().unwrap().ino()
+            );
+            send(second.as_raw_fd(), b"I1", Some(&sealed(b"tiny")), until()).unwrap();
+        });
+        let hash = format!("{:x}", Sha256::digest(b"tiny"));
+        let image = request_with_backpressure(socket, &source(b"tiny"), 4, &hash, until()).unwrap();
+        verify(&image, 4, &hash, until()).unwrap();
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn creation_rate_bounds_attempts_not_store_age() {
+        let mut rate = CreationRate::new(2);
+        let now = rate.refill;
+        assert!(rate.take(now, 2));
+        assert!(rate.take(now, 2));
+        assert!(!rate.take(now, 2));
+        assert!(!rate.take(now + Duration::from_millis(999), 2));
+        assert!(rate.take(now + Duration::from_secs(1), 2));
+        assert!(!rate.take(now + Duration::from_secs(1), 2));
+        let days = now + Duration::from_secs(86400 * 3);
+        assert!(rate.take(days, 2));
+        assert!(rate.take(days, 2));
+        assert!(!rate.take(days, 2));
+    }
+
     #[test]
     fn positional_copy_and_independent_readonly_aliases() {
         let bytes = b"#!/bin/sh\necho positional\n";
@@ -920,28 +1126,26 @@ mod tests {
     }
 
     #[test]
-    fn single_publication_no_eviction_and_compound_budget_failure() {
+    fn warm_publication_and_rate_limited_turnover_preserve_held_images() {
         let limits = Limits {
             bytes: 4,
             count: 1,
             deadline: Duration::from_secs(2),
         };
-        let mut store = Store {
-            images: HashMap::new(),
-            bytes: 0,
-            limits,
-        };
+        let mut store = Store::new(limits);
         let (a, b) = pair();
         let f = source(b"tiny");
         let hash = format!("{:x}", Sha256::digest(b"tiny"));
         let mut packet = 4u64.to_le_bytes().to_vec();
         packet.extend_from_slice(hash.as_bytes());
         let mut inodes = Vec::new();
+        let mut held = Vec::new();
         for _ in 0..3 {
             send(a.as_raw_fd(), &packet, Some(&f), until()).unwrap();
             store.serve(&b, until()).unwrap();
             let (_, files) = receive(a.as_raw_fd(), until()).unwrap();
             inodes.push(files[0].metadata().unwrap().ino());
+            held.extend(files);
         }
         assert!(inodes.iter().all(|i| *i == inodes[0]));
         assert_eq!(store.bytes, 4);
@@ -950,13 +1154,36 @@ mod tests {
         let hash = format!("{:x}", Sha256::digest(b"else"));
         packet[8..].copy_from_slice(hash.as_bytes());
         send(a.as_raw_fd(), &packet, Some(&other), until()).unwrap();
-        assert!(
-            store
-                .serve(&b, until())
-                .unwrap_err()
-                .to_string()
-                .contains("capacity")
-        );
+        store.serve(&b, until()).unwrap();
+        assert_eq!(receive(a.as_raw_fd(), until()).unwrap().0, b"B1");
+        // Deterministic time passage, not a sleep or a maximum store age.
+        store.creation.refill -= Duration::from_secs(86400 * 3);
+        send(a.as_raw_fd(), &packet, Some(&other), until()).unwrap();
+        store.serve(&b, until()).unwrap();
+        let (_, files) = receive(a.as_raw_fd(), until()).unwrap();
+        assert_ne!(files[0].metadata().unwrap().ino(), inodes[0]);
+        assert_eq!(store.images.len(), 1);
         assert_eq!(store.bytes, 4);
+        verify(
+            &held[0],
+            4,
+            &format!("{:x}", Sha256::digest(b"tiny")),
+            until(),
+        )
+        .unwrap();
+        // Legitimate old content can return too; no permanent exclusion set.
+        store.creation.refill -= Duration::from_secs(1);
+        packet[8..].copy_from_slice(format!("{:x}", Sha256::digest(b"tiny")).as_bytes());
+        send(a.as_raw_fd(), &packet, Some(&f), until()).unwrap();
+        store.serve(&b, until()).unwrap();
+        let (_, restored) = receive(a.as_raw_fd(), until()).unwrap();
+        verify(
+            &restored[0],
+            4,
+            &format!("{:x}", Sha256::digest(b"tiny")),
+            until(),
+        )
+        .unwrap();
+        assert_ne!(restored[0].metadata().unwrap().ino(), inodes[0]);
     }
 }

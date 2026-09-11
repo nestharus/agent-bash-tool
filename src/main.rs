@@ -623,7 +623,7 @@ fn detach_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppE
 fn mode_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
     let meta = read_meta_for_handle(&paths, &handle)?;
-    let mode = if caller_is_control_eligible(&meta, &paths, &caller) {
+    let mode = if caller_is_control_eligible(&meta, &paths, &caller)? {
         delivery::settled_delivery_mode(&paths)
     } else {
         delivery::observed_delivery_mode(&paths)
@@ -665,7 +665,7 @@ fn status_command(
 ) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
     let meta = read_meta_for_handle(&paths, &handle)?;
-    let meta = if !observe_only && caller_is_control_eligible(&meta, &paths, &caller) {
+    let meta = if !observe_only && caller_is_control_eligible(&meta, &paths, &caller)? {
         reconcile_status_meta(&paths, &handle, meta)?
     } else {
         meta
@@ -1048,7 +1048,7 @@ fn handle_matches_control_route(
     meta: &Meta,
     paths: &StatePaths,
     caller_chain: &[state::CallerChainEntry],
-) -> bool {
+) -> io::Result<bool> {
     if let Some(recorded_session_id) = meta.owner_session_id.as_deref() {
         return acting_session_matches_handle(meta, paths, caller_chain, recorded_session_id);
     }
@@ -1064,9 +1064,9 @@ fn handle_matches_control_route(
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return false,
+        Err(err) => return Err(err),
     }
-    caller_chain_matches_handle(meta, caller_chain)
+    Ok(caller_chain_matches_handle(meta, caller_chain))
 }
 
 fn acting_session_matches_handle(
@@ -1074,11 +1074,11 @@ fn acting_session_matches_handle(
     paths: &StatePaths,
     caller_chain: &[state::CallerChainEntry],
     recorded_session_id: &str,
-) -> bool {
-    delivery::resolve_handle_owner_binding(paths, meta.delivery_helper.as_ref(), caller_chain)
-        .ok()
-        .flatten()
-        .is_some_and(|(session_id, _)| session_id == recorded_session_id)
+) -> io::Result<bool> {
+    Ok(
+        delivery::resolve_handle_owner_binding(paths, meta.delivery_helper.as_ref(), caller_chain)?
+            .is_some_and(|(session_id, _)| session_id == recorded_session_id),
+    )
 }
 
 fn caller_chain_matches_handle(meta: &Meta, caller_chain: &[state::CallerChainEntry]) -> bool {
@@ -1105,8 +1105,16 @@ fn caller_is_control_eligible(
     meta: &Meta,
     paths: &StatePaths,
     caller: &ControlRouteCaller,
-) -> bool {
-    handle_matches_control_route(meta, paths, &caller.caller_chain)
+) -> Result<bool, AppError> {
+    handle_matches_control_route(meta, paths, &caller.caller_chain).map_err(|err| {
+        AppError::new(
+            EX_IOERR,
+            format!(
+                "agent-bash: cannot determine control eligibility for handle {}: {err}",
+                paths.handle
+            ),
+        )
+    })
 }
 
 fn require_control_eligibility(
@@ -1115,7 +1123,7 @@ fn require_control_eligibility(
     caller: &ControlRouteCaller,
 ) -> Result<(), AppError> {
     let meta = read_meta_for_handle(paths, handle)?;
-    if caller_is_control_eligible(&meta, paths, caller) {
+    if caller_is_control_eligible(&meta, paths, caller)? {
         return Ok(());
     }
     Err(AppError::new(

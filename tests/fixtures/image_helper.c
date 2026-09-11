@@ -17,6 +17,19 @@ int main(int argc, char **argv) {
                 getenv("OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY") ? "authority" : "no-authority");
         fclose(f);
     }
+    const char *registration_hold = getenv("IMAGE_FIXTURE_REGISTER_HOLD");
+    if (registration_hold && argc > 2 && !strcmp(argv[2], "agent-bash-register")) {
+        char marker[4096]; snprintf(marker, sizeof(marker), "%s.registered", registration_hold);
+        int fd = open(marker, O_WRONLY | O_CREAT, 0600);
+        if (fd < 0) return 98;
+        close(fd);
+        for (int i = 0; i < 1000 && access(registration_hold, F_OK); i++) usleep(10000);
+        if (access(registration_hold, F_OK)) return 99;
+    }
+    const char *session = getenv("IMAGE_FIXTURE_SESSION");
+    if (session && argc > 2 && !strcmp(argv[1], "session") && !strcmp(argv[2], "of-pid")) {
+        printf("{\"found\":true,\"session_id\":\"%s\",\"invocation_uuid\":\"11111111-1111-4111-8111-111111111111\"}\n", session);
+    }
     const char *hold = getenv("IMAGE_FIXTURE_HOLD");
     if (hold && argc > 2 && !strcmp(argv[2], "agent-bash-complete")) {
         char marker[4096]; snprintf(marker, sizeof(marker), "%s.admitted", hold);
