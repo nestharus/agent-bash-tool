@@ -111,3 +111,9 @@ when `agent-bash` executes its immutable snapshot from a Linux memfd.
 ## License
 
 MIT
+
+### Sealed delivery-helper image reuse
+
+Managed trees share verified sealed helper images through a tree-owned, image-only
+custodian. Independent roots may duplicate images; no host-wide memory bound is
+claimed. See [ownership, budgets, epoch limits and failure behavior](docs/helper-image-custody.md).

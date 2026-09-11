@@ -339,7 +339,7 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
         if accepted_cancel {
             let escalation = recovered_cancel_escalation
                 .get_or_insert_with(CancellationEscalation::begin_guardian_takeover);
-            signal_descendants(current_pid(), escalation.signal());
+            signal_descendants(current_pid(), escalation.signal(), None);
         }
         let adopted_tree_empty = reap_adopted_children();
         if accepted_cancel && !adopted_tree_empty {
@@ -443,6 +443,19 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
     };
     persist_supervisor_meta_best_effort(&config.paths, &meta);
 
+    let image_owner = match crate::image::Owner::start() {
+        Ok(owner) => owner,
+        Err(err) => {
+            let _ = record_supervisor_error(
+                &config.paths,
+                &mut meta,
+                format!("image custodian bootstrap failed: {err}"),
+                Some(&mut log),
+            );
+            return EX_SOFTWARE;
+        }
+    };
+
     let cgroup_setup = cgroup::setup(&meta.handle);
     apply_cgroup_setup_meta(&mut meta, cgroup_setup.meta.clone());
     persist_supervisor_meta_best_effort(&config.paths, &meta);
@@ -499,6 +512,7 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
         owner_pidfd,
         completion_scope: config.completion_scope,
         sentinel,
+        image_owner,
     });
     event_loop_exit_code(event_loop(loop_state))
 }
@@ -663,6 +677,7 @@ fn map_sentinel_matcher(regex: Regex, pattern: &str) -> SentinelMatcher {
 }
 
 struct EventLoopSeed {
+    image_owner: crate::image::Owner,
     paths: StatePaths,
     meta: Meta,
     log: BoundedLog,
@@ -677,6 +692,7 @@ struct EventLoopSeed {
 
 fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
     EventLoop {
+        image_owner: seed.image_owner,
         paths: seed.paths,
         meta: seed.meta,
         log: seed.log,
@@ -844,8 +860,11 @@ fn current_pid() -> libc::pid_t {
     unsafe { libc::getpid() }
 }
 
-fn signal_descendants(root_pid: libc::pid_t, signal: i32) {
+fn signal_descendants(root_pid: libc::pid_t, signal: i32, infrastructure: Option<libc::pid_t>) {
     for pid in descendant_pids(root_pid) {
+        if infrastructure == Some(pid) {
+            continue;
+        }
         unsafe {
             libc::kill(pid, signal);
         }
@@ -1135,6 +1154,7 @@ impl SentinelMatcher {
 }
 
 struct EventLoop {
+    image_owner: crate::image::Owner,
     paths: StatePaths,
     meta: Meta,
     log: BoundedLog,
@@ -1471,7 +1491,11 @@ impl EventLoop {
                 explicit_cancel_accepted(&self.paths),
                 Ok(true)
             ));
-        signal_descendants(current_pid(), cancellation.escalation.signal());
+        signal_descendants(
+            current_pid(),
+            cancellation.escalation.signal(),
+            self.image_owner.pid(),
+        );
     }
 
     fn handle_cgroup_event(&self) {
@@ -1588,13 +1612,14 @@ impl EventLoop {
             let mut status = 0;
             let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
             if pid > 0 {
+                self.image_owner.reaped(pid);
                 if pid == self.root_pid {
                     self.record_root_status(status)?;
                 }
                 continue;
             }
             if pid == 0 {
-                self.tree_empty = false;
+                self.tree_empty = self.image_owner.only_child();
                 return Ok(());
             }
             let err = io::Error::last_os_error();

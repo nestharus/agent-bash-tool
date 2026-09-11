@@ -4,6 +4,7 @@ mod cgroup;
 mod config;
 mod delivery;
 mod guard;
+mod image;
 mod state;
 mod supervisor;
 
@@ -149,6 +150,9 @@ impl AppError {
 }
 
 fn main() {
+    if let Some(code) = image::internal_main() {
+        std::process::exit(code);
+    }
     let guard = AttachedGuard::capture();
     let cli = Cli::parse();
     if let Err(err) = run_cli(cli, guard) {

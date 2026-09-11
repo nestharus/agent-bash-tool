@@ -3,10 +3,10 @@ use std::env;
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -267,7 +267,13 @@ impl ConfiguredDeliveryHelper {
             ))
         })?;
         validate_delivery_helper_metadata(path, &metadata).map_err(DeliveryHelperError::invalid)?;
-        let interpreter = configured_interpreter(&source)?;
+        let (executable, sha256) = sealed_execution_image(&source).map_err(|err| {
+            DeliveryHelperError::unavailable(format!(
+                "cannot snapshot delivery helper {}: {err}",
+                path.display()
+            ))
+        })?;
+        let interpreter = configured_interpreter(&executable)?;
         let interpreter_provenance =
             interpreter
                 .as_ref()
@@ -275,12 +281,6 @@ impl ConfiguredDeliveryHelper {
                     path: path.to_string_lossy().into_owned(),
                     sha256: sha256.clone(),
                 });
-        let (executable, sha256) = sealed_execution_image(&source).map_err(|err| {
-            DeliveryHelperError::unavailable(format!(
-                "cannot snapshot delivery helper {}: {err}",
-                path.display()
-            ))
-        })?;
         let environment = capture_delivery_helper_environment()?;
         Ok(Self {
             provenance: provenance_from_metadata(
@@ -501,6 +501,18 @@ impl HandleBoundDeliveryHelper {
                 path.display()
             )));
         }
+        let observed = crate::image::digest(&executable).map_err(|err| {
+            DeliveryHelperError::unavailable(format!(
+                "cannot validate registered delivery helper for {}: {err}",
+                paths.handle
+            ))
+        })?;
+        if observed != provenance.sha256 {
+            return Err(DeliveryHelperError::changed(format!(
+                "registered delivery helper contents changed for {}",
+                paths.handle
+            )));
+        }
         let (executable, sha256) = sealed_execution_image(&executable).map_err(|err| {
             DeliveryHelperError::unavailable(format!(
                 "cannot load registered delivery helper for {}: {err}",
@@ -610,14 +622,8 @@ fn validate_delivery_helper_metadata(path: &Path, metadata: &Metadata) -> Result
 fn configured_interpreter(
     source: &File,
 ) -> Result<Option<(PathBuf, File, String)>, DeliveryHelperError> {
-    let mut reader = source.try_clone().map_err(|err| {
-        DeliveryHelperError::unavailable(format!("cannot inspect delivery helper: {err}"))
-    })?;
-    reader.seek(SeekFrom::Start(0)).map_err(|err| {
-        DeliveryHelperError::unavailable(format!("cannot inspect delivery helper: {err}"))
-    })?;
     let mut prefix = [0_u8; 4096];
-    let read = reader.read(&mut prefix).map_err(|err| {
+    let read = crate::image::read_prefix(source, &mut prefix).map_err(|err| {
         DeliveryHelperError::unavailable(format!("cannot inspect delivery helper: {err}"))
     })?;
     if !prefix[..read].starts_with(b"#!") {
@@ -679,14 +685,8 @@ fn configured_interpreter(
 }
 
 fn execution_image_is_script(executable: &File) -> Result<bool, DeliveryHelperError> {
-    let mut reader = executable.try_clone().map_err(|err| {
-        DeliveryHelperError::unavailable(format!("cannot inspect execution image: {err}"))
-    })?;
-    reader.seek(SeekFrom::Start(0)).map_err(|err| {
-        DeliveryHelperError::unavailable(format!("cannot inspect execution image: {err}"))
-    })?;
     let mut prefix = [0_u8; 2];
-    let read = reader.read(&mut prefix).map_err(|err| {
+    let read = crate::image::read_prefix(executable, &mut prefix).map_err(|err| {
         DeliveryHelperError::unavailable(format!("cannot inspect execution image: {err}"))
     })?;
     Ok(read == prefix.len() && prefix == *b"#!")
@@ -716,6 +716,18 @@ fn load_bound_interpreter(
             paths.handle
         ))
     })?;
+    let observed = crate::image::digest(&source).map_err(|err| {
+        DeliveryHelperError::unavailable(format!(
+            "cannot validate registered interpreter for {}: {err}",
+            paths.handle
+        ))
+    })?;
+    if observed != provenance.sha256 {
+        return Err(DeliveryHelperError::changed(format!(
+            "registered delivery helper interpreter contents changed for {}",
+            paths.handle
+        )));
+    }
     let (executable, sha256) = sealed_execution_image(&source).map_err(|err| {
         DeliveryHelperError::unavailable(format!(
             "cannot load registered delivery helper interpreter for {}: {err}",
@@ -891,37 +903,7 @@ fn validate_delivery_helper_environment_name(name: &str) -> Result<(), DeliveryH
 }
 
 fn sealed_execution_image(source: &File) -> io::Result<(File, String)> {
-    let name = CString::new("agent-bash-delivery-helper").expect("static memfd name");
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_memfd_create,
-            name.as_ptr(),
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut image = unsafe { File::from_raw_fd(i32::try_from(fd).map_err(io::Error::other)?) };
-    let mut reader = source.try_clone()?;
-    reader.seek(SeekFrom::Start(0))?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-        image.write_all(&buffer[..read])?;
-    }
-    image.set_permissions(fs::Permissions::from_mode(0o500))?;
-    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
-    if unsafe { libc::fcntl(image.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    image.seek(SeekFrom::Start(0))?;
-    Ok((image, format!("{:x}", digest.finalize())))
+    crate::image::acquire(source)
 }
 
 fn create_helper_cache_dir(path: &Path) -> io::Result<()> {
@@ -985,9 +967,7 @@ fn install_cached_helper(
         .write(true)
         .mode(0o500)
         .open(&temp)?;
-    let mut input = image.try_clone()?;
-    input.seek(SeekFrom::Start(0))?;
-    io::copy(&mut input, &mut output)?;
+    crate::image::copy(image, &mut output)?;
     output.sync_all()?;
     drop(output);
     match fs::hard_link(&temp, cached) {
@@ -1007,7 +987,7 @@ fn validate_cached_helper(path: &Path, expected_sha256: &str) -> io::Result<Meta
     let metadata = file.metadata()?;
     validate_delivery_helper_metadata(path, &metadata)
         .map_err(|detail| io::Error::new(io::ErrorKind::InvalidData, detail))?;
-    let (_, observed_sha256) = sealed_execution_image(&file)?;
+    let observed_sha256 = crate::image::digest(&file)?;
     if observed_sha256 == expected_sha256 {
         Ok(metadata)
     } else {
