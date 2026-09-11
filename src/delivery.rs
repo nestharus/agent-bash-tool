@@ -1235,14 +1235,59 @@ pub(crate) fn register(
     })
 }
 
-pub(crate) fn reconcile_completion_delivery(
+// Completion has one active transfer process. The supervisor owns its exact reap
+// through the event loop; synchronous control callers wait for that same exact PID.
+// The shared flock survives parent loss and serializes both acquisition and admission.
+pub(crate) struct CompletionTransfer {
+    pid: libc::pid_t,
+    _lock: DeliveryLockGuard,
+    retry_count: u8,
+}
+
+pub(crate) enum CompletionStart {
+    Busy,
+    Settled,
+    Running(CompletionTransfer),
+}
+
+impl CompletionTransfer {
+    pub(crate) fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
+    // Caller has already reaped this PID. Never wait here: the supervisor's
+    // wildcard reaper and a competing exact waiter must not own the same child.
+    pub(crate) fn finish(self, paths: &StatePaths, meta: &mut Meta, status: i32) -> io::Result<()> {
+        integrate_completion_transfer(paths, meta, transfer_status(status), self.retry_count)
+    }
+}
+
+pub(crate) fn try_start_completion_delivery(
     paths: &StatePaths,
     meta: &mut Meta,
-) -> std::io::Result<()> {
-    let delivery_lock = DeliveryLockGuard::acquire(paths)?;
+) -> io::Result<CompletionStart> {
+    let Some(file) = state::try_lock_delivery(paths)? else {
+        return Ok(CompletionStart::Busy);
+    };
+    start_completion_delivery(paths, meta, DeliveryLockGuard { _file: file })
+}
+
+pub(crate) fn reconcile_completion_delivery(paths: &StatePaths, meta: &mut Meta) -> io::Result<()> {
+    let lock = DeliveryLockGuard::acquire(paths)?;
+    if let CompletionStart::Running(transfer) = start_completion_delivery(paths, meta, lock)? {
+        let result = wait_for_delivery_transfer_worker(transfer.pid);
+        integrate_completion_transfer(paths, meta, result, transfer.retry_count)?;
+    }
+    Ok(())
+}
+
+fn start_completion_delivery(
+    paths: &StatePaths,
+    meta: &mut Meta,
+    lock: DeliveryLockGuard,
+) -> io::Result<CompletionStart> {
     let mut persisted = state::read_meta(paths)?;
-    let mode = state::read_delivery_mode(paths)?;
-    persisted.delivery_mode = mode;
+    persisted.delivery_mode = state::read_delivery_mode(paths)?;
     let lifecycle = persisted.delivery.completion_lifecycle();
     if lifecycle == CompletionDeliveryLifecycle::ProvisionalTransfer {
         persisted.delivery = completion_delivery_meta_from_unknown_transfer(
@@ -1251,16 +1296,53 @@ pub(crate) fn reconcile_completion_delivery(
         );
         persisted.touch();
         state::write_meta_atomic(paths, &persisted)?;
-        *meta = persisted;
-        return Ok(());
     }
+    *meta = persisted.clone();
     if !lifecycle.permits_attempt() {
-        *meta = persisted;
-        return Ok(());
+        return Ok(CompletionStart::Settled);
     }
     let retry_count = persisted.delivery.retry_count.saturating_add(u8::from(
         lifecycle == CompletionDeliveryLifecycle::RetryablePreAdmissionFailure,
     ));
+    // Single-threaded callers only, matching the existing transfer-worker fork
+    // contract. No image acquisition occurs before this ownership boundary.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        integrate_completion_transfer(paths, meta, Err(io::Error::last_os_error()), retry_count)?;
+        return Ok(CompletionStart::Settled);
+    }
+    if pid == 0 {
+        let result = prepare_completion_worker(lock._file.as_raw_fd())
+            .and_then(|()| execute_completion_transfer(paths, persisted, retry_count));
+        unsafe { libc::_exit(if result.is_ok() { 0 } else { 70 }) };
+    }
+    Ok(CompletionStart::Running(CompletionTransfer {
+        pid,
+        _lock: lock,
+        retry_count,
+    }))
+}
+
+fn prepare_completion_worker(lock_fd: i32) -> io::Result<()> {
+    // Do not retain the founding listener, signalfd, output pipes or unrelated
+    // locks while acquiring an image or after supervisor loss. Only the delivery
+    // flock is inherited by this worker (and is CLOEXEC for the helper).
+    for (first, last) in [
+        (3u32, (lock_fd as u32).saturating_sub(1)),
+        ((lock_fd as u32 + 1).max(3), u32::MAX),
+    ] {
+        if first <= last && unsafe { libc::syscall(libc::SYS_close_range, first, last, 0u32) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn execute_completion_transfer(
+    paths: &StatePaths,
+    mut persisted: Meta,
+    retry_count: u8,
+) -> io::Result<()> {
     let request = match completion_request(
         persisted.caller_ppid,
         &persisted.handle,
@@ -1272,31 +1354,34 @@ pub(crate) fn reconcile_completion_delivery(
         Err(err) => {
             persisted.delivery = completion_delivery_meta_from_helper_error(err, retry_count);
             persisted.touch();
-            state::write_meta_atomic(paths, &persisted)?;
-            *meta = persisted;
-            return Ok(());
+            return state::write_meta_atomic(paths, &persisted);
         }
     };
-    let worker_result = run_delivery_transfer_worker_holding_lock(&delivery_lock, || {
-        persisted.delivery = provisional_completion_delivery_transfer_meta();
-        persisted.touch();
-        state::write_meta_atomic(paths, &persisted)?;
-        persisted.delivery = match run_delivery_helper_command(&request) {
-            Ok(status) => completion_delivery_meta_from_status(status),
-            Err(DeliveryHelperCommandError::NotStarted(err)) => {
-                completion_delivery_meta_from_launch_error(err, retry_count)
-            }
-            Err(DeliveryHelperCommandError::Admitted(err)) => {
-                completion_delivery_meta_from_error(err)
-            }
-        };
-        persisted.touch();
-        state::write_meta_atomic(paths, &persisted)
-    });
+    persisted.delivery = provisional_completion_delivery_transfer_meta();
+    persisted.touch();
+    state::write_meta_atomic(paths, &persisted)?;
+    persisted.delivery = match run_delivery_helper_command(&request) {
+        Ok(status) => completion_delivery_meta_from_status(status),
+        Err(DeliveryHelperCommandError::NotStarted(err)) => {
+            completion_delivery_meta_from_launch_error(err, retry_count)
+        }
+        Err(DeliveryHelperCommandError::Admitted(err)) => completion_delivery_meta_from_error(err),
+    };
+    persisted.touch();
+    state::write_meta_atomic(paths, &persisted)
+}
+
+fn integrate_completion_transfer(
+    paths: &StatePaths,
+    meta: &mut Meta,
+    worker_result: io::Result<()>,
+    retry_count: u8,
+) -> io::Result<()> {
     let mut observed = state::read_meta(paths)?;
     if let Err(err) = worker_result {
         observed.delivery = match observed.delivery.completion_lifecycle() {
-            CompletionDeliveryLifecycle::Unclaimed => {
+            CompletionDeliveryLifecycle::Unclaimed
+            | CompletionDeliveryLifecycle::RetryablePreAdmissionFailure => {
                 completion_delivery_meta_from_owner_launch_error(err, retry_count)
             }
             CompletionDeliveryLifecycle::ProvisionalTransfer => {
@@ -1312,6 +1397,14 @@ pub(crate) fn reconcile_completion_delivery(
     }
     *meta = observed;
     Ok(())
+}
+
+fn transfer_status(status: i32) -> io::Result<()> {
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::other("delivery transfer worker failed"))
+    }
 }
 
 fn completion_delivery_meta_from_unknown_transfer(
@@ -1459,10 +1552,7 @@ fn wait_for_delivery_transfer_worker(pid: libc::pid_t) -> io::Result<()> {
         let mut status = 0;
         let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
         if waited == pid {
-            if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
-                return Ok(());
-            }
-            return Err(io::Error::other("delivery transfer worker failed"));
+            return transfer_status(status);
         }
         if waited < 0 {
             let err = io::Error::last_os_error();

@@ -173,17 +173,39 @@ supervisor/guardian loss. They are **not** the retained 420-producer
 failure rerun, the 10,100-producer AGE-353 goal, a real runner wake test, or evidence
 that the historical EBUSY page-reference holder has been identified.
 
-## Unresolved founding-owner continuity (correction 2)
+## Founding-owner completion continuity
 
-The founding supervisor still synchronously acquires its own completion image and
-waits for the admitted delivery transfer worker. Its recovery loop cannot run
-during either wait. A private fixture establishes failed image acquisition for
-founding exit and ready completion after service death, and failed descendant
-acquisition while the founding helper is admitted and held. **This correction does
-not resolve notification restoration or the retained 420-case outage.** No second
-recovery loop or recovery thread has been added. Moving recovery to another process
-requires explicit custody/teardown integration; threading the current supervisor
-would cross delivery's fork-then-Rust execution boundary.
+Completion publication in the live supervisor leaves delivery pending. Its event
+loop tries the delivery lock without waiting, then launches one active transfer
+worker that acquires the images, writes the admission claim, executes the helper
+and persists its result. The supervisor retains the inherited lock until its
+existing wildcard reaper observes that exact worker and integrates the result.
+There is no recovery thread, second reaper, or idle monitor per image generation.
+The worker closes inherited descriptors other than stdio and its delivery lock;
+it does not keep the founding listener alive after supervisor loss.
+
+Both ready and normal-exit publication use this boundary. Pending delivery keeps
+the supervisor alive even for Root completion scope. A root exit observed during
+a ready transfer is retained in memory and merged into current metadata once the
+lock is available, rather than blocking recovery or overwriting the worker's
+result. Accepted cancellation drains the workload tree before starting its own
+completion transfer; that new notification is not cancelled again. Owner exit
+can cancel an already active ready transfer, preserving non-replayable uncertainty
+when the worker dies without a conclusive handback. Such an unknown outcome closes
+replay but retains adopted-tree custody even in Root scope: otherwise a surviving
+helper could be orphaned. Unrelated surviving Root-scope descendants can therefore
+also prolong supervision after worker loss. The existing guardian adopts
+and reaps remaining children after abnormal supervisor loss, even when delivery
+metadata becomes terminal before the worker exits.
+
+The retained correction-2 fixture establishes the old three failures. The same
+stimuli now pass with tiny images: founding exit/ready acquisition during recovery,
+and descendant acquisition while the founding helper remains admitted and held.
+Additional private tests cover root-status integration, pending Root-scope delivery,
+cancellation, worker/supervisor loss, exact invocation counts and lock/reap cleanup.
+This is **not** a rerun of the 420-case outage, proof of uninterrupted acquisition,
+or a large-image/multi-day throughput result. Request deadlines and recovery
+backoff remain; interrupted accepted image RPCs still fail without helper replay.
 
 Session-bound control lookup now propagates inability to determine eligibility
 (`EX_IOERR`, preserving the image-service error), rather than reporting that the

@@ -126,7 +126,10 @@ supervisor exit ends the guardian. After an abnormal exit, including `SIGKILL`, 
 the persisted PID/start-time/boot-ID identities and per-handle reconciliation lock to wait until
 supervisor loss is conclusive, record `supervisor-lost`, and run any pending async delivery. A
 persisted root exit code remains diagnostic evidence; supervisor loss is still `ERROR rc=70`
-because full process-tree completion can no longer be proven.
+because full process-tree completion can no longer be proven. After delivery reconciliation,
+the guardian continues reaping adopted children until they exit; a durable terminal handback
+is not evidence that the transfer worker itself has exited. It does not retry that reconciled
+delivery while draining children or terminate surviving descendants without accepted cancellation.
 
 The guardian becomes a subreaper before it forks the supervisor. If explicit cancellation was
 accepted before abnormal supervisor exit, the synchronized `cancel-requested` marker is the
@@ -161,9 +164,14 @@ transition but not the delivery-helper-operation role. A targeted eligible `stat
 delivery in its current process and synchronously waits for the local delivery transfer worker and helper
 outcome. An origin-session-scoped bulk `list` may publish the same terminal state for an accurate projection,
 but it never executes a helper as an incidental enumeration side effect; its disposition is
-`CompletionDeliveryDisposition::LeavePending`. Live terminal producers, targeted status, and the guardian
-use `CompletionDeliveryDisposition::ClaimPending`; the disposition names only who progresses delivery, not how
-the terminal state was reached. Cross-owner status and
+`CompletionDeliveryDisposition::LeavePending`. Live event-loop terminal producers publish with
+`LiveLoop { tree_empty }`, then retain the delivery obligation in the event loop and progress it
+asynchronously. A durable cancellation arriving after the loop's last check defers publication under
+`completion.lock` until the adopted tree has drained; it cannot prematurely publish a cancelled
+Root-scope completion and exempt surviving workload descendants from termination.
+Targeted status, bootstrap-error publication and guardian reconciliation use
+`CompletionDeliveryDisposition::ClaimPending` and wait synchronously for an exact transfer child.
+The disposition names who progresses delivery, not how the terminal state was reached. Cross-owner status and
 `list --all` remain observational and do not reconcile state. Cross-route `mode` is likewise a
 point-in-time read, but it still fails closed when the durable activation outcome is unsettled.
 List projections represent that state as `delivery_mode: null` with `delivery_mode_error` in JSON
@@ -353,6 +361,22 @@ Detach and completion first fork a local delivery transfer worker while retainin
 persists `activation-attempted` plus canonical `async` mode, or `attempted=true` plus
 `error_code="delivery_attempt_in_progress"`, immediately before it launches the helper. The worker
 retains the lock and persists the observed outcome even if the initiating CLI or supervisor dies.
+The live supervisor acquires the lock nonblocking and places completion image acquisition inside
+that same worker, before the claim. It does not wait for the worker: its sole event-loop reaper
+integrates the exact PID's result while continuing image-service recovery. Pending delivery keeps
+both Root- and Tree-scope supervisors alive. Ready-mode root-exit observations are deferred while
+a transfer or detach holds the lock, then merged from current persisted metadata. Targeted control
+callers remain synchronous exact-child waiters. Workers are fork-then-Rust children of single-threaded
+processes, not background-thread forks; completion workers close unrelated inherited descriptors.
+Cancellation waits for the workload tree to drain before publishing its own completion notification,
+which is not signalled as workload again. Owner loss after readiness can still terminate an active
+ready transfer; an unresolved admitted outcome remains unknown and cannot be replayed.
+After worker loss with an unknown admitted outcome, the live supervisor conservatively retains
+all adopted children even in Root scope: the surviving helper cannot be distinguished conclusively
+from other adopted descendants. Terminal metadata is available, but physical custody lasts until
+that tree drains (or authorized cancellation terminates it). Normal successful Root delivery does
+not acquire this conservative Tree-custody obligation.
+
 These are write-ahead transfer claims: once present, a successor never hands the same one-shot
 obligation to the helper again, including after a nonzero exit or unknown admitted outcome.
 Conclusive helper-resolution, fork, spawn, or pre-exec failures remain `attempted=false`; detach

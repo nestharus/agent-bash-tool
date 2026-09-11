@@ -898,7 +898,7 @@ fn reap_state_entry(
         root.to_path_buf(),
         entry.file_name().to_string_lossy().into_owned(),
     );
-    let _delivery_lock = match try_lock_delivery_for_reap(&paths) {
+    let _delivery_lock = match try_lock_delivery(&paths) {
         Ok(Some(lock)) => lock,
         Ok(None) => return,
         Err(_) => {
@@ -916,7 +916,7 @@ fn reap_state_entry(
     }
 }
 
-fn try_lock_delivery_for_reap(paths: &StatePaths) -> io::Result<Option<File>> {
+pub(crate) fn try_lock_delivery(paths: &StatePaths) -> io::Result<Option<File>> {
     use std::os::fd::AsRawFd;
 
     let file = OpenOptions::new()

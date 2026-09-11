@@ -75,6 +75,9 @@ architecture and ownership boundary.
 
 The spooler transfers each helper operation to a local delivery transfer worker before persisting its
 write-ahead claim and guarantees at most one admitted helper invocation per handle operation.
+Live supervisors acquire completion images and run the helper in that worker asynchronously, so
+image recovery and child reaping continue during delivery. Pending delivery retains the supervisor
+even for Root scope; ready-mode workload exit metadata is merged after the transfer lock releases.
 Conclusive process-launch failures remain pre-admission. Automatic completion progression permits
 one bounded status-triggered retry; activation instead restores sync mode and requires another
 explicit control-route-eligible `detach` request before retrying. Agent-runner is the authority for
