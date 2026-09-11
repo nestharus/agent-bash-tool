@@ -219,8 +219,19 @@ success. A successfully attested mismatching session still gets no control right
 External status/retry completion and detach activation do not inherit the founding
 reapers' adoption. Their synchronous transfer workers now publish a separate
 `external-transfer-custody` boot marker before spawning the helper. Confirmed
-non-admission or a raw helper wait result clears only the creating attempt's marker;
-a wait error or worker loss leaves it. Activation distinguishes nonzero helper exit
+non-admission or a raw helper wait result attempts to clear only the creating
+attempt's marker; a wait error or worker loss leaves it. Discharge bookkeeping
+failure never replaces the established non-admission, wait status or wait uncertainty
+and grants no replay authority. The last cleanup failure is recorded separately in
+`external-transfer-cleanup-error` (at most 512 diagnostic characters plus a fixed
+prefix, overwritten on later failures, not a custody marker or outcome). If recording
+fails, a bounded stderr diagnostic reports both errors; if that channel also fails,
+there is no guaranteed diagnostic retention. This historical last-failure record is
+not cleared by later success. It is overwritten in place under the delivery lock,
+so interruption or write failure can leave a partial record; diagnostic writes do
+not create a growing set of temporary files. Unlink failure and successful unlink followed by directory
+sync failure are distinguished: the latter leaves no visible marker and uncertain
+crash durability, not a promise of retained custody. Activation distinguishes nonzero helper exit
 from wait uncertainty before both become logical errors. Successor reconciliation
 may close replay but cannot remove the marker. A later successful transfer cannot
 discharge older external uncertainty, and founding-tree discharge is independent.

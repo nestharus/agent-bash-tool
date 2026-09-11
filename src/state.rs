@@ -686,10 +686,52 @@ pub(crate) fn begin_external_transfer_custody(paths: &StatePaths) -> io::Result<
 }
 
 pub(crate) fn end_external_transfer_custody(paths: &StatePaths) -> io::Result<()> {
-    rollback_created_marker(
-        &paths.external_transfer_custody,
-        &File::open(&paths.state_dir)?,
-    )
+    end_external_transfer_custody_with(paths, |path| fs::remove_file(path), File::sync_all)
+}
+
+// The injected operations also exercise the unlink-before-sync boundary in tests.
+pub(crate) fn end_external_transfer_custody_with(
+    paths: &StatePaths,
+    unlink: impl FnOnce(&Path) -> io::Result<()>,
+    sync: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
+    let directory = File::open(&paths.state_dir)
+        .map_err(|err| io::Error::other(format!("open custody directory before unlink: {err}")))?;
+    match unlink(&paths.external_transfer_custody) {
+        Ok(()) => sync(&directory).map_err(|err| {
+            io::Error::other(format!(
+                "custody marker unlinked; directory sync failed; crash durability uncertain: {err}"
+            ))
+        }),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(io::Error::other(format!(
+            "custody marker unlink failed: {err}"
+        ))),
+    }
+}
+
+// One bounded last-failure record, separate from admission/outcome and custody.
+// Caller holds the delivery lock. This diagnostic never acts as a retention veto.
+pub(crate) fn record_external_custody_cleanup_error(
+    paths: &StatePaths,
+    error: &io::Error,
+) -> io::Result<()> {
+    let detail: String = error.to_string().chars().take(512).collect();
+    // Diagnostic-only overwrite: interruption can leave a partial record, but
+    // repeated write failures must not accumulate uniquely named temp files.
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(paths.state_dir.join("external-transfer-cleanup-error"))?;
+    writeln!(
+        file,
+        "external custody cleanup failed; helper result unchanged: {detail}"
+    )?;
+    file.sync_all()?;
+    File::open(&paths.state_dir)?.sync_all()
 }
 
 pub(crate) fn record_cancellation_drained(paths: &StatePaths) -> io::Result<()> {

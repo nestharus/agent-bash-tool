@@ -1738,6 +1738,7 @@ fn path_arg(path: &Path) -> OsString {
     path.as_os_str().to_os_string()
 }
 
+#[derive(Debug)]
 enum DeliveryHelperCommandError {
     NotStarted(io::Error),
     Admitted(io::Error),
@@ -1750,6 +1751,14 @@ fn with_external_transfer_custody<T>(
     paths: Option<&StatePaths>,
     operation: impl FnOnce() -> Result<T, DeliveryHelperCommandError>,
 ) -> Result<T, DeliveryHelperCommandError> {
+    with_external_transfer_custody_cleanup(paths, operation, state::end_external_transfer_custody)
+}
+
+fn with_external_transfer_custody_cleanup<T>(
+    paths: Option<&StatePaths>,
+    operation: impl FnOnce() -> Result<T, DeliveryHelperCommandError>,
+    cleanup: impl FnOnce(&StatePaths) -> io::Result<()>,
+) -> Result<T, DeliveryHelperCommandError> {
     let Some(paths) = paths else {
         return operation();
     };
@@ -1757,10 +1766,25 @@ fn with_external_transfer_custody<T>(
         .map_err(DeliveryHelperCommandError::NotStarted)?;
     let result = operation();
     if owned && !matches!(result, Err(DeliveryHelperCommandError::Admitted(_))) {
-        state::end_external_transfer_custody(paths)
-            .map_err(DeliveryHelperCommandError::Admitted)?;
+        report_external_custody_cleanup(paths, cleanup(paths));
     }
     result
+}
+
+fn report_external_custody_cleanup(paths: &StatePaths, cleanup: io::Result<()>) {
+    let Err(error) = cleanup else { return };
+    if let Err(record_error) = state::record_external_custody_cleanup_error(paths, &error) {
+        use std::io::Write;
+        // Even diagnostics I/O cannot replace an established helper result. stderr
+        // is the last-resort channel; it too may be unavailable in a lost worker.
+        let detail: String = error.to_string().chars().take(512).collect();
+        let record_detail: String = record_error.to_string().chars().take(512).collect();
+        let _ = writeln!(
+            io::stderr(),
+            "external custody cleanup failed for {}; helper result unchanged: {detail}; diagnostic persistence failed: {record_detail}",
+            paths.handle,
+        );
+    }
 }
 
 fn run_delivery_helper_command(
@@ -1942,6 +1966,184 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
+
+    #[derive(Clone, Copy, Debug)]
+    enum CleanupFault {
+        Unlink,
+        Sync,
+    }
+
+    fn injected_custody_cleanup(paths: &StatePaths, fault: CleanupFault) -> io::Result<()> {
+        state::end_external_transfer_custody_with(
+            paths,
+            |path| match fault {
+                CleanupFault::Unlink => Err(io::Error::from_raw_os_error(libc::EACCES)),
+                CleanupFault::Sync => fs::remove_file(path),
+            },
+            |_| Err(io::Error::from_raw_os_error(libc::EIO)),
+        )
+    }
+
+    fn bookkeeping_case(fault: CleanupFault, exit: Option<i32>) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_bookkeeping".into());
+        fs::create_dir(&paths.state_dir).unwrap();
+        let _lock = DeliveryLockGuard::acquire(&paths).unwrap();
+        let result = with_external_transfer_custody_cleanup(
+            Some(&paths),
+            || actual_bookkeeping_operation(temp.path(), exit),
+            |paths| injected_custody_cleanup(paths, fault),
+        );
+        assert_eq!(
+            paths.external_transfer_custody.exists(),
+            matches!(fault, CleanupFault::Unlink)
+        );
+        let diagnostic =
+            fs::read_to_string(paths.state_dir.join("external-transfer-cleanup-error")).unwrap();
+        assert!(diagnostic.contains("helper result unchanged"));
+        match fault {
+            CleanupFault::Unlink => assert!(diagnostic.contains("unlink failed: Permission denied")),
+            CleanupFault::Sync => assert!(diagnostic.contains("marker unlinked; directory sync failed; crash durability uncertain: Input/output error")),
+        }
+        println!("{fault:?} {exit:?}: {}", diagnostic.trim());
+        assert_bookkeeping_result(result, exit);
+    }
+
+    fn actual_bookkeeping_operation(
+        root: &Path,
+        exit: Option<i32>,
+    ) -> Result<std::process::Output, DeliveryHelperCommandError> {
+        let Some(exit) = exit else {
+            return Command::new(root.join("missing-helper"))
+                .output()
+                .map_err(DeliveryHelperCommandError::NotStarted);
+        };
+        Command::new("/bin/sh")
+            .args(["-c", &format!("exit {exit}")])
+            .spawn()
+            .map_err(DeliveryHelperCommandError::NotStarted)?
+            .wait_with_output()
+            .map_err(DeliveryHelperCommandError::Admitted)
+    }
+
+    fn assert_bookkeeping_result(
+        result: Result<std::process::Output, DeliveryHelperCommandError>,
+        exit: Option<i32>,
+    ) {
+        let Some(exit) = exit else {
+            let Err(DeliveryHelperCommandError::NotStarted(error)) = result else {
+                panic!("non-admission changed: {result:?}");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            let meta = completion_delivery_meta_from_launch_error(error, 0);
+            assert!(!meta.attempted);
+            assert_eq!(meta.retryable, Some(true));
+            return;
+        };
+        let output = result.unwrap();
+        assert_eq!(output.status.code(), Some(exit));
+        let meta = completion_delivery_meta_from_status(output.status);
+        assert!(meta.attempted);
+        assert_eq!(meta.exit_code, Some(exit));
+        assert_eq!(
+            meta.completion_lifecycle(),
+            CompletionDeliveryLifecycle::AdmittedOutcome
+        );
+        assert!(!meta.completion_lifecycle().needs_progress());
+        let required = require_helper_success(output);
+        if exit == 0 {
+            assert!(required.is_ok());
+            return;
+        }
+        let Err(DeliveryHelperCommandError::Admitted(error)) = required else {
+            panic!("nonzero exit changed: {required:?}");
+        };
+        assert_eq!(
+            error.to_string(),
+            format!("delivery helper exited with {exit}")
+        );
+    }
+
+    #[test]
+    fn external_bookkeeping_unlink_preserves_nonadmission_and_actual_wait_results() {
+        for exit in [None, Some(0), Some(23)] {
+            bookkeeping_case(CleanupFault::Unlink, exit);
+        }
+    }
+
+    #[test]
+    fn external_bookkeeping_sync_preserves_nonadmission_and_actual_wait_results() {
+        for exit in [None, Some(0), Some(23)] {
+            bookkeeping_case(CleanupFault::Sync, exit);
+        }
+    }
+
+    #[test]
+    fn external_bookkeeping_wait_uncertainty_never_attempts_faulting_cleanup() {
+        for fault in [CleanupFault::Unlink, CleanupFault::Sync] {
+            uncertain_bookkeeping_case(fault);
+        }
+    }
+
+    fn uncertain_bookkeeping_case(fault: CleanupFault) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_uncertain".into());
+        fs::create_dir(&paths.state_dir).unwrap();
+        let _lock = DeliveryLockGuard::acquire(&paths).unwrap();
+        let called = std::cell::Cell::new(false);
+        let result: Result<(), _> = with_external_transfer_custody_cleanup(
+            Some(&paths),
+            || {
+                Err(DeliveryHelperCommandError::Admitted(
+                    io::Error::from_raw_os_error(libc::ECHILD),
+                ))
+            },
+            |paths| {
+                called.set(true);
+                injected_custody_cleanup(paths, fault)
+            },
+        );
+        let Err(DeliveryHelperCommandError::Admitted(error)) = result else {
+            panic!("uncertainty changed")
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+        assert!(!called.get());
+        assert!(paths.external_transfer_custody.exists());
+        assert!(
+            !paths
+                .state_dir
+                .join("external-transfer-cleanup-error")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn external_bookkeeping_diagnostic_is_bounded_and_failure_cannot_replace_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_diagnostic".into());
+        fs::create_dir(&paths.state_dir).unwrap();
+        let _lock = DeliveryLockGuard::acquire(&paths).unwrap();
+        let diagnostic = paths.state_dir.join("external-transfer-cleanup-error");
+        state::record_external_custody_cleanup_error(&paths, &io::Error::other("x".repeat(4096)))
+            .unwrap();
+        assert!(fs::metadata(&diagnostic).unwrap().len() < 2200);
+        state::record_external_custody_cleanup_error(&paths, &io::Error::other("latest failure"))
+            .unwrap();
+        assert!(
+            fs::read_to_string(&diagnostic)
+                .unwrap()
+                .ends_with("latest failure\n")
+        );
+        fs::remove_file(&diagnostic).unwrap();
+        fs::create_dir(&diagnostic).unwrap();
+        let result = with_external_transfer_custody_cleanup(
+            Some(&paths),
+            || Ok(ExitStatus::from_raw(0)),
+            |paths| injected_custody_cleanup(paths, CleanupFault::Sync),
+        );
+        assert!(result.unwrap().success());
+        assert!(!paths.external_transfer_custody.exists());
+    }
 
     #[test]
     fn external_wait_uncertainty_survives_later_conclusive_operations() {
