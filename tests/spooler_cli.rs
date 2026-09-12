@@ -6405,8 +6405,8 @@ fn age364_reachable_diagnostics_preserve_main_outcomes_and_collector_bytes() {
             if mode == "closed" {
                 drop(receiver.take());
             }
-            // A new control process opens its own diagnostic socket after worker
-            // FD preparation. The second detach must not manufacture a retry.
+            // Detach exercises diagnostic emission from a later control process.
+            // The second detach must not manufacture a retry.
             for transitioned in [true, false] {
                 let mut command = agent_bash(&temp);
                 command.timeout(FIXTURE_DEADLINE);
