@@ -76,11 +76,11 @@ impl AttemptDiagnostics {
             "pid": unsafe { libc::getpid() },
             "elapsed_us": self.started.elapsed().as_micros(), "evidence": evidence,
         });
-        if let Ok(bytes) = serde_json::to_vec(&value) {
-            if bytes.len() <= 4096 {
-                // One atomic datagram, no retry, blocking fallback or stderr write.
-                let _ = socket.send(&bytes);
-            }
+        if let Ok(bytes) = serde_json::to_vec(&value)
+            && bytes.len() <= 4096
+        {
+            // One atomic datagram, no retry, blocking fallback or stderr write.
+            let _ = socket.send(&bytes);
         }
     }
 }
