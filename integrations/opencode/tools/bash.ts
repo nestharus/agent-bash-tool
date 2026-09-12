@@ -27,7 +27,7 @@ type RunDispatch = {
 }
 
 type StatusReadPolicy = {
-  detail: "header" | "full"
+  detail: "header" | "tail"
   progression: "observe-only" | "request-progress"
 }
 
@@ -278,7 +278,6 @@ async function statusText(
 ): Promise<string> {
   const args = [AGENT_BASH, "status"]
   if (policy.detail === "header") args.push("--tail-bytes", "0")
-  else args.push("--full")
   if (policy.progression === "observe-only") args.push("--observe-only")
   args.push(handle)
   const result = await runProcess(args, ownerSessionId, abort, "agent-bash status")
@@ -293,7 +292,7 @@ async function statusText(
 
 async function observeVisibleHandle(
   handle: string,
-  runningDetail: "omit" | "full",
+  runningDetail: "omit" | "tail",
   ownerSessionId?: string,
   abort?: AbortSignal,
 ): Promise<string | undefined> {
@@ -310,7 +309,7 @@ async function observeVisibleHandle(
 
   const status = await statusText(
     handle,
-    { detail: "full", progression: "observe-only" },
+    { detail: "tail", progression: "observe-only" },
     ownerSessionId,
     abort,
   )
@@ -370,7 +369,7 @@ async function retainedTerminalOutput(handle: string, ownerSessionId?: string, a
   }
   return `${retained.status}\nlocal acceptance: ${acceptance}; remote ACK: unconfirmed; physical drain: unconfirmed` +
     `\nprogression: ${progression}\nsnapshot: ${JSON.stringify(retained.snapshot)}` +
-    `\noutput representation: ${retained.representation}; bounded prefix only, later append data unknown` +
+    `\noutput representation: ${retained.representation}; acquired bounded bytes only, not an atomic historical log; later append data unknown` +
     `\n--- output ---\n${retained.output}`
 }
 
@@ -735,7 +734,19 @@ async function waitForSyncResult(
     if (abort.aborted) return cancelResult(handle, ownerSessionId)
     try {
       const status = await observeVisibleHandle(handle, "omit", ownerSessionId, abort)
-      if (status !== undefined) return status
+      if (status !== undefined) {
+        if (!abort.aborted) return status
+        // Retention must not discharge this synchronous caller's cancellation duty.
+        // Cancel without the aborted signal, and keep the acquired output even if
+        // cancellation itself fails. Explicit async polls do not gain this duty.
+        let cancellation: string
+        try {
+          cancellation = await cancelResult(handle, ownerSessionId)
+        } catch (error) {
+          cancellation = `Cancellation unconfirmed: ${error instanceof Error ? error.message : String(error)}`
+        }
+        return status.replace("\n", `\ncancellation after acquisition: ${cancellation}\n`)
+      }
       if ((await modeText(handle, ownerSessionId, abort)) === "async") return asyncDispatchResponse(handle)
     } catch (error) {
       if (abort.aborted) return cancelResult(handle, ownerSessionId)
@@ -768,7 +779,7 @@ export default tool({
   },
   async execute(args, context) {
     if (args.handle) {
-      return observeVisibleHandle(args.handle, "full", context.sessionID, context.abort)
+      return observeVisibleHandle(args.handle, "tail", context.sessionID, context.abort)
     }
     if (!commandProvided(args.command)) return missingCommandResponse()
     if (args.delivery !== undefined && !validDeliveryMode(args.delivery)) {

@@ -10,8 +10,15 @@ returns a terminal, bounded log prefix in JSON, without trimming or lossy decodi
 The byte bound is captured from the open log's length. Reads stop there even if output appends.
 A short read or missing source fails; it is not an empty successful snapshot. The hash identifies
 acquired bytes, not a file's eventual size, a workload's physical cessation, or an atomic snapshot
-of all metadata. Terminal ready-sentinel/root-completion output may still grow. A rewritten source
+of the log or all metadata. Terminal ready-sentinel/root-completion output may still grow. A rewritten source
 can prevent future recovery/acceptance, even though bytes already acquired by a caller remain useful.
+Normal `BoundedLog` rollover truncates the same inode and rewrites a marker plus retained tail at
+its configured cap. It can invalidate an earlier prefix **before cleanup/TTL expiry**. Producers
+are not locked: acquisition concurrent with rollover can fail short, or return equal-length/mixed
+bytes that are not an atomic historical final log image. The hash identifies exactly the bytes
+actually acquired; a later acceptance read may reject them. Acceptance likewise validates the
+bytes it reads, not an immutable historical image. Sequential append/replacement/truncation tests
+do not establish behavior under concurrent producer rollover; that interleaving is not tested.
 
 After validating the entire response, length, hash and identity, the consumer calls
 `consume HANDLE --snapshot '<snapshot JSON>'`. This rejects malformed, wrong-handle, stale-source,
@@ -62,9 +69,25 @@ status, exact identity and local/remote uncertainty precede it. If a running tex
 terminal state and exact acquisition fails, that text is retained without exact-acceptance claims.
 
 Consume errors/rejection, malformed/stale/lost replies, timeout/abort and later progression failure
-cannot replace acquired output. Only a validated reply changes local acceptance to accepted. Unknown
+cannot replace acquired output. After post-acquisition abort in a synchronous call, the adapter
+still invokes the existing cancellation path without the aborted signal and reports its actual
+response (or explicitly unconfirmed failure) alongside the retained output. This preserves the
+existing cancellation invocation responsibility; a request is not itself drain proof.
+**Unresolved:** the current supervisor cancellation admission rejects terminal metadata with
+`requested:false`, including root-completed workloads with live descendants. Reaching that existing
+path does not cancel/drain such descendants. The deterministic post-acquisition regression tests
+remain failing until the owning workflow decides the terminal-with-live-custody cancellation policy. An
+explicit asynchronous poll does not acquire synchronous cancellation ownership.
+The adapter's resolved return value retains the bytes while its process remains alive. A host
+that discards results after abort may not display or persist them; actual host-aborted OpenCode UI
+retention is unverified. Process death loses adapter memory; source recovery remains bounded by
+the lifetime/rollover limitations above. Only a validated reply changes local acceptance to accepted. Unknown
 acceptance does not justify replaying the workload: observe retained state or retry the same bounded
 identity using existing authority. A failed/partial snapshot response never authorizes a marker.
+
+Explicit running-handle polls retain the existing default tail read (65,536 bytes), not full-log
+reads. Terminal acquisition alone reads the complete observed bounded prefix. If a running read
+races terminal state and exact acquisition fails, only the acquired tail text is retained.
 
 Wire hex expands bytes 2x; acquisition/adapter memory is proportional to the acquired prefix, as with
 full status. Persistent storage remains the existing log plus a small lock file and existing marker,
