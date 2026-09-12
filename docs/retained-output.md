@@ -47,7 +47,7 @@ invocation remains authorized; the historical owner's invocation UUID is not a n
 No provenance/schema-7 shortcut or ambient owner-string override is introduced.
 
 `output.lock` excludes reaping during acquisition and acceptance; reaping takes the existing delivery
-lock then tries the output lock without waiting. Output operations never acquire the delivery or
+lock, then the bounded custody lock, then tries the output lock without waiting. Output operations never acquire the delivery or
 reconciliation locks. The lock does not exclude appenders or change TTL/delivery/physical-retention
 eligibility. It is released after the individual operation; it does not pin a caller's unread source
 between commands. A cleanup race can therefore yield explicit unavailable/unknown, never a recreated
@@ -73,11 +73,14 @@ cannot replace acquired output. After post-acquisition abort in a synchronous ca
 still invokes the existing cancellation path without the aborted signal and reports its actual
 response (or explicitly unconfirmed failure) alongside the retained output. This preserves the
 existing cancellation invocation responsibility; a request is not itself drain proof.
-**Unresolved:** the current supervisor cancellation admission rejects terminal metadata with
-`requested:false`, including root-completed workloads with live descendants. Reaching that existing
-path does not cancel/drain such descendants. The deterministic post-acquisition regression tests
-remain failing until the owning workflow decides the terminal-with-live-custody cancellation policy. An
-explicit asynchronous poll does not acquire synchronous cancellation ownership.
+Terminal cancellation uses the merged AGE-362 same-boot physical-custody admission path,
+independently of logical completion and delivery waits. The two post-acquisition abort regressions
+(consume and progression) now observe accepted cancellation, exact live-descendant exit and guardian
+custody discharge while the adapter remains alive, with the acquired bytes retained exactly once.
+These cases failed before that prerequisite; they do not establish all-topology cancellation success.
+In particular, uncertified delivery-role custodian loss leaves UNKNOWN and can indefinitely withhold
+workload signals until independent cessation. A request alone still proves neither drain nor remote
+ACK. An explicit asynchronous poll does not acquire synchronous cancellation ownership.
 The adapter's resolved return value retains the bytes while its process remains alive. A host
 that discards results after abort may not display or persist them; actual host-aborted OpenCode UI
 retention is unverified. Process death loses adapter memory; source recovery remains bounded by
