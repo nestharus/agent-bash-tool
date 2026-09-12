@@ -1,3 +1,5 @@
+mod attempt_diagnostics;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{CString, OsStr, OsString};
@@ -1620,13 +1622,15 @@ fn wait_for_consumed_marker(paths: &StatePaths, grace: Duration) -> io::Result<b
     Ok(false)
 }
 
-struct DeliveryHelperRequest {
+struct DeliveryHelperRequest<'a> {
+    paths: &'a StatePaths,
+    operation: &'static str,
     helper: HandleBoundDeliveryHelper,
     args: Vec<OsString>,
     transient_environment: Vec<(OsString, OsString)>,
 }
 
-impl DeliveryHelperRequest {
+impl DeliveryHelperRequest<'_> {
     fn command(&self) -> Command {
         let mut command = self.helper.operation_command();
         command.args(&self.args).envs(
@@ -1638,13 +1642,15 @@ impl DeliveryHelperRequest {
     }
 }
 
-fn register_request(
+fn register_request<'a>(
     meta: &Meta,
-    paths: &StatePaths,
+    paths: &'a StatePaths,
     helper: HandleBoundDeliveryHelper,
     authority: Option<OsString>,
-) -> DeliveryHelperRequest {
+) -> DeliveryHelperRequest<'a> {
     DeliveryHelperRequest {
+        paths,
+        operation: "register",
         helper,
         args: register_args(meta, paths),
         transient_environment: authority
@@ -1653,25 +1659,29 @@ fn register_request(
     }
 }
 
-fn activate_request(
+fn activate_request<'a>(
     meta: &Meta,
-    paths: &StatePaths,
-) -> Result<DeliveryHelperRequest, DeliveryHelperError> {
+    paths: &'a StatePaths,
+) -> Result<DeliveryHelperRequest<'a>, DeliveryHelperError> {
     Ok(DeliveryHelperRequest {
+        paths,
+        operation: "activate",
         helper: HandleBoundDeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)?,
         args: activate_args(&meta.handle),
         transient_environment: Vec::new(),
     })
 }
 
-fn completion_request(
+fn completion_request<'a>(
     caller_ppid: libc::pid_t,
     handle: &str,
-    paths: &StatePaths,
+    paths: &'a StatePaths,
     consumed: bool,
     provenance: Option<&DeliveryHelperProvenance>,
-) -> Result<DeliveryHelperRequest, DeliveryHelperError> {
+) -> Result<DeliveryHelperRequest<'a>, DeliveryHelperError> {
     Ok(DeliveryHelperRequest {
+        paths,
+        operation: "complete",
         helper: HandleBoundDeliveryHelper::from_provenance(provenance, paths)?,
         args: completion_args(caller_ppid, handle, paths, consumed),
         transient_environment: Vec::new(),
@@ -1791,7 +1801,14 @@ fn run_delivery_helper_command(
     request: &DeliveryHelperRequest,
     custody: Option<&StatePaths>,
 ) -> Result<ExitStatus, DeliveryHelperCommandError> {
-    with_external_transfer_custody(custody, || wait_delivery_helper(request))
+    with_external_transfer_custody(custody, || {
+        attempt_diagnostics::observe(
+            request.paths,
+            request.operation,
+            || wait_delivery_helper(request),
+            |status| *status,
+        )
+    })
 }
 
 fn wait_delivery_helper(
@@ -1811,8 +1828,14 @@ fn run_required_delivery_helper_command_detailed(
     request: &DeliveryHelperRequest,
     custody: Option<&StatePaths>,
 ) -> Result<(), DeliveryHelperCommandError> {
-    let output =
-        with_external_transfer_custody(custody, || wait_required_delivery_helper(request))?;
+    let output = with_external_transfer_custody(custody, || {
+        attempt_diagnostics::observe(
+            request.paths,
+            request.operation,
+            || wait_required_delivery_helper(request),
+            |output| output.status,
+        )
+    })?;
     require_helper_success(output)
 }
 

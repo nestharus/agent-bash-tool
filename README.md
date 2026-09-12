@@ -101,6 +101,7 @@ cargo build --release   # produces `agent-bash`
 ```
 
 See [private parallel test execution](docs/testing.md) for test prerequisites and isolation.
+Optional [local attempt diagnostics](docs/attempt-diagnostics.md) observe existing delivery-helper calls without delivery or custody authority.
 
 ## Installed configuration
 
