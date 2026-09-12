@@ -13,11 +13,14 @@ trait Boundary {
     fn capture(&mut self, pid: Pid) -> io::Result<Self::Handle>;
     fn parent(&mut self, pid: Pid) -> Option<Pid>;
     fn live(&mut self, handle: &Self::Handle) -> bool;
+    fn confirm_role(&mut self) -> bool {
+        true
+    }
     fn send(&mut self, handle: &Self::Handle, signal: i32) -> io::Result<()>;
 }
 
 struct Kernel<'a> {
-    role_guard: Option<&'a OwnedFd>,
+    role_guard: Option<&'a (Pid, OwnedFd)>,
 }
 impl Boundary for Kernel<'_> {
     type Handle = OwnedFd;
@@ -36,12 +39,14 @@ impl Boundary for Kernel<'_> {
         // Unknown, exited and invalid descriptors all fail closed.
         unsafe { libc::poll(&mut event, 1, 0) == 0 && event.revents == 0 }
     }
+    fn confirm_role(&mut self) -> bool {
+        // Fresh userspace response follows ALL ancestry reads. Kernel exit can
+        // reparent helpers before pidfd readiness, but cannot answer a challenge.
+        self.role_guard.is_none_or(|(pid, guard)| {
+            crate::delivery_role::confirm_containment(*pid) && self.live(guard)
+        })
+    }
     fn send(&mut self, handle: &OwnedFd, signal: i32) -> io::Result<()> {
-        // The role custodian must still be alive AFTER ancestry observations.
-        // Otherwise its adopted helpers could now look like workload children.
-        if self.role_guard.is_some_and(|guard| !self.live(guard)) {
-            return Err(io::Error::other("delivery role lost during signal proof"));
-        }
         let rc = unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
@@ -69,9 +74,7 @@ pub(super) fn signal(
     // intact. Both reapers retry and escalate. The guardian requires ECHILD;
     // the live supervisor also has the non-spawning image-owner shortcut.
     let _ = signal_using_exclusions(
-        &mut Kernel {
-            role_guard: role.map(|(_, fd)| fd),
-        },
+        &mut Kernel { role_guard: role },
         current_pid(),
         pid,
         signal,
@@ -140,6 +143,11 @@ fn signal_using_exclusions<B: Boundary>(
     // Root is this process, not a caller-supplied stale PID. Reparenting after
     // proof does not revoke ownership: the live supervisor/guardian is a
     // subreaper. Exit/reuse after proof cannot retarget this stable handle.
+    if !boundary.confirm_role() {
+        return Err(io::Error::other(
+            "delivery role did not confirm containment",
+        ));
+    }
     boundary.send(&target.handle, signal)?;
     Ok(true)
 }
@@ -157,6 +165,8 @@ mod tests {
         dead: HashSet<Pid>,
         capture_error: Option<Pid>,
         sent: Vec<Pid>,
+        role_unresponsive: bool,
+        confirmation_reads: Vec<usize>,
     }
     impl Boundary for Injected {
         type Handle = Pid;
@@ -185,6 +195,10 @@ mod tests {
         fn live(&mut self, handle: &Pid) -> bool {
             !self.dead.contains(handle)
         }
+        fn confirm_role(&mut self) -> bool {
+            self.confirmation_reads.push(self.reads);
+            !self.role_unresponsive
+        }
         fn send(&mut self, handle: &Pid, _: i32) -> io::Result<()> {
             self.sent.push(*handle);
             Ok(())
@@ -199,6 +213,22 @@ mod tests {
     fn attempt(b: &mut Injected) -> io::Result<bool> {
         signal_using(b, 10, 30, libc::SIGTERM, None)
     }
+    #[test]
+    fn adopted_helper_before_role_exit_readiness_cannot_be_signaled() {
+        let mut b = tree();
+        // Already adopted helper passes both parent reads and every pidfd
+        // remains nonready. No new custodian response is possible after exit.
+        b.parents.insert(30, 10);
+        b.role_unresponsive = true;
+        assert!(attempt(&mut b).is_err());
+        assert_eq!(b.confirmation_reads, [2]);
+        assert!(b.sent.is_empty());
+        let mut workload = tree();
+        assert!(attempt(&mut workload).unwrap());
+        assert_eq!(workload.confirmation_reads, [4]);
+        assert_eq!(workload.sent, [30]);
+    }
+
     #[test]
     fn exact_descendant_boundary_rejects_reused_target_or_ancestor() {
         for dead in [20, 30] {
@@ -305,8 +335,9 @@ mod tests {
         let role_pin = Kernel { role_guard: None }.capture(role.pid()).unwrap();
         let target_pin = Kernel { role_guard: None }.capture(target.pid()).unwrap();
         role.stop();
+        let role_identity = (role.pid(), role_pin);
         let mut boundary = Kernel {
-            role_guard: Some(&role_pin),
+            role_guard: Some(&role_identity),
         };
         assert!(
             signal_using(

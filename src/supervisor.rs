@@ -453,6 +453,7 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
     // completion does not discharge this guardian's physical reaping custody.
     let mut completion_reconciled = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
     let mut recovered_cancel_escalation = None;
+    let mut completion_transfer = None;
     loop {
         let accepted_cancel = match explicit_cancel_accepted(paths) {
             Ok(accepted) => accepted,
@@ -476,7 +477,10 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
                 .get_or_insert_with(CancellationEscalation::begin_guardian_takeover);
             signal_descendants(current_pid(), escalation.signal(), None);
         }
-        let adopted_tree_empty = reap_adopted_children();
+        let adopted_tree_empty = match reap_guardian_children(paths, &mut completion_transfer) {
+            Ok(empty) => empty,
+            Err(_) => return EX_SOFTWARE,
+        };
         // Durable helper handback can precede the worker's _exit. After abnormal
         // supervisor loss this guardian is its sole adopting reaper. Do not
         // orphan it (or other adopted descendants) merely because metadata is
@@ -511,8 +515,20 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
             paths,
             accepted_cancel && (adopted_tree_empty || cancellation_drained),
         ) {
-            Ok(meta) if state::terminal(&meta) || !state::running_exit_mode(&meta) => {
-                completion_reconciled = true;
+            Ok(mut meta) if state::terminal(&meta) || !state::running_exit_mode(&meta) => {
+                match delivery::try_start_completion_delivery(paths, &mut meta) {
+                    Ok(delivery::CompletionStart::Busy) => {
+                        std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                    }
+                    Ok(delivery::CompletionStart::Settled) => completion_reconciled = true,
+                    Ok(delivery::CompletionStart::Running(transfer)) => {
+                        completion_transfer = Some(transfer);
+                        // Delivery is now owned by our nonblocking child reaper.
+                        // Physical emptiness still gates guardian retirement.
+                        completion_reconciled = true;
+                    }
+                    Err(_) => return EX_SOFTWARE,
+                }
             }
             Ok(_) => std::thread::sleep(SUPERVISOR_RECOVERY_POLL),
             Err(_) => return EX_SOFTWARE,
@@ -520,17 +536,29 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
     }
 }
 
-fn reap_adopted_children() -> bool {
+fn reap_guardian_children(
+    paths: &StatePaths,
+    transfer: &mut Option<delivery::CompletionTransfer>,
+) -> io::Result<bool> {
     loop {
         let err = match crate::delivery_role::reap_one(libc::WNOHANG) {
-            Ok(Some(_)) => continue,
-            Ok(None) => return false,
+            Ok(Some((pid, status))) => {
+                if transfer.as_ref().map(delivery::CompletionTransfer::pid) == Some(pid) {
+                    let mut meta = state::read_meta(paths)?;
+                    transfer
+                        .take()
+                        .expect("matched guardian transfer")
+                        .finish(paths, &mut meta, status)?;
+                }
+                continue;
+            }
+            Ok(None) => return Ok(false),
             Err(err) => err,
         };
         if err.kind() == io::ErrorKind::Interrupted {
             continue;
         }
-        return err.raw_os_error() == Some(libc::ECHILD);
+        return Ok(err.raw_os_error() == Some(libc::ECHILD));
     }
 }
 
@@ -2246,7 +2274,7 @@ fn reconcile_lost_supervisor_after_guardian(
 ) -> io::Result<Meta> {
     reconcile_lost_supervisor_with_delivery(
         paths,
-        CompletionDeliveryDisposition::ClaimPending,
+        CompletionDeliveryDisposition::LeavePending,
         accepted_cancel_tree_empty,
     )
 }

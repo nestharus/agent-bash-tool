@@ -371,8 +371,16 @@ publishes the exact, unreaped custodian PID before releasing an execution gate. 
 name, environment tag or post-exec enrollment supplies that role. Both reapers retire the slot
 **before** reaping its PID. Only the custodian can certify its role subtree drained; abnormal
 custodian death instead records unknown. Guardian takeover inherits the same slot. Cancellation
-excludes the connected role subtree, pins the live custodian with a pidfd, and rechecks that pin
-*after* target ancestry observations so adoption during role loss cannot authorize a helper signal.
+excludes the connected role subtree and pins the custodian with a pidfd. Pidfd nonreadiness is
+**not** role-containment evidence: Linux can reparent children before publishing exit readiness.
+After **all** target ancestry reads and pin checks, the reaper publishes a never-reused shared
+atomic challenge. Only the single-threaded custodian acknowledges it, from its userspace reaping
+loop. A fresh response establishes that it had not entered irreversible kernel exit/reparenting
+when the target was classified. Death after that response cannot turn the already-pinned workload
+target into a helper. No response, changed slot, exhausted challenge counter or invalid pin denies
+that signal without claiming cessation. Neither stale acknowledgements nor pidfd nonreadiness
+substitute for the response. This relies on coherent process-shared atomics and ordinary Linux
+exit semantics, not a particular ordering of procfs parent reads versus pidfd exit readiness.
 Unexpected custodian loss fails closed: adopted role identity is unknown, cancellation responsibility
 remains, and no stale numeric exemption is used. This can prevent workload cessation indefinitely;
 it is not a recovery mechanism for loss of the new role custodian or both founding reapers.
@@ -380,7 +388,18 @@ it is not a recovery mechanism for loss of the new role custodian or both foundi
 Live completion remains asynchronous to image-service recovery. Its `CompletionTransfer` now
 represents the custodian, not the execution worker. Pending role descendants retain both Root-
 and Tree-scope supervisors; guardian recovery polls cancellation instead of blocking on the
-role's delivery flock. Ready-mode root status is merged after transfer ownership settles.
+role's delivery flock. The guardian also starts its **own** pending completion using the nonblocking
+start path, retaining its transfer until the wildcard reaper observes that exact child. It never
+joins a completion wait or delivery flock while processing custody; external synchronous callers
+remain unchanged. Ready-mode root status is merged after transfer ownership settles.
+
+The custodian now polls `waitpid(WNOHANG)` every 10ms while children remain, rather than sleeping
+in a blocking wait. Every proposed non-role descendant signal can wait up to 100ms locally for a
+fresh response (1ms polling), in addition to ancestry discovery and OS/filesystem scheduling.
+This adds idle wakeups and O(target-count) handshake latency; it is not an overall cancellation
+latency bound. A stopped/starved custodian or blocked outcome persistence can postpone cancellation;
+retry retains responsibility rather than trusting a stale response. Unknown custodian loss remains
+the explicit no-progress case, distinct from delivery outcome uncertainty.
 Targeted external control callers retain their existing synchronous exact-child waits and external
 custody contract; this is not a global delivery-topology consolidation.
 

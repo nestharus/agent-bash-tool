@@ -594,8 +594,28 @@ fn parent_killing_fake_agents(
     fs::write(
         &fake,
         format!(
-            "#!/bin/sh\noperation=${{2:-}}\nif [ \"$operation\" = {} ]; then\n  printf '%s\\n' \"$operation\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\n  caller_pid=$(ps -o ppid= -p \"$PPID\" | tr -d ' ')\n  if [ \"$operation\" = agent-bash-complete ]; then caller_pid=$(ps -o ppid= -p \"$caller_pid\" | tr -d ' '); fi\n  kill -KILL \"$caller_pid\"\nfi\nexit 0\n",
-            shell_quote(Path::new(killed_operation))
+            r#"#!/usr/bin/python3
+import os, select, signal, sys
+from pathlib import Path
+operation = sys.argv[2] if len(sys.argv) > 2 else ''
+if operation == '{}':
+    def parent(pid):
+        return int(Path('/proc/' + str(pid) + '/stat').read_text().rsplit(') ', 1)[1].split()[1])
+    worker = os.getppid()
+    owner = parent(worker)
+    caller = parent(owner) if operation == 'agent-bash-complete' else owner
+    fd = os.pidfd_open(caller)
+    assert (parent(owner) if operation == 'agent-bash-complete' else parent(worker)) == caller
+    poll = select.poll(); poll.register(fd, select.POLLIN)
+    assert not poll.poll(0)
+    signal.pidfd_send_signal(fd, signal.SIGKILL)
+    assert poll.poll(3000), 'intended caller loss not observed'
+    log = Path(os.environ['AGENT_BASH_FAKE_DELIVERY_LOG'])
+    Path(str(log) + '.loss').write_text(str(caller))
+    with log.open('a') as stream: stream.write(operation + '\n')
+    os.close(fd)
+"#,
+            killed_operation
         ),
     )
     .expect("write parent-killing fake");
@@ -4473,6 +4493,11 @@ fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["exit_code"] == 0).then_some(meta)
     });
+    let lost_pid: i64 = fs::read_to_string(format!("{}.loss", delivery_log.display()))
+        .expect("helper observed exact caller pidfd exit")
+        .parse()
+        .expect("lost caller PID");
+    assert_eq!(delivered["supervisor_pid"].as_i64(), Some(lost_pid));
     assert_eq!(delivered["delivery"]["attempted"], true);
     assert!(delivered["delivery"]["retryable"].is_null());
     assert!(delivered["delivery"]["error"].is_null());

@@ -3,9 +3,14 @@
 //! It is not a discovered PID registry: the only producer is the forking owner.
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering};
 
-static SLOT: AtomicPtr<AtomicI32> = AtomicPtr::new(std::ptr::null_mut());
+struct Role {
+    pid: AtomicI32,
+    challenge: AtomicU64,
+    acknowledged: AtomicU64,
+}
+static SLOT: AtomicPtr<Role> = AtomicPtr::new(std::ptr::null_mut());
 const UNKNOWN: i32 = -1;
 
 // Called in the single-threaded daemon before the guardian/supervisor fork.
@@ -13,7 +18,7 @@ pub(crate) fn initialize() -> io::Result<()> {
     let memory = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            std::mem::size_of::<AtomicI32>(),
+            std::mem::size_of::<Role>(),
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED | libc::MAP_ANONYMOUS,
             -1,
@@ -23,16 +28,67 @@ pub(crate) fn initialize() -> io::Result<()> {
     if memory == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    let slot = memory.cast::<AtomicI32>();
+    let slot = memory.cast::<Role>();
     unsafe {
-        slot.write(AtomicI32::new(0));
+        slot.write(Role {
+            pid: AtomicI32::new(0),
+            challenge: AtomicU64::new(0),
+            acknowledged: AtomicU64::new(0),
+        });
     }
     SLOT.store(slot, Ordering::SeqCst);
     Ok(())
 }
 
-fn slot() -> Option<&'static AtomicI32> {
+fn role() -> Option<&'static Role> {
     unsafe { SLOT.load(Ordering::SeqCst).as_ref() }
+}
+fn slot() -> Option<&'static AtomicI32> {
+    role().map(|role| &role.pid)
+}
+
+// Called AFTER all target ancestry observations. Only the single-threaded
+// custodian answers, in userspace. A fresh response proves it had not begun
+// irreversible kernel exit/reparenting at the time of those observations.
+// Pidfd nonreadiness alone does NOT prove that (exit_state is published later).
+pub(crate) fn confirm_containment(pid: i32) -> bool {
+    let Some(role) = role() else { return false };
+    confirm_role(role, pid)
+}
+
+fn confirm_role(role: &Role, pid: i32) -> bool {
+    if role.pid.load(Ordering::SeqCst) != pid {
+        return false;
+    }
+    let Ok(previous) = role
+        .challenge
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            value.checked_add(1)
+        })
+    else {
+        return false; // Never reuse a challenge, including on overflow.
+    };
+    let challenge = previous + 1;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    loop {
+        if role.pid.load(Ordering::SeqCst) != pid {
+            return false;
+        }
+        if role.acknowledged.load(Ordering::SeqCst) == challenge {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+fn acknowledge_containment() {
+    if let Some(role) = role() {
+        let challenge = role.challenge.load(Ordering::SeqCst);
+        role.acknowledged.store(challenge, Ordering::SeqCst);
+    }
 }
 
 pub(crate) fn enabled() -> bool {
@@ -163,8 +219,13 @@ pub(crate) fn run_custodian(
     let mut code = 70;
     let mut outcome = Some(outcome);
     loop {
+        acknowledge_containment();
         let mut status = 0;
-        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
         if pid == worker {
             code = if outcome.take().expect("sole worker outcome")(status).is_ok() {
                 0
@@ -191,6 +252,36 @@ pub(crate) fn run_custodian(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn containment_requires_fresh_post_observation_userspace_response() {
+        let role = std::sync::Arc::new(Role {
+            pid: AtomicI32::new(42),
+            challenge: AtomicU64::new(7),
+            acknowledged: AtomicU64::new(7),
+        });
+        // Model reparent-before-exit-readiness: the exact role still has its
+        // published PID, but can no longer execute userspace. Old ACK is useless.
+        assert!(!confirm_role(&role, 42));
+        assert_eq!(role.challenge.load(Ordering::SeqCst), 8);
+        let responder = role.clone();
+        let thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while responder.challenge.load(Ordering::SeqCst) != 9 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "challenge was not published"
+                );
+                std::thread::yield_now();
+            }
+            responder.acknowledged.store(9, Ordering::SeqCst);
+        });
+        assert!(confirm_role(&role, 42));
+        thread.join().unwrap();
+        role.challenge.store(u64::MAX, Ordering::SeqCst);
+        assert!(!confirm_role(&role, 42));
+        assert!(!confirm_role(&role, 43));
+    }
 
     #[test]
     fn role_retirement_requires_exact_unreaped_custodian_and_drain_certificate() {
