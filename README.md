@@ -84,7 +84,9 @@ completion returns synchronously in-band or asynchronously through the agent mai
 - **Delivery helper boundary.** Every completion invokes the handle's pinned helper operation.
   Agent-runner interprets the registered mode and event flags: asynchronous completion wakes
   (headless: `resume`) or forwards (PTY), while synchronous or already-consumed completion does not
-  enter that mailbox. The spooler owns helper admission and process outcome, not mailbox closure.
+  enter that mailbox. New `accept-output` local receipts never mark completion consumed; normal
+  duplicate notification is an accepted cost. Existing coarse consumed state is rejected, not migrated.
+  The spooler owns helper admission and process outcome, not mailbox closure.
 - **Pinned delivery helper.** Registration snapshots the selected helper into a content-addressed,
   account-private cache and hard-links that exact version into the handle. It also records the exact
   initiating execution environment and clears later callers' ambient environment before every helper launch.

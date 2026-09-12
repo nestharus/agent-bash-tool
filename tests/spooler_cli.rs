@@ -2791,7 +2791,7 @@ fn opencode_adapter_cross_owner_poll_cannot_mark_terminal_result_consumed() {
 }
 
 #[test]
-fn opencode_adapter_owner_poll_marks_terminal_result_consumed_without_mutating_delivery_mode() {
+fn opencode_adapter_owner_poll_records_local_receipt_without_mutating_delivery_mode() {
     if test_support::private_case() {
         return;
     }
@@ -2814,12 +2814,12 @@ fn opencode_adapter_owner_poll_marks_terminal_result_consumed_without_mutating_d
         temp.path()
             .join("agent-bash")
             .join(handle)
-            .join("consumed")
+            .join("output-receipt.json")
             .exists()
     );
     let delivery = fs::read_to_string(&delivery_log).expect("completion helper invocation");
     assert!(delivery.contains("agent-bash-complete"), "{delivery}");
-    assert!(delivery.contains("--consumed"), "{delivery}");
+    assert!(!delivery.contains("--consumed"), "{delivery}");
 }
 
 #[test]

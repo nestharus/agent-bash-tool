@@ -21,27 +21,40 @@ bytes it reads, not an immutable historical image. Sequential append/replacement
 do not establish behavior under concurrent producer rollover; that interleaving is not tested.
 
 After validating the entire response, length, hash and identity, the consumer calls
-`consume HANDLE --snapshot '<snapshot JSON>'`. This rejects malformed, wrong-handle, stale-source,
-wrong-encoding and changed-prefix identities before publishing the durable `consumed` marker.
-The old bare consume command is no longer sufficient evidence and requires the identity argument;
-this is a coordinated CLI/adapter contract change, not a backwards-compatible old-adapter rollout.
-Partial prefixes may be explicitly acquired with `snapshot HANDLE --bytes N` and accepted as **only
-those N bytes** (including zero). No unseen suffix is thereby locally accepted.
+`accept-output HANDLE --snapshot '<snapshot JSON>'`. This revalidates authority and exact
+source bytes before publishing a separate `output-receipt.json`. Partial and zero-byte
+prefixes represent only those acquired bytes, never an event or forever-final log.
 
-A successful response has `version:1`, the exact `handle` and `snapshot`,
-`local_acceptance:"accepted"`, boolean `consumed`, `remote_ack:"unconfirmed"` and
-`physical_drain:"unconfirmed"`. `consumed:true` means this call created the existing marker;
-`false` means it already existed, not rejection. Every retry still validates the identified source
-prefix and authority. The marker remains a coarse local hint to the existing completion protocol,
-not a ledger of per-prefix receipts; duplicates do not replay completed work or rewrite delivery
-metadata. A successful process exit without a valid correlated reply does not confirm acceptance.
-The hint's existing remote `--consumed` meaning is unchanged. No new remote RPC or ACK/drain proof
-is introduced; full remote integration remains AGE-363 residual scope with AGE-360/361 dependencies.
+Success returns `version:1`, exact `handle` and `snapshot`, `local_receipt:"durable"`,
+boolean `receipt_updated`, `remote_ack:"unconfirmed"`, and `physical_drain:"unconfirmed"`.
+`receipt_updated:false` means the same identity was already visible; **every success,
+including duplicates, syncs the record and containing directory**. A lost reply is unconfirmed.
+One latest identity per handle is retained, not bytes or unlimited history. Later acceptance
+replaces it; no prior receipt lifetime or arbitrary new TTL is promised.
+
+Publication uses one reusable, non-authoritative pending file, file sync, atomic rename,
+and directory sync. Published content is never rolled back on a later synchronization error.
+Visible content means publication intent, not confirmed durability or receipt of a response.
+Errors identify preparation/file-sync/publication/directory-sync phases; a post-publication
+error leaves the visible identity for a revalidated retry to sync. Readers must not infer
+successful acceptance from file existence. Replacement intentionally supersedes prior records.
+Shared activation-marker publication semantics are unchanged.
+
+This operation never creates `consumed` or forwards an event-wide consumed hint. Normal
+completion notification remains enabled; duplicate presentation is an accepted cost. Local
+receipt does not imply remote ACK. Paired suppression/settlement remains deferred to separately
+authorized AGE-360/361/363 work, not solved here.
+
+Any existing `consumed` entry causes distinguishable `legacy-state` rejection, without modifying
+it. Previous suppression/ACK cannot be reversed locally. The guarantee applies only without
+legacy coarse state and with coordinated new CLI/adapter callers. Concurrent old binaries or
+old writers are unsupported. There is no unsafe consume compatibility shim, live migration,
+or automatic cleanup of old effects; keep acquired bytes on rejection.
 
 ## Authority and lifetime
 
 Snapshot observation preserves existing account-local status read access. Knowledge of a handle or
-snapshot does not grant control. Consume uses the existing live caller-chain/pinned-helper acting
+snapshot does not grant control. Accept-output uses the existing live caller-chain/pinned-helper acting
 session rule, or exact caller ancestry for sessionless handles. Same-session recovery in a new
 invocation remains authorized; the historical owner's invocation UUID is not a new recovery gate.
 No provenance/schema-7 shortcut or ambient owner-string override is introduced.
@@ -49,7 +62,7 @@ No provenance/schema-7 shortcut or ambient owner-string override is introduced.
 `output.lock` excludes reaping during acquisition and acceptance; reaping takes the existing delivery
 lock, then the bounded custody lock, then tries the output lock without waiting. Output operations never acquire the delivery or
 reconciliation locks. The lock does not exclude appenders or change TTL/delivery/physical-retention
-eligibility. It is released after the individual operation; it does not pin a caller's unread source
+eligibility. It is released after owned acquisition/validation/publication, before stdout transport; it does not pin a caller's unread source
 between commands. A cleanup race can therefore yield explicit unavailable/unknown, never a recreated
 source or fabricated acceptance. A caller must keep already acquired bytes when acceptance fails.
 
@@ -62,20 +75,20 @@ not proof of recovering the former one. No adapter-memory persistence is claimed
 
 ## OpenCode representation and failure behavior
 
-The bundled adapter obtains and validates the whole snapshot before consumption/progression. Valid
+The bundled adapter obtains and validates the whole snapshot before receipt/progression. Valid
 UTF-8 is returned unchanged, including leading/trailing whitespace, BOM, NUL and newlines. Bytes that
 cannot round-trip through UTF-8 are returned as explicitly labelled hex. The output block is last;
 status, exact identity and local/remote uncertainty precede it. If a running textual status read races
 terminal state and exact acquisition fails, that text is retained without exact-acceptance claims.
 
-Consume errors/rejection, malformed/stale/lost replies, timeout/abort and later progression failure
+Receipt errors/rejection, malformed/stale/lost replies, timeout/abort and later progression failure
 cannot replace acquired output. After post-acquisition abort in a synchronous call, the adapter
 still invokes the existing cancellation path without the aborted signal and reports its actual
 response (or explicitly unconfirmed failure) alongside the retained output. This preserves the
 existing cancellation invocation responsibility; a request is not itself drain proof.
 Terminal cancellation uses the merged AGE-362 same-boot physical-custody admission path,
 independently of logical completion and delivery waits. The two post-acquisition abort regressions
-(consume and progression) now observe accepted cancellation, exact live-descendant exit and guardian
+(receipt and progression) now observe accepted cancellation, exact live-descendant exit and guardian
 custody discharge while the adapter remains alive, with the acquired bytes retained exactly once.
 These cases failed before that prerequisite; they do not establish all-topology cancellation success.
 In particular, uncertified delivery-role custodian loss leaves UNKNOWN and can indefinitely withhold
@@ -84,14 +97,14 @@ ACK. An explicit asynchronous poll does not acquire synchronous cancellation own
 The adapter's resolved return value retains the bytes while its process remains alive. A host
 that discards results after abort may not display or persist them; actual host-aborted OpenCode UI
 retention is unverified. Process death loses adapter memory; source recovery remains bounded by
-the lifetime/rollover limitations above. Only a validated reply changes local acceptance to accepted. Unknown
+the lifetime/rollover limitations above. Only a validated reply confirms a durable local receipt. Unknown
 acceptance does not justify replaying the workload: observe retained state or retry the same bounded
-identity using existing authority. A failed/partial snapshot response never authorizes a marker.
+identity using existing authority. A failed/partial snapshot response never authorizes a receipt.
 
 Explicit running-handle polls retain the existing default tail read (65,536 bytes), not full-log
 reads. Terminal acquisition alone reads the complete observed bounded prefix. If a running read
 races terminal state and exact acquisition fails, only the acquired tail text is retained.
 
 Wire hex expands bytes 2x; acquisition/adapter memory is proportional to the acquired prefix, as with
-full status. Persistent storage remains the existing log plus a small lock file and existing marker,
+full status. Persistent storage remains the existing log plus a small lock file and bounded receipt record,
 not a copy per read/acceptance. No aggregate capacity or universal reliability claim is made.

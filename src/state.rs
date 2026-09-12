@@ -848,13 +848,6 @@ pub(crate) fn record_activation_attempt(paths: &StatePaths) -> io::Result<bool> 
     record_durable_create_once_marker(&paths.activation_attempted, &paths.state_dir)
 }
 
-pub(crate) fn record_consumed(paths: &StatePaths) -> io::Result<bool> {
-    if durable_marker_exists(&paths.consumed)? {
-        return Ok(false);
-    }
-    record_durable_create_once_marker(&paths.consumed, &paths.state_dir)
-}
-
 pub(crate) fn durable_marker_exists(marker: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(marker) {
         Ok(metadata) if metadata.is_file() => Ok(true),

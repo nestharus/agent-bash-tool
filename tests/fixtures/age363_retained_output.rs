@@ -11,9 +11,54 @@ fn snapshot(temp: &tempfile::TempDir, handle: &str) -> Value {
 
 fn consume(temp: &tempfile::TempDir, handle: &str, identity: &Value) -> Output {
     agent_bash(temp)
-        .args(["consume", handle, "--snapshot", &identity.to_string()])
+        .args(["accept-output", handle, "--snapshot", &identity.to_string()])
         .output()
         .unwrap()
+}
+
+#[test]
+fn zero_partial_append_receipts_never_create_suppression_and_legacy_rejects() {
+    if test_support::private_case() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let handle = "ab_age363_no_suppression";
+    let dir = seed_done_state_dir(&temp, handle, unix_ms(), false);
+    fs::write(dir.join("log"), b"prefix").unwrap();
+    for count in [0, 3, 6] {
+        let output = agent_bash(&temp)
+            .args(["snapshot", handle, "--bytes", &count.to_string()])
+            .output()
+            .unwrap();
+        assert_command_success(&output);
+        let acquired = parse_stdout_json(&output);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("log"))
+            .unwrap()
+            .write_all(b"suffix")
+            .unwrap();
+        let reply = consume(&temp, handle, &acquired["snapshot"]);
+        assert_command_success(&reply);
+        assert_eq!(parse_stdout_json(&reply)["local_receipt"], "durable");
+        assert!(!dir.join("consumed").exists());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(dir.join("output-receipt.json")).unwrap())
+                .unwrap(),
+            acquired["snapshot"]
+        );
+    }
+    let acquired = snapshot(&temp, handle);
+    let previous = fs::read(dir.join("output-receipt.json")).unwrap();
+    fs::write(dir.join("consumed"), b"historical effect").unwrap();
+    let rejected = consume(&temp, handle, &acquired["snapshot"]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("legacy-state"));
+    assert_eq!(
+        fs::read(dir.join("consumed")).unwrap(),
+        b"historical effect"
+    );
+    assert_eq!(fs::read(dir.join("output-receipt.json")).unwrap(), previous);
 }
 
 #[test]
@@ -55,11 +100,11 @@ fn exact_prefix_survives_append_restart_duplicate_and_rejects_stale_source() {
     // Separate processes model restart between acquisition/acceptance and a lost reply.
     let first = consume(&temp, handle, identity);
     assert_command_success(&first);
-    assert_eq!(parse_stdout_json(&first)["consumed"], true);
+    assert_eq!(parse_stdout_json(&first)["receipt_updated"], true);
     let second = consume(&temp, handle, identity);
     assert_command_success(&second);
     let reply = parse_stdout_json(&second);
-    assert_eq!(reply["consumed"], false);
+    assert_eq!(reply["receipt_updated"], false);
     assert_eq!(reply["snapshot"], *identity);
     assert_eq!(reply["remote_ack"], "unconfirmed");
     assert_eq!(reply["physical_drain"], "unconfirmed");
@@ -108,15 +153,15 @@ fn rejects_malformed_wrong_identity_unacquired_bytes_and_malformed_marker() {
         let mut identity = acquired["snapshot"].clone();
         identity[key] = value;
         assert!(!consume(&temp, handle, &identity).status.success());
-        assert!(!dir.join("consumed").exists());
+        assert!(!dir.join("output-receipt.json").exists());
     }
     assert!(!consume(&temp, handle, &json!({})).status.success());
     let bare = agent_bash(&temp)
-        .args(["consume", handle])
+        .args(["accept-output", handle])
         .output()
         .unwrap();
     assert!(!bare.status.success());
-    assert!(!dir.join("consumed").exists());
+    assert!(!dir.join("output-receipt.json").exists());
     let partial = agent_bash(&temp)
         .args(["snapshot", handle, "--bytes", "3"])
         .output()
@@ -128,8 +173,8 @@ fn rejects_malformed_wrong_identity_unacquired_bytes_and_malformed_marker() {
         handle,
         &parse_stdout_json(&partial)["snapshot"],
     ));
-    fs::remove_file(dir.join("consumed")).unwrap();
-    std::os::unix::fs::symlink("missing", dir.join("consumed")).unwrap();
+    fs::remove_file(dir.join("output-receipt.json")).unwrap();
+    std::os::unix::fs::symlink("missing", dir.join("output-receipt.json")).unwrap();
     assert!(
         !consume(&temp, handle, &acquired["snapshot"])
             .status
@@ -159,7 +204,7 @@ fn read_authority_is_not_acceptance_authority_and_session_recovery_still_works()
         consume(&temp, handle, &acquired["snapshot"]).status.code(),
         Some(77)
     );
-    assert!(!dir.join("consumed").exists());
+    assert!(!dir.join("output-receipt.json").exists());
     fs::write(&route, "ses_owner\n").unwrap();
     assert_command_success(&consume(&temp, handle, &acquired["snapshot"]));
     meta["handle"] = json!("ab_mismatched_metadata");
@@ -191,7 +236,7 @@ fn parallel_duplicate_acceptance_publishes_once() {
     assert_eq!(
         replies
             .iter()
-            .filter(|reply| parse_stdout_json(reply)["consumed"] == true)
+            .filter(|reply| parse_stdout_json(reply)["receipt_updated"] == true)
             .count(),
         1
     );
@@ -211,8 +256,8 @@ if args[0] == 'status' and '--tail-bytes' in args and mode == 'running-partial':
     print('RUNNING handle=' + args[-1] + '\n--- output ---')
     raise SystemExit(0)
 if args[0] == 'status' and '--observe-only' not in args: raise SystemExit(74)
-if args[0] == 'consume' and mode == 'timeout': time.sleep(10)
-if args[0] == 'consume' and mode in ('error', 'reject'):
+if args[0] == 'accept-output' and mode == 'timeout': time.sleep(10)
+if args[0] == 'accept-output' and mode in ('error', 'reject'):
     raise SystemExit(77 if mode == 'reject' else 74)
 p = subprocess.run([os.environ['AGE363_REAL'], *args], capture_output=True)
 if p.returncode: sys.stderr.buffer.write(p.stderr); raise SystemExit(p.returncode)
@@ -225,7 +270,7 @@ if args[0] == 'snapshot' and mode.startswith('snapshot-'):
     elif mode == 'snapshot-hash': value['snapshot']['sha256'] = '0' * 64
     elif mode == 'snapshot-bytes': value['snapshot']['bytes'] += 1
     out = json.dumps(value).encode()
-if args[0] == 'consume':
+if args[0] == 'accept-output':
     if mode == 'lost': out = b''
     elif mode == 'malformed': out = b'not-json'
     elif mode in ('wrong', 'stale', 'bytes', 'rejected-reply'):
@@ -233,7 +278,7 @@ if args[0] == 'consume':
         if mode == 'wrong': value['handle'] += '_wrong'
         elif mode == 'stale': value['snapshot']['created_at_unix_ms'] += 1
         elif mode == 'bytes': value['snapshot']['bytes'] += 1
-        else: value['local_acceptance'] = 'rejected'
+        else: value['local_receipt'] = 'rejected'
         out = json.dumps(value).encode()
 sys.stdout.buffer.write(out)
 "#,
@@ -254,6 +299,7 @@ fn real_adapter_keeps_full_exact_output_across_consume_faults_and_progress_failu
     let wrapper = proxy(&temp);
     let bytes = format!(" \n\t{}\n \n", "retained-prefix-".repeat(5000));
     for fault in [
+        "legacy",
         "error",
         "reject",
         "lost",
@@ -273,6 +319,9 @@ fn real_adapter_keeps_full_exact_output_across_consume_faults_and_progress_failu
         let handle = format!("ab_age363_{fault}");
         let dir = seed_done_state_dir(&temp, &handle, unix_ms(), false);
         fs::write(dir.join("log"), &bytes).unwrap();
+        if fault == "legacy" {
+            fs::write(dir.join("consumed"), b"legacy").unwrap();
+        }
         let calls = temp.path().join(format!("{fault}.calls"));
         let output = adapter_driver_command(&temp, &driver, "poll", Some(&handle))
             .env("AGENT_BASH_BIN", &wrapper)
@@ -286,8 +335,8 @@ fn real_adapter_keeps_full_exact_output_across_consume_faults_and_progress_failu
         assert!(!calls.lines().any(|line| line == "run"));
         if fault == "partial" || fault.starts_with("snapshot-") {
             assert!(!output.status.success());
-            assert!(!dir.join("consumed").exists());
-            assert!(!calls.lines().any(|line| line == "consume"));
+            assert!(!dir.join("output-receipt.json").exists());
+            assert!(!calls.lines().any(|line| line == "accept-output"));
             continue;
         }
         assert_command_success(&output);
@@ -303,21 +352,33 @@ fn real_adapter_keeps_full_exact_output_across_consume_faults_and_progress_failu
             observed,
             "{fault}"
         );
+        if fault == "legacy" {
+            assert!(text.contains("legacy-state"), "{text}");
+            assert_eq!(fs::read(dir.join("consumed")).unwrap(), b"legacy");
+        } else {
+            assert!(!dir.join("consumed").exists());
+        }
         assert!(text.contains("remote ACK: unconfirmed"));
         assert!(text.contains("physical drain: unconfirmed"));
         assert_eq!(
-            text.contains("local acceptance: accepted bounded snapshot"),
+            text.contains("local receipt: durable bounded snapshot"),
             fault == "progress"
         );
         assert_eq!(
-            dir.join("consumed").exists(),
-            !matches!(fault, "error" | "reject" | "timeout" | "running-partial")
+            dir.join("output-receipt.json").exists(),
+            !matches!(
+                fault,
+                "legacy" | "error" | "reject" | "timeout" | "running-partial"
+            )
         );
         if fault == "running-partial" {
             assert_eq!(calls, "status\nstatus\nsnapshot\n");
             assert!(text.contains("textual observation only"));
         } else {
-            assert!(calls.starts_with("status\nsnapshot\nconsume\n"), "{calls}");
+            assert!(
+                calls.starts_with("status\nsnapshot\naccept-output\n"),
+                "{calls}"
+            );
         }
     }
 }
@@ -341,7 +402,7 @@ fn real_adapter_preserves_non_utf8_output_as_explicit_hex() {
     let text = result["result"].as_str().unwrap();
     assert!(text.contains("output representation: hex"));
     assert!(text.ends_with("efbbbfffe28200200a"));
-    assert!(dir.join("consumed").exists());
+    assert!(dir.join("output-receipt.json").exists());
 }
 
 // Exact-owned cleanup also runs when the regression oracle fails.
@@ -358,7 +419,7 @@ fn post_acquisition_consume_abort_cancels_exact_live_descendants_and_retains_res
     if test_support::private_case() {
         return;
     }
-    assert_post_acquisition_abort("consume");
+    assert_post_acquisition_abort("accept-output");
 }
 
 #[test]
@@ -396,8 +457,8 @@ import json, os, sys, time
 args = sys.argv[1:]
 with open(os.environ['AGE363_CALLS'], 'a') as f: f.write(json.dumps(args) + '\n')
 stage = os.environ['AGE363_STAGE']
-if (stage == 'consume' and args[0] == 'consume') or (stage == 'progress' and args[0] == 'status' and '--observe-only' not in args):
-    handle = args[1] if stage == 'consume' else args[-1]
+if (stage == 'accept-output' and args[0] == 'accept-output') or (stage == 'progress' and args[0] == 'status' and '--observe-only' not in args):
+    handle = args[1] if stage == 'accept-output' else args[-1]
     with open(os.environ['AGE363_PENDING'], 'w') as f: f.write(handle)
     time.sleep(60)
     raise SystemExit('barrier was not aborted')
@@ -459,7 +520,10 @@ os.execv(os.environ['AGE363_REAL'], [os.environ['AGE363_REAL'], *args])
         assert!(descendants.iter().all(|p| !p.exited()));
         assert!(dir.join("physical-custody").exists());
         assert!(!dir.join("cancel-requested").exists());
-        assert_eq!(dir.join("consumed").exists(), stage == "progress");
+        assert_eq!(
+            dir.join("output-receipt.json").exists(),
+            stage == "progress"
+        );
         let acquired = snapshot(&temp, &handle);
         assert_eq!(acquired["snapshot"]["bytes"], bytes.len());
         fs::write(&abort, "abort now").unwrap();
@@ -477,7 +541,7 @@ os.execv(os.environ['AGE363_REAL'], [os.environ['AGE363_REAL'], *args])
         );
         assert!(text.contains("subprocess aborted"), "{text}");
         assert_eq!(
-            text.contains("local acceptance: accepted bounded snapshot"),
+            text.contains("local receipt: durable bounded snapshot"),
             stage == "progress"
         );
         assert!(text.contains("remote ACK: unconfirmed; physical drain: unconfirmed"));
@@ -531,12 +595,12 @@ fn running_poll_reads_tail_but_terminal_acquires_complete_bounded_bytes() {
     let tail = text.split_once("--- output ---\n").unwrap().1;
     assert_eq!(tail.as_bytes(), &bytes.as_bytes()[bytes.len() - 65_536..]);
     assert!(!text.contains("omitted-prefix:"));
-    assert!(!dir.join("consumed").exists());
+    assert!(!dir.join("output-receipt.json").exists());
     fs::write(&path, terminal_meta).unwrap();
     let terminal = run_adapter_driver(&temp, &driver, "poll", Some(handle));
     let text = terminal["result"].as_str().unwrap();
     assert_eq!(text.split_once("--- output ---\n").unwrap().1, bytes);
-    assert!(text.contains("local acceptance: accepted bounded snapshot"));
+    assert!(text.contains("local receipt: durable bounded snapshot"));
     assert!(text.contains(&format!("\"bytes\":{}", bytes.len())));
-    assert!(dir.join("consumed").exists());
+    assert!(dir.join("output-receipt.json").exists());
 }

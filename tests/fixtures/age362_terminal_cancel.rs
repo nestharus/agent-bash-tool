@@ -57,13 +57,13 @@ fn terminal_live_descendants_cancel_without_rewriting_root_or_delivery() {
         bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
     );
     let consume = agent_bash(&temp)
-        .args(["consume", handle, "--snapshot", &identity.to_string()])
+        .args(["accept-output", handle, "--snapshot", &identity.to_string()])
         .output()
         .unwrap();
     assert_command_success(&consume);
     assert_eq!(parse_stdout_json(&consume)["snapshot"], *identity);
-    assert_eq!(parse_stdout_json(&consume)["consumed"], true);
-    let consumed = fs::metadata(dir.join("consumed")).unwrap().ino();
+    assert_eq!(parse_stdout_json(&consume)["receipt_updated"], true);
+    let consumed = fs::metadata(dir.join("output-receipt.json")).unwrap().ino();
     let start = Instant::now();
     let cancel = agent_bash(&temp).args(["cancel", handle]).output().unwrap();
     assert_command_success(&cancel);
@@ -105,7 +105,10 @@ fn terminal_live_descendants_cancel_without_rewriting_root_or_delivery() {
         assert_eq!(after[field], before[field], "changed {field}");
     }
     assert_eq!(fs::read(dir.join("rc")).unwrap(), rc);
-    assert_eq!(fs::metadata(dir.join("consumed")).unwrap().ino(), consumed);
+    assert_eq!(
+        fs::metadata(dir.join("output-receipt.json")).unwrap().ino(),
+        consumed
+    );
     let drained = agent_bash(&temp).args(["cancel", handle]).output().unwrap();
     assert_command_success(&drained);
     assert_eq!(parse_stdout_json(&drained)["requested"], false);

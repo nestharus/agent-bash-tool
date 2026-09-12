@@ -80,8 +80,8 @@ enum Command {
     Detach { handle: String },
     /// Cancel a supervised workload and all of its adopted descendants.
     Cancel { handle: String },
-    /// Record that the owning in-call consumer received a terminal result.
-    Consume {
+    /// Durably record a local receipt for acquired bytes; never suppress notifications.
+    AcceptOutput {
         handle: String,
         /// Identity returned by snapshot, after acquiring and validating its output.
         #[arg(long)]
@@ -200,8 +200,8 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
         ),
         Command::Detach { handle } => detach_command(handle, control_route_caller(&guard)),
         Command::Cancel { handle } => cancel_command(handle, control_route_caller(&guard)),
-        Command::Consume { handle, snapshot } => {
-            consume_command(handle, snapshot, control_route_caller(&guard))
+        Command::AcceptOutput { handle, snapshot } => {
+            accept_output_command(handle, snapshot, control_route_caller(&guard))
         }
         Command::Snapshot { handle, bytes } => snapshot_command(handle, bytes),
         Command::Mode { handle } => mode_command(handle, control_route_caller(&guard)),
@@ -384,6 +384,7 @@ fn snapshot_command(handle: String, bytes: Option<u64>) -> Result<(), AppError> 
     let meta = terminal_output_meta(&paths, &handle)?;
     let snapshot = retained_output::acquire(&paths, &meta, bytes).map_err(output_error)?;
     let header = render_status_header(&meta, Some(state::read_rc(&paths).map_err(output_error)?))?;
+    drop(_lock);
     serde_json::to_writer(
         io::stdout(),
         &serde_json::json!({
@@ -394,7 +395,7 @@ fn snapshot_command(handle: String, bytes: Option<u64>) -> Result<(), AppError> 
     io::stdout().write_all(b"\n").map_err(json_write_error)
 }
 
-fn consume_command(
+fn accept_output_command(
     handle: String,
     snapshot: String,
     caller: ControlRouteCaller,
@@ -406,12 +407,14 @@ fn consume_command(
     require_control_eligibility(&paths, &handle, &caller)?;
     let meta = terminal_output_meta(&paths, &handle)?;
     retained_output::validate(&paths, &meta, &identity).map_err(output_error)?;
-    let consumed = state::record_consumed(&paths).map_err(output_error)?;
+    let receipt_updated =
+        retained_output::record_receipt(&paths, &identity).map_err(output_error)?;
+    drop(_lock);
     serde_json::to_writer(
         io::stdout(),
         &serde_json::json!({
-            "version": 1, "handle": handle, "consumed": consumed,
-            "local_acceptance": "accepted", "snapshot": identity,
+            "version": 1, "handle": handle, "receipt_updated": receipt_updated,
+            "local_receipt": "durable", "snapshot": identity,
             "remote_ack": "unconfirmed", "physical_drain": "unconfirmed",
         }),
     )

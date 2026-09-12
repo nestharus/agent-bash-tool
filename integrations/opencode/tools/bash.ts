@@ -319,7 +319,7 @@ async function observeVisibleHandle(
   } catch {
     // The running read raced a terminal transition. Preserve that already acquired
     // textual observation even if the exact snapshot source is now unavailable.
-    return status.replace("\n", "\nlocal acceptance: unconfirmed; remote ACK: unconfirmed; physical drain: unconfirmed; exact snapshot unavailable; textual observation only\n")
+    return status.replace("\n", "\nlocal receipt: unconfirmed; remote ACK: unconfirmed; physical drain: unconfirmed; exact snapshot unavailable; textual observation only\n")
   }
 }
 
@@ -353,44 +353,44 @@ function acquireOutput(handle: string, response: string): AcquiredOutput {
 }
 
 async function retainedTerminalOutput(handle: string, ownerSessionId?: string, abort?: AbortSignal): Promise<string> {
-  // Acquisition is observe-only and complete before any consumption/progression.
+  // Acquisition is observe-only and complete before any local receipt/progression.
   const result = await runProcess([AGENT_BASH, "snapshot", handle], ownerSessionId, abort, "agent-bash snapshot")
   if (result.exitCode !== 0) throw processFailure("agent-bash snapshot", result)
   const retained = acquireOutput(handle, result.stdout)
   let acceptance = "unconfirmed"
   let progression = "not requested"
   try {
-    acceptance = await attemptTerminalConsumption(retained.snapshot, ownerSessionId, abort)
+    acceptance = await attemptLocalReceipt(retained.snapshot, ownerSessionId, abort)
     await statusText(handle, { detail: "header", progression: "request-progress" }, ownerSessionId, abort)
     progression = "requested (not remote settlement evidence)"
   } catch (error) {
     // Never replace an acquired command result with a control/transport failure.
     progression = `unconfirmed: ${error instanceof Error ? error.message : String(error)}`
   }
-  return `${retained.status}\nlocal acceptance: ${acceptance}; remote ACK: unconfirmed; physical drain: unconfirmed` +
+  return `${retained.status}\nlocal receipt: ${acceptance}; remote ACK: unconfirmed; physical drain: unconfirmed` +
     `\nprogression: ${progression}\nsnapshot: ${JSON.stringify(retained.snapshot)}` +
     `\noutput representation: ${retained.representation}; acquired bounded bytes only, not an atomic historical log; later append data unknown` +
     `\n--- output ---\n${retained.output}`
 }
 
-async function attemptTerminalConsumption(
+async function attemptLocalReceipt(
   snapshot: SnapshotIdentity,
   ownerSessionId?: string,
   abort?: AbortSignal,
 ): Promise<string> {
-  const consume = await runProcess(
-    [AGENT_BASH, "consume", snapshot.handle, "--snapshot", JSON.stringify(snapshot)],
-    ownerSessionId, abort, "agent-bash consume",
+  const receipt = await runProcess(
+    [AGENT_BASH, "accept-output", snapshot.handle, "--snapshot", JSON.stringify(snapshot)],
+    ownerSessionId, abort, "agent-bash accept-output",
   )
-  if (consume.exitCode === 77) return "ineligible"
-  if (consume.exitCode !== 0) throw processFailure("agent-bash consume", consume)
-  const reply = JSON.parse(consume.stdout)
-  if (reply.version !== 1 || reply.handle !== snapshot.handle || reply.local_acceptance !== "accepted" ||
-      typeof reply.consumed !== "boolean" || !sameSnapshot(reply.snapshot, snapshot) ||
+  if (receipt.exitCode === 77) return "ineligible"
+  if (receipt.exitCode !== 0) throw processFailure("agent-bash accept-output", receipt)
+  const reply = JSON.parse(receipt.stdout)
+  if (reply.version !== 1 || reply.handle !== snapshot.handle || reply.local_receipt !== "durable" ||
+      typeof reply.receipt_updated !== "boolean" || !sameSnapshot(reply.snapshot, snapshot) ||
       reply.remote_ack !== "unconfirmed" || reply.physical_drain !== "unconfirmed") {
-    throw new Error("agent-bash consume returned invalid local acceptance; remote settlement unconfirmed")
+    throw new Error("agent-bash accept-output returned invalid local receipt; remote settlement unconfirmed")
   }
-  return "accepted bounded snapshot"
+  return "durable bounded snapshot"
 }
 
 async function modeText(handle: string, ownerSessionId: string, abort?: AbortSignal): Promise<DeliveryMode> {
