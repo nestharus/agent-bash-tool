@@ -6502,3 +6502,6 @@ print('collector accepted six real datagrams, three attempts; loss unknown')
         }
     }
 }
+
+#[path = "fixtures/age362_terminal_cancel.rs"]
+mod age362_terminal_cancel;
