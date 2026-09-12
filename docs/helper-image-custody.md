@@ -21,10 +21,13 @@ fd 3. Parent-death SIGKILL plus a parent-identity recheck closes the startup rac
 
 The supervisor's existing waiter reaps all children. While the custodian remains
 an unreaped exact child, Tree completion may establish emptiness when `/proc`'s
-**entire direct-child set is exactly that child**. No other process or descendant
-is exempt. Normal cancellation skips only that same child so cancellation's
-completion delivery can still acquire images. Supervisor teardown kills and reaps
-it; supervisor loss kills it through the kernel parent-death signal. Guardian
+**entire direct-child set is exactly that child**. This is not an `ECHILD`
+observation and does not enumerate descendants beneath that child. Cancellation
+skips the custodian and its still-connected subtree so completion delivery can
+still acquire images; other direct children prevent the shortcut. The current
+clean-exec custodian serves requests without spawning children. The shortcut is
+not proof that an arbitrary future custodian implementation has no descendants.
+Supervisor teardown kills and reaps it; supervisor loss kills it through the kernel parent-death signal. Guardian
 recovery has no descendant exemption. Independent roots have independent services
 and may duplicate images. Root-scope completion deliberately ends this service
 when the owning supervisor ends, even if an opaque descendant remains elsewhere.

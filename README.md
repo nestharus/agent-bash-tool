@@ -53,6 +53,10 @@ completion returns synchronously in-band or asynchronously through the agent mai
   validating a live, pidfd-pinned parent chain to the adopting reaper. Unknown,
   exited or changed ancestry is skipped and retried, never numerically signaled;
   only an empty-tree reaping observation discharges cancellation custody.
+  Descendant signal validation requires `/proc` to expose the same PID-namespace
+  coordinates as the reaper's `pidfd_open` calls. A procfs mount from a different
+  PID namespace is unsupported; the current boundary does not verify that mount
+  condition. PIDfd identity checks are not a claim of universal namespace safety.
   Missing reapers or unavailable pidfds leave drain uncertain, not successful. A sent wake is not proof of completed cancellation or tree cessation. Direct CLI
   runs remain detached unless they explicitly request a lease. Direct cancel and detach require
   the handle's recorded session, attested from the live caller chain by the handle's pinned helper,

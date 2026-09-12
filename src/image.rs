@@ -806,7 +806,9 @@ impl Owner {
             self.recovery.lost(Instant::now());
         }
     }
-    /// Only this exact unreaped clean-exec child is infrastructure, never its descendants.
+    /// Direct-child shortcut for the exact unreaped clean-exec custodian, which
+    /// does not spawn children. This does not enumerate a hypothetical subtree;
+    /// cancellation also excludes the custodian's still-connected descendants.
     pub(crate) fn only_child(&self) -> bool {
         let Some(child) = &self.child else {
             return false;

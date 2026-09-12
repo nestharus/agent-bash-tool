@@ -54,7 +54,8 @@ impl Boundary for Kernel {
 
 pub(super) fn signal(pid: Pid, signal: i32, infrastructure: Option<Pid>) {
     // Failed capture/validation/send leaves the existing cancellation obligation
-    // intact. Both reapers retry and escalate; only waitpid ECHILD proves drain.
+    // intact. Both reapers retry and escalate. The guardian requires ECHILD;
+    // the live supervisor also has the non-spawning image-owner shortcut.
     let _ = signal_using(&mut Kernel, current_pid(), pid, signal, infrastructure);
 }
 
