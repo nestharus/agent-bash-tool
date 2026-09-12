@@ -6,7 +6,7 @@ use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct AttemptDiagnostics {
-    socket: UnixDatagram,
+    address: SocketAddr,
     id: String,
     operation: String,
     source_id: String,
@@ -40,13 +40,14 @@ impl AttemptDiagnostics {
             return None;
         }
         let attempt = Self {
-            socket,
+            address,
             id: random.iter().map(|b| format!("{b:02x}")).collect(),
             operation: operation.into(),
             source_id: source_id(paths),
             started: Instant::now(),
         };
-        attempt.record("started", serde_json::json!({}));
+        attempt.record_to(&socket, "started", serde_json::json!({}));
+        // The initial sender is dropped here, before any helper can spawn.
         Some(attempt)
     }
 
@@ -56,6 +57,17 @@ impl AttemptDiagnostics {
     }
 
     fn record(&self, phase: &'static str, evidence: serde_json::Value) {
+        // Reopen only for this terminal emission, after the raw helper result.
+        let Ok(socket) = UnixDatagram::unbound() else {
+            return;
+        };
+        if socket.set_nonblocking(true).is_err() || socket.connect_addr(&self.address).is_err() {
+            return;
+        }
+        self.record_to(&socket, phase, evidence);
+    }
+
+    fn record_to(&self, socket: &UnixDatagram, phase: &'static str, evidence: serde_json::Value) {
         let value = serde_json::json!({
             "schema": "owned-attempt-diagnostic-v3", "attempt_id": self.id,
             "source_id": self.source_id,
@@ -67,15 +79,16 @@ impl AttemptDiagnostics {
         if let Ok(bytes) = serde_json::to_vec(&value) {
             if bytes.len() <= 4096 {
                 // One atomic datagram, no retry, blocking fallback or stderr write.
-                let _ = self.socket.send(&bytes);
+                let _ = socket.send(&bytes);
             }
         }
     }
 }
 
 // Observe the raw local spawn/wait result, before logical success conversion or
-// custody cleanup. This socket is created in the executing worker, after its FD
-// preparation; it is never carried across that close-range boundary.
+// custody cleanup. Only envelope data survives across spawn/wait, never a socket.
+// Completion emits after its explicit close-range preparation; detach has no
+// analogous preparation and registration runs before daemonization.
 pub(super) fn observe<T>(
     paths: &StatePaths,
     operation_name: &'static str,
@@ -276,6 +289,121 @@ mod tests {
         }
     }
 
+    #[test]
+    fn age364_real_helper_launch_at_private_fd_limit() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        use std::os::fd::AsRawFd;
+        let name = "age364-private-fd-limit";
+        let receiver =
+            UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(name).unwrap()).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        // Fill every low descriptor so spare slots, not ambient test-harness
+        // descriptors, determine admission. Only this exact private case changes
+        // its soft limit; the outer harness and live processes are untouched.
+        let mut fillers = Vec::new();
+        loop {
+            let file = fs::File::open("/dev/null").unwrap();
+            let fd = file.as_raw_fd();
+            fillers.push(file);
+            if fd >= 31 {
+                break;
+            }
+        }
+        let base = fillers.last().unwrap().as_raw_fd() as libc::rlim_t + 1;
+        let mut original = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
+            0
+        );
+        let paths = StatePaths::new("/not-created".into(), "fd-limit".into());
+        for piped in [false, true] {
+            let mut first_success = None;
+            for spare in 0..=16 {
+                let mut outcomes = Vec::new();
+                let mut phases = Vec::new();
+                for enabled in [false, true] {
+                    unsafe {
+                        if enabled {
+                            std::env::set_var("AGENT_BASH_DIAGNOSTIC_SOCKET", name);
+                        } else {
+                            std::env::remove_var("AGENT_BASH_DIAGNOSTIC_SOCKET");
+                        }
+                    }
+                    let limit = libc::rlimit {
+                        rlim_cur: base + spare,
+                        rlim_max: original.rlim_max,
+                    };
+                    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+                    let result = observe(
+                        &paths,
+                        "complete",
+                        || {
+                            // Real exec/wait, matching the null and piped production
+                            // helper stdio shapes; no model or installed runner.
+                            let mut command = Command::new("/bin/true");
+                            command.stdin(Stdio::null());
+                            if piped {
+                                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+                            } else {
+                                command.stdout(Stdio::null()).stderr(Stdio::null());
+                            }
+                            let child = command
+                                .spawn()
+                                .map_err(DeliveryHelperCommandError::NotStarted)?;
+                            child
+                                .wait_with_output()
+                                .map(|o| o.status)
+                                .map_err(DeliveryHelperCommandError::Admitted)
+                        },
+                        |status| *status,
+                    );
+                    assert_eq!(
+                        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) },
+                        0
+                    );
+                    outcomes.push(match result {
+                        Ok(status) => {
+                            assert!(status.success());
+                            ("returned", None)
+                        }
+                        Err(DeliveryHelperCommandError::NotStarted(e)) => {
+                            ("not_started", e.raw_os_error())
+                        }
+                        Err(DeliveryHelperCommandError::Admitted(e)) => {
+                            panic!("unexpected wait error: {e}")
+                        }
+                    });
+                    let mut bytes = [0; 4097];
+                    while let Ok(size) = receiver.recv(&mut bytes) {
+                        let event: serde_json::Value =
+                            serde_json::from_slice(&bytes[..size]).unwrap();
+                        phases.push(event["phase"].as_str().unwrap().to_owned());
+                    }
+                }
+                println!(
+                    "AGE-364 real helper piped={piped} base={base} spare={spare} disabled={:?} enabled={:?} phases={phases:?}",
+                    outcomes[0], outcomes[1]
+                );
+                assert_eq!(
+                    outcomes[0], outcomes[1],
+                    "diagnostics changed real launch at spare={spare}, piped={piped}"
+                );
+                if outcomes[0].0 == "returned" {
+                    assert_eq!(phases, ["started", "wait_returned"]);
+                    first_success = Some(spare);
+                    break;
+                }
+                assert_eq!(outcomes[0], ("not_started", Some(libc::EMFILE)));
+            }
+            assert!(first_success.is_some_and(|spare| spare > 0));
+        }
+    }
+
     fn cpu_us() -> i64 {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
         assert_eq!(
@@ -290,10 +418,13 @@ mod tests {
 
     #[test]
     fn full_or_failed_sink_never_waits() {
-        let (sender, receiver) = UnixDatagram::pair().unwrap();
-        sender.set_nonblocking(true).unwrap();
+        if crate::test_support::private_case() {
+            return;
+        }
+        let address = SocketAddr::from_abstract_name("age364-full-failed").unwrap();
+        let receiver = UnixDatagram::bind_addr(&address).unwrap();
         let diagnostic = AttemptDiagnostics {
-            socket: sender,
+            address,
             id: "test".into(),
             operation: "complete".into(),
             source_id: "test-source".into(),
@@ -305,10 +436,11 @@ mod tests {
         }
         assert!(start.elapsed() < Duration::from_secs(2));
         // Oversized serialization is dropped rather than truncated or retried.
-        let (sender, oversized_receiver) = UnixDatagram::pair().unwrap();
+        let address = SocketAddr::from_abstract_name("age364-oversized").unwrap();
+        let oversized_receiver = UnixDatagram::bind_addr(&address).unwrap();
         oversized_receiver.set_nonblocking(true).unwrap();
         let oversized = AttemptDiagnostics {
-            socket: sender,
+            address,
             id: "test".into(),
             operation: "complete".into(),
             source_id: "test-source".into(),

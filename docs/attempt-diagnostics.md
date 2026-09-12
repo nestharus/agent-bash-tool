@@ -28,11 +28,16 @@ that attempt's observations. New control/recovery processes need their own opt-i
 there is no durable enablement or restart replay. No pinned helper environment is
 rewritten or broadened. Existing environment capture rules remain unchanged.
 
-The sender opens one nonblocking CLOEXEC socket inside the actual executing worker,
-**after** its existing descriptor-close preparation, and drops it after the raw
-spawn/wait result. No descriptor is exempted from that preparation. A lost process
-may leave only a prefix or no observations. There is no diagnostic custodian,
-retained file, retry, sync, stderr fallback or delivery obligation.
+Each emission uses a short-lived nonblocking CLOEXEC socket in the executing
+process. The started sender is dropped **before** helper spawn; the result sender
+is reopened only after raw spawn/wait returns. Only envelope data persists across
+the helper call, not telemetry-owned descriptors. Completion emits after its
+explicit close-range preparation; detach has no analogous preparation, and
+registration runs before daemonization. No descriptor is exempted from preparation.
+A lost process may leave only a prefix or no observations. There is no diagnostic custodian,
+retained file, retry, sync, stderr fallback or delivery obligation. Reconnecting
+for the result may reach a replacement receiver bound to the same name; a pair
+need not reach the same collector instance.
 
 ## Wire contract and interpretation
 
@@ -50,7 +55,9 @@ The reused envelope is `schema: "owned-attempt-diagnostic-v3"`; the historical
   or `wait_error` with numeric/null `os_error`. Result phases describe the local
   raw spawn/wait outcome, before logical success conversion or custody cleanup.
 - `pid`, `unix_time_us` (nullable wall clock), and `elapsed_us` (local monotonic
-  duration from sender creation). These are observations, not ordering authority.
+  duration from envelope creation, after initial sink setup/randomness/hashing).
+  This local wrapper interval excludes earlier preparation and downstream settlement;
+  it is not end-to-end delivery latency or ordering authority.
 
 There are at most two send attempts per observed helper call. Fields are fixed
 labels, fixed-size hashes/IDs and numeric scalars; no command, environment, path,
@@ -63,8 +70,8 @@ validate senders.
 A datagram send is atomic: failure drops that whole record, never retries a partial
 write. A truncated receiver buffer is not supported evidence. Missing, late,
 evicted, duplicate-discarded, restarted or failed emission is **unknown**, not a
-negative result. No diagnostic can change the returned helper result, metadata,
-retry eligibility or custody cleanup decision. Instrumentation still consumes CPU
+negative result. The observer returns the raw helper result unchanged and has no
+metadata, retry eligibility or custody cleanup authority. Instrumentation still consumes CPU
 and syscalls and can perturb timing; nonblocking does not mean zero overhead.
 
 `wait_returned` is NOT physical tree drain, recipient receipt, remote ACK, durable
@@ -75,15 +82,21 @@ remote-ACK events. Those later phases remain pending in AGE-353's residual work.
 
 ## Bounds and verification limits
 
-Runtime retains one socket and a small envelope per active instrumented call, with
-no on-disk diagnostic storage. Aggregate concurrent overhead is not globally capped.
+Runtime retains a small envelope per active instrumented call and at most one
+transient socket per emission, with no socket across spawn/wait and no on-disk
+diagnostic storage. Aggregate concurrent overhead is not globally capped.
 Source hashing costs scale with root/handle length. The optional collector retains
 at most 64 attempts and 12 first phase records per attempt, each <=4096 bytes; its
 Python object overhead is additional, and transport loss remains unknown.
 
 `delivery::attempt_diagnostics::tests` covers attribution/retries, disabled evidence
 laziness, synthetic local errors, full/closed sinks and a 10,000-attempt debug-build
-wall/CPU/FD micro-measurement. The `age364_` spooler test exercises real helper hooks
+wall/CPU/FD micro-measurement. A separate private RLIMIT_NOFILE test compares
+otherwise identical enabled/disabled real `/bin/true` spawn/wait calls with null
+and piped helper stdio at each spare-FD count through first admission; limits change
+only in the exact isolated test process, never the root/live processes. This is
+resource-limit evidence, unlike the synthetic timing measurement. The `age364_`
+spooler test exercises real helper hooks
 through pinned private fake helpers, including a later detach process, nonzero
 completion, disabled/missing/full/closed sinks, and feeds real emitted bytes into
 an independent source-hash calculation and the unchanged collector. Existing
