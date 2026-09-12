@@ -40,12 +40,20 @@ completion returns synchronously in-band or asynchronously through the agent mai
   OpenCode tool abort terminates the complete adopted process tree, escalating to `SIGKILL` after
   a bounded grace period. A direct cancel is accepted when its durable marker is synchronized;
   signaling only wakes the supervisor, which also observes the marker independently. Cancellation
-  captures and validates an exact supervisor pidfd, with no numeric-signal fallback; unavailable
+  of nonterminal work captures and validates an exact supervisor pidfd, with no numeric-signal fallback; unavailable
   capture fails before acceptance. Cancel JSON `requested` reports durable acceptance by this attempt,
   not whether a prior accepted cancellation obligation remains pending (`false` does not mean none
   is pending). `wake`
-  separately reports `not-requested`, `sent`, `supervisor-gone`, or `failed` (`wake_error` gives detail).
-  A sent wake is not proof of completed cancellation or tree cessation. Direct CLI
+  separately reports `not-requested`, `custody-polling`, `sent`, `supervisor-gone`, or `failed` (`wake_error` gives detail).
+  Terminal work with same-boot physical custody accepts cancellation through the existing
+  reapers' durable poll (`custody-polling`, no signal sent by the requester). Empty-tree
+  discharge and this admission are serialized; drained work and duplicate terminal requests
+  are no-ops. Completed root status/rc and notification/ACK custody remain unchanged.
+  Descendant PID scans are discovery hints only: each signal uses a pidfd after
+  validating a live, pidfd-pinned parent chain to the adopting reaper. Unknown,
+  exited or changed ancestry is skipped and retried, never numerically signaled;
+  only an empty-tree reaping observation discharges cancellation custody.
+  Missing reapers or unavailable pidfds leave drain uncertain, not successful. A sent wake is not proof of completed cancellation or tree cessation. Direct CLI
   runs remain detached unless they explicitly request a lease. Direct cancel and detach require
   the handle's recorded session, attested from the live caller chain by the handle's pinned helper,
   falling back to exact caller-tree ownership only when no session was recorded; `list --all` is

@@ -1,3 +1,5 @@
+mod descendant_signal;
+
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{self, File};
@@ -219,6 +221,7 @@ pub(crate) struct CancelOutcome {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum CancelWake {
     NotRequested,
+    CustodyPolling,
     Sent,
     SupervisorGone,
     Failed,
@@ -245,12 +248,15 @@ fn request_cancel_using(
 ) -> io::Result<CancelOutcome> {
     let meta = wait_for_supervisor_metadata(paths)?;
     if state::terminal(&meta) {
-        return Ok(CancelOutcome::not_requested());
+        return request_terminal_cancel(paths);
     }
     let completion_lock = state::lock_completion(paths)?;
     let current = state::read_meta(paths)?;
     if state::terminal(&current) {
-        return Ok(CancelOutcome::not_requested());
+        // Delivery operations acquire completion.lock under delivery.lock.
+        // Release it before joining custody admission/discharge serialization.
+        drop(completion_lock);
+        return request_terminal_cancel(paths);
     }
     let captured = match supervisor_identity(&current) {
         Some(identity) => capture(&identity)?,
@@ -287,6 +293,20 @@ fn request_cancel_using(
         requested: true,
         wake,
         wake_error,
+    })
+}
+
+// Logical completion is immutable, but the existing adopting reapers may still
+// own physical work. Do not signal the exited root/supervisor or invent a new
+// process identity: their durable custody handoff is polled by the live owner.
+fn request_terminal_cancel(paths: &StatePaths) -> io::Result<CancelOutcome> {
+    if !state::accept_terminal_custody_cancel(paths)? {
+        return Ok(CancelOutcome::not_requested());
+    }
+    Ok(CancelOutcome {
+        requested: true,
+        wake: CancelWake::CustodyPolling,
+        wake_error: None,
     })
 }
 
@@ -999,12 +1019,7 @@ fn current_pid() -> libc::pid_t {
 
 fn signal_descendants(root_pid: libc::pid_t, signal: i32, infrastructure: Option<libc::pid_t>) {
     for pid in descendant_pids(root_pid) {
-        if infrastructure == Some(pid) {
-            continue;
-        }
-        unsafe {
-            libc::kill(pid, signal);
-        }
+        descendant_signal::signal(pid, signal, infrastructure);
     }
 }
 

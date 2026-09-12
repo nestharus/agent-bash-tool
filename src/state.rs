@@ -660,6 +660,28 @@ pub(crate) fn begin_physical_custody(paths: &StatePaths) -> io::Result<()> {
     atomic_write(&paths.physical_custody, current_boot_id().as_bytes())
 }
 
+// Share the discharge/reaping lock, not completion.lock: terminal admission
+// cannot recreate a responsibility already discharged by an empty-tree observer.
+// External transfer custody alone never authorizes workload cancellation.
+pub(crate) fn accept_terminal_custody_cancel(paths: &StatePaths) -> io::Result<bool> {
+    let _lock = lock_delivery(paths)?;
+    let recorded_boot = match fs::read_to_string(&paths.physical_custody) {
+        Ok(boot) => boot,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    let boot = current_boot_id();
+    if !valid_boot_id(&recorded_boot) || !valid_boot_id(&boot) {
+        return Err(io::Error::other(
+            "physical custody boot identity unavailable",
+        ));
+    }
+    if recorded_boot != boot || durable_marker_exists(&paths.cancellation_drained)? {
+        return Ok(false);
+    }
+    record_explicit_cancel_acceptance(paths)
+}
+
 pub(crate) fn end_physical_custody(paths: &StatePaths) -> io::Result<()> {
     let _lock = match lock_delivery(paths) {
         Ok(lock) => lock,
@@ -668,6 +690,11 @@ pub(crate) fn end_physical_custody(paths: &StatePaths) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     };
+    // This caller has observed an empty tree. Read acceptance under the same
+    // lock as terminal admission, including requests arriving after its last poll.
+    if durable_marker_exists(&paths.accepted_cancel)? {
+        record_cancellation_drained(paths)?;
+    }
     rollback_created_marker(&paths.physical_custody, &File::open(&paths.state_dir)?)
 }
 
@@ -1882,6 +1909,55 @@ mod tests {
         // must explicitly discharge the physical obligation.
         end_physical_custody(&paths).unwrap();
         assert_eq!(reap_state_dirs(temp.path(), config).reaped, 1);
+    }
+
+    #[test]
+    fn terminal_custody_cancel_and_discharge_preserve_both_lock_orders() {
+        for accept_first in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = write_reap_state(temp.path(), "ab_terminal_cancel", "DONE", 1, true);
+            begin_physical_custody(&paths).unwrap();
+            let before = fs::read(&paths.meta).unwrap();
+            if accept_first {
+                assert!(accept_terminal_custody_cancel(&paths).unwrap());
+                assert!(!accept_terminal_custody_cancel(&paths).unwrap());
+                assert!(!paths.cancellation_drained.exists());
+            }
+            // Empty-tree observer's call, including late admission after its
+            // last cancellation poll; no actual process cessation is inferred.
+            end_physical_custody(&paths).unwrap();
+            assert!(!accept_terminal_custody_cancel(&paths).unwrap());
+            assert_eq!(paths.accepted_cancel.exists(), accept_first);
+            assert_eq!(paths.cancellation_drained.exists(), accept_first);
+            assert!(!paths.physical_custody.exists());
+            assert_eq!(fs::read(&paths.meta).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn terminal_cancel_never_uses_external_or_unknown_boot_custody_as_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = write_reap_state(temp.path(), "ab_terminal_authority", "DONE", 1, true);
+        assert!(begin_external_transfer_custody(&paths).unwrap());
+        let external = fs::read(&paths.external_transfer_custody).unwrap();
+        assert!(!accept_terminal_custody_cancel(&paths).unwrap());
+        fs::write(&paths.physical_custody, "unknown").unwrap();
+        assert!(accept_terminal_custody_cancel(&paths).is_err());
+        let old_boot = if current_boot_id() == "00000000-0000-0000-0000-000000000000" {
+            "11111111-1111-1111-1111-111111111111"
+        } else {
+            "00000000-0000-0000-0000-000000000000"
+        };
+        fs::write(&paths.physical_custody, old_boot).unwrap();
+        assert!(!accept_terminal_custody_cancel(&paths).unwrap());
+        begin_physical_custody(&paths).unwrap();
+        record_cancellation_drained(&paths).unwrap();
+        assert!(!accept_terminal_custody_cancel(&paths).unwrap());
+        assert!(!paths.accepted_cancel.exists());
+        assert_eq!(
+            fs::read(&paths.external_transfer_custody).unwrap(),
+            external
+        );
     }
 
     #[test]
