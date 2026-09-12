@@ -6345,3 +6345,160 @@ fn list_all_observes_lost_supervisors_without_reconciling_or_delivery() {
     assert_eq!(delivered["delivery"]["attempted"], true, "{evidence}");
     assert_eq!(delivered["delivery"]["exit_code"], 0, "{evidence}");
 }
+
+#[test]
+fn age364_reachable_diagnostics_preserve_main_outcomes_and_collector_bytes() {
+    if test_support::private_case() {
+        return;
+    }
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+    for mode in ["enabled", "disabled", "missing", "full", "closed"] {
+        for exit in [0, 23] {
+            let temp = tempfile::tempdir().unwrap();
+            let fake = temp.path().join("fake-helper");
+            let log = temp.path().join("operations");
+            fs::write(&fake, format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$2\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\n[ \"$2\" != agent-bash-complete ] || exit {exit}\nexit 0\n"
+            )).unwrap();
+            set_executable(&fake);
+            let name = format!("age364-{mode}-{exit}");
+            let address = SocketAddr::from_abstract_name(&name).unwrap();
+            let receiver = UnixDatagram::bind_addr(&address).unwrap();
+            receiver
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut receiver = Some(receiver);
+            let filler = UnixDatagram::unbound().unwrap();
+            filler.set_nonblocking(true).unwrap();
+            filler.connect_addr(&address).unwrap();
+            if mode == "full" {
+                while filler.send(b"queue-full").is_ok() {}
+            }
+            if mode == "missing" {
+                drop(receiver.take());
+            }
+            let mut command = agent_bash(&temp);
+            command
+                .timeout(FIXTURE_DEADLINE)
+                .env("AGENT_BASH_AGENT_RUNNER_BIN", &fake)
+                .env("AGENT_BASH_FAKE_DELIVERY_LOG", &log);
+            if mode == "disabled" {
+                command.env_remove("AGENT_BASH_DIAGNOSTIC_SOCKET");
+            } else {
+                command.env("AGENT_BASH_DIAGNOSTIC_SOCKET", &name);
+            }
+            let output = command
+                .args(["run", "--delivery", "sync", "--", "/bin/true"])
+                .output()
+                .unwrap();
+            let json = parse_run_output(&output);
+            let handle = json["handle"].as_str().unwrap();
+            let meta = wait_until(FIXTURE_DEADLINE, || {
+                let meta = read_meta(&meta_path(&json));
+                (meta["delivery"]["attempted"] == true && delivery_lifecycle_is_closed(&meta))
+                    .then_some(meta)
+            });
+            assert_eq!(meta["delivery"]["exit_code"], exit);
+            assert_eq!(meta["delivery"]["attempted"], true);
+            assert_eq!(meta["delivery"]["retry_count"].as_u64().unwrap_or(0), 0);
+            if mode == "closed" {
+                drop(receiver.take());
+            }
+            // A new control process opens its own diagnostic socket after worker
+            // FD preparation. The second detach must not manufacture a retry.
+            for transitioned in [true, false] {
+                let mut command = agent_bash(&temp);
+                command.timeout(FIXTURE_DEADLINE);
+                if mode != "disabled" {
+                    command.env("AGENT_BASH_DIAGNOSTIC_SOCKET", &name);
+                } else {
+                    command.env_remove("AGENT_BASH_DIAGNOSTIC_SOCKET");
+                }
+                let output = command.args(["detach", handle]).output().unwrap();
+                assert_command_success(&output);
+                assert_eq!(parse_stdout_json(&output)["transitioned"], transitioned);
+            }
+            for operation in [
+                "agent-bash-register",
+                "agent-bash-activate",
+                "agent-bash-complete",
+            ] {
+                assert_eq!(operation_count(&log, operation), 1, "{mode} {exit}");
+            }
+            let state_dir = meta_path(&json).parent().unwrap().to_owned();
+            assert!(!state_dir.join("external-transfer-custody").exists());
+            if mode == "enabled" {
+                let receiver = receiver.as_ref().unwrap();
+                let mut records = Vec::new();
+                let mut raw = Vec::new();
+                for _ in 0..6 {
+                    let mut bytes = [0; 4097];
+                    let n = receiver.recv(&mut bytes).unwrap();
+                    assert!(n <= 4096);
+                    records.push(serde_json::from_slice::<Value>(&bytes[..n]).unwrap());
+                    raw.extend_from_slice(&bytes[..n]);
+                    raw.push(b'\n');
+                }
+                receiver.set_nonblocking(true).unwrap();
+                assert!(receiver.recv(&mut [0; 4097]).is_err());
+                let capture = temp.path().join("real-datagrams.jsonl");
+                fs::write(&capture, raw).unwrap();
+                let reader = StdCommand::new("timeout")
+                    .args([
+                        "10s",
+                        "python3",
+                        "-c",
+                        r#"
+import hashlib, importlib.util, json, pathlib, sys
+spec = importlib.util.spec_from_file_location('collector', 'tools/collect-attempt-diagnostics.py')
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+h = m.History()
+d = hashlib.sha256(b'owned-attempt-source-v1\0')
+for part in [sys.argv[2].encode(), sys.argv[3].encode()]:
+    d.update(len(part).to_bytes(8, 'big')); d.update(part)
+for line in pathlib.Path(sys.argv[1]).read_bytes().splitlines():
+    assert json.loads(line)['source_id'] == d.hexdigest()
+    h.add(line)
+r = h.result()
+assert len(r['attempts']) == 3 and r['discarded'] == 0
+assert r['transport_loss'] == 'unknown'
+for phases in r['attempts'].values():
+    assert set(phases) == {'started', 'wait_returned'}
+print('collector accepted six real datagrams, three attempts; loss unknown')
+"#,
+                    ])
+                    .arg(&capture)
+                    .arg(state_dir.parent().unwrap())
+                    .arg(handle)
+                    .env("PYTHONDONTWRITEBYTECODE", "1")
+                    .output()
+                    .unwrap();
+                assert_command_success(&reader);
+                print!("{}", String::from_utf8_lossy(&reader.stdout));
+                for operation in ["register", "activate", "complete"] {
+                    let matching: Vec<_> = records
+                        .iter()
+                        .filter(|r| r["operation"] == operation)
+                        .collect();
+                    assert_eq!(matching.len(), 2);
+                    assert_eq!(matching[0]["attempt_id"], matching[1]["attempt_id"]);
+                    assert_eq!(
+                        matching[1]["evidence"]["raw_status"],
+                        if operation == "complete" {
+                            exit << 8
+                        } else {
+                            0
+                        }
+                    );
+                }
+            } else if mode == "disabled" {
+                receiver.as_ref().unwrap().set_nonblocking(true).unwrap();
+                assert!(receiver.as_ref().unwrap().recv(&mut [0; 4097]).is_err());
+            }
+            println!(
+                "AGE-364 mode={mode} complete_exit={exit}: one register/complete/activate, unchanged outcome"
+            );
+        }
+    }
+}
