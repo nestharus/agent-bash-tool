@@ -1235,9 +1235,10 @@ pub(crate) fn register(
     })
 }
 
-// Completion has one active transfer process. The supervisor owns its exact reap
-// through the event loop; synchronous control callers wait for that same exact PID.
-// The shared flock survives parent loss and serializes both acquisition and admission.
+// Founding completion has one active role custodian, with an execution worker
+// below it. The event loop owns the custodian's exact reap. External synchronous
+// control callers retain a direct worker. Delivery flock ownership survives parent
+// loss; physical cancellation admission uses its independent short custody lock.
 pub(crate) struct CompletionTransfer {
     pid: libc::pid_t,
     _lock: DeliveryLockGuard,
@@ -1276,10 +1277,32 @@ pub(crate) fn reconcile_completion_delivery(paths: &StatePaths, meta: &mut Meta)
     let lock = DeliveryLockGuard::acquire(paths)?;
     if let CompletionStart::Running(transfer) = start_completion_delivery(paths, meta, lock, true)?
     {
-        let result = wait_for_delivery_transfer_worker(transfer.pid);
+        let result = wait_for_completion_custodian(transfer.pid);
         integrate_completion_transfer(paths, meta, result, transfer.retry_count)?;
     }
     Ok(())
+}
+
+fn wait_for_completion_custodian(pid: libc::pid_t) -> io::Result<()> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as u32,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        } == 0
+        {
+            crate::delivery_role::before_reap(pid);
+            return wait_for_delivery_transfer_worker(pid);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
 }
 
 fn start_completion_delivery(
@@ -1308,16 +1331,53 @@ fn start_completion_delivery(
     ));
     // Single-threaded callers only, matching the existing transfer-worker fork
     // contract. No image acquisition occurs before this ownership boundary.
+    // The gate prevents execution until the adopting reapers know the exact
+    // custodian. EOF before admission creates no helper descendants.
+    let (mut admission, mut gate) = std::os::unix::net::UnixStream::pair()?;
+    let role = crate::delivery_role::enabled();
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         integrate_completion_transfer(paths, meta, Err(io::Error::last_os_error()), retry_count)?;
         return Ok(CompletionStart::Settled);
     }
     if pid == 0 {
-        let result = prepare_completion_worker(lock._file.as_raw_fd())
-            .and_then(|()| execute_completion_transfer(paths, persisted, retry_count, external));
+        drop(admission);
+        let mut accepted = [0];
+        if std::io::Read::read_exact(&mut gate, &mut accepted).is_err() {
+            if role {
+                crate::delivery_role::drained();
+            }
+            unsafe { libc::_exit(70) };
+        }
+        drop(gate);
+        if prepare_completion_worker(lock._file.as_raw_fd()).is_err() {
+            if role {
+                crate::delivery_role::drained();
+            }
+            unsafe { libc::_exit(70) };
+        }
+        let mut custodian_meta = persisted.clone();
+        let work = || execute_completion_transfer(paths, persisted, retry_count, external);
+        if role {
+            crate::delivery_role::run_custodian(work, |status| {
+                integrate_completion_transfer(
+                    paths,
+                    &mut custodian_meta,
+                    transfer_status(status),
+                    retry_count,
+                )
+            });
+        }
+        let result = work();
         unsafe { libc::_exit(if result.is_ok() { 0 } else { 70 }) };
     }
+    drop(gate);
+    if role {
+        crate::delivery_role::publish(pid)?;
+    }
+    // A lost gate reader leaves a waitable child, not an untracked execution.
+    let _ = std::io::Write::write_all(&mut admission, &[1]);
+    drop(admission);
     Ok(CompletionStart::Running(CompletionTransfer {
         pid,
         _lock: lock,

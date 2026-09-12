@@ -16,8 +16,10 @@ trait Boundary {
     fn send(&mut self, handle: &Self::Handle, signal: i32) -> io::Result<()>;
 }
 
-struct Kernel;
-impl Boundary for Kernel {
+struct Kernel<'a> {
+    role_guard: Option<&'a OwnedFd>,
+}
+impl Boundary for Kernel<'_> {
     type Handle = OwnedFd;
     fn capture(&mut self, pid: Pid) -> io::Result<OwnedFd> {
         open_pidfd(pid)
@@ -35,6 +37,11 @@ impl Boundary for Kernel {
         unsafe { libc::poll(&mut event, 1, 0) == 0 && event.revents == 0 }
     }
     fn send(&mut self, handle: &OwnedFd, signal: i32) -> io::Result<()> {
+        // The role custodian must still be alive AFTER ancestry observations.
+        // Otherwise its adopted helpers could now look like workload children.
+        if self.role_guard.is_some_and(|guard| !self.live(guard)) {
+            return Err(io::Error::other("delivery role lost during signal proof"));
+        }
         let rc = unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
@@ -52,11 +59,24 @@ impl Boundary for Kernel {
     }
 }
 
-pub(super) fn signal(pid: Pid, signal: i32, infrastructure: Option<Pid>) {
+pub(super) fn signal(
+    pid: Pid,
+    signal: i32,
+    infrastructure: Option<Pid>,
+    role: Option<&(Pid, OwnedFd)>,
+) {
     // Failed capture/validation/send leaves the existing cancellation obligation
     // intact. Both reapers retry and escalate. The guardian requires ECHILD;
     // the live supervisor also has the non-spawning image-owner shortcut.
-    let _ = signal_using(&mut Kernel, current_pid(), pid, signal, infrastructure);
+    let _ = signal_using_exclusions(
+        &mut Kernel {
+            role_guard: role.map(|(_, fd)| fd),
+        },
+        current_pid(),
+        pid,
+        signal,
+        &[infrastructure, role.map(|(pid, _)| *pid)],
+    );
 }
 
 struct Link<H> {
@@ -65,6 +85,7 @@ struct Link<H> {
     handle: H,
 }
 
+#[cfg(test)]
 fn signal_using<B: Boundary>(
     boundary: &mut B,
     root: Pid,
@@ -72,11 +93,21 @@ fn signal_using<B: Boundary>(
     signal: i32,
     infrastructure: Option<Pid>,
 ) -> io::Result<bool> {
+    signal_using_exclusions(boundary, root, pid, signal, &[infrastructure])
+}
+
+fn signal_using_exclusions<B: Boundary>(
+    boundary: &mut B,
+    root: Pid,
+    pid: Pid,
+    signal: i32,
+    exclusions: &[Option<Pid>],
+) -> io::Result<bool> {
     let mut chain = Vec::new();
     let mut seen = HashSet::new();
     let mut cursor = pid;
     while cursor != root {
-        if cursor <= 1 || infrastructure == Some(cursor) || !seen.insert(cursor) {
+        if cursor <= 1 || exclusions.contains(&Some(cursor)) || !seen.insert(cursor) {
             return Ok(false);
         }
         // Pin BEFORE observing /proc, including every intermediate ancestor.
@@ -245,7 +276,7 @@ mod tests {
     impl Boundary for ExitRace<'_> {
         type Handle = OwnedFd;
         fn capture(&mut self, pid: Pid) -> io::Result<OwnedFd> {
-            Kernel.capture(pid)
+            Kernel { role_guard: None }.capture(pid)
         }
         fn parent(&mut self, pid: Pid) -> Option<Pid> {
             if !self.at_send && !self.stopped {
@@ -254,27 +285,52 @@ mod tests {
             }
             // Deterministic logical slot reuse: numeric reads show a live
             // replacement with a plausible owned parent, while the fd is old.
-            Kernel.parent(if self.stopped { self.replacement } else { pid })
+            Kernel { role_guard: None }.parent(if self.stopped { self.replacement } else { pid })
         }
         fn live(&mut self, handle: &OwnedFd) -> bool {
-            Kernel.live(handle)
+            Kernel { role_guard: None }.live(handle)
         }
         fn send(&mut self, handle: &OwnedFd, signal: i32) -> io::Result<()> {
             self.sends += 1;
             self.target.stop();
             self.stopped = true;
-            Kernel.send(handle, signal)
+            Kernel { role_guard: None }.send(handle, signal)
         }
+    }
+
+    #[test]
+    fn lost_role_pin_prevents_signal_even_with_an_owned_live_target() {
+        let mut role = Child::new();
+        let target = Child::new();
+        let role_pin = Kernel { role_guard: None }.capture(role.pid()).unwrap();
+        let target_pin = Kernel { role_guard: None }.capture(target.pid()).unwrap();
+        role.stop();
+        let mut boundary = Kernel {
+            role_guard: Some(&role_pin),
+        };
+        assert!(
+            signal_using(
+                &mut boundary,
+                current_pid(),
+                target.pid(),
+                libc::SIGKILL,
+                None
+            )
+            .is_err()
+        );
+        assert!(Kernel { role_guard: None }.live(&target_pin));
     }
 
     #[test]
     fn exact_descendant_real_signal_and_wrong_root_noop() {
         let mut target = Child::new();
         let unrelated = Child::new();
-        let sentinel = Kernel.capture(unrelated.pid()).unwrap();
+        let sentinel = Kernel { role_guard: None }
+            .capture(unrelated.pid())
+            .unwrap();
         assert!(
             !signal_using(
-                &mut Kernel,
+                &mut Kernel { role_guard: None },
                 unrelated.pid(),
                 target.pid(),
                 libc::SIGKILL,
@@ -285,7 +341,7 @@ mod tests {
         assert!(target.0.try_wait().unwrap().is_none());
         assert!(
             signal_using(
-                &mut Kernel,
+                &mut Kernel { role_guard: None },
                 current_pid(),
                 target.pid(),
                 libc::SIGKILL,
@@ -295,7 +351,7 @@ mod tests {
         );
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(target.0.wait().unwrap().signal(), Some(libc::SIGKILL));
-        assert!(Kernel.live(&sentinel));
+        assert!(Kernel { role_guard: None }.live(&sentinel));
     }
 
     #[test]
@@ -303,7 +359,9 @@ mod tests {
         for at_send in [false, true] {
             let mut target = Child::new();
             let unrelated = Child::new();
-            let sentinel = Kernel.capture(unrelated.pid()).unwrap();
+            let sentinel = Kernel { role_guard: None }
+                .capture(unrelated.pid())
+                .unwrap();
             let pid = target.pid();
             let mut boundary = ExitRace {
                 target: &mut target,
@@ -321,7 +379,7 @@ mod tests {
                 assert_eq!(boundary.sends, 0);
             }
             assert!(
-                Kernel.live(&sentinel),
+                Kernel { role_guard: None }.live(&sentinel),
                 "replacement must not receive signal"
             );
         }

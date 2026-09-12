@@ -37,7 +37,7 @@ completion returns synchronously in-band or asynchronously through the agent mai
   tree and finishes any already-accepted explicit cancellation.
 - **Owner-scoped cancellation.** Integrations can opt into an exact PID/start-time/boot-ID lease
   with `run --cancel-on-owner-exit --owner-pid <pid>`. `cancel <handle>`, an owner exit, or an
-  OpenCode tool abort terminates the complete adopted process tree, escalating to `SIGKILL` after
+  OpenCode tool abort terminates the complete adopted workload process tree, escalating to `SIGKILL` after
   a bounded grace period. A direct cancel is accepted when its durable marker is synchronized;
   signaling only wakes the supervisor, which also observes the marker independently. Cancellation
   of nonterminal work captures and validates an exact supervisor pidfd, with no numeric-signal fallback; unavailable
@@ -49,6 +49,10 @@ completion returns synchronously in-band or asynchronously through the agent mai
   reapers' durable poll (`custody-polling`, no signal sent by the requester). Empty-tree
   discharge and this admission are serialized; drained work and duplicate terminal requests
   are no-ops. Completed root status/rc and notification/ACK custody remain unchanged.
+  Admission does not wait on the completion helper's delivery lock. Founding completion
+  uses a separate subreaper role custodian, preserving helpers and their descendants
+  through worker loss and guardian takeover. Unexpected role-custodian loss retains
+  uncertainty and may prevent cancellation progress; it never grants a stale PID exemption.
   Descendant PID scans are discovery hints only: each signal uses a pidfd after
   validating a live, pidfd-pinned parent chain to the adopting reaper. Unknown,
   exited or changed ancestry is skipped and retried, never numerically signaled;

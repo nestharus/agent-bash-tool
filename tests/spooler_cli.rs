@@ -581,6 +581,8 @@ exit 0
     }
 }
 
+// Founding completion's caller is above its role custodian; activation remains
+// a direct worker. Kill the intended initiating actor, not the new custodian.
 fn parent_killing_fake_agents(
     temp: &tempfile::TempDir,
     killed_operation: &str,
@@ -592,7 +594,7 @@ fn parent_killing_fake_agents(
     fs::write(
         &fake,
         format!(
-            "#!/bin/sh\noperation=${{2:-}}\nif [ \"$operation\" = {} ]; then\n  printf '%s\\n' \"$operation\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\n  caller_pid=$(ps -o ppid= -p \"$PPID\")\n  kill -KILL \"$caller_pid\"\nfi\nexit 0\n",
+            "#!/bin/sh\noperation=${{2:-}}\nif [ \"$operation\" = {} ]; then\n  printf '%s\\n' \"$operation\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\n  caller_pid=$(ps -o ppid= -p \"$PPID\" | tr -d ' ')\n  if [ \"$operation\" = agent-bash-complete ]; then caller_pid=$(ps -o ppid= -p \"$caller_pid\" | tr -d ' '); fi\n  kill -KILL \"$caller_pid\"\nfi\nexit 0\n",
             shell_quote(Path::new(killed_operation))
         ),
     )
@@ -630,7 +632,7 @@ fn delivery_handoff_killing_fake_agents(
     fs::write(
         &fake,
         format!(
-            "#!/bin/sh\noperation=${{2:-}}\nif [ \"$operation\" = {} ]; then\n  printf '%s\\n' \"$operation\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\n  owner_pid=$PPID\n  initiator_pid=$(ps -o ppid= -p \"$owner_pid\" | tr -d ' ')\n  kill -KILL \"$initiator_pid\" \"$owner_pid\"\nfi\nexit 0\n",
+            "#!/bin/sh\noperation=${{2:-}}\nif [ \"$operation\" = {} ]; then\n  printf '%s\\n' \"$operation\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\n  owner_pid=$PPID\n  initiator_pid=$(ps -o ppid= -p \"$owner_pid\" | tr -d ' ')\n  if [ \"$operation\" = agent-bash-complete ]; then initiator_pid=$(ps -o ppid= -p \"$initiator_pid\" | tr -d ' '); fi\n  kill -KILL \"$initiator_pid\" \"$owner_pid\"\nfi\nexit 0\n",
             shell_quote(Path::new(killed_operation))
         ),
     )
