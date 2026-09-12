@@ -1258,7 +1258,12 @@ impl CompletionTransfer {
 
     // Caller has already reaped this PID. Never wait here: the supervisor's
     // wildcard reaper and a competing exact waiter must not own the same child.
-    pub(crate) fn finish(self, paths: &StatePaths, meta: &mut Meta, status: i32) -> io::Result<()> {
+    pub(crate) fn finish(
+        &self,
+        paths: &StatePaths,
+        meta: &mut Meta,
+        status: i32,
+    ) -> io::Result<()> {
         integrate_completion_transfer(paths, meta, transfer_status(status), self.retry_count)
     }
 }
@@ -1452,7 +1457,9 @@ fn integrate_completion_transfer(
             }
             _ => {
                 *meta = observed;
-                return Err(err);
+                // A recorded delivery outcome is not invalidated by execution-role loss.
+                // Physical custody is discharged separately by the adopting reaper.
+                return Ok(());
             }
         };
         observed.touch();
@@ -2049,6 +2056,108 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
+
+    fn continuity_meta(paths: &StatePaths) -> Meta {
+        Meta::new(
+            paths.handle.clone(),
+            unsafe { libc::getpid() },
+            unsafe { libc::getpid() },
+            vec!["true".into()],
+            paths.root.clone(),
+            "exit",
+            state::DeliveryMode::Async,
+            None,
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[test]
+    fn recorded_outcome_survives_worker_and_custodian_failure_integration() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_recorded_loss".into());
+        state::create_handle_state(&paths).unwrap();
+        let mut meta = continuity_meta(&paths);
+        meta.delivery = completion_delivery_meta_from_status(ExitStatus::from_raw(0));
+        state::write_meta_atomic(&paths, &meta).unwrap();
+        let before = fs::read(&paths.meta).unwrap();
+        // The custodian integrates worker loss; the guardian integrates custodian
+        // loss. Both see the same already recorded fact and must not invalidate it.
+        for _ in 0..2 {
+            integrate_completion_transfer(&paths, &mut meta, transfer_status(libc::SIGKILL), 0)
+                .unwrap();
+            assert_eq!(fs::read(&paths.meta).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn guardian_empty_tree_restores_unknown_role_for_incurred_pre_admission_retry() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        crate::delivery_role::initialize().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_unknown_retry".into());
+        state::create_handle_state(&paths).unwrap();
+        state::write_delivery_mode_atomic(&paths, state::DeliveryMode::Async).unwrap();
+        let mut meta = continuity_meta(&paths);
+        // A real pinned native helper, never the configured runner/provider.
+        meta.delivery_helper = Some(
+            ConfiguredDeliveryHelper::from_resolved_path(Path::new("/usr/bin/true"))
+                .unwrap()
+                .pin_to_handle(&paths)
+                .unwrap()
+                .provenance,
+        );
+        state::write_meta_atomic(&paths, &meta).unwrap();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe { libc::_exit(70) };
+        }
+        crate::delivery_role::publish(child).unwrap();
+        let result = wait_for_completion_custodian(child);
+        assert!(result.is_err());
+        integrate_completion_transfer(&paths, &mut meta, result, 0).unwrap();
+        assert_eq!(
+            meta.delivery.completion_lifecycle(),
+            CompletionDeliveryLifecycle::RetryablePreAdmissionFailure
+        );
+        assert!(crate::delivery_role::exclusion().is_err());
+        assert!(crate::delivery_role::publish(child).is_err());
+        // This private process models the sole guardian after exact supervisor
+        // reap. Actual ECHILD, not another custodian's exit, permits role reset.
+        assert_eq!(
+            crate::delivery_role::reap_one(libc::WNOHANG)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        crate::delivery_role::guardian_tree_drained();
+        assert!(!crate::delivery_role::pending());
+        let CompletionStart::Running(transfer) =
+            try_start_completion_delivery(&paths, &mut meta).unwrap()
+        else {
+            panic!("incurred retry was not started");
+        };
+        let result = wait_for_completion_custodian(transfer.pid());
+        integrate_completion_transfer(&paths, &mut meta, result, transfer.retry_count).unwrap();
+        // The authorized retry actually executes the private native helper.
+        // Successful helper metadata intentionally resets its retry count.
+        assert_eq!(transfer.retry_count, 1);
+        assert_eq!(meta.delivery.exit_code, Some(0));
+        assert_eq!(
+            meta.delivery.completion_lifecycle(),
+            CompletionDeliveryLifecycle::AdmittedOutcome
+        );
+        assert!(!crate::delivery_role::pending());
+        assert_eq!(
+            crate::delivery_role::reap_one(libc::WNOHANG)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum CleanupFault {

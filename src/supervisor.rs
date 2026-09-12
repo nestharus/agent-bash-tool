@@ -454,6 +454,7 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
     let mut completion_reconciled = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
     let mut recovered_cancel_escalation = None;
     let mut completion_transfer = None;
+    let mut reaped_transfer = None;
     loop {
         let accepted_cancel = match explicit_cancel_accepted(paths) {
             Ok(accepted) => accepted,
@@ -477,10 +478,26 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
                 .get_or_insert_with(CancellationEscalation::begin_guardian_takeover);
             signal_descendants(current_pid(), escalation.signal(), None);
         }
-        let adopted_tree_empty = match reap_guardian_children(paths, &mut completion_transfer) {
-            Ok(empty) => empty,
-            Err(_) => return EX_SOFTWARE,
-        };
+        let adopted_tree_empty =
+            match reap_guardian_children(&mut completion_transfer, &mut reaped_transfer) {
+                Ok(empty) => empty,
+                Err(_) => {
+                    std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                    continue;
+                }
+            };
+        if let Some((transfer, status)) = reaped_transfer.as_ref() {
+            let integrated = state::read_meta(paths)
+                .and_then(|mut meta| transfer.finish(paths, &mut meta, *status));
+            if integrated.is_err() {
+                std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                continue;
+            }
+            reaped_transfer = None;
+        }
+        if adopted_tree_empty {
+            crate::delivery_role::guardian_tree_drained();
+        }
         // Durable helper handback can precede the worker's _exit. After abnormal
         // supervisor loss this guardian is its sole adopting reaper. Do not
         // orphan it (or other adopted descendants) merely because metadata is
@@ -492,7 +509,10 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
                     std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
                     continue;
                 }
-                Err(_) => return EX_SOFTWARE,
+                Err(_) => {
+                    std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                    continue;
+                }
             }
         }
         if cancel_workload
@@ -515,7 +535,7 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
             paths,
             accepted_cancel && (adopted_tree_empty || cancellation_drained),
         ) {
-            Ok(mut meta) if state::terminal(&meta) || !state::running_exit_mode(&meta) => {
+            Ok(Some(mut meta)) if state::terminal(&meta) || !state::running_exit_mode(&meta) => {
                 match delivery::try_start_completion_delivery(paths, &mut meta) {
                     Ok(delivery::CompletionStart::Busy) => {
                         std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
@@ -527,28 +547,23 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
                         // Physical emptiness still gates guardian retirement.
                         completion_reconciled = true;
                     }
-                    Err(_) => return EX_SOFTWARE,
+                    Err(_) => std::thread::sleep(SUPERVISOR_RECOVERY_POLL),
                 }
             }
-            Ok(_) => std::thread::sleep(SUPERVISOR_RECOVERY_POLL),
-            Err(_) => return EX_SOFTWARE,
+            Ok(_) | Err(_) => std::thread::sleep(SUPERVISOR_RECOVERY_POLL),
         }
     }
 }
 
 fn reap_guardian_children(
-    paths: &StatePaths,
     transfer: &mut Option<delivery::CompletionTransfer>,
+    reaped: &mut Option<(delivery::CompletionTransfer, i32)>,
 ) -> io::Result<bool> {
     loop {
         let err = match crate::delivery_role::reap_one(libc::WNOHANG) {
             Ok(Some((pid, status))) => {
                 if transfer.as_ref().map(delivery::CompletionTransfer::pid) == Some(pid) {
-                    let mut meta = state::read_meta(paths)?;
-                    transfer
-                        .take()
-                        .expect("matched guardian transfer")
-                        .finish(paths, &mut meta, status)?;
+                    *reaped = Some((transfer.take().expect("matched guardian transfer"), status));
                 }
                 continue;
             }
@@ -558,7 +573,11 @@ fn reap_guardian_children(
         if err.kind() == io::ErrorKind::Interrupted {
             continue;
         }
-        return Ok(err.raw_os_error() == Some(libc::ECHILD));
+        return if err.raw_os_error() == Some(libc::ECHILD) {
+            Ok(true)
+        } else {
+            Err(err)
+        };
     }
 }
 
@@ -2271,12 +2290,18 @@ pub(crate) fn reconcile_lost_supervisor_for_list(paths: &StatePaths) -> io::Resu
 fn reconcile_lost_supervisor_after_guardian(
     paths: &StatePaths,
     accepted_cancel_tree_empty: bool,
-) -> io::Result<Meta> {
-    reconcile_lost_supervisor_with_delivery(
+) -> io::Result<Option<Meta>> {
+    // External ClaimPending reconciliation can hold this through helper exit.
+    // The last physical owner must return to cancellation polling instead.
+    let Some(_lock) = state::try_lock_reconciliation(paths)? else {
+        return Ok(None);
+    };
+    reconcile_lost_supervisor_locked(
         paths,
         CompletionDeliveryDisposition::LeavePending,
         accepted_cancel_tree_empty,
     )
+    .map(Some)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2292,6 +2317,14 @@ fn reconcile_lost_supervisor_with_delivery(
     accepted_cancel_tree_empty: bool,
 ) -> io::Result<Meta> {
     let _lock = state::lock_reconciliation(paths)?;
+    reconcile_lost_supervisor_locked(paths, delivery_disposition, accepted_cancel_tree_empty)
+}
+
+fn reconcile_lost_supervisor_locked(
+    paths: &StatePaths,
+    delivery_disposition: CompletionDeliveryDisposition,
+    accepted_cancel_tree_empty: bool,
+) -> io::Result<Meta> {
     let mut meta = state::read_meta(paths)?;
     if state::terminal(&meta) {
         if delivery_disposition == CompletionDeliveryDisposition::ClaimPending {
@@ -2933,7 +2966,8 @@ for line in sys.stdin:
         supervisor.wait().expect("reap supervisor identity");
 
         let terminal = reconcile_lost_supervisor_after_guardian(&paths, true)
-            .expect("guardian reconciliation");
+            .expect("guardian reconciliation")
+            .expect("uncontended reconciliation");
 
         assert_eq!(terminal.state, "DONE");
         assert_eq!(

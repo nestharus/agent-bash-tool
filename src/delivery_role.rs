@@ -139,6 +139,16 @@ fn retired_slot(value: i32, pid: i32) -> i32 {
     }
 }
 
+// Only the guardian, after the supervisor is reaped AND its own reaper has
+// observed ECHILD. No old role descendant can survive this whole-tree proof.
+// Keep challenge generations monotonic; this clears physical uncertainty, not
+// delivery state (which independently decides whether another attempt is legal).
+pub(crate) fn guardian_tree_drained() {
+    if let Some(slot) = slot() {
+        let _ = slot.compare_exchange(UNKNOWN, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
 pub(crate) fn exclusion() -> io::Result<Option<(i32, OwnedFd)>> {
     let Some(slot) = slot() else {
         return Ok(None);

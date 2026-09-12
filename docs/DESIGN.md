@@ -170,8 +170,16 @@ but it never executes a helper as an incidental enumeration side effect; its dis
 asynchronously. A durable cancellation arriving after the loop's last check defers publication under
 `completion.lock` until the adopted tree has drained; it cannot prematurely publish a cancelled
 Root-scope completion and exempt surviving workload descendants from termination.
-Targeted status, bootstrap-error publication and guardian reconciliation use
+Targeted status and bootstrap-error publication use
 `CompletionDeliveryDisposition::ClaimPending` and wait synchronously for an exact transfer child.
+Guardian reconciliation uses `LeavePending` under a nonblocking reconciliation lock,
+then starts completion asynchronously. External synchronous reconciliation cannot
+hold the guardian away from its cancellation poll. Reaped-transfer integration errors
+retain the transfer and its lock for retry without abandoning physical custody.
+An already recorded delivery outcome survives abnormal execution-role exit.
+UNKNOWN role custody is cleared only after the guardian has reaped the supervisor
+and proved its entire adopted tree empty with ECHILD; delivery metadata still
+independently authorizes (or forbids) another attempt.
 The disposition names who progresses delivery, not how the terminal state was reached. Cross-owner status and
 `list --all` remain observational and do not reconcile state. Cross-route `mode` is likewise a
 point-in-time read, but it still fails closed when the durable activation outcome is unsettled.

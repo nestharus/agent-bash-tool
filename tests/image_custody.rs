@@ -76,3 +76,8 @@ fn age362_pending_delivery_role_continuity() {
     );
     println!("{}", String::from_utf8_lossy(&output.stdout));
 }
+
+#[test]
+fn age362_guardian_continuity_through_reconciliation_and_recorded_outcome_loss() {
+    run_private_fixture("65", "tests/fixtures/age362_guardian_continuity.py");
+}

@@ -1100,6 +1100,14 @@ fn reap_state_entry(
 }
 
 pub(crate) fn try_lock_delivery(paths: &StatePaths) -> io::Result<Option<File>> {
+    try_lock_file(&paths.delivery_lock)
+}
+
+pub(crate) fn try_lock_reconciliation(paths: &StatePaths) -> io::Result<Option<File>> {
+    try_lock_file(&paths.reconciliation_lock)
+}
+
+fn try_lock_file(path: &Path) -> io::Result<Option<File>> {
     use std::os::fd::AsRawFd;
 
     let file = OpenOptions::new()
@@ -1108,7 +1116,7 @@ pub(crate) fn try_lock_delivery(paths: &StatePaths) -> io::Result<Option<File>> 
         .write(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .mode(0o600)
-        .open(&paths.delivery_lock)?;
+        .open(path)?;
     loop {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(Some(file));
