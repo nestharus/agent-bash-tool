@@ -2091,6 +2091,99 @@ mod tests {
     }
 
     #[test]
+    fn reaped_transfer_retains_status_and_lock_after_observed_integration_error() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        crate::delivery_role::initialize().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_integration_error".into());
+        state::create_handle_state(&paths).unwrap();
+        let mut meta = continuity_meta(&paths);
+        meta.delivery = completion_delivery_meta_from_status(ExitStatus::from_raw(0));
+        state::write_meta_atomic(&paths, &meta).unwrap();
+        let saved_meta = fs::read(&paths.meta).unwrap();
+        let lock = DeliveryLockGuard::acquire(&paths).unwrap();
+        // Model an owned custodian with an already recorded helper outcome.
+        // This child executes no helper and exits immediately; the private test
+        // process is its only reaper. No scheduling sleep supplies the witness.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe { libc::_exit(70) };
+        }
+        crate::delivery_role::publish(child).unwrap();
+        let (pid, status) = crate::delivery_role::reap_one(0).unwrap().unwrap();
+        assert_eq!(pid, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 70);
+        let mut reaped = Some((
+            CompletionTransfer {
+                pid,
+                _lock: lock,
+                retry_count: 0,
+            },
+            status,
+        ));
+        fs::write(&paths.meta, b"injected-private-read-error").unwrap();
+        let (transfer, retained_status) = reaped.as_ref().unwrap();
+        let lock_fd = transfer._lock._file.as_raw_fd();
+        // Unlike the process fixture, this enters finish itself and observes its
+        // returned metadata error BEFORE restoration. The guardian's outer read
+        // and event-loop retry scheduling are not executed by this unit test.
+        let err = transfer
+            .finish(&paths, &mut meta, *retained_status)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(
+            err.get_ref()
+                .and_then(|cause| cause.downcast_ref::<serde_json::Error>())
+                .expect("integration returned the injected JSON parse error")
+                .is_syntax()
+        );
+        assert_eq!(
+            fs::read(&paths.meta).unwrap(),
+            b"injected-private-read-error"
+        );
+        let (transfer, retained_status) = reaped.as_ref().unwrap();
+        assert_eq!(transfer.pid(), child);
+        assert_eq!(*retained_status, status);
+        assert_eq!(transfer.retry_count, 0);
+        assert_eq!(transfer._lock._file.as_raw_fd(), lock_fd);
+        assert!(state::try_lock_delivery(&paths).unwrap().is_none());
+        // Exact reap already occurred. Recovery must use retained status, not
+        // obtain a second exit observation or launch a replacement attempt.
+        assert_eq!(
+            crate::delivery_role::reap_one(libc::WNOHANG)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(crate::delivery_role::exclusion().is_err());
+        fs::write(&paths.meta, &saved_meta).unwrap();
+        transfer
+            .finish(&paths, &mut meta, *retained_status)
+            .unwrap();
+        assert_eq!(fs::read(&paths.meta).unwrap(), saved_meta);
+        assert_eq!(meta.delivery.exit_code, Some(0));
+        assert_eq!(
+            meta.delivery.completion_lifecycle(),
+            CompletionDeliveryLifecycle::AdmittedOutcome
+        );
+        assert!(state::try_lock_delivery(&paths).unwrap().is_none());
+        // Integration success does not certify physical role custody or clear
+        // UNKNOWN. Dropping the unit's retained owner, as the guardian does only
+        // after successful integration, is what releases this delivery flock.
+        assert!(crate::delivery_role::exclusion().is_err());
+        reaped = None;
+        assert!(reaped.is_none());
+        assert!(state::try_lock_delivery(&paths).unwrap().is_some());
+        println!(
+            "observed finish JSON syntax error; exact reaped pid/status and flock retained; restored bytes integrated without re-wait; owner drop released flock"
+        );
+    }
+
+    #[test]
     fn guardian_empty_tree_restores_unknown_role_for_incurred_pre_admission_retry() {
         if crate::test_support::private_case() {
             return;

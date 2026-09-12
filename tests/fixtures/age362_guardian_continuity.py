@@ -76,12 +76,15 @@ def case(root, helper, mode):
             Path(item['meta']).write_bytes(b'injected-private-read-error')
         signal.pidfd_send_signal(fds['role'], signal.SIGKILL)
         f.wait(lambda: r.exited(fds['role']) and f.stat(helper_leaf)[0] == guardian)
-        time.sleep(.3) # guardian integrates failed status while workload is live
+        # This interval is not a witness of a guardian integration attempt.
+        # The deterministic delivery unit test separately observes a returned
+        # integration error; this fixture covers interval survival and recovery.
+        time.sleep(.3)
         if mode == 'guardian-integration-read-error':
             assert not r.exited(fds['guardian']) and (sd / 'physical-custody').exists()
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                raise AssertionError('failed integration released its transfer lock')
+                raise AssertionError('corruption interval released its transfer lock')
             except BlockingIOError: pass
             Path(item['meta']).write_bytes(saved_meta)
     before = f.read_json(item['meta']); rc = (sd / 'rc').read_bytes()
