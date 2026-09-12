@@ -6566,3 +6566,6 @@ print('collector accepted six real datagrams, three attempts; loss unknown')
 
 #[path = "fixtures/age362_terminal_cancel.rs"]
 mod age362_terminal_cancel;
+
+#[path = "fixtures/age363_retained_output.rs"]
+mod age363_retained_output;

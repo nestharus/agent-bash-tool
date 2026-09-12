@@ -213,17 +213,19 @@ the PID is **harness-code polling (cheap, no LLM tokens)** — not the LLM self-
 forbidden.
 
 `status --observe-only <handle>` suppresses owner-triggered reconciliation and delivery progression.
-The bundled adapter uses it to observe a terminal asynchronous result, records `consume`, and then
-issues progress-capable status. This ordering puts the in-call consumer decision ahead of the
-completion helper request so the helper receives `--consumed` rather than admitting a duplicate
-active mailbox publication.
+The bundled adapter first observes terminal status, then acquires `snapshot <handle>` before
+requesting `consume <handle> --snapshot '<identity JSON>'` and progress-capable status. A bare
+`consume` is rejected: callers must first acquire and validate the bounded bytes they identify.
+The marker still supplies the existing completion-helper `--consumed` hint; it is not a remote
+receipt, durable remote ACK, physical drain, or evidence that all future output was read.
+See [retained output](retained-output.md) for the exact local contract and retention limits.
 
 Handle observation and handle control are separate cooperative routing policies within the
 supported CLI. Default list visibility and control require the recorded owner session when one
 exists, falling back to the exact caller-chain predicate only for handles without session metadata.
 At every supported mutating control boundary, the
 handle's pinned helper resolves the live caller chain to its acting session; ambient owner strings
-never satisfy that supported-interface check. `list --all`, cross-owner `status`, and cross-owner `mode` may
+never satisfy that supported-interface check. `list --all`, cross-owner `status`/`snapshot`, and cross-owner `mode` may
 observe account-local handles, but they cannot publish recovery state, claim delivery, cancel work,
 or change delivery mode. Cancel, detach, and consume fail with `EX_NOPERM` for ineligible callers. Guardian recovery
 remains independent of any observing caller and is the automatic cleanup/progress path after the

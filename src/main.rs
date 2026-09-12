@@ -6,6 +6,7 @@ mod delivery;
 mod delivery_role;
 mod guard;
 mod image;
+mod retained_output;
 mod state;
 mod supervisor;
 #[cfg(test)]
@@ -80,7 +81,19 @@ enum Command {
     /// Cancel a supervised workload and all of its adopted descendants.
     Cancel { handle: String },
     /// Record that the owning in-call consumer received a terminal result.
-    Consume { handle: String },
+    Consume {
+        handle: String,
+        /// Identity returned by snapshot, after acquiring and validating its output.
+        #[arg(long)]
+        snapshot: String,
+    },
+    /// Acquire a bounded terminal log prefix without progressing delivery.
+    Snapshot {
+        handle: String,
+        /// Recover a previously acquired prefix; fails if the source is now shorter.
+        #[arg(long)]
+        bytes: Option<u64>,
+    },
     /// Print the current completion delivery mode for a handle.
     Mode { handle: String },
     /// Status of a spooled job. Owner calls may reconcile terminal state and delivery first.
@@ -187,7 +200,10 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
         ),
         Command::Detach { handle } => detach_command(handle, control_route_caller(&guard)),
         Command::Cancel { handle } => cancel_command(handle, control_route_caller(&guard)),
-        Command::Consume { handle } => consume_command(handle, control_route_caller(&guard)),
+        Command::Consume { handle, snapshot } => {
+            consume_command(handle, snapshot, control_route_caller(&guard))
+        }
+        Command::Snapshot { handle, bytes } => snapshot_command(handle, bytes),
         Command::Mode { handle } => mode_command(handle, control_route_caller(&guard)),
         Command::Status {
             tail_bytes,
@@ -347,25 +363,57 @@ fn cancel_request_error(handle: &str, err: io::Error) -> AppError {
     )
 }
 
-fn consume_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {
-    let paths = paths_for_existing_handle(&handle)?;
-    require_control_eligibility(&paths, &handle, &caller)?;
-    let meta = read_meta_for_handle(&paths, &handle)?;
-    if !state::terminal(&meta) {
-        return Err(AppError::new(
-            EX_DATAERR,
-            format!("agent-bash: cannot consume non-terminal handle {handle}"),
-        ));
+fn output_error(err: impl std::fmt::Display) -> AppError {
+    AppError::new(
+        EX_DATAERR,
+        format!("agent-bash: retained output unavailable or invalid: {err}"),
+    )
+}
+
+fn terminal_output_meta(paths: &StatePaths, handle: &str) -> Result<Meta, AppError> {
+    let meta = read_meta_for_handle(paths, handle)?;
+    if meta.handle != handle || !state::terminal(&meta) {
+        return Err(output_error("mismatched identity or non-terminal source"));
     }
-    let consumed = state::record_consumed(&paths).map_err(|err| {
-        AppError::new(
-            EX_IOERR,
-            format!("agent-bash: failed to record consumption for {handle}: {err}"),
-        )
-    })?;
+    Ok(meta)
+}
+
+fn snapshot_command(handle: String, bytes: Option<u64>) -> Result<(), AppError> {
+    let paths = paths_for_existing_handle(&handle)?;
+    let _lock = state::lock_output(&paths).map_err(output_error)?;
+    let meta = terminal_output_meta(&paths, &handle)?;
+    let snapshot = retained_output::acquire(&paths, &meta, bytes).map_err(output_error)?;
+    let header = render_status_header(&meta, Some(state::read_rc(&paths).map_err(output_error)?))?;
     serde_json::to_writer(
         io::stdout(),
-        &serde_json::json!({ "handle": handle, "consumed": consumed }),
+        &serde_json::json!({
+            "snapshot": snapshot.identity, "output": snapshot.output, "status": header,
+        }),
+    )
+    .map_err(json_write_error)?;
+    io::stdout().write_all(b"\n").map_err(json_write_error)
+}
+
+fn consume_command(
+    handle: String,
+    snapshot: String,
+    caller: ControlRouteCaller,
+) -> Result<(), AppError> {
+    let identity: retained_output::Identity =
+        serde_json::from_str(&snapshot).map_err(output_error)?;
+    let paths = paths_for_existing_handle(&handle)?;
+    let _lock = state::lock_output(&paths).map_err(output_error)?;
+    require_control_eligibility(&paths, &handle, &caller)?;
+    let meta = terminal_output_meta(&paths, &handle)?;
+    retained_output::validate(&paths, &meta, &identity).map_err(output_error)?;
+    let consumed = state::record_consumed(&paths).map_err(output_error)?;
+    serde_json::to_writer(
+        io::stdout(),
+        &serde_json::json!({
+            "version": 1, "handle": handle, "consumed": consumed,
+            "local_acceptance": "accepted", "snapshot": identity,
+            "remote_ack": "unconfirmed", "physical_drain": "unconfirmed",
+        }),
     )
     .map_err(json_write_error)?;
     io::stdout().write_all(b"\n").map_err(json_write_error)

@@ -1,5 +1,6 @@
 import { tool } from "@opencode-ai/plugin"
 import { createConnection } from "node:net"
+import { createHash } from "node:crypto"
 
 /**
  * opencode `bash` tool override. Workloads survive shell timeouts under agent-bash, but remain
@@ -30,7 +31,21 @@ type StatusReadPolicy = {
   progression: "observe-only" | "request-progress"
 }
 
-type ConsumptionAttempt = "consumed" | "ineligible"
+type SnapshotIdentity = {
+  version: 1
+  handle: string
+  created_at_unix_ms: number
+  bytes: number
+  sha256: string
+  encoding: "hex"
+}
+
+type AcquiredOutput = {
+  snapshot: SnapshotIdentity
+  status: string
+  output: string
+  representation: "utf8" | "hex"
+}
 
 type ShellCommandWithoutAdapterControls = {
   prefix: string
@@ -263,11 +278,14 @@ async function statusText(
 ): Promise<string> {
   const args = [AGENT_BASH, "status"]
   if (policy.detail === "header") args.push("--tail-bytes", "0")
+  else args.push("--full")
   if (policy.progression === "observe-only") args.push("--observe-only")
   args.push(handle)
-  const status = await checkedProcessText(args, "agent-bash status", ownerSessionId, abort)
+  const result = await runProcess(args, ownerSessionId, abort, "agent-bash status")
+  if (result.exitCode !== 0) throw processFailure("agent-bash status", result)
+  const status = result.stdout
   const header = status.split("\n", 1)[0]
-  if (!/^(RUNNING|DONE rc=-?\d+|ERROR rc=-?\d+) handle=/.test(header) || !header.includes(`handle=${handle}`)) {
+  if (!/^(RUNNING|DONE rc=-?\d+|ERROR rc=-?\d+) handle=/.test(header) || !header.split(/\s+/).includes(`handle=${handle}`)) {
     throw new Error(`agent-bash status returned invalid output: ${header || "<empty>"}`)
   }
   return status
@@ -286,8 +304,7 @@ async function observeVisibleHandle(
     abort,
   )
   if (isTerminalStatus(header)) {
-    await attemptTerminalConsumption(handle, ownerSessionId, abort)
-    return statusText(handle, { detail: "full", progression: "request-progress" }, ownerSessionId, abort)
+    return retainedTerminalOutput(handle, ownerSessionId, abort)
   }
   if (runningDetail === "omit") return undefined
 
@@ -298,19 +315,83 @@ async function observeVisibleHandle(
     abort,
   )
   if (!isTerminalStatus(status)) return status
-  await attemptTerminalConsumption(handle, ownerSessionId, abort)
-  return statusText(handle, { detail: "full", progression: "request-progress" }, ownerSessionId, abort)
+  try {
+    return await retainedTerminalOutput(handle, ownerSessionId, abort)
+  } catch {
+    // The running read raced a terminal transition. Preserve that already acquired
+    // textual observation even if the exact snapshot source is now unavailable.
+    return status.replace("\n", "\nlocal acceptance: unconfirmed; remote ACK: unconfirmed; physical drain: unconfirmed; exact snapshot unavailable; textual observation only\n")
+  }
+}
+
+function sameSnapshot(value: any, expected: SnapshotIdentity): boolean {
+  return value !== null && typeof value === "object" &&
+    Object.keys(value).length === Object.keys(expected).length &&
+    Object.entries(expected).every(([key, entry]) => value[key] === entry)
+}
+
+function acquireOutput(handle: string, response: string): AcquiredOutput {
+  const value = JSON.parse(response)
+  const snapshot = value.snapshot as SnapshotIdentity
+  if (!snapshot || snapshot.version !== 1 || snapshot.handle !== handle || snapshot.encoding !== "hex" ||
+      !Number.isSafeInteger(snapshot.created_at_unix_ms) || snapshot.created_at_unix_ms < 0 ||
+      !Number.isSafeInteger(snapshot.bytes) || snapshot.bytes < 0 ||
+      typeof snapshot.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(snapshot.sha256) ||
+      typeof value.output !== "string" || !/^(?:[0-9a-f]{2})*$/.test(value.output) ||
+      value.output.length / 2 !== snapshot.bytes ||
+      typeof value.status !== "string" || value.status.includes("\n") ||
+      !/^(DONE|ERROR) rc=-?\d+ handle=/.test(value.status) ||
+      !value.status.split(/\s+/).includes(`handle=${handle}`)) {
+    throw new Error("agent-bash snapshot returned an invalid or incomplete identity/representation")
+  }
+  const bytes = Buffer.from(value.output, "hex")
+  if (createHash("sha256").update(bytes).digest("hex") !== snapshot.sha256) {
+    throw new Error("agent-bash snapshot output hash mismatch")
+  }
+  const text = bytes.toString("utf8")
+  const utf8 = Buffer.from(text, "utf8").equals(bytes)
+  return { snapshot, status: value.status, output: utf8 ? text : value.output, representation: utf8 ? "utf8" : "hex" }
+}
+
+async function retainedTerminalOutput(handle: string, ownerSessionId?: string, abort?: AbortSignal): Promise<string> {
+  // Acquisition is observe-only and complete before any consumption/progression.
+  const result = await runProcess([AGENT_BASH, "snapshot", handle], ownerSessionId, abort, "agent-bash snapshot")
+  if (result.exitCode !== 0) throw processFailure("agent-bash snapshot", result)
+  const retained = acquireOutput(handle, result.stdout)
+  let acceptance = "unconfirmed"
+  let progression = "not requested"
+  try {
+    acceptance = await attemptTerminalConsumption(retained.snapshot, ownerSessionId, abort)
+    await statusText(handle, { detail: "header", progression: "request-progress" }, ownerSessionId, abort)
+    progression = "requested (not remote settlement evidence)"
+  } catch (error) {
+    // Never replace an acquired command result with a control/transport failure.
+    progression = `unconfirmed: ${error instanceof Error ? error.message : String(error)}`
+  }
+  return `${retained.status}\nlocal acceptance: ${acceptance}; remote ACK: unconfirmed; physical drain: unconfirmed` +
+    `\nprogression: ${progression}\nsnapshot: ${JSON.stringify(retained.snapshot)}` +
+    `\noutput representation: ${retained.representation}; bounded prefix only, later append data unknown` +
+    `\n--- output ---\n${retained.output}`
 }
 
 async function attemptTerminalConsumption(
-  handle: string,
+  snapshot: SnapshotIdentity,
   ownerSessionId?: string,
   abort?: AbortSignal,
-): Promise<ConsumptionAttempt> {
-  const consume = await runProcess([AGENT_BASH, "consume", handle], ownerSessionId, abort, "agent-bash consume")
-  if (consume.exitCode === 0) return "consumed"
+): Promise<string> {
+  const consume = await runProcess(
+    [AGENT_BASH, "consume", snapshot.handle, "--snapshot", JSON.stringify(snapshot)],
+    ownerSessionId, abort, "agent-bash consume",
+  )
   if (consume.exitCode === 77) return "ineligible"
-  throw processFailure("agent-bash consume", consume)
+  if (consume.exitCode !== 0) throw processFailure("agent-bash consume", consume)
+  const reply = JSON.parse(consume.stdout)
+  if (reply.version !== 1 || reply.handle !== snapshot.handle || reply.local_acceptance !== "accepted" ||
+      typeof reply.consumed !== "boolean" || !sameSnapshot(reply.snapshot, snapshot) ||
+      reply.remote_ack !== "unconfirmed" || reply.physical_drain !== "unconfirmed") {
+    throw new Error("agent-bash consume returned invalid local acceptance; remote settlement unconfirmed")
+  }
+  return "accepted bounded snapshot"
 }
 
 async function modeText(handle: string, ownerSessionId: string, abort?: AbortSignal): Promise<DeliveryMode> {
