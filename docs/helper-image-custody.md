@@ -21,10 +21,13 @@ fd 3. Parent-death SIGKILL plus a parent-identity recheck closes the startup rac
 
 The supervisor's existing waiter reaps all children. While the custodian remains
 an unreaped exact child, Tree completion may establish emptiness when `/proc`'s
-**entire direct-child set is exactly that child**. No other process or descendant
-is exempt. Normal cancellation skips only that same child so cancellation's
-completion delivery can still acquire images. Supervisor teardown kills and reaps
-it; supervisor loss kills it through the kernel parent-death signal. Guardian
+**entire direct-child set is exactly that child**. This is not an `ECHILD`
+observation and does not enumerate descendants beneath that child. Cancellation
+skips the custodian and its still-connected subtree so completion delivery can
+still acquire images; other direct children prevent the shortcut. The current
+clean-exec custodian serves requests without spawning children. The shortcut is
+not proof that an arbitrary future custodian implementation has no descendants.
+Supervisor teardown kills and reaps it; supervisor loss kills it through the kernel parent-death signal. Guardian
 recovery has no descendant exemption. Independent roots have independent services
 and may duplicate images. Root-scope completion deliberately ends this service
 when the owning supervisor ends, even if an opaque descendant remains elsewhere.
@@ -176,27 +179,33 @@ that the historical EBUSY page-reference holder has been identified.
 ## Founding-owner completion continuity
 
 Completion publication in the live supervisor leaves delivery pending. Its event
-loop tries the delivery lock without waiting, then launches one active transfer
-worker that acquires the images, writes the admission claim, executes the helper
-and persists its result. The supervisor retains the inherited lock until its
-existing wildcard reaper observes that exact worker and integrates the result.
-There is no recovery thread, second reaper, or idle monitor per image generation.
-The worker closes inherited descriptors other than stdio and its delivery lock;
-it does not keep the founding listener alive after supervisor loss.
+loop tries the delivery lock without waiting, then launches one role custodian.
+The custodian is published to shared supervisor/guardian memory before execution
+is released, becomes a subreaper, and forks the actual completion worker. The
+worker acquires images, writes admission, executes the helper and persists its
+result. The custodian integrates worker-loss uncertainty promptly and retains
+helper descendants until ECHILD, even through orphan adoption and session changes.
+The supervisor's reaper then integrates the custodian result. This is one extra
+process per active founding completion, not an image-generation monitor or a
+recovery thread. Both custodian and worker close unrelated inherited descriptors.
 
-Both ready and normal-exit publication use this boundary. Pending delivery keeps
-the supervisor alive even for Root completion scope. A root exit observed during
-a ready transfer is retained in memory and merged into current metadata once the
-lock is available, rather than blocking recovery or overwriting the worker's
-result. Accepted cancellation drains the workload tree before starting its own
-completion transfer; that new notification is not cancelled again. Owner exit
-can cancel an already active ready transfer, preserving non-replayable uncertainty
-when the worker dies without a conclusive handback. Such an unknown outcome closes
-replay but retains adopted-tree custody even in Root scope: otherwise a surviving
-helper could be orphaned. Unrelated surviving Root-scope descendants can therefore
-also prolong supervision after worker loss. The existing guardian adopts
-and reaps remaining children after abnormal supervisor loss, even when delivery
-metadata becomes terminal before the worker exits.
+Both ready and normal-exit publication use this boundary. Pending role custody
+keeps the supervisor alive even for Root completion scope. Ready-mode root exit
+is merged once the delivery lock becomes available. Cancellation preserves the
+completion role regardless of terminal reason or which operation acquired first;
+worker loss and supervisor takeover do not discard that role. The guardian keeps
+polling cancellation while a role owns the long delivery flock. Physical admission
+and discharge use a separate, locally bounded custody lock.
+
+Custodian PID retirement precedes reaping, and a pidfd liveness guard follows
+all target ancestry reads before signaling. Unexpected custodian loss retains
+unknown role responsibility rather than guessing from adopted PIDs. This may
+prevent further workload cancellation until the tree ends independently. Unknown
+outcomes still close replay and conservatively retain adopted-tree custody, so
+unrelated surviving Root descendants can prolong supervision after worker loss.
+The role mechanism does not change external CLI transfer ownership or provide
+recovery after loss of both founding reapers. See [DESIGN.md](DESIGN.md) for the
+role-slot protocol, lock ordering and explicit limits.
 
 The retained correction-2 fixture establishes the old three failures. The same
 stimuli now pass with tiny images: founding exit/ready acquisition during recovery,

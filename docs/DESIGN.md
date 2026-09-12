@@ -170,8 +170,16 @@ but it never executes a helper as an incidental enumeration side effect; its dis
 asynchronously. A durable cancellation arriving after the loop's last check defers publication under
 `completion.lock` until the adopted tree has drained; it cannot prematurely publish a cancelled
 Root-scope completion and exempt surviving workload descendants from termination.
-Targeted status, bootstrap-error publication and guardian reconciliation use
+Targeted status and bootstrap-error publication use
 `CompletionDeliveryDisposition::ClaimPending` and wait synchronously for an exact transfer child.
+Guardian reconciliation uses `LeavePending` under a nonblocking reconciliation lock,
+then starts completion asynchronously. External synchronous reconciliation cannot
+hold the guardian away from its cancellation poll. Reaped-transfer integration errors
+retain the transfer and its lock for retry without abandoning physical custody.
+An already recorded delivery outcome survives abnormal execution-role exit.
+UNKNOWN role custody is cleared only after the guardian has reaped the supervisor
+and proved its entire adopted tree empty with ECHILD; delivery metadata still
+independently authorizes (or forbids) another attempt.
 The disposition names who progresses delivery, not how the terminal state was reached. Cross-owner status and
 `list --all` remain observational and do not reconcile state. Cross-route `mode` is likewise a
 point-in-time read, but it still fails closed when the durable activation outcome is unsettled.
@@ -358,25 +366,59 @@ downstream notification. The detach JSON serializer retains the established wire
 does not mean the spooler observed downstream notification. It also does not report whether the
 activation helper operation ran; that operation is internal to every claimed transition.
 
-Detach and completion first fork a local delivery transfer worker while retaining `delivery.lock`. That worker
-persists `activation-attempted` plus canonical `async` mode, or `attempted=true` plus
-`error_code="delivery_attempt_in_progress"`, immediately before it launches the helper. The worker
-retains the lock and persists the observed outcome even if the initiating CLI or supervisor dies.
-The live supervisor acquires the lock nonblocking and places completion image acquisition inside
-that same worker, before the claim. It does not wait for the worker: its sole event-loop reaper
-integrates the exact PID's result while continuing image-service recovery. Pending delivery keeps
-both Root- and Tree-scope supervisors alive. Ready-mode root-exit observations are deferred while
-a transfer or detach holds the lock, then merged from current persisted metadata. Targeted control
-callers remain synchronous exact-child waiters. Workers are fork-then-Rust children of single-threaded
-processes, not background-thread forks; completion workers close unrelated inherited descriptors.
-Cancellation waits for the workload tree to drain before publishing its own completion notification,
-which is not signalled as workload again. Owner loss after readiness can still terminate an active
-ready transfer; an unresolved admitted outcome remains unknown and cannot be replayed.
-After worker loss with an unknown admitted outcome, the live supervisor conservatively retains
-all adopted children even in Root scope: the surviving helper cannot be distinguished conclusively
-from other adopted descendants. Terminal metadata is available, but physical custody lasts until
-that tree drains (or authorized cancellation terminates it). Normal successful Root delivery does
-not acquire this conservative Tree-custody obligation.
+Detach and external control callers fork a local delivery transfer worker while retaining
+`delivery.lock`. Founding completion execution adds one role custodian between the supervisor
+and that worker. The custodian becomes a Linux subreaper before forking the worker; all helper
+forks, including daemonized/session-changing descendants, stay below it through worker loss.
+The worker persists the write-ahead claim immediately before launching the helper and records
+its outcome. The custodian integrates a lost worker's unknown outcome promptly, but retains
+physical role custody and the delivery flock until `waitpid` proves ECHILD.
+
+A shared anonymous atomic slot is created before the guardian/supervisor fork. The supervisor
+publishes the exact, unreaped custodian PID before releasing an execution gate. No process scan,
+name, environment tag or post-exec enrollment supplies that role. Both reapers retire the slot
+**before** reaping its PID. Only the custodian can certify its role subtree drained; abnormal
+custodian death instead records unknown. Guardian takeover inherits the same slot. Cancellation
+excludes the connected role subtree and pins the custodian with a pidfd. Pidfd nonreadiness is
+**not** role-containment evidence: Linux can reparent children before publishing exit readiness.
+After **all** target ancestry reads and pin checks, the reaper publishes a never-reused shared
+atomic challenge. Only the single-threaded custodian acknowledges it, from its userspace reaping
+loop. A fresh response establishes that it had not entered irreversible kernel exit/reparenting
+when the target was classified. Death after that response cannot turn the already-pinned workload
+target into a helper. No response, changed slot, exhausted challenge counter or invalid pin denies
+that signal without claiming cessation. Neither stale acknowledgements nor pidfd nonreadiness
+substitute for the response. This relies on coherent process-shared atomics and ordinary Linux
+exit semantics, not a particular ordering of procfs parent reads versus pidfd exit readiness.
+Unexpected custodian loss fails closed: adopted role identity is unknown, cancellation responsibility
+remains, and no stale numeric exemption is used. This can prevent workload cessation indefinitely;
+it is not a recovery mechanism for loss of the new role custodian or both founding reapers.
+
+Live completion remains asynchronous to image-service recovery. Its `CompletionTransfer` now
+represents the custodian, not the execution worker. Pending role descendants retain both Root-
+and Tree-scope supervisors; guardian recovery polls cancellation instead of blocking on the
+role's delivery flock. The guardian also starts its **own** pending completion using the nonblocking
+start path, retaining its transfer until the wildcard reaper observes that exact child. It never
+joins a completion wait or delivery flock while processing custody; external synchronous callers
+remain unchanged. Ready-mode root status is merged after transfer ownership settles.
+
+The custodian now polls `waitpid(WNOHANG)` every 10ms while children remain, rather than sleeping
+in a blocking wait. Every proposed non-role descendant signal can wait up to 100ms locally for a
+fresh response (1ms polling), in addition to ancestry discovery and OS/filesystem scheduling.
+This adds idle wakeups and O(target-count) handshake latency; it is not an overall cancellation
+latency bound. A stopped/starved custodian or blocked outcome persistence can postpone cancellation;
+retry retains responsibility rather than trusting a stale response. Unknown custodian loss remains
+the explicit no-progress case, distinct from delivery outcome uncertainty.
+Targeted external control callers retain their existing synchronous exact-child waits and external
+custody contract; this is not a global delivery-topology consolidation.
+
+Physical terminal cancellation admission/discharge and TTL deletion additionally serialize under
+`custody.lock`, never held across helper execution. Lock acquisition uses nonblocking flock with
+a 250ms local wait limit; contention returns an error requiring retry, not false acceptance or drain.
+Deletion's order is delivery then custody; terminal admission/discharge takes custody only. This
+bounds lock contention, not filesystem I/O latency. Ordinary root completion and its rc remain
+immutable while cancellation terminates workload descendants and preserves completion delivery.
+The conservative physical-custody/drained markers remain until the entire owned tree, including
+any unfinished helper role, has settled. They do not assert remote notification or ACK success.
 
 These are write-ahead transfer claims: once present, a successor never hands the same one-shot
 obligation to the helper again, including after a nonzero exit or unknown admitted outcome.

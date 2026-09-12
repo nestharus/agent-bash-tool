@@ -581,6 +581,8 @@ exit 0
     }
 }
 
+// Founding completion's caller is above its role custodian; activation remains
+// a direct worker. Kill the intended initiating actor, not the new custodian.
 fn parent_killing_fake_agents(
     temp: &tempfile::TempDir,
     killed_operation: &str,
@@ -592,8 +594,28 @@ fn parent_killing_fake_agents(
     fs::write(
         &fake,
         format!(
-            "#!/bin/sh\noperation=${{2:-}}\nif [ \"$operation\" = {} ]; then\n  printf '%s\\n' \"$operation\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\n  caller_pid=$(ps -o ppid= -p \"$PPID\")\n  kill -KILL \"$caller_pid\"\nfi\nexit 0\n",
-            shell_quote(Path::new(killed_operation))
+            r#"#!/usr/bin/python3
+import os, select, signal, sys
+from pathlib import Path
+operation = sys.argv[2] if len(sys.argv) > 2 else ''
+if operation == '{}':
+    def parent(pid):
+        return int(Path('/proc/' + str(pid) + '/stat').read_text().rsplit(') ', 1)[1].split()[1])
+    worker = os.getppid()
+    owner = parent(worker)
+    caller = parent(owner) if operation == 'agent-bash-complete' else owner
+    fd = os.pidfd_open(caller)
+    assert (parent(owner) if operation == 'agent-bash-complete' else parent(worker)) == caller
+    poll = select.poll(); poll.register(fd, select.POLLIN)
+    assert not poll.poll(0)
+    signal.pidfd_send_signal(fd, signal.SIGKILL)
+    assert poll.poll(3000), 'intended caller loss not observed'
+    log = Path(os.environ['AGENT_BASH_FAKE_DELIVERY_LOG'])
+    Path(str(log) + '.loss').write_text(str(caller))
+    with log.open('a') as stream: stream.write(operation + '\n')
+    os.close(fd)
+"#,
+            killed_operation
         ),
     )
     .expect("write parent-killing fake");
@@ -630,8 +652,37 @@ fn delivery_handoff_killing_fake_agents(
     fs::write(
         &fake,
         format!(
-            "#!/bin/sh\noperation=${{2:-}}\nif [ \"$operation\" = {} ]; then\n  printf '%s\\n' \"$operation\" >> \"$AGENT_BASH_FAKE_DELIVERY_LOG\"\n  owner_pid=$PPID\n  initiator_pid=$(ps -o ppid= -p \"$owner_pid\" | tr -d ' ')\n  kill -KILL \"$initiator_pid\" \"$owner_pid\"\nfi\nexit 0\n",
-            shell_quote(Path::new(killed_operation))
+            r#"#!/usr/bin/python3
+import os, select, signal, sys
+from pathlib import Path
+operation = sys.argv[2] if len(sys.argv) > 2 else ''
+if operation == '{}':
+    def parent(pid):
+        return int(Path('/proc/' + str(pid) + '/stat').read_text().rsplit(') ', 1)[1].split()[1])
+    worker = os.getppid()
+    owner = parent(worker)
+    caller = parent(owner) if operation == 'agent-bash-complete' else owner
+    guardian = parent(caller)
+    targets = [(pid, os.pidfd_open(pid)) for pid in [caller, worker]]
+    assert os.getppid() == worker and parent(worker) == owner
+    assert (parent(owner) if operation == 'agent-bash-complete' else parent(worker)) == caller
+    for pid, fd in targets:
+        poll = select.poll(); poll.register(fd, select.POLLIN)
+        assert not poll.poll(0)
+        signal.pidfd_send_signal(fd, signal.SIGKILL)
+        assert poll.poll(3000), 'intended loss not observed'
+        os.close(fd)
+    if operation == 'agent-bash-complete':
+        import time
+        deadline = time.monotonic() + 3
+        while parent(owner) != guardian:
+            assert time.monotonic() < deadline, 'custodian takeover not observed'
+            time.sleep(.01)
+    log = Path(os.environ['AGENT_BASH_FAKE_DELIVERY_LOG'])
+    Path(str(log) + '.loss').write_text(str(caller))
+    with log.open('a') as stream: stream.write(operation + '\n')
+"#,
+            killed_operation
         ),
     )
     .expect("write delivery-handoff-killing fake");
@@ -4471,6 +4522,11 @@ fn caller_death_after_completion_handoff_does_not_repeat_delivery() {
         let meta = read_meta(&meta_path);
         (meta["delivery"]["exit_code"] == 0).then_some(meta)
     });
+    let lost_pid: i64 = fs::read_to_string(format!("{}.loss", delivery_log.display()))
+        .expect("helper observed exact caller pidfd exit")
+        .parse()
+        .expect("lost caller PID");
+    assert_eq!(delivered["supervisor_pid"].as_i64(), Some(lost_pid));
     assert_eq!(delivered["delivery"]["attempted"], true);
     assert!(delivered["delivery"]["retryable"].is_null());
     assert!(delivered["delivery"]["error"].is_null());
@@ -4603,6 +4659,11 @@ fn successor_closes_orphaned_completion_transfer_without_replay() {
     let status = status_text(&temp, handle, true);
     assert!(status.starts_with("DONE rc=0"), "{status}");
     let settled = read_meta(&meta_path);
+    let lost_pid: i64 = fs::read_to_string(delivery_log.with_extension("log.loss"))
+        .expect("observed exact caller loss")
+        .parse()
+        .expect("lost caller PID");
+    assert_eq!(settled["supervisor_pid"].as_i64(), Some(lost_pid));
     assert_eq!(
         settled["delivery"]["error_code"],
         "transfer_outcome_unknown"
@@ -6502,3 +6563,6 @@ print('collector accepted six real datagrams, three attempts; loss unknown')
         }
     }
 }
+
+#[path = "fixtures/age362_terminal_cancel.rs"]
+mod age362_terminal_cancel;

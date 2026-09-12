@@ -37,15 +37,36 @@ completion returns synchronously in-band or asynchronously through the agent mai
   tree and finishes any already-accepted explicit cancellation.
 - **Owner-scoped cancellation.** Integrations can opt into an exact PID/start-time/boot-ID lease
   with `run --cancel-on-owner-exit --owner-pid <pid>`. `cancel <handle>`, an owner exit, or an
-  OpenCode tool abort terminates the complete adopted process tree, escalating to `SIGKILL` after
+  OpenCode tool abort terminates the complete adopted workload process tree, escalating to `SIGKILL` after
   a bounded grace period. A direct cancel is accepted when its durable marker is synchronized;
   signaling only wakes the supervisor, which also observes the marker independently. Cancellation
-  captures and validates an exact supervisor pidfd, with no numeric-signal fallback; unavailable
+  of nonterminal work captures and validates an exact supervisor pidfd, with no numeric-signal fallback; unavailable
   capture fails before acceptance. Cancel JSON `requested` reports durable acceptance by this attempt,
   not whether a prior accepted cancellation obligation remains pending (`false` does not mean none
   is pending). `wake`
-  separately reports `not-requested`, `sent`, `supervisor-gone`, or `failed` (`wake_error` gives detail).
-  A sent wake is not proof of completed cancellation or tree cessation. Direct CLI
+  separately reports `not-requested`, `custody-polling`, `sent`, `supervisor-gone`, or `failed` (`wake_error` gives detail).
+  Terminal work with same-boot physical custody accepts cancellation through the existing
+  reapers' durable poll (`custody-polling`, no signal sent by the requester). Empty-tree
+  discharge and this admission are serialized; drained work and duplicate terminal requests
+  are no-ops. Completed root status/rc and notification/ACK custody remain unchanged.
+  Admission does not wait on the completion helper's delivery lock. Founding completion
+  uses a separate subreaper role custodian, preserving helpers and their descendants
+  through worker loss and guardian takeover. Before signaling, a fresh post-ancestry
+  userspace acknowledgement from that custodian proves role containment; pidfd
+  nonreadiness alone is insufficient during kernel exit. Guardian-created completion
+  also leaves its cancellation poll active. The custodian polls every 10ms, and each
+  signal proof may wait 100ms for acknowledgement; these are not end-to-end bounds.
+  Unexpected role-custodian loss retains
+  uncertainty and may prevent cancellation progress; it never grants a stale PID exemption.
+  Descendant PID scans are discovery hints only: each signal uses a pidfd after
+  validating a live, pidfd-pinned parent chain to the adopting reaper. Unknown,
+  exited or changed ancestry is skipped and retried, never numerically signaled;
+  only an empty-tree reaping observation discharges cancellation custody.
+  Descendant signal validation requires `/proc` to expose the same PID-namespace
+  coordinates as the reaper's `pidfd_open` calls. A procfs mount from a different
+  PID namespace is unsupported; the current boundary does not verify that mount
+  condition. PIDfd identity checks are not a claim of universal namespace safety.
+  Missing reapers or unavailable pidfds leave drain uncertain, not successful. A sent wake is not proof of completed cancellation or tree cessation. Direct CLI
   runs remain detached unless they explicitly request a lease. Direct cancel and detach require
   the handle's recorded session, attested from the live caller chain by the handle's pinned helper,
   falling back to exact caller-tree ownership only when no session was recorded; `list --all` is

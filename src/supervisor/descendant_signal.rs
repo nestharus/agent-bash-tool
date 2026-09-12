@@ -1,0 +1,418 @@
+//! Numeric discovery is only a hint. Signal authority comes from a live,
+//! pidfd-pinned ancestry chain terminating at this adopting reaper.
+use std::collections::HashSet;
+use std::io;
+use std::os::fd::{AsRawFd, OwnedFd};
+
+use super::{current_pid, open_pidfd, state};
+
+type Pid = libc::pid_t;
+
+trait Boundary {
+    type Handle;
+    fn capture(&mut self, pid: Pid) -> io::Result<Self::Handle>;
+    fn parent(&mut self, pid: Pid) -> Option<Pid>;
+    fn live(&mut self, handle: &Self::Handle) -> bool;
+    fn confirm_role(&mut self) -> bool {
+        true
+    }
+    fn send(&mut self, handle: &Self::Handle, signal: i32) -> io::Result<()>;
+}
+
+struct Kernel<'a> {
+    role_guard: Option<&'a (Pid, OwnedFd)>,
+}
+impl Boundary for Kernel<'_> {
+    type Handle = OwnedFd;
+    fn capture(&mut self, pid: Pid) -> io::Result<OwnedFd> {
+        open_pidfd(pid)
+    }
+    fn parent(&mut self, pid: Pid) -> Option<Pid> {
+        state::process_parent_pid(pid)
+    }
+    fn live(&mut self, handle: &OwnedFd) -> bool {
+        let mut event = libc::pollfd {
+            fd: handle.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Unknown, exited and invalid descriptors all fail closed.
+        unsafe { libc::poll(&mut event, 1, 0) == 0 && event.revents == 0 }
+    }
+    fn confirm_role(&mut self) -> bool {
+        // Fresh userspace response follows ALL ancestry reads. Kernel exit can
+        // reparent helpers before pidfd readiness, but cannot answer a challenge.
+        self.role_guard.is_none_or(|(pid, guard)| {
+            crate::delivery_role::confirm_containment(*pid) && self.live(guard)
+        })
+    }
+    fn send(&mut self, handle: &OwnedFd, signal: i32) -> io::Result<()> {
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                handle.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub(super) fn signal(
+    pid: Pid,
+    signal: i32,
+    infrastructure: Option<Pid>,
+    role: Option<&(Pid, OwnedFd)>,
+) {
+    // Failed capture/validation/send leaves the existing cancellation obligation
+    // intact. Both reapers retry and escalate. The guardian requires ECHILD;
+    // the live supervisor also has the non-spawning image-owner shortcut.
+    let _ = signal_using_exclusions(
+        &mut Kernel { role_guard: role },
+        current_pid(),
+        pid,
+        signal,
+        &[infrastructure, role.map(|(pid, _)| *pid)],
+    );
+}
+
+struct Link<H> {
+    pid: Pid,
+    parent: Pid,
+    handle: H,
+}
+
+#[cfg(test)]
+fn signal_using<B: Boundary>(
+    boundary: &mut B,
+    root: Pid,
+    pid: Pid,
+    signal: i32,
+    infrastructure: Option<Pid>,
+) -> io::Result<bool> {
+    signal_using_exclusions(boundary, root, pid, signal, &[infrastructure])
+}
+
+fn signal_using_exclusions<B: Boundary>(
+    boundary: &mut B,
+    root: Pid,
+    pid: Pid,
+    signal: i32,
+    exclusions: &[Option<Pid>],
+) -> io::Result<bool> {
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = pid;
+    while cursor != root {
+        if cursor <= 1 || exclusions.contains(&Some(cursor)) || !seen.insert(cursor) {
+            return Ok(false);
+        }
+        // Pin BEFORE observing /proc, including every intermediate ancestor.
+        let handle = boundary.capture(cursor)?;
+        let Some(parent) = boundary.parent(cursor) else {
+            return Ok(false);
+        };
+        chain.push(Link {
+            pid: cursor,
+            parent,
+            handle,
+        });
+        cursor = parent;
+    }
+    let Some(target) = chain.first() else {
+        return Ok(false);
+    };
+    // Re-read edges after every referenced ancestor has been captured. A parent
+    // dying/reparenting during capture invalidates the pass (retry on next poll).
+    // Then check ALL pins after ALL numeric reads: a live pidfd cannot refer to
+    // an earlier occupant of any /proc slot observed above. Unlike start ticks,
+    // this temporal proof does not depend on clock granularity or boot markers.
+    if chain
+        .iter()
+        .any(|link| boundary.parent(link.pid) != Some(link.parent))
+        || chain.iter().any(|link| !boundary.live(&link.handle))
+    {
+        return Ok(false);
+    }
+    // Root is this process, not a caller-supplied stale PID. Reparenting after
+    // proof does not revoke ownership: the live supervisor/guardian is a
+    // subreaper. Exit/reuse after proof cannot retarget this stable handle.
+    if !boundary.confirm_role() {
+        return Err(io::Error::other(
+            "delivery role did not confirm containment",
+        ));
+    }
+    boundary.send(&target.handle, signal)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Injected {
+        parents: HashMap<Pid, Pid>,
+        reads: usize,
+        change_on_read: Option<(usize, Pid, Option<Pid>)>,
+        dead: HashSet<Pid>,
+        capture_error: Option<Pid>,
+        sent: Vec<Pid>,
+        role_unresponsive: bool,
+        confirmation_reads: Vec<usize>,
+    }
+    impl Boundary for Injected {
+        type Handle = Pid;
+        fn capture(&mut self, pid: Pid) -> io::Result<Pid> {
+            if self.capture_error == Some(pid) {
+                return Err(io::Error::other("unavailable"));
+            }
+            Ok(pid)
+        }
+        fn parent(&mut self, pid: Pid) -> Option<Pid> {
+            self.reads += 1;
+            if let Some((at, changed, parent)) = self.change_on_read
+                && at == self.reads
+            {
+                match parent {
+                    Some(parent) => {
+                        self.parents.insert(changed, parent);
+                    }
+                    None => {
+                        self.parents.remove(&changed);
+                    }
+                }
+            }
+            self.parents.get(&pid).copied()
+        }
+        fn live(&mut self, handle: &Pid) -> bool {
+            !self.dead.contains(handle)
+        }
+        fn confirm_role(&mut self) -> bool {
+            self.confirmation_reads.push(self.reads);
+            !self.role_unresponsive
+        }
+        fn send(&mut self, handle: &Pid, _: i32) -> io::Result<()> {
+            self.sent.push(*handle);
+            Ok(())
+        }
+    }
+    fn tree() -> Injected {
+        Injected {
+            parents: [(30, 20), (20, 10)].into(),
+            ..Default::default()
+        }
+    }
+    fn attempt(b: &mut Injected) -> io::Result<bool> {
+        signal_using(b, 10, 30, libc::SIGTERM, None)
+    }
+    #[test]
+    fn adopted_helper_before_role_exit_readiness_cannot_be_signaled() {
+        let mut b = tree();
+        // Already adopted helper passes both parent reads and every pidfd
+        // remains nonready. No new custodian response is possible after exit.
+        b.parents.insert(30, 10);
+        b.role_unresponsive = true;
+        assert!(attempt(&mut b).is_err());
+        assert_eq!(b.confirmation_reads, [2]);
+        assert!(b.sent.is_empty());
+        let mut workload = tree();
+        assert!(attempt(&mut workload).unwrap());
+        assert_eq!(workload.confirmation_reads, [4]);
+        assert_eq!(workload.sent, [30]);
+    }
+
+    #[test]
+    fn exact_descendant_boundary_rejects_reused_target_or_ancestor() {
+        for dead in [20, 30] {
+            let mut b = tree();
+            // Numeric ancestry can look identical after reuse; the captured
+            // old identity's pidfd must nevertheless be dead.
+            b.dead.insert(dead);
+            assert!(!attempt(&mut b).unwrap());
+            assert!(b.sent.is_empty());
+        }
+    }
+    #[test]
+    fn exact_descendant_boundary_retries_disappearance_and_reparenting() {
+        for parent in [None, Some(10), Some(99)] {
+            let mut b = tree();
+            b.change_on_read = Some((3, 30, parent));
+            assert!(!attempt(&mut b).unwrap());
+            assert!(b.sent.is_empty());
+            if parent == Some(10) {
+                assert!(attempt(&mut b).unwrap());
+                assert_eq!(b.sent, [30]);
+            }
+        }
+    }
+    #[test]
+    fn exact_descendant_boundary_rejects_unknown_wrong_owner_and_infrastructure() {
+        let mut b = tree();
+        b.capture_error = Some(20);
+        assert!(attempt(&mut b).is_err());
+        assert!(b.sent.is_empty());
+        let mut b = tree();
+        b.parents.insert(20, 1);
+        assert!(!attempt(&mut b).unwrap());
+        assert!(b.sent.is_empty());
+        let mut b = tree();
+        assert!(!signal_using(&mut b, 10, 30, libc::SIGTERM, Some(20)).unwrap());
+        assert!(b.sent.is_empty());
+    }
+
+    struct Child(std::process::Child);
+    impl Child {
+        fn new() -> Self {
+            Self(
+                std::process::Command::new("/bin/sleep")
+                    .env_clear()
+                    .arg("60")
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+        fn pid(&self) -> Pid {
+            self.0.id() as Pid
+        }
+        fn stop(&mut self) {
+            self.0.kill().unwrap();
+            self.0.wait().unwrap();
+        }
+    }
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // Injection is at the same capture/read/send boundary used by production.
+    // Descriptors and signal syscall remain real, unlike the structural tests.
+    struct ExitRace<'a> {
+        target: &'a mut Child,
+        replacement: Pid,
+        at_send: bool,
+        stopped: bool,
+        sends: usize,
+    }
+    impl Boundary for ExitRace<'_> {
+        type Handle = OwnedFd;
+        fn capture(&mut self, pid: Pid) -> io::Result<OwnedFd> {
+            Kernel { role_guard: None }.capture(pid)
+        }
+        fn parent(&mut self, pid: Pid) -> Option<Pid> {
+            if !self.at_send && !self.stopped {
+                self.target.stop();
+                self.stopped = true;
+            }
+            // Deterministic logical slot reuse: numeric reads show a live
+            // replacement with a plausible owned parent, while the fd is old.
+            Kernel { role_guard: None }.parent(if self.stopped { self.replacement } else { pid })
+        }
+        fn live(&mut self, handle: &OwnedFd) -> bool {
+            Kernel { role_guard: None }.live(handle)
+        }
+        fn send(&mut self, handle: &OwnedFd, signal: i32) -> io::Result<()> {
+            self.sends += 1;
+            self.target.stop();
+            self.stopped = true;
+            Kernel { role_guard: None }.send(handle, signal)
+        }
+    }
+
+    #[test]
+    fn lost_role_pin_prevents_signal_even_with_an_owned_live_target() {
+        let mut role = Child::new();
+        let target = Child::new();
+        let role_pin = Kernel { role_guard: None }.capture(role.pid()).unwrap();
+        let target_pin = Kernel { role_guard: None }.capture(target.pid()).unwrap();
+        role.stop();
+        let role_identity = (role.pid(), role_pin);
+        let mut boundary = Kernel {
+            role_guard: Some(&role_identity),
+        };
+        assert!(
+            signal_using(
+                &mut boundary,
+                current_pid(),
+                target.pid(),
+                libc::SIGKILL,
+                None
+            )
+            .is_err()
+        );
+        assert!(Kernel { role_guard: None }.live(&target_pin));
+    }
+
+    #[test]
+    fn exact_descendant_real_signal_and_wrong_root_noop() {
+        let mut target = Child::new();
+        let unrelated = Child::new();
+        let sentinel = Kernel { role_guard: None }
+            .capture(unrelated.pid())
+            .unwrap();
+        assert!(
+            !signal_using(
+                &mut Kernel { role_guard: None },
+                unrelated.pid(),
+                target.pid(),
+                libc::SIGKILL,
+                None
+            )
+            .unwrap()
+        );
+        assert!(target.0.try_wait().unwrap().is_none());
+        assert!(
+            signal_using(
+                &mut Kernel { role_guard: None },
+                current_pid(),
+                target.pid(),
+                libc::SIGKILL,
+                None
+            )
+            .unwrap()
+        );
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(target.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(Kernel { role_guard: None }.live(&sentinel));
+    }
+
+    #[test]
+    fn exact_descendant_real_pidfd_rejects_numeric_replacement_and_late_exit() {
+        for at_send in [false, true] {
+            let mut target = Child::new();
+            let unrelated = Child::new();
+            let sentinel = Kernel { role_guard: None }
+                .capture(unrelated.pid())
+                .unwrap();
+            let pid = target.pid();
+            let mut boundary = ExitRace {
+                target: &mut target,
+                replacement: unrelated.pid(),
+                at_send,
+                stopped: false,
+                sends: 0,
+            };
+            let result = signal_using(&mut boundary, current_pid(), pid, libc::SIGKILL, None);
+            if at_send {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ESRCH));
+                assert_eq!(boundary.sends, 1);
+            } else {
+                assert!(!result.unwrap());
+                assert_eq!(boundary.sends, 0);
+            }
+            assert!(
+                Kernel { role_guard: None }.live(&sentinel),
+                "replacement must not receive signal"
+            );
+        }
+    }
+}

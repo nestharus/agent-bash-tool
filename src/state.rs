@@ -37,6 +37,7 @@ pub(crate) struct StatePaths {
     pub(crate) activation_attempted: PathBuf,
     pub(crate) activation_outcome: PathBuf,
     pub(crate) delivery_lock: PathBuf,
+    pub(crate) custody_lock: PathBuf,
     pub(crate) accepted_cancel: PathBuf,
     pub(crate) cancellation_drained: PathBuf,
     pub(crate) physical_custody: PathBuf,
@@ -63,6 +64,7 @@ impl StatePaths {
             activation_attempted: state_dir.join("activation-attempted"),
             activation_outcome: state_dir.join("activation-outcome"),
             delivery_lock: state_dir.join("delivery.lock"),
+            custody_lock: state_dir.join("custody.lock"),
             accepted_cancel: state_dir.join("cancel-requested"),
             cancellation_drained: state_dir.join("cancel-workload-drained"),
             physical_custody: state_dir.join("physical-custody"),
@@ -650,6 +652,40 @@ pub(crate) fn lock_completion(paths: &StatePaths) -> io::Result<File> {
     Ok(file)
 }
 
+// Short physical-admission/discharge critical sections only. No helper execution
+// owns this lock, and even a stopped critical-section owner cannot block a caller
+// indefinitely. Timeout is an error/retry, not acceptance or drain evidence.
+fn lock_custody(paths: &StatePaths) -> io::Result<File> {
+    use std::os::fd::AsRawFd;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&paths.custody_lock)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        let err = io::Error::last_os_error();
+        if !matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ) {
+            return Err(err);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "custody serialization busy; retry",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 pub(crate) fn record_explicit_cancel_acceptance(paths: &StatePaths) -> io::Result<bool> {
     record_durable_create_once_marker(&paths.accepted_cancel, &paths.state_dir)
 }
@@ -660,14 +696,41 @@ pub(crate) fn begin_physical_custody(paths: &StatePaths) -> io::Result<()> {
     atomic_write(&paths.physical_custody, current_boot_id().as_bytes())
 }
 
+// Share the discharge/reaping lock, not completion.lock: terminal admission
+// cannot recreate a responsibility already discharged by an empty-tree observer.
+// External transfer custody alone never authorizes workload cancellation.
+pub(crate) fn accept_terminal_custody_cancel(paths: &StatePaths) -> io::Result<bool> {
+    let _lock = lock_custody(paths)?;
+    let recorded_boot = match fs::read_to_string(&paths.physical_custody) {
+        Ok(boot) => boot,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    let boot = current_boot_id();
+    if !valid_boot_id(&recorded_boot) || !valid_boot_id(&boot) {
+        return Err(io::Error::other(
+            "physical custody boot identity unavailable",
+        ));
+    }
+    if recorded_boot != boot || durable_marker_exists(&paths.cancellation_drained)? {
+        return Ok(false);
+    }
+    record_explicit_cancel_acceptance(paths)
+}
+
 pub(crate) fn end_physical_custody(paths: &StatePaths) -> io::Result<()> {
-    let _lock = match lock_delivery(paths) {
+    let _lock = match lock_custody(paths) {
         Ok(lock) => lock,
         // Another empty-tree observer already discharged custody and cleanup
         // removed the directory after the supervisor exited.
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     };
+    // This caller has observed an empty tree. Read acceptance under the same
+    // lock as terminal admission, including requests arriving after its last poll.
+    if durable_marker_exists(&paths.accepted_cancel)? {
+        record_cancellation_drained(paths)?;
+    }
     rollback_created_marker(&paths.physical_custody, &File::open(&paths.state_dir)?)
 }
 
@@ -1022,6 +1085,10 @@ fn reap_state_entry(
             return;
         }
     };
+    // Lock order is delivery -> custody; admission never takes delivery.
+    let Ok(_custody_lock) = lock_custody(&paths) else {
+        return;
+    };
     if !state_dir_reap_eligible(&paths, config, boot_id) {
         return;
     }
@@ -1033,6 +1100,14 @@ fn reap_state_entry(
 }
 
 pub(crate) fn try_lock_delivery(paths: &StatePaths) -> io::Result<Option<File>> {
+    try_lock_file(&paths.delivery_lock)
+}
+
+pub(crate) fn try_lock_reconciliation(paths: &StatePaths) -> io::Result<Option<File>> {
+    try_lock_file(&paths.reconciliation_lock)
+}
+
+fn try_lock_file(path: &Path) -> io::Result<Option<File>> {
     use std::os::fd::AsRawFd;
 
     let file = OpenOptions::new()
@@ -1041,7 +1116,7 @@ pub(crate) fn try_lock_delivery(paths: &StatePaths) -> io::Result<Option<File>> 
         .write(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .mode(0o600)
-        .open(&paths.delivery_lock)?;
+        .open(path)?;
     loop {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(Some(file));
@@ -1882,6 +1957,79 @@ mod tests {
         // must explicitly discharge the physical obligation.
         end_physical_custody(&paths).unwrap();
         assert_eq!(reap_state_dirs(temp.path(), config).reaped, 1);
+    }
+
+    #[test]
+    fn terminal_custody_cancel_and_discharge_preserve_both_lock_orders() {
+        for accept_first in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = write_reap_state(temp.path(), "ab_terminal_cancel", "DONE", 1, true);
+            begin_physical_custody(&paths).unwrap();
+            let before = fs::read(&paths.meta).unwrap();
+            if accept_first {
+                assert!(accept_terminal_custody_cancel(&paths).unwrap());
+                assert!(!accept_terminal_custody_cancel(&paths).unwrap());
+                assert!(!paths.cancellation_drained.exists());
+            }
+            // Empty-tree observer's call, including late admission after its
+            // last cancellation poll; no actual process cessation is inferred.
+            end_physical_custody(&paths).unwrap();
+            assert!(!accept_terminal_custody_cancel(&paths).unwrap());
+            assert_eq!(paths.accepted_cancel.exists(), accept_first);
+            assert_eq!(paths.cancellation_drained.exists(), accept_first);
+            assert!(!paths.physical_custody.exists());
+            assert_eq!(fs::read(&paths.meta).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn custody_serialization_is_independent_and_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = write_reap_state(temp.path(), "ab_custody_lock", "DONE", 1, true);
+        begin_physical_custody(&paths).unwrap();
+        let _delivery = lock_delivery(&paths).unwrap();
+        // A helper may keep this delivery flock indefinitely. Neither operation
+        // below joins it, including duplicate admission and discharge.
+        assert!(accept_terminal_custody_cancel(&paths).unwrap());
+        assert!(!accept_terminal_custody_cancel(&paths).unwrap());
+        let custody = lock_custody(&paths).unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(
+            end_physical_custody(&paths).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert!(paths.physical_custody.exists());
+        assert!(!paths.cancellation_drained.exists());
+        drop(custody);
+        end_physical_custody(&paths).unwrap();
+        assert!(!accept_terminal_custody_cancel(&paths).unwrap());
+    }
+
+    #[test]
+    fn terminal_cancel_never_uses_external_or_unknown_boot_custody_as_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = write_reap_state(temp.path(), "ab_terminal_authority", "DONE", 1, true);
+        assert!(begin_external_transfer_custody(&paths).unwrap());
+        let external = fs::read(&paths.external_transfer_custody).unwrap();
+        assert!(!accept_terminal_custody_cancel(&paths).unwrap());
+        fs::write(&paths.physical_custody, "unknown").unwrap();
+        assert!(accept_terminal_custody_cancel(&paths).is_err());
+        let old_boot = if current_boot_id() == "00000000-0000-0000-0000-000000000000" {
+            "11111111-1111-1111-1111-111111111111"
+        } else {
+            "00000000-0000-0000-0000-000000000000"
+        };
+        fs::write(&paths.physical_custody, old_boot).unwrap();
+        assert!(!accept_terminal_custody_cancel(&paths).unwrap());
+        begin_physical_custody(&paths).unwrap();
+        record_cancellation_drained(&paths).unwrap();
+        assert!(!accept_terminal_custody_cancel(&paths).unwrap());
+        assert!(!paths.accepted_cancel.exists());
+        assert_eq!(
+            fs::read(&paths.external_transfer_custody).unwrap(),
+            external
+        );
     }
 
     #[test]

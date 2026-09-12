@@ -1,3 +1,5 @@
+mod descendant_signal;
+
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{self, File};
@@ -219,6 +221,7 @@ pub(crate) struct CancelOutcome {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum CancelWake {
     NotRequested,
+    CustodyPolling,
     Sent,
     SupervisorGone,
     Failed,
@@ -245,12 +248,15 @@ fn request_cancel_using(
 ) -> io::Result<CancelOutcome> {
     let meta = wait_for_supervisor_metadata(paths)?;
     if state::terminal(&meta) {
-        return Ok(CancelOutcome::not_requested());
+        return request_terminal_cancel(paths);
     }
     let completion_lock = state::lock_completion(paths)?;
     let current = state::read_meta(paths)?;
     if state::terminal(&current) {
-        return Ok(CancelOutcome::not_requested());
+        // Delivery operations acquire completion.lock under delivery.lock.
+        // Release it before joining custody admission/discharge serialization.
+        drop(completion_lock);
+        return request_terminal_cancel(paths);
     }
     let captured = match supervisor_identity(&current) {
         Some(identity) => capture(&identity)?,
@@ -287,6 +293,20 @@ fn request_cancel_using(
         requested: true,
         wake,
         wake_error,
+    })
+}
+
+// Logical completion is immutable, but the existing adopting reapers may still
+// own physical work. Do not signal the exited root/supervisor or invent a new
+// process identity: their durable custody handoff is polled by the live owner.
+fn request_terminal_cancel(paths: &StatePaths) -> io::Result<CancelOutcome> {
+    if !state::accept_terminal_custody_cancel(paths)? {
+        return Ok(CancelOutcome::not_requested());
+    }
+    Ok(CancelOutcome {
+        requested: true,
+        wake: CancelWake::CustodyPolling,
+        wake_error: None,
     })
 }
 
@@ -392,7 +412,9 @@ unsafe fn daemonization_child(config: SupervisorConfig) -> ! {
         );
         unsafe { libc::_exit(EX_SOFTWARE) };
     }
-    if state::begin_physical_custody(&config.paths).is_err() {
+    if crate::delivery_role::initialize().is_err()
+        || state::begin_physical_custody(&config.paths).is_err()
+    {
         unsafe { libc::_exit(EX_SOFTWARE) };
     }
     let guardian_paths = config.paths.clone();
@@ -431,6 +453,8 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
     // completion does not discharge this guardian's physical reaping custody.
     let mut completion_reconciled = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
     let mut recovered_cancel_escalation = None;
+    let mut completion_transfer = None;
+    let mut reaped_transfer = None;
     loop {
         let accepted_cancel = match explicit_cancel_accepted(paths) {
             Ok(accepted) => accepted,
@@ -446,24 +470,50 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
                 continue;
             }
         };
-        // This proof precedes cancellation publication/admission. It protects
-        // only the new cancellation notification, not an existing ready transfer
-        // or descendants merely associated with some terminal metadata.
+        // Role custody, not terminal reason, separates completion execution from
+        // workload. It survives the supervisor whose exact exit was observed above.
         let cancel_workload = accepted_cancel && !cancellation_drained;
         if cancel_workload {
             let escalation = recovered_cancel_escalation
                 .get_or_insert_with(CancellationEscalation::begin_guardian_takeover);
             signal_descendants(current_pid(), escalation.signal(), None);
         }
-        let adopted_tree_empty = reap_adopted_children();
+        let adopted_tree_empty =
+            match reap_guardian_children(&mut completion_transfer, &mut reaped_transfer) {
+                Ok(empty) => empty,
+                Err(_) => {
+                    std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                    continue;
+                }
+            };
+        if let Some((transfer, status)) = reaped_transfer.as_ref() {
+            let integrated = state::read_meta(paths)
+                .and_then(|mut meta| transfer.finish(paths, &mut meta, *status));
+            if integrated.is_err() {
+                std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                continue;
+            }
+            reaped_transfer = None;
+        }
+        if adopted_tree_empty {
+            crate::delivery_role::guardian_tree_drained();
+        }
         // Durable helper handback can precede the worker's _exit. After abnormal
         // supervisor loss this guardian is its sole adopting reaper. Do not
         // orphan it (or other adopted descendants) merely because metadata is
         // terminal, and do not progress an already reconciled delivery again.
         if completion_reconciled && adopted_tree_empty {
-            return state::end_physical_custody(paths)
-                .map(|()| 0)
-                .unwrap_or(EX_SOFTWARE);
+            match state::end_physical_custody(paths) {
+                Ok(()) => return 0,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                    continue;
+                }
+                Err(_) => {
+                    std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                    continue;
+                }
+            }
         }
         if cancel_workload
             && adopted_tree_empty
@@ -472,7 +522,12 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
             std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
             continue;
         }
-        if completion_reconciled || (cancel_workload && !adopted_tree_empty) {
+        // Do not join the helper's long delivery flock during role custody.
+        // Cancellation may arrive AFTER takeover, while this role is still held.
+        if completion_reconciled
+            || (cancel_workload && !adopted_tree_empty)
+            || (crate::delivery_role::pending() && !adopted_tree_empty)
+        {
             std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
             continue;
         }
@@ -480,30 +535,49 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
             paths,
             accepted_cancel && (adopted_tree_empty || cancellation_drained),
         ) {
-            Ok(meta) if state::terminal(&meta) || !state::running_exit_mode(&meta) => {
-                completion_reconciled = true;
+            Ok(Some(mut meta)) if state::terminal(&meta) || !state::running_exit_mode(&meta) => {
+                match delivery::try_start_completion_delivery(paths, &mut meta) {
+                    Ok(delivery::CompletionStart::Busy) => {
+                        std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                    }
+                    Ok(delivery::CompletionStart::Settled) => completion_reconciled = true,
+                    Ok(delivery::CompletionStart::Running(transfer)) => {
+                        completion_transfer = Some(transfer);
+                        // Delivery is now owned by our nonblocking child reaper.
+                        // Physical emptiness still gates guardian retirement.
+                        completion_reconciled = true;
+                    }
+                    Err(_) => std::thread::sleep(SUPERVISOR_RECOVERY_POLL),
+                }
             }
-            Ok(_) => std::thread::sleep(SUPERVISOR_RECOVERY_POLL),
-            Err(_) => return EX_SOFTWARE,
+            Ok(_) | Err(_) => std::thread::sleep(SUPERVISOR_RECOVERY_POLL),
         }
     }
 }
 
-fn reap_adopted_children() -> bool {
+fn reap_guardian_children(
+    transfer: &mut Option<delivery::CompletionTransfer>,
+    reaped: &mut Option<(delivery::CompletionTransfer, i32)>,
+) -> io::Result<bool> {
     loop {
-        let mut status = 0;
-        let waited = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-        if waited > 0 {
-            continue;
-        }
-        if waited == 0 {
-            return false;
-        }
-        let err = io::Error::last_os_error();
+        let err = match crate::delivery_role::reap_one(libc::WNOHANG) {
+            Ok(Some((pid, status))) => {
+                if transfer.as_ref().map(delivery::CompletionTransfer::pid) == Some(pid) {
+                    *reaped = Some((transfer.take().expect("matched guardian transfer"), status));
+                }
+                continue;
+            }
+            Ok(None) => return Ok(false),
+            Err(err) => err,
+        };
         if err.kind() == io::ErrorKind::Interrupted {
             continue;
         }
-        return err.raw_os_error() == Some(libc::ECHILD);
+        return if err.raw_os_error() == Some(libc::ECHILD) {
+            Ok(true)
+        } else {
+            Err(err)
+        };
     }
 }
 
@@ -998,13 +1072,11 @@ fn current_pid() -> libc::pid_t {
 }
 
 fn signal_descendants(root_pid: libc::pid_t, signal: i32, infrastructure: Option<libc::pid_t>) {
+    let Ok(role) = crate::delivery_role::exclusion() else {
+        return;
+    };
     for pid in descendant_pids(root_pid) {
-        if infrastructure == Some(pid) {
-            continue;
-        }
-        unsafe {
-            libc::kill(pid, signal);
-        }
+        descendant_signal::signal(pid, signal, infrastructure, role.as_ref());
     }
 }
 
@@ -1452,7 +1524,11 @@ fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
             // Also discharges custody when the guardian itself was lost. If
             // Root descendants remain, only the guardian can later prove empty.
             if loop_state.tree_empty {
-                state::end_physical_custody(&loop_state.paths)?;
+                match state::end_physical_custody(&loop_state.paths) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(err) => return Err(err),
+                }
             }
             return Ok(());
         }
@@ -1645,9 +1721,9 @@ impl EventLoop {
     }
 
     fn drive_cancellation(&mut self) {
-        // A published cancellation has already drained the workload tree. Its
-        // completion transfer is new delivery responsibility, not more workload
-        // to terminate. A ready-sentinel transfer remains cancellable on owner loss.
+        // A published cancellation already drained the workload tree. Other
+        // terminal reasons can still have cancellable workload, but the execution
+        // role boundary below protects completion helpers in every ordering.
         if self.completion_recorded
             && self
                 .meta
@@ -1785,9 +1861,8 @@ impl EventLoop {
 
     fn reap_children(&mut self) -> io::Result<()> {
         loop {
-            let mut status = 0;
-            let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-            if pid > 0 {
+            let result = crate::delivery_role::reap_one(libc::WNOHANG);
+            if let Ok(Some((pid, status))) = result {
                 self.image_owner.reaped(pid);
                 self.integrate_completion_transfer(pid, status)?;
                 if pid == self.root_pid {
@@ -1795,11 +1870,13 @@ impl EventLoop {
                 }
                 continue;
             }
-            if pid == 0 {
-                self.tree_empty = self.image_owner.only_child();
-                return Ok(());
-            }
-            let err = io::Error::last_os_error();
+            let err = match result {
+                Ok(_) => {
+                    self.tree_empty = self.image_owner.only_child();
+                    return Ok(());
+                }
+                Err(err) => err,
+            };
             if matches!(err.raw_os_error(), Some(libc::ECHILD)) {
                 self.tree_empty = true;
                 return Ok(());
@@ -1873,9 +1950,9 @@ impl EventLoop {
     }
 
     fn mark_completion_delivery_settled(&mut self) {
-        // A dead worker may have left its admitted helper among adopted children.
-        // Unknown settles replay eligibility, not physical custody. Without a
-        // conclusive helper handback retain the adopted tree even in Root scope.
+        // Worker loss is integrated by the role custodian, which retains helper
+        // descendants until ECHILD. Unexpected custodian loss can still leave
+        // indistinguishable adopted children. Unknown is not physical discharge.
         self.completion_tree_pending = self.meta.delivery.completion_lifecycle()
             == state::CompletionDeliveryLifecycle::NonReplayableUnknownTransfer;
         self.completion_delivery_settled = true;
@@ -2213,12 +2290,18 @@ pub(crate) fn reconcile_lost_supervisor_for_list(paths: &StatePaths) -> io::Resu
 fn reconcile_lost_supervisor_after_guardian(
     paths: &StatePaths,
     accepted_cancel_tree_empty: bool,
-) -> io::Result<Meta> {
-    reconcile_lost_supervisor_with_delivery(
+) -> io::Result<Option<Meta>> {
+    // External ClaimPending reconciliation can hold this through helper exit.
+    // The last physical owner must return to cancellation polling instead.
+    let Some(_lock) = state::try_lock_reconciliation(paths)? else {
+        return Ok(None);
+    };
+    reconcile_lost_supervisor_locked(
         paths,
-        CompletionDeliveryDisposition::ClaimPending,
+        CompletionDeliveryDisposition::LeavePending,
         accepted_cancel_tree_empty,
     )
+    .map(Some)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2234,6 +2317,14 @@ fn reconcile_lost_supervisor_with_delivery(
     accepted_cancel_tree_empty: bool,
 ) -> io::Result<Meta> {
     let _lock = state::lock_reconciliation(paths)?;
+    reconcile_lost_supervisor_locked(paths, delivery_disposition, accepted_cancel_tree_empty)
+}
+
+fn reconcile_lost_supervisor_locked(
+    paths: &StatePaths,
+    delivery_disposition: CompletionDeliveryDisposition,
+    accepted_cancel_tree_empty: bool,
+) -> io::Result<Meta> {
     let mut meta = state::read_meta(paths)?;
     if state::terminal(&meta) {
         if delivery_disposition == CompletionDeliveryDisposition::ClaimPending {
@@ -2875,7 +2966,8 @@ for line in sys.stdin:
         supervisor.wait().expect("reap supervisor identity");
 
         let terminal = reconcile_lost_supervisor_after_guardian(&paths, true)
-            .expect("guardian reconciliation");
+            .expect("guardian reconciliation")
+            .expect("uncontended reconciliation");
 
         assert_eq!(terminal.state, "DONE");
         assert_eq!(

@@ -1235,9 +1235,10 @@ pub(crate) fn register(
     })
 }
 
-// Completion has one active transfer process. The supervisor owns its exact reap
-// through the event loop; synchronous control callers wait for that same exact PID.
-// The shared flock survives parent loss and serializes both acquisition and admission.
+// Founding completion has one active role custodian, with an execution worker
+// below it. The event loop owns the custodian's exact reap. External synchronous
+// control callers retain a direct worker. Delivery flock ownership survives parent
+// loss; physical cancellation admission uses its independent short custody lock.
 pub(crate) struct CompletionTransfer {
     pid: libc::pid_t,
     _lock: DeliveryLockGuard,
@@ -1257,7 +1258,12 @@ impl CompletionTransfer {
 
     // Caller has already reaped this PID. Never wait here: the supervisor's
     // wildcard reaper and a competing exact waiter must not own the same child.
-    pub(crate) fn finish(self, paths: &StatePaths, meta: &mut Meta, status: i32) -> io::Result<()> {
+    pub(crate) fn finish(
+        &self,
+        paths: &StatePaths,
+        meta: &mut Meta,
+        status: i32,
+    ) -> io::Result<()> {
         integrate_completion_transfer(paths, meta, transfer_status(status), self.retry_count)
     }
 }
@@ -1276,10 +1282,32 @@ pub(crate) fn reconcile_completion_delivery(paths: &StatePaths, meta: &mut Meta)
     let lock = DeliveryLockGuard::acquire(paths)?;
     if let CompletionStart::Running(transfer) = start_completion_delivery(paths, meta, lock, true)?
     {
-        let result = wait_for_delivery_transfer_worker(transfer.pid);
+        let result = wait_for_completion_custodian(transfer.pid);
         integrate_completion_transfer(paths, meta, result, transfer.retry_count)?;
     }
     Ok(())
+}
+
+fn wait_for_completion_custodian(pid: libc::pid_t) -> io::Result<()> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as u32,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        } == 0
+        {
+            crate::delivery_role::before_reap(pid);
+            return wait_for_delivery_transfer_worker(pid);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
 }
 
 fn start_completion_delivery(
@@ -1308,16 +1336,53 @@ fn start_completion_delivery(
     ));
     // Single-threaded callers only, matching the existing transfer-worker fork
     // contract. No image acquisition occurs before this ownership boundary.
+    // The gate prevents execution until the adopting reapers know the exact
+    // custodian. EOF before admission creates no helper descendants.
+    let (mut admission, mut gate) = std::os::unix::net::UnixStream::pair()?;
+    let role = crate::delivery_role::enabled();
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         integrate_completion_transfer(paths, meta, Err(io::Error::last_os_error()), retry_count)?;
         return Ok(CompletionStart::Settled);
     }
     if pid == 0 {
-        let result = prepare_completion_worker(lock._file.as_raw_fd())
-            .and_then(|()| execute_completion_transfer(paths, persisted, retry_count, external));
+        drop(admission);
+        let mut accepted = [0];
+        if std::io::Read::read_exact(&mut gate, &mut accepted).is_err() {
+            if role {
+                crate::delivery_role::drained();
+            }
+            unsafe { libc::_exit(70) };
+        }
+        drop(gate);
+        if prepare_completion_worker(lock._file.as_raw_fd()).is_err() {
+            if role {
+                crate::delivery_role::drained();
+            }
+            unsafe { libc::_exit(70) };
+        }
+        let mut custodian_meta = persisted.clone();
+        let work = || execute_completion_transfer(paths, persisted, retry_count, external);
+        if role {
+            crate::delivery_role::run_custodian(work, |status| {
+                integrate_completion_transfer(
+                    paths,
+                    &mut custodian_meta,
+                    transfer_status(status),
+                    retry_count,
+                )
+            });
+        }
+        let result = work();
         unsafe { libc::_exit(if result.is_ok() { 0 } else { 70 }) };
     }
+    drop(gate);
+    if role {
+        crate::delivery_role::publish(pid)?;
+    }
+    // A lost gate reader leaves a waitable child, not an untracked execution.
+    let _ = std::io::Write::write_all(&mut admission, &[1]);
+    drop(admission);
     Ok(CompletionStart::Running(CompletionTransfer {
         pid,
         _lock: lock,
@@ -1392,7 +1457,9 @@ fn integrate_completion_transfer(
             }
             _ => {
                 *meta = observed;
-                return Err(err);
+                // A recorded delivery outcome is not invalidated by execution-role loss.
+                // Physical custody is discharged separately by the adopting reaper.
+                return Ok(());
             }
         };
         observed.touch();
@@ -1989,6 +2056,201 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
+
+    fn continuity_meta(paths: &StatePaths) -> Meta {
+        Meta::new(
+            paths.handle.clone(),
+            unsafe { libc::getpid() },
+            unsafe { libc::getpid() },
+            vec!["true".into()],
+            paths.root.clone(),
+            "exit",
+            state::DeliveryMode::Async,
+            None,
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[test]
+    fn recorded_outcome_survives_worker_and_custodian_failure_integration() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_recorded_loss".into());
+        state::create_handle_state(&paths).unwrap();
+        let mut meta = continuity_meta(&paths);
+        meta.delivery = completion_delivery_meta_from_status(ExitStatus::from_raw(0));
+        state::write_meta_atomic(&paths, &meta).unwrap();
+        let before = fs::read(&paths.meta).unwrap();
+        // The custodian integrates worker loss; the guardian integrates custodian
+        // loss. Both see the same already recorded fact and must not invalidate it.
+        for _ in 0..2 {
+            integrate_completion_transfer(&paths, &mut meta, transfer_status(libc::SIGKILL), 0)
+                .unwrap();
+            assert_eq!(fs::read(&paths.meta).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn reaped_transfer_retains_status_and_lock_after_observed_integration_error() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        crate::delivery_role::initialize().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_integration_error".into());
+        state::create_handle_state(&paths).unwrap();
+        let mut meta = continuity_meta(&paths);
+        meta.delivery = completion_delivery_meta_from_status(ExitStatus::from_raw(0));
+        state::write_meta_atomic(&paths, &meta).unwrap();
+        let saved_meta = fs::read(&paths.meta).unwrap();
+        let lock = DeliveryLockGuard::acquire(&paths).unwrap();
+        // Model an owned custodian with an already recorded helper outcome.
+        // This child executes no helper and exits immediately; the private test
+        // process is its only reaper. No scheduling sleep supplies the witness.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe { libc::_exit(70) };
+        }
+        crate::delivery_role::publish(child).unwrap();
+        let (pid, status) = crate::delivery_role::reap_one(0).unwrap().unwrap();
+        assert_eq!(pid, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 70);
+        let mut reaped = Some((
+            CompletionTransfer {
+                pid,
+                _lock: lock,
+                retry_count: 0,
+            },
+            status,
+        ));
+        fs::write(&paths.meta, b"injected-private-read-error").unwrap();
+        let (transfer, retained_status) = reaped.as_ref().unwrap();
+        let lock_fd = transfer._lock._file.as_raw_fd();
+        // Unlike the process fixture, this enters finish itself and observes its
+        // returned metadata error BEFORE restoration. The guardian's outer read
+        // and event-loop retry scheduling are not executed by this unit test.
+        let err = transfer
+            .finish(&paths, &mut meta, *retained_status)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(
+            err.get_ref()
+                .and_then(|cause| cause.downcast_ref::<serde_json::Error>())
+                .expect("integration returned the injected JSON parse error")
+                .is_syntax()
+        );
+        assert_eq!(
+            fs::read(&paths.meta).unwrap(),
+            b"injected-private-read-error"
+        );
+        let (transfer, retained_status) = reaped.as_ref().unwrap();
+        assert_eq!(transfer.pid(), child);
+        assert_eq!(*retained_status, status);
+        assert_eq!(transfer.retry_count, 0);
+        assert_eq!(transfer._lock._file.as_raw_fd(), lock_fd);
+        assert!(state::try_lock_delivery(&paths).unwrap().is_none());
+        // Exact reap already occurred. Recovery must use retained status, not
+        // obtain a second exit observation or launch a replacement attempt.
+        assert_eq!(
+            crate::delivery_role::reap_one(libc::WNOHANG)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(crate::delivery_role::exclusion().is_err());
+        fs::write(&paths.meta, &saved_meta).unwrap();
+        transfer
+            .finish(&paths, &mut meta, *retained_status)
+            .unwrap();
+        assert_eq!(fs::read(&paths.meta).unwrap(), saved_meta);
+        assert_eq!(meta.delivery.exit_code, Some(0));
+        assert_eq!(
+            meta.delivery.completion_lifecycle(),
+            CompletionDeliveryLifecycle::AdmittedOutcome
+        );
+        assert!(state::try_lock_delivery(&paths).unwrap().is_none());
+        // Integration success does not certify physical role custody or clear
+        // UNKNOWN. Dropping the unit's retained owner, as the guardian does only
+        // after successful integration, is what releases this delivery flock.
+        assert!(crate::delivery_role::exclusion().is_err());
+        reaped = None;
+        assert!(reaped.is_none());
+        assert!(state::try_lock_delivery(&paths).unwrap().is_some());
+        println!(
+            "observed finish JSON syntax error; exact reaped pid/status and flock retained; restored bytes integrated without re-wait; owner drop released flock"
+        );
+    }
+
+    #[test]
+    fn guardian_empty_tree_restores_unknown_role_for_incurred_pre_admission_retry() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        crate::delivery_role::initialize().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_unknown_retry".into());
+        state::create_handle_state(&paths).unwrap();
+        state::write_delivery_mode_atomic(&paths, state::DeliveryMode::Async).unwrap();
+        let mut meta = continuity_meta(&paths);
+        // A real pinned native helper, never the configured runner/provider.
+        meta.delivery_helper = Some(
+            ConfiguredDeliveryHelper::from_resolved_path(Path::new("/usr/bin/true"))
+                .unwrap()
+                .pin_to_handle(&paths)
+                .unwrap()
+                .provenance,
+        );
+        state::write_meta_atomic(&paths, &meta).unwrap();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe { libc::_exit(70) };
+        }
+        crate::delivery_role::publish(child).unwrap();
+        let result = wait_for_completion_custodian(child);
+        assert!(result.is_err());
+        integrate_completion_transfer(&paths, &mut meta, result, 0).unwrap();
+        assert_eq!(
+            meta.delivery.completion_lifecycle(),
+            CompletionDeliveryLifecycle::RetryablePreAdmissionFailure
+        );
+        assert!(crate::delivery_role::exclusion().is_err());
+        assert!(crate::delivery_role::publish(child).is_err());
+        // This private process models the sole guardian after exact supervisor
+        // reap. Actual ECHILD, not another custodian's exit, permits role reset.
+        assert_eq!(
+            crate::delivery_role::reap_one(libc::WNOHANG)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        crate::delivery_role::guardian_tree_drained();
+        assert!(!crate::delivery_role::pending());
+        let CompletionStart::Running(transfer) =
+            try_start_completion_delivery(&paths, &mut meta).unwrap()
+        else {
+            panic!("incurred retry was not started");
+        };
+        let result = wait_for_completion_custodian(transfer.pid());
+        integrate_completion_transfer(&paths, &mut meta, result, transfer.retry_count).unwrap();
+        // The authorized retry actually executes the private native helper.
+        // Successful helper metadata intentionally resets its retry count.
+        assert_eq!(transfer.retry_count, 1);
+        assert_eq!(meta.delivery.exit_code, Some(0));
+        assert_eq!(
+            meta.delivery.completion_lifecycle(),
+            CompletionDeliveryLifecycle::AdmittedOutcome
+        );
+        assert!(!crate::delivery_role::pending());
+        assert_eq!(
+            crate::delivery_role::reap_one(libc::WNOHANG)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum CleanupFault {

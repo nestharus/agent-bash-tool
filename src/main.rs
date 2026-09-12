@@ -3,6 +3,7 @@
 mod cgroup;
 mod config;
 mod delivery;
+mod delivery_role;
 mod guard;
 mod image;
 mod state;

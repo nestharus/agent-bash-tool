@@ -26,14 +26,15 @@ def children(pid):
 
 
 def active_transfer(owner):
-    for parent in children(owner):
-        for child in children(parent):
-            try:
-                args = Path(f'/proc/{child}/cmdline').read_bytes().split(b'\0')
-                if args[1:3] == [b'notify', b'agent-bash-complete']:
-                    return parent, child
-            except FileNotFoundError:
-                pass
+    # Completion now has a role custodian above its execution worker. Discover
+    # the actual helper and return its direct worker, not the extra custodian.
+    for child in f.descendants(owner):
+        try:
+            args = Path(f'/proc/{child}/cmdline').read_bytes().split(b'\0')
+            if args[1:3] == [b'notify', b'agent-bash-complete']:
+                return f.stat(child)[0], child
+        except FileNotFoundError:
+            pass
     return None
 
 
@@ -117,7 +118,7 @@ def wait_settled(item, identity, guardian, transfer, helper_pid, guardian_reaped
 
 
 def acquiring_worker(identity):
-    for pid in children(identity['owner']):
+    for pid in f.descendants(identity['owner']):
         if pid in [identity['custodian'], identity['root']] or children(pid):
             continue
         try:
@@ -220,7 +221,7 @@ def suite():
                     os.kill(identity['owner'], signal.SIGKILL)
                 elif mode == 'worker-loss' or mode.startswith('worker-loss-aged'):
                     os.kill(transfer, signal.SIGKILL)
-                unknown = mode in ['owner-cancel', 'worker-loss'] or mode.startswith('worker-loss-aged')
+                unknown = mode == 'worker-loss' or mode.startswith('worker-loss-aged')
                 if not unknown:
                     # More than a supervisor tick; pending delivery must keep its owner
                     # alive, and post-cancellation completion must not be cancelled anew.
