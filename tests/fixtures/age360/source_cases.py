@@ -155,7 +155,9 @@ def publication_second(root, env):
 
 def capture_schedule(root, env):
     preheader = CASE == 'selection-before-header'
-    fault = CASE if preheader else 'guardian-' + CASE
+    occupied = CASE.startswith('capture-occupied-')
+    stage = CASE.replace('capture-occupied-', 'capture-') if occupied else CASE
+    fault = stage if preheader else 'guardian-' + stage
     env['AGENT_BASH_SOURCE_FAULT'] = fault
     env['AGENT_BASH_LOG_MAX_BYTES'] = '65536'
     original = b'a'*32768 + b'READY\n'
@@ -168,6 +170,10 @@ def capture_schedule(root, env):
     observer = wait(lambda: read(path/f'fault-{marker}.reached.json'))
     selection = read(path/'output-selection-v2.json')
     original_event = selection['observation']
+    selected_record = (path/'output-selection-v2.json').read_bytes()
+    if occupied:
+        unknown = path / ('.completion-output-' + hashlib.sha256(selected_record).hexdigest() + '.tmp')
+        unknown.write_bytes(b'unknown retained capture evidence')
     assert original_event['outcome']['observer'] == observer
     assert original_event['outcome']['kind'] == 'ready'
     if preheader:
@@ -184,12 +190,14 @@ def capture_schedule(root, env):
         (path/'fault-selection-before-header.release').touch()
         wait(lambda: (path/'completion-snapshot-v2.json').exists())
     else:
-        capturer = wait(lambda: read(path/f'fault-{CASE}.reached.json'))
+        capturer = wait(lambda: read(path/f'fault-{stage}.reached.json'))
         assert capturer != observer
         wait(lambda: Path(f"/proc/{capturer['pid']}/stat").read_text().split(') ')[1][0] == 'T')
-        (path/'selected-log-v2.bin').unlink()
-        # Exact review ordering: original observer gone, rolled log, no selected
-        # pathname, cooperating guardian owns the only complete descriptor.
+        if not occupied:
+            (path/'selected-log-v2.bin').unlink()
+        # Original observer gone and live log rolled. Original loss schedules
+        # remove the pin; occupied-slot progress schedules retain that source.
+        # A stopped cooperating guardian still excludes loss inventory.
         result = reconcile(path, env)
         assert result.returncode == 0, result.stderr
         assert json.loads(result.stdout)['status'] == 'pending', result.stdout
@@ -207,12 +215,20 @@ def capture_schedule(root, env):
             # killed child; a retained zombie is intentionally not Gone evidence.
             waited, status = os.waitpid(capturer['pid'], 0)
             assert waited == capturer['pid'] and os.WIFSIGNALED(status)
-            result = reconcile(path, env)
+            retry_env = env.copy()
+            if occupied:
+                retry_env.pop('AGENT_BASH_SOURCE_FAULT', None)
+            result = reconcile(path, retry_env)
             assert result.returncode == 0, result.stderr
             expected = 'source_output_missing' if CASE == 'capture-partial' else 'source_ready'
             assert json.loads(result.stdout)['status'] == expected, result.stdout
     assert read(path/'source-outcome-v2.json') == original_event['outcome']
     assert read(path/'source-observation-v2.json') == original_event
+    assert (path/'output-selection-v2.json').read_bytes() == selected_record
+    if occupied:
+        assert unknown.read_bytes() == b'unknown retained capture evidence'
+        assert list(path.glob('.completion-output-*.tmp')) == [unknown]
+        assert (path/'selected-log-v2.bin').read_bytes().startswith(original)
     if CASE == 'capture-partial':
         snapshot = read(path/'completion-snapshot-v2.json')
         assert snapshot['output']['reason'] == 'selected_storage_lost'
@@ -224,7 +240,8 @@ def capture_schedule(root, env):
         assert read(path/'completion-snapshot-v2.json')['rc'] == 0
     print(json.dumps(dict(case=CASE, original_event_preserved=True,
         original_selected_bytes=len(original), actual_guardian_drain=True,
-        missing_while_capture_owned=False, native_notification_delivery_exercised=False)), flush=True)
+        missing_while_capture_owned=False, occupied_slot=occupied,
+        native_notification_delivery_exercised=False)), flush=True)
 
 def suite(root):
     endpoint = root/'owner.sock'
@@ -248,7 +265,7 @@ def suite(root):
                OULIPOLY_PARENT_INVOCATION=json.dumps(dict(id='55555555-5555-4555-8555-555555555555')),
                OULIPOLY_COMPLETION_ENDPOINT=str(endpoint))
     try:
-        if CASE in ['selection-before-header', 'capture-open', 'capture-complete', 'capture-partial']:
+        if CASE in ['selection-before-header', 'capture-open', 'capture-complete', 'capture-partial', 'capture-occupied-partial', 'capture-occupied-complete']:
             return capture_schedule(root, env)
         if CASE in ['recovery-lock', 'header-only-loss', 'pre-capture-rollover', 'pre-capture-owner-loss', 'transient-read-loss']:
             publication_second(root, env)

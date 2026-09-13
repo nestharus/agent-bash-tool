@@ -146,3 +146,14 @@ fn dead_guardian_completed_copy_recovers_without_selected_path() {
 fn dead_guardian_partial_copy_is_not_complete_or_permanent_pending() {
     case("capture-partial");
 }
+
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn occupied_slot_partial_interruption_preserves_event_and_recovers_original_pin() {
+    case("capture-occupied-partial");
+}
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn occupied_slot_full_interruption_preserves_event_and_recovers_original_pin() {
+    case("capture-occupied-complete");
+}

@@ -162,9 +162,12 @@ pub(super) fn freeze(paths: &StatePaths) -> io::Result<()> {
         .as_u64()
         .ok_or_else(|| error("missing selected boundary"))?;
     stop_barrier(paths, "capture-open")?;
-    // One slot per selection bounds even repeated cleanup failures. Existing
-    // slots are crash/cleanup uncertainty, not permission to overwrite evidence.
+    // Keep retained slot evidence intact. A validated original source permits
+    // an anonymous retry, whose private allocation dies with its descriptor.
     let name = format!(".completion-output-{}.tmp", digest(&bytes(&selection)?));
+    if occupied_slot(paths, &name)? {
+        return capture_anonymous(paths, source, length);
+    }
     let mut attempt = Attempt::new(paths, &name);
     let result = attempt.capture(source, length, &selection);
     // Only this call's created inodes, under the capture lease, are disposable.
@@ -177,6 +180,78 @@ pub(super) fn freeze(paths: &StatePaths) -> io::Result<()> {
         fs::remove_file(paths.state_dir.join(&name))?;
     }
     result
+}
+
+// Occupancy is not ownership, including dangling symlinks and orphan receipts.
+fn occupied_slot(paths: &StatePaths, name: &str) -> io::Result<bool> {
+    let receipt = paths.state_dir.join(receipt_name(name));
+    for path in [
+        paths.state_dir.join(name),
+        receipt.with_extension("pending"),
+        receipt,
+    ] {
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => (),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(false)
+}
+
+/// Source-proven escape from retained-slot uncertainty. The capture lease bounds
+/// live allocation to one private inode. O_TMPFILE needs no unlink or persisted
+/// cleanup authority, even across returned errors or process death. Never fall
+/// back to random named scratch on unsupported filesystems. Existing receipts,
+/// fragments and original pins are not changed. As with initial capture, original
+/// managed storage must survive interruption for retry: this is not protection
+/// against external deletion of all original and completed storage.
+fn capture_anonymous(paths: &StatePaths, source: File, length: u64) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_TMPFILE | libc::O_CLOEXEC)
+        .open(&paths.state_dir)?;
+    copy_selected(paths, source, &mut file, length)?;
+    stop_barrier(paths, "capture-complete")?;
+    returning_fault(paths, "publish", &file)?;
+    link_anonymous(&file, &paths.state_dir.join(OUTPUT))?;
+    File::open(&paths.state_dir)?.sync_all()
+}
+
+// /proc/self/fd + AT_SYMLINK_FOLLOW is Linux's unprivileged O_TMPFILE
+// publication path (AT_EMPTY_PATH requires CAP_DAC_READ_SEARCH). linkat never
+// replaces a public destination. The descriptor remains owned until after link.
+fn link_anonymous(file: &File, destination: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let source = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())?;
+    let result = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn copy_selected(paths: &StatePaths, source: File, file: &mut File, length: u64) -> io::Result<()> {
+    let mut source = source.take(length);
+    let first = io::copy(&mut source.by_ref().take(length.min(4096)), file)?;
+    stop_barrier(paths, "capture-partial")?;
+    returning_fault(paths, "copy", file)?;
+    if first + io::copy(&mut source, file)? != length {
+        return Err(error("original output selection was lost during copy"));
+    }
+    returning_fault(paths, "fsync", file)?;
+    file.sync_all()
 }
 
 /// In-memory operation ownership, not a retained authority ledger. A crash drops
@@ -235,15 +310,7 @@ impl<'a> Attempt<'a> {
             "selection_sha256": digest(&bytes(selection)?), "byte_len": length,
             "writer": identity(unsafe { libc::getpid() })?, "complete": false});
         self.save_receipt(&record)?;
-        let mut source = source.take(length);
-        let first = io::copy(&mut source.by_ref().take(length.min(4096)), &mut file)?;
-        stop_barrier(self.paths, "capture-partial")?;
-        returning_fault(self.paths, "copy", &file)?;
-        if first + io::copy(&mut source, &mut file)? != length {
-            return Err(error("original output selection was lost during copy"));
-        }
-        returning_fault(self.paths, "fsync", &file)?;
-        file.sync_all()?;
+        copy_selected(self.paths, source, &mut file, length)?;
         record["complete"] = json!(true);
         self.save_receipt(&record)?;
         stop_barrier(self.paths, "capture-complete")?;
@@ -289,8 +356,12 @@ impl<'a> Attempt<'a> {
 fn returning_fault(paths: &StatePaths, edge: &str, file: &File) -> io::Result<()> {
     let configured =
         fs::read_to_string(paths.state_dir.join("test-returning-error")).unwrap_or_default();
-    if configured != edge {
+    if configured.strip_suffix("-cleanup").unwrap_or(&configured) != edge {
         return Ok(());
+    }
+    if configured.ends_with("-cleanup") {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&paths.state_dir, fs::Permissions::from_mode(0o500))?;
     }
     if edge == "publish" {
         use std::os::unix::fs::PermissionsExt;
@@ -411,6 +482,286 @@ mod tests {
             println!("edge={edge} recovered_original=true writer_still_alive=true");
         }
     }
+    // Re-exec the unit image, not a retained Attempt or inherited capture FD.
+    fn capture_process(paths: &StatePaths) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "continuation::capture::tests::capture_process_worker",
+                "--nocapture",
+            ])
+            .env("AGE360_CAPTURE_ROOT", &paths.root)
+            .env("AGE360_CAPTURE_HANDLE", &paths.handle);
+        command
+    }
+    #[test]
+    fn capture_process_worker() {
+        let Some(root) = std::env::var_os("AGE360_CAPTURE_ROOT") else {
+            return;
+        };
+        let paths = StatePaths::new(root.into(), std::env::var("AGE360_CAPTURE_HANDLE").unwrap());
+        let result = freeze_output(&paths);
+        if let Ok(expected) = std::env::var("AGE360_CAPTURE_ERRNO") {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.raw_os_error(), Some(expected.parse().unwrap()));
+            println!("fresh_pid={} actual_errno={failure}", std::process::id());
+        } else {
+            result.unwrap();
+            println!("fresh_pid={} recovered=true", std::process::id());
+        }
+    }
+    fn run_capture_process(paths: &StatePaths, errno: Option<i32>) {
+        let mut command = capture_process(paths);
+        if let Some(errno) = errno {
+            command.env("AGE360_CAPTURE_ERRNO", errno.to_string());
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    fn scratch_evidence(paths: &StatePaths) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut result: Vec<_> = fs::read_dir(&paths.state_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("completion-output-")
+                    && p.file_name().unwrap() != OUTPUT
+            })
+            .map(|p| {
+                let data = fs::read(&p).unwrap();
+                (p, data)
+            })
+            .collect();
+        result.sort();
+        result
+    }
+    #[test]
+    fn cleanup_errors_then_fresh_process_retries_retain_evidence_and_recover() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        for edge in ["copy", "fsync", "receipt-write", "receipt-fsync"] {
+            let (_temp, paths, _) = super::super::tests::source();
+            let original = vec![b'a'; 32768];
+            fs::write(&paths.log, &original).unwrap();
+            select_output(&paths).unwrap();
+            let selection = fs::read(paths.state_dir.join(SELECTION)).unwrap();
+            fs::remove_file(&paths.log).unwrap();
+            fs::write(&paths.log, b"unrelated replacement log").unwrap();
+            fs::write(
+                paths.state_dir.join("test-returning-error"),
+                format!("{edge}-cleanup"),
+            )
+            .unwrap();
+            let errno = if edge.ends_with("fsync") {
+                libc::EINVAL
+            } else {
+                libc::ENOSPC
+            };
+            run_capture_process(&paths, Some(errno));
+            let evidence = scratch_evidence(&paths);
+            assert!(!evidence.is_empty());
+            // Fresh processes cannot unlink with this directory's actual mode.
+            for _ in 0..3 {
+                run_capture_process(&paths, Some(libc::EACCES));
+                assert_eq!(scratch_evidence(&paths), evidence);
+                assert!(lock(&paths).is_ok());
+            }
+            // Anonymous copy errors must not append fresh named slots, even
+            // when each operation returns with cleanup permission denied again.
+            for attempt in 0..12 {
+                fs::set_permissions(&paths.state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(paths.state_dir.join("test-returning-error"), "copy-cleanup").unwrap();
+                run_capture_process(&paths, Some(libc::ENOSPC));
+                assert_eq!(scratch_evidence(&paths), evidence);
+                assert!(!paths.state_dir.join(OUTPUT).exists());
+                assert!(
+                    !paths
+                        .state_dir
+                        .join("missing-output-observation-v2.json")
+                        .exists()
+                );
+                assert_eq!(
+                    fs::read(paths.state_dir.join(SELECTION)).unwrap(),
+                    selection
+                );
+                assert!(lock(&paths).is_ok());
+                println!(
+                    "initial_edge={edge} retry={attempt} retained_files={} retained_bytes={}",
+                    evidence.len(),
+                    evidence.iter().map(|(_, b)| b.len()).sum::<usize>()
+                );
+            }
+            fs::set_permissions(&paths.state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::remove_file(paths.state_dir.join("test-returning-error")).unwrap();
+            run_capture_process(&paths, None);
+            assert_eq!(scratch_evidence(&paths), evidence);
+            assert_eq!(fs::read(paths.state_dir.join(OUTPUT)).unwrap(), original);
+            assert_eq!(
+                fs::read(paths.state_dir.join(SELECTION)).unwrap(),
+                selection
+            );
+        }
+    }
+    #[test]
+    #[cfg(feature = "source-fault-tests")]
+    fn interrupted_occupied_slot_retry_releases_allocation_and_recovers_original() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        for edge in ["capture-partial", "capture-complete"] {
+            let (_temp, paths, _) = super::super::tests::source();
+            let original = vec![b'a'; 32768];
+            fs::write(&paths.log, &original).unwrap();
+            select_output(&paths).unwrap();
+            let selection = fs::read(paths.state_dir.join(SELECTION)).unwrap();
+            let name = format!(".completion-output-{}.tmp", digest(&selection));
+            fs::write(paths.state_dir.join(name), b"unknown retained evidence").unwrap();
+            fs::remove_file(&paths.log).unwrap();
+            fs::write(&paths.log, b"replacement live log").unwrap();
+            let evidence = scratch_evidence(&paths);
+            let mut child = capture_process(&paths)
+                .env("AGENT_BASH_SOURCE_FAULT", edge)
+                .spawn()
+                .unwrap();
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(child.id() as i32, &mut status, libc::WUNTRACED) },
+                child.id() as i32
+            );
+            assert!(libc::WIFSTOPPED(status));
+            assert!(
+                paths
+                    .state_dir
+                    .join(format!("fault-{edge}.reached.json"))
+                    .exists()
+            );
+            assert!(
+                lock(&paths).is_err(),
+                "stopped capture still excludes loss inventory"
+            );
+            assert!(freeze_output(&paths).is_err());
+            assert!(!paths.state_dir.join(OUTPUT).exists());
+            assert!(
+                !paths
+                    .state_dir
+                    .join("missing-output-observation-v2.json")
+                    .exists()
+            );
+            assert_eq!(scratch_evidence(&paths), evidence);
+            // Prove the stopped copier holds an anonymous inode, not a new name.
+            let anonymous: Vec<_> = fs::read_dir(format!("/proc/{}/fd", child.id()))
+                .unwrap()
+                .filter_map(|e| fs::read_link(e.ok()?.path()).ok())
+                .filter(|p| {
+                    p.to_string_lossy().contains("(deleted)") && p.starts_with(&paths.state_dir)
+                })
+                .collect();
+            assert_eq!(anonymous.len(), 1, "{anonymous:?}");
+            child.kill().unwrap();
+            assert!(!child.wait().unwrap().success());
+            assert!(lock(&paths).is_ok());
+            run_capture_process(&paths, None);
+            assert_eq!(scratch_evidence(&paths), evidence);
+            assert_eq!(fs::read(paths.state_dir.join(OUTPUT)).unwrap(), original);
+            assert_eq!(
+                fs::read(paths.state_dir.join(SELECTION)).unwrap(),
+                selection
+            );
+            println!(
+                "interruption={edge} anonymous_fds=1 reaped=true original_recovered=true unknown_unchanged=true"
+            );
+        }
+    }
+    #[test]
+    fn occupied_slot_anonymous_fsync_and_link_errors_retry_without_named_growth() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        for edge in ["fsync", "publish"] {
+            let (_temp, paths, selection) = fixture();
+            let name = format!(
+                ".completion-output-{}.tmp",
+                digest(&bytes(&selection).unwrap())
+            );
+            fs::write(paths.state_dir.join(name), b"unknown evidence").unwrap();
+            let evidence = scratch_evidence(&paths);
+            fs::remove_file(&paths.log).unwrap();
+            fs::write(&paths.log, b"replacement log").unwrap();
+            fs::write(paths.state_dir.join("test-returning-error"), edge).unwrap();
+            for _ in 0..12 {
+                run_capture_process(
+                    &paths,
+                    Some(if edge == "fsync" {
+                        libc::EINVAL
+                    } else {
+                        libc::EACCES
+                    }),
+                );
+                assert_eq!(scratch_evidence(&paths), evidence);
+                assert!(!paths.state_dir.join(OUTPUT).exists());
+                fs::set_permissions(&paths.state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            fs::remove_file(paths.state_dir.join("test-returning-error")).unwrap();
+            run_capture_process(&paths, None);
+            assert_eq!(scratch_evidence(&paths), evidence);
+            assert_eq!(
+                fs::read(paths.state_dir.join(OUTPUT)).unwrap(),
+                b"original selected bytes"
+            );
+        }
+    }
+    #[test]
+    #[cfg(feature = "source-fault-tests")]
+    fn interrupted_named_attempt_with_intact_pin_recovers_in_fresh_process() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        for edge in ["capture-partial", "capture-complete"] {
+            let (_temp, paths, _) = super::super::tests::source();
+            let original = vec![b'a'; 32768];
+            fs::write(&paths.log, &original).unwrap();
+            select_output(&paths).unwrap();
+            let selection = fs::read(paths.state_dir.join(SELECTION)).unwrap();
+            fs::remove_file(&paths.log).unwrap();
+            fs::write(&paths.log, b"replacement live log").unwrap();
+            let mut child = capture_process(&paths)
+                .env("AGENT_BASH_SOURCE_FAULT", edge)
+                .spawn()
+                .unwrap();
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(child.id() as i32, &mut status, libc::WUNTRACED) },
+                child.id() as i32
+            );
+            assert!(libc::WIFSTOPPED(status));
+            assert!(
+                paths
+                    .state_dir
+                    .join(format!("fault-{edge}.reached.json"))
+                    .exists()
+            );
+            assert!(lock(&paths).is_err());
+            let evidence = scratch_evidence(&paths);
+            assert_eq!(evidence.len(), 2, "actual named body plus product receipt");
+            child.kill().unwrap();
+            assert!(!child.wait().unwrap().success());
+            run_capture_process(&paths, None);
+            assert_eq!(scratch_evidence(&paths), evidence);
+            assert_eq!(fs::read(paths.state_dir.join(OUTPUT)).unwrap(), original);
+            assert_eq!(
+                fs::read(paths.state_dir.join(SELECTION)).unwrap(),
+                selection
+            );
+            println!(
+                "named_interruption={edge} retained_evidence_unchanged=true fresh_process_original_recovery=true"
+            );
+        }
+    }
     #[test]
     fn returned_link_failure_retains_completed_copy_for_another_owner() {
         if crate::test_support::private_case() {
@@ -481,7 +832,7 @@ mod tests {
         );
     }
     #[test]
-    fn unknown_fixed_slot_is_bounded_and_never_overwritten() {
+    fn unknown_fixed_slot_recovers_original_without_overwriting_evidence() {
         if crate::test_support::private_case() {
             return;
         }
@@ -492,17 +843,99 @@ mod tests {
         );
         let unknown = paths.state_dir.join(name);
         fs::write(&unknown, b"uncertain crash evidence").unwrap();
-        for _ in 0..12 {
-            assert!(freeze_output(&paths).is_err());
-            assert_eq!(fs::read(&unknown).unwrap(), b"uncertain crash evidence");
-            assert!(!paths.state_dir.join(OUTPUT).exists());
-        }
+        fs::remove_file(&paths.log).unwrap();
+        fs::write(&paths.log, b"replacement live log").unwrap();
+        let committed = fs::read(paths.state_dir.join(SELECTION)).unwrap();
+        freeze_output(&paths).unwrap();
+        assert_eq!(fs::read(&unknown).unwrap(), b"uncertain crash evidence");
+        assert_eq!(
+            fs::read(paths.state_dir.join(OUTPUT)).unwrap(),
+            b"original selected bytes"
+        );
+        assert_eq!(
+            fs::read(paths.state_dir.join(SELECTION)).unwrap(),
+            committed
+        );
         assert_eq!(
             fs::read_dir(&paths.state_dir)
                 .unwrap()
                 .filter(|e| candidate(&e.as_ref().unwrap().file_name().to_string_lossy()))
                 .count(),
             1
+        );
+    }
+    #[test]
+    fn orphan_receipts_and_dangling_slots_preserve_evidence_and_selected_prefix() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        for kind in ["receipt", "pending", "dangling"] {
+            let (_temp, paths, selection) = fixture();
+            let name = format!(
+                ".completion-output-{}.tmp",
+                digest(&bytes(&selection).unwrap())
+            );
+            let receipt = paths.state_dir.join(receipt_name(&name));
+            let occupied = match kind {
+                "receipt" => receipt,
+                "pending" => receipt.with_extension("pending"),
+                _ => paths.state_dir.join(&name),
+            };
+            if kind == "dangling" {
+                std::os::unix::fs::symlink("absent-unknown-target", &occupied).unwrap();
+            } else {
+                fs::write(&occupied, b"unknown receipt evidence").unwrap();
+            }
+            let before = fs::symlink_metadata(&occupied).unwrap();
+            // Same selected inode can grow: the committed prefix is the output.
+            OpenOptions::new()
+                .append(true)
+                .open(paths.state_dir.join(SELECTED_LOG))
+                .unwrap()
+                .write_all(b"later bytes beyond selected boundary")
+                .unwrap();
+            fs::remove_file(&paths.log).unwrap();
+            fs::write(&paths.log, b"replacement live log").unwrap();
+            run_capture_process(&paths, None);
+            let after = fs::symlink_metadata(&occupied).unwrap();
+            assert_eq!(
+                (before.dev(), before.ino(), before.len()),
+                (after.dev(), after.ino(), after.len())
+            );
+            if kind == "dangling" {
+                assert_eq!(
+                    fs::read_link(&occupied).unwrap(),
+                    Path::new("absent-unknown-target")
+                );
+            } else {
+                assert_eq!(fs::read(&occupied).unwrap(), b"unknown receipt evidence");
+            }
+            assert_eq!(
+                fs::read(paths.state_dir.join(OUTPUT)).unwrap(),
+                b"original selected bytes"
+            );
+        }
+    }
+    #[test]
+    fn occupied_unknown_slot_without_original_remains_uncertain() {
+        let (_temp, paths, selection) = fixture();
+        let name = format!(
+            ".completion-output-{}.tmp",
+            digest(&bytes(&selection).unwrap())
+        );
+        let unknown = paths.state_dir.join(name);
+        fs::write(&unknown, b"possibly sole original bytes").unwrap();
+        fs::remove_file(paths.state_dir.join(SELECTED_LOG)).unwrap();
+        fs::remove_file(&paths.log).unwrap();
+        fs::write(&paths.log, b"replacement live log").unwrap();
+        assert!(freeze_output(&paths).is_err());
+        assert_eq!(fs::read(&unknown).unwrap(), b"possibly sole original bytes");
+        assert!(!paths.state_dir.join(OUTPUT).exists());
+        assert!(
+            !paths
+                .state_dir
+                .join("missing-output-observation-v2.json")
+                .exists()
         );
     }
     #[test]
@@ -523,14 +956,9 @@ mod tests {
         attempt.cleanup();
         assert!(path.exists(), "actual unlink permission failure required");
         fs::set_permissions(&paths.state_dir, fs::Permissions::from_mode(0o700)).unwrap();
-        // The returned invocation still has positive ownership, so it can retry
-        // cleanup; a new capture call has no such authority and cannot allocate.
-        for _ in 0..12 {
-            assert!(freeze_output(&paths).is_err());
-        }
-        attempt.cleanup();
-        assert!(!path.exists());
+        drop(attempt); // Production cannot carry in-memory cleanup ownership.
         freeze_output(&paths).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"private partial");
         assert_eq!(
             fs::read(paths.state_dir.join(OUTPUT)).unwrap(),
             b"original selected bytes"
