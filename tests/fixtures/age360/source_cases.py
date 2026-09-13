@@ -120,16 +120,7 @@ def publication_second(root, env):
     else:
         if CASE == 'transient-read-loss':
             selected = path/'selected-log-v2.bin'
-            # ENOENT at the expected pin is not permanent loss when another
-            # original-inode alias survives the same managed inventory.
-            alias = path/'preserved-original-alias'
-            selected.rename(alias)
-            result = reconcile(path, env)
-            assert result.returncode == 0, result.stderr
-            assert json.loads(result.stdout)['status'] == 'pending', result.stdout
-            assert not (path/'missing-output-observation-v2.json').exists()
-            assert not (path/'completion-snapshot-v2.json').exists()
-            alias.rename(selected)
+            # A real access error remains uncertainty, not proof of loss.
             selected.chmod(0)
             result = reconcile(path, env)
             assert result.returncode == 0, result.stderr
@@ -138,6 +129,8 @@ def publication_second(root, env):
             assert not (path/'completion-snapshot-v2.json').exists()
             assert not (path/'completion-output-v2.bin').exists()
             selected.chmod(0o600)
+            # Recover a validated managed alias without canonical-path repair.
+            selected.rename(path/'preserved-original-alias')
         (path/f'fault-{fault}.release').touch()
         if CASE in ['pre-capture-owner-loss', 'transient-read-loss']:
             # The original pin+boundary, not its later mutable pathname, can be
@@ -159,6 +152,79 @@ def publication_second(root, env):
         capture_missing=CASE=='header-only-loss', guardian_pid=guardian,
         actual_cancel_drain=True, physical_custody_discharged=True,
         original_output_resampled=False, native_notification_delivery_exercised=False)), flush=True)
+
+def capture_schedule(root, env):
+    preheader = CASE == 'selection-before-header'
+    fault = CASE if preheader else 'guardian-' + CASE
+    env['AGENT_BASH_SOURCE_FAULT'] = fault
+    env['AGENT_BASH_LOG_MAX_BYTES'] = '65536'
+    original = b'a'*32768 + b'READY\n'
+    script = root/'capture-writer.py'
+    script.write_text("import os,time\nos.write(1,b'a'*32768+b'READY\\n')\nwhile not os.path.exists(%r): time.sleep(.01)\nfor _ in range(128): os.write(1,b'z'*8192)\nopen(%r,'w').write('done')\nwhile True: time.sleep(1)\n" % (str(root/'write-more'), str(root/'writer-done')))
+    result = run(env, 'run', '--ready-sentinel', 'READY', '--', '/usr/bin/python3', str(script))
+    assert result.returncode == 0, result.stderr
+    item = json.loads(result.stdout); path = Path(item['state_dir'])
+    marker = 'selection-before-header' if preheader else 'before-output-capture'
+    observer = wait(lambda: read(path/f'fault-{marker}.reached.json'))
+    selection = read(path/'output-selection-v2.json')
+    original_event = selection['observation']
+    assert original_event['outcome']['observer'] == observer
+    assert original_event['outcome']['kind'] == 'ready'
+    if preheader:
+        assert not (path/'source-observation-v2.json').exists()
+    (root/'write-more').touch()
+    wait(lambda: (root/'writer-done').exists())
+    wait(lambda: b'READY' not in (path/'log').read_bytes())
+    os.kill(observer['pid'], signal.SIGKILL)
+    result = run(env, 'cancel', item['handle'])
+    assert result.returncode == 0 and json.loads(result.stdout)['requested'], result.stdout
+    wait(lambda: (path/'cancel-workload-drained').exists())
+    if preheader:
+        assert not (path/'source-observation-v2.json').exists()
+        (path/'fault-selection-before-header.release').touch()
+        wait(lambda: (path/'completion-snapshot-v2.json').exists())
+    else:
+        capturer = wait(lambda: read(path/f'fault-{CASE}.reached.json'))
+        assert capturer != observer
+        wait(lambda: Path(f"/proc/{capturer['pid']}/stat").read_text().split(') ')[1][0] == 'T')
+        (path/'selected-log-v2.bin').unlink()
+        # Exact review ordering: original observer gone, rolled log, no selected
+        # pathname, cooperating guardian owns the only complete descriptor.
+        result = reconcile(path, env)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)['status'] == 'pending', result.stdout
+        assert not (path/'missing-output-observation-v2.json').exists()
+        assert not (path/'completion-snapshot-v2.json').exists()
+        if CASE == 'capture-open':
+            assert not list(path.glob('.completion-output-*.tmp'))
+            os.kill(capturer['pid'], signal.SIGCONT)
+            wait(lambda: (path/'completion-snapshot-v2.json').exists())
+        else:
+            os.kill(capturer['pid'], signal.SIGKILL)
+            wait(lambda: not Path(f"/proc/{capturer['pid']}").exists() or
+                 Path(f"/proc/{capturer['pid']}/stat").read_text().split(') ')[1][0] == 'Z')
+            # The fixture is the actual adopting subreaper. Reap this exact
+            # killed child; a retained zombie is intentionally not Gone evidence.
+            waited, status = os.waitpid(capturer['pid'], 0)
+            assert waited == capturer['pid'] and os.WIFSIGNALED(status)
+            result = reconcile(path, env)
+            assert result.returncode == 0, result.stderr
+            expected = 'source_output_missing' if CASE == 'capture-partial' else 'source_ready'
+            assert json.loads(result.stdout)['status'] == expected, result.stdout
+    assert read(path/'source-outcome-v2.json') == original_event['outcome']
+    assert read(path/'source-observation-v2.json') == original_event
+    if CASE == 'capture-partial':
+        snapshot = read(path/'completion-snapshot-v2.json')
+        assert snapshot['output']['reason'] == 'selected_storage_lost'
+        assert not (path/'completion-output-v2.bin').exists()
+        assert len(list(path.glob('.completion-output-*.tmp'))) == 1
+        assert list(path.glob('.completion-output-*.tmp'))[0].stat().st_size == 4096
+    else:
+        assert (path/'completion-output-v2.bin').read_bytes() == original
+        assert read(path/'completion-snapshot-v2.json')['rc'] == 0
+    print(json.dumps(dict(case=CASE, original_event_preserved=True,
+        original_selected_bytes=len(original), actual_guardian_drain=True,
+        missing_while_capture_owned=False, native_notification_delivery_exercised=False)), flush=True)
 
 def suite(root):
     endpoint = root/'owner.sock'
@@ -182,6 +248,8 @@ def suite(root):
                OULIPOLY_PARENT_INVOCATION=json.dumps(dict(id='55555555-5555-4555-8555-555555555555')),
                OULIPOLY_COMPLETION_ENDPOINT=str(endpoint))
     try:
+        if CASE in ['selection-before-header', 'capture-open', 'capture-complete', 'capture-partial']:
+            return capture_schedule(root, env)
         if CASE in ['recovery-lock', 'header-only-loss', 'pre-capture-rollover', 'pre-capture-owner-loss', 'transient-read-loss']:
             publication_second(root, env)
             return

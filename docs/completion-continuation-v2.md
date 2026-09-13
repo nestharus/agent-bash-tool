@@ -107,10 +107,10 @@ Private `source-observation-v2.json` retains original evidence and snapshot head
 copy before JSON publication. These are not an alternative public wire or event
 ACK. Recovery can finish this staged original observation rather than invent a
 new cessation result. Once frozen, later ready output cannot replace its bytes.
-An I/O failure before raw capture succeeds leaves an outstanding capture: retained
-observation is original, but the log may advance before the first successful
-capture. A successor cannot resample the mutable log for that incomplete
-capture; completion-only recovery returns pending instead. Loss before any durable
+An I/O failure before raw capture succeeds leaves an outstanding capture. The
+selected inode/prefix remains original even if the live log advances; a successor
+can recover that selection, but cannot resample newer mutable log bytes when the
+original selected storage is unavailable. Loss before any durable
 observation still cannot be recovered as that exact event. Neither limitation authorizes loss of the surviving observer.
 `source_ready` replies include hashes of the exact retained snapshot/outcome files.
 
@@ -120,8 +120,8 @@ Build the actual source binary with `cargo build --locked --features source-faul
 Default builds contain no active hooks. Set `AGENT_BASH_SOURCE_FAULT` in the original
 Bash launch environment to one of:
 
-- `after-terminal-metadata`: yields after the first terminal publication and before
-  source completion-lock acquisition. The original loop keeps servicing I/O and
+- `after-terminal-metadata`: yields after the first terminal publication and
+  original event/selection retention, before body capture. The original loop keeps servicing I/O and
   cancellation. Root can accept a real cancellation here before source publication.
 - `publication-error`: injects ENOSPC after the original observation and raw output
   are retained, before the immutable public bundle/outcome/snapshot publication.
@@ -165,8 +165,8 @@ record with no orphaned pin yields `original_selection_not_retained`; absence of
 the selected inode across managed storage yields `selected_storage_lost`; durable
 shortening of that same inode yields `selected_storage_short`. The latter records
 its actual length after syncing/rechecking the inode. An intact live-log alias,
-replacement pin, unaccounted hard link, surviving body/copy candidate, ambiguous
-symlink or changed source directory prevents attestation. No timestamp, retry
+replacement pin, unaccounted hard link, surviving body/unvalidated copy candidate,
+ambiguous symlink or changed source directory prevents attestation. No timestamp, retry
 count, pending response or failed open is permanent-loss proof. In particular a
 transient permission/read failure with intact storage stays pending and can later
 produce the original successful bytes.
@@ -182,6 +182,50 @@ not alter physical-drain or artifact-retention duties.
 This is a managed local source-storage observation, not filesystem omniscience:
 Bash owns the pin/log/body/copy inventory and original writer lifetime. Unknown
 external backups, hostile concurrent filesystem mutation, unsupported old selection
-records and in-progress-copy recovery are not certified. Such ambiguities that
+records and unvalidated copy recovery are not certified. Such ambiguities that
 are observed remain pending. No existing-domain migration or full-owner-loss policy
 is introduced here.
+
+## Capture ownership and interrupted publication
+
+The original event turn now commits the event/outcome and snapshot header **inside
+`output-selection-v2.json`**, together with the selected inode and exclusive
+boundary, before returning to log I/O. `source-observation-v2.json` is an immutable
+projection of this record. A guardian or completion-only recovery can restore that
+projection after observer loss, but cannot attach its later cancellation/cessation
+to an earlier selection. Old selection-only records lacking event evidence remain
+uncertain rather than acquiring a new label. Death before event/selection retention
+still loses that exact observation; metadata alone is not its reconstruction.
+
+`source-capture.lock` is an exclusive **nonblocking**, cooperating capture lease.
+All capturers acquire it before opening original bytes; recovery holds it across
+capture failure, storage inventory and durable missing-output publication. A busy
+lease means pending, including when the owner is paused with the only recoverable
+open descriptor and no surviving pathname. No whole-body hashing occurs under
+this lease; recovery hashing also remains outside `completion.lock`. Live I/O and
+cancellation do not acquire the capture lease. Initial copy/fsync remains
+synchronous and is not a latency guarantee.
+
+Capture enumerates managed aliases and validates the opened descriptor against the
+original directory/device/inode and selected boundary. It never requires restoring
+the canonical selected pathname. Each newly created copy has a local receipt bound
+to the exact selection digest, target inode/device, expected length and writer
+identity. A complete receipt is retained only after exact-length copy and fsync.
+Recovery can promote that surviving exact copy after an interruption before its
+final hardlink, without manufacturing a public header, output bytes or ACK.
+A dead writer's exact short, unfinished copy cannot represent the complete output;
+its bytes and receipt are preserved but no longer indefinitely inhibit otherwise
+valid loss inventory. Live/unknown writer identities and unvalidated copies remain
+uncertain. In particular, a full copy interrupted before its completion receipt
+cannot be promoted from length alone when original storage is also lost. These
+rules are local cooperating-producer evidence, not authentication against hostile
+same-account file rewriting, external backup discovery or an upgrade/migration
+protocol for already-pinned recovery executables.
+
+Fixture-only `selection-before-header` yields after the bound selection but before
+header projection. `guardian-capture-open`, `guardian-capture-partial`, and
+`guardian-capture-complete` first defer the live capture and later SIGSTOP the actual
+adopting guardian at the selected-open, partial-copy or fsynced/receipted-copy
+boundary. Deterministic source tests remove the original observer and selected
+pathname, exercise actual guardian drain, and check recovery while capture is
+owned and after resume/death. The tests do not claim native recipient receipt.

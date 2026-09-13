@@ -125,3 +125,24 @@ fn pre_capture_owner_loss_recovers_pinned_original_selection() {
 fn transient_selected_read_denial_after_owner_loss_remains_pending_then_recovers() {
     case("transient-read-loss");
 }
+
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn selection_without_header_preserves_original_event_after_guardian_drain() {
+    case("selection-before-header");
+}
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn guardian_open_descriptor_excludes_loss_proof_without_blocking_recovery() {
+    case("capture-open");
+}
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn dead_guardian_completed_copy_recovers_without_selected_path() {
+    case("capture-complete");
+}
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn dead_guardian_partial_copy_is_not_complete_or_permanent_pending() {
+    case("capture-partial");
+}

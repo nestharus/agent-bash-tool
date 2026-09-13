@@ -5,6 +5,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
+mod capture;
 mod missing_output;
 use std::path::Path;
 
@@ -30,7 +31,11 @@ const SELECTED_LOG: &str = "selected-log-v2.bin";
 /// Select once, in the original event turn, before any retry can collect output.
 /// The logger replaces (never truncates) an inode pinned by this hard link.
 /// A failed selection is explicit missing evidence, not permission to resample.
-pub(crate) fn select_output(paths: &StatePaths) -> io::Result<()> {
+#[cfg(test)]
+fn select_output(paths: &StatePaths) -> io::Result<()> {
+    select_event_output(paths, None)
+}
+fn select_event_output(paths: &StatePaths, observation: Option<&Value>) -> io::Result<()> {
     if !enabled(paths) || paths.state_dir.join(SELECTION).try_exists()? {
         return Ok(());
     }
@@ -39,6 +44,9 @@ pub(crate) fn select_output(paths: &StatePaths) -> io::Result<()> {
         Ok(selection) => selection,
         Err(err) => json!({"missing": err.to_string()}),
     };
+    if let Some(observation) = observation {
+        selection["observation"] = observation.clone();
+    }
     selection["directory"] = json!({"device": directory.dev(), "inode": directory.ino()});
     immutable(paths, SELECTION, &bytes(&selection)?)
 }
@@ -506,8 +514,50 @@ fn capture_observation(
     {
         return finish_snapshot(paths);
     }
-    let staged = paths.state_dir.join("source-observation-v2.json");
-    if !staged.try_exists()? {
+    retain_event(paths, meta, observation)?;
+    if !paths
+        .state_dir
+        .join("completion-output-v2.bin")
+        .try_exists()?
+    {
+        fault_barrier(paths, "before-output-capture")?;
+        freeze_output(paths)?;
+    }
+    Ok(())
+}
+
+// Retain selection and its original event in one immutable record. The public
+// header is a recoverable projection; a later observer never supplies its label.
+pub(crate) fn retain_event(
+    paths: &StatePaths,
+    meta: &Meta,
+    observation: Observation<'_>,
+) -> io::Result<()> {
+    select_observed_event(paths, meta, observation)?;
+    if !paths
+        .state_dir
+        .join("source-observation-v2.json")
+        .try_exists()?
+    {
+        restore_selected_event(paths)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn select_observed_event(
+    paths: &StatePaths,
+    meta: &Meta,
+    observation: Observation<'_>,
+) -> io::Result<()> {
+    if !enabled(paths)
+        || paths
+            .state_dir
+            .join("source-observation-v2.json")
+            .try_exists()?
+    {
+        return Ok(());
+    }
+    if !paths.state_dir.join(SELECTION).try_exists()? {
         let (_, common) = binding(paths)?;
         let fence = value(&paths.state_dir.join(FENCE))?;
         exact(&common, &fence)?;
@@ -544,87 +594,27 @@ fn capture_observation(
         } else {
             "completed"
         });
-        // Direct/guardian callers select here; live callers already selected in
-        // the terminal event turn. Never select again for an existing header.
-        select_output(paths)?;
-        // Retain original observation independently of later publication errors.
-        immutable(
-            paths,
-            "source-observation-v2.json",
-            &bytes(&json!({
-                "outcome": outcome, "snapshot": snapshot
-            }))?,
-        )?;
-    }
-    if !paths
-        .state_dir
-        .join("completion-output-v2.bin")
-        .try_exists()?
-    {
-        if output_unavailable(paths)? {
-            record_missing_output(paths)?;
-            return Err(error(
-                "original output capture incomplete; cannot resample mutable log",
-            ));
-        }
-        fault_barrier(paths, "before-output-capture")?;
-        freeze_output(paths)?;
+        let staged = json!({"outcome": outcome, "snapshot": snapshot});
+        select_event_output(paths, Some(&staged))?;
     }
     Ok(())
 }
 
-fn freeze_output(paths: &StatePaths) -> io::Result<()> {
-    let destination = paths.state_dir.join("completion-output-v2.bin");
-    if destination.try_exists()? {
-        return Ok(());
-    }
-    let source = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(paths.state_dir.join(SELECTED_LOG))?;
-    let length = value(&paths.state_dir.join(SELECTION))?["byte_len"]
-        .as_u64()
-        .ok_or_else(|| error("original output selection missing"))?;
-    let metadata = source.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_OUTPUT {
-        return Err(error(
-            "output source is not a supported bounded regular log",
-        ));
-    }
+fn restore_selected_event(paths: &StatePaths) -> io::Result<()> {
     let selection = value(&paths.state_dir.join(SELECTION))?;
-    if selection.get("inode").is_some()
-        && (selection["inode"] != metadata.ino() || selection["device"] != metadata.dev())
-    {
-        return Err(error("original selected inode identity changed"));
-    }
-    if metadata.len() < length {
-        return Err(error("original output selection was lost"));
-    }
-    let temp = paths.state_dir.join(format!(
-        ".completion-output-{}.tmp",
-        state::generate_handle().map_err(io::Error::other)?
-    ));
-    let result = (|| -> io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temp)?;
-        if io::copy(&mut source.take(length), &mut file)? != length {
-            return Err(error("original output selection was lost during copy"));
-        }
-        file.sync_all()?;
-        match fs::hard_link(&temp, &destination) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(err),
-        }
-        File::open(&paths.state_dir)?.sync_all()
-    })();
-    let _ = fs::remove_file(temp);
-    result
+    let staged = selection
+        .get("observation")
+        .ok_or_else(|| error("original selection has no retained event; cannot relabel"))?;
+    let (_, common) = binding(paths)?;
+    exact(&common, &staged["outcome"])?;
+    exact(&common, &staged["snapshot"])?;
+    fault_barrier(paths, "selection-before-header")?;
+    immutable(paths, "source-observation-v2.json", &bytes(staged)?)
+}
+
+fn freeze_output(paths: &StatePaths) -> io::Result<()> {
+    let _capture = capture::lock(paths)?;
+    capture::freeze(paths)
 }
 
 // Wire revision 4: complete raw body, fixed buffers and one MiB CPU/I/O quanta.
@@ -765,7 +755,12 @@ fn recovery_hash_barrier(_paths: &StatePaths) -> io::Result<()> {
 /// supplied by a harness: the source reaches this point and writes its identity.
 #[cfg(feature = "source-fault-tests")]
 pub(crate) fn fault_barrier(paths: &StatePaths, name: &str) -> io::Result<()> {
-    if std::env::var("AGENT_BASH_SOURCE_FAULT").as_deref() != Ok(name) {
+    let configured = std::env::var("AGENT_BASH_SOURCE_FAULT").unwrap_or_default();
+    let guardian_capture = configured.starts_with("guardian-capture-")
+        && name == "before-output-capture"
+        && value(&paths.state_dir.join("source-observation-v2.json"))?["outcome"]["observer"]
+            == json!(identity(unsafe { libc::getpid() })?);
+    if configured != name && !guardian_capture {
         return Ok(());
     }
     let reached = format!("fault-{name}.reached.json");
@@ -917,9 +912,14 @@ fn recover_output(paths: &StatePaths) -> io::Result<bool> {
         finish_snapshot(paths)?;
         return Ok(true);
     }
+    let _capture = match capture::lock(paths) {
+        Ok(lock) => lock,
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+        Err(err) => return Err(err),
+    };
     // A read error is not a loss attestation. The independent inventory below
     // must establish permanent loss before any public missing snapshot exists.
-    let Err(capture_error) = freeze_output(paths) else {
+    let Err(capture_error) = capture::freeze(paths) else {
         return Ok(true);
     };
     state::atomic_write(
@@ -1002,6 +1002,18 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
     save(&paths, LOCAL, &local)?;
     drop(local_lock);
     let fence = value(&paths.state_dir.join(FENCE))?;
+    if !paths
+        .state_dir
+        .join("source-observation-v2.json")
+        .try_exists()?
+        && paths.state_dir.join(SELECTION).try_exists()?
+        && let Err(err) = restore_selected_event(&paths)
+    {
+        let mut pending = common;
+        pending["status"] = json!("pending");
+        pending["reason"] = json!(err.to_string());
+        return Ok(pending);
+    }
     if paths
         .state_dir
         .join("source-observation-v2.json")
@@ -1124,6 +1136,29 @@ mod tests {
             interpreter: None,
         });
         meta
+    }
+
+    #[test]
+    fn unlinked_legacy_selection_cannot_inherit_later_guardian_event() {
+        let (_temp, paths, common) = source();
+        fence(&paths, &common, "launched");
+        fs::write(&paths.log, b"original selection").unwrap();
+        select_output(&paths).unwrap();
+        let meta = registration_meta(&paths, "exit", state::DeliveryMode::Async);
+        let result = retain_event(
+            &paths,
+            &meta,
+            Observation {
+                kind: "ceased_status_unknown",
+                root_wait_status: None,
+                tree_drained: true,
+                output_closed: true,
+                ready_sentinel: None,
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("cannot relabel"));
+        assert!(!paths.state_dir.join("source-observation-v2.json").exists());
+        assert!(!paths.state_dir.join(SNAPSHOT).exists());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Conservative revision5 producer. Only a completion-only successor with an
 //! exact dead original observer may attest loss. Managed-storage enumeration,
 //! not a failed pathname lookup, establishes absence. Unknown/legacy selections
-//! and any surviving copy candidate stay pending; nothing here drains or ACKs.
+//! and unvalidated copy candidates stay pending; nothing here drains or ACKs.
 use super::*;
 
 const PROOF: &str = "missing-output-observation-v2.json";
@@ -30,10 +30,11 @@ pub(super) fn observe(paths: &StatePaths) -> io::Result<Option<Value>> {
         return Ok(None);
     }
     let entries = inventory(paths)?;
-    if entries
-        .iter()
-        .any(|(name, _)| name == OUTPUT || name.starts_with(".completion-output-"))
-    {
+    if entries.iter().any(|(name, meta)| {
+        name == OUTPUT
+            || (name.starts_with(".completion-output-")
+                && !capture::incomplete_dead_copy(paths, name, meta, &selection))
+    }) {
         return Ok(None);
     }
     let Some((reason, selected, observed)) = loss(&selection, &entries)? else {

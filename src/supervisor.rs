@@ -2167,6 +2167,30 @@ impl EventLoop {
             && self.output_closed()
     }
 
+    fn select_initial_source_event(&self) -> io::Result<()> {
+        let Some(pending) = &self.pending_source else {
+            return Ok(());
+        };
+        // This first, bounded selection cannot yield to further log I/O even if
+        // another completion-lock user intervenes. No capture/hash occurs here.
+        let _lock = state::lock_completion(&self.paths)?;
+        crate::continuation::select_observed_event(
+            &self.paths,
+            &pending.meta,
+            crate::continuation::Observation {
+                kind: pending.kind,
+                root_wait_status: pending.root_wait_status,
+                tree_drained: pending.tree_drained,
+                output_closed: pending.output_closed,
+                ready_sentinel: if pending.kind == "ready" {
+                    pending.meta.ready_sentinel.as_deref()
+                } else {
+                    None
+                },
+            },
+        )
+    }
+
     fn retry_source_publication(&mut self) {
         let Some(pending) = &mut self.pending_source else {
             return;
@@ -2175,10 +2199,27 @@ impl EventLoop {
             return;
         }
         let result = (|| -> io::Result<bool> {
-            crate::continuation::fault_barrier(&self.paths, "after-terminal-metadata")?;
+            // Original selection was committed before any further log I/O.
+            // A retry only projects its bound header, never a later event.
             let Some(_lock) = state::try_lock_completion(&self.paths)? else {
                 return Ok(false);
             };
+            crate::continuation::retain_event(
+                &self.paths,
+                &pending.meta,
+                crate::continuation::Observation {
+                    kind: pending.kind,
+                    root_wait_status: pending.root_wait_status,
+                    tree_drained: pending.tree_drained,
+                    output_closed: pending.output_closed,
+                    ready_sentinel: if pending.kind == "ready" {
+                        pending.meta.ready_sentinel.as_deref()
+                    } else {
+                        None
+                    },
+                },
+            )?;
+            crate::continuation::fault_barrier(&self.paths, "after-terminal-metadata")?;
             crate::continuation::advance_publication(
                 &self.paths,
                 &pending.meta,
@@ -2246,6 +2287,7 @@ impl EventLoop {
                     tree_drained: false,
                     output_closed: false,
                 });
+            self.select_initial_source_event()?;
             self.retry_source_publication();
         }
         self.integrate_terminal_publication(result);
@@ -2303,6 +2345,7 @@ impl EventLoop {
                     tree_drained: self.tree_empty,
                     output_closed: self.output_closed(),
                 });
+            self.select_initial_source_event()?;
             self.retry_source_publication();
         }
         self.integrate_terminal_publication(result);
@@ -2333,6 +2376,7 @@ impl EventLoop {
                     tree_drained: true,
                     output_closed: true,
                 });
+            self.select_initial_source_event()?;
             self.retry_source_publication();
         }
         self.integrate_terminal_publication(result);
@@ -2745,14 +2789,6 @@ fn publish_terminal_with_delivery_disposition(
         state::record_cancellation_drained(paths)?;
     }
     sync_optional_log(log)?;
-    // This is the original event turn, before fault barriers or later log I/O.
-    // Persist selection failure rather than pairing this event with retry bytes.
-    if matches!(
-        delivery_disposition,
-        CompletionDeliveryDisposition::LiveLoop { .. }
-    ) {
-        crate::continuation::select_output(paths)?;
-    }
     match proposal {
         TerminalProposal::ReadySentinel(now) => apply_ready_sentinel_metadata(meta, now),
         TerminalProposal::Exit {
