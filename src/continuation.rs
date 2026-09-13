@@ -184,6 +184,16 @@ fn exact(common: &Value, reply: &Value) -> io::Result<()> {
     Ok(())
 }
 
+// Local CLI metadata uses "sentinel"; the continuation wire uses "ready".
+// Translate only at the producer boundary, never in retained source evidence.
+fn completion_kind(mode: &str) -> io::Result<&'static str> {
+    match mode {
+        "exit" => Ok("exit"),
+        "sentinel" => Ok("ready"),
+        _ => Err(error("invalid local completion mode")),
+    }
+}
+
 /// Called in the original registration worker, before admitting its helper.
 pub(crate) fn prepare(
     paths: &StatePaths,
@@ -191,6 +201,7 @@ pub(crate) fn prepare(
     domain: &str,
     scope: &str,
 ) -> io::Result<()> {
+    let kind = completion_kind(&meta.mode)?;
     let helper = meta
         .delivery_helper
         .as_ref()
@@ -231,7 +242,7 @@ pub(crate) fn prepare(
         "meta_relative": "meta.json", "log_relative": "log", "rc_relative": "rc",
         "registration_relative": REGISTRATION, "outcome_relative": OUTCOME, "snapshot_relative": SNAPSHOT,
         "owner_session_id": session, "owner_invocation_uuid": invocation, "registering_caller": worker,
-        "delivery_mode": meta.delivery_mode.as_str(), "completion_kind": meta.mode, "completion_scope": scope,
+        "delivery_mode": meta.delivery_mode.as_str(), "completion_kind": kind, "completion_scope": scope,
         "helper": {"path":helper.path, "sha256":helper.sha256, "environment_sha256":helper.environment_sha256},
         "recovery": {"path":recovery_path, "sha256":recovery_hash, "environment_sha256":helper.environment_sha256},
         "source_evidence_protocol": PROTOCOL, "listener_revision":1,
@@ -906,6 +917,88 @@ mod tests {
         let common = binding(&paths).unwrap().1;
         (temp, paths, common)
     }
+    fn registration_meta(paths: &StatePaths, mode: &str, delivery: state::DeliveryMode) -> Meta {
+        let mut meta = Meta::new(
+            paths.handle.clone(),
+            1,
+            1,
+            vec![],
+            paths.root.clone(),
+            mode,
+            delivery,
+            (mode == "sentinel").then(|| "READY".into()),
+            vec![],
+            None,
+        );
+        meta.owner_session_id = Some("fixture-session".into());
+        meta.owner_invocation_uuid = Some("55555555-5555-4555-8555-555555555555".into());
+        meta.delivery_helper = Some(state::DeliveryHelperProvenance {
+            schema_version: 5,
+            path: paths.state_dir.join("helper").display().to_string(),
+            device: 0,
+            inode: 0,
+            size: 0,
+            modified_seconds: 0,
+            modified_nanoseconds: 0,
+            mode: 0o500,
+            sha256: "a".repeat(64),
+            environment: Default::default(),
+            environment_sha256: Some("b".repeat(64)),
+            interpreter: None,
+        });
+        meta
+    }
+
+    #[test]
+    fn prepare_translates_local_mode_into_canonical_registration_kind() {
+        for (mode, expected) in [("exit", "exit"), ("sentinel", "ready")] {
+            for scope in ["root", "tree"] {
+                for delivery in [state::DeliveryMode::Sync, state::DeliveryMode::Async] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let root = fs::canonicalize(temp.path()).unwrap();
+                    let paths = StatePaths::new(root, "ab_registration".into());
+                    fs::create_dir(&paths.state_dir).unwrap();
+                    let meta = registration_meta(&paths, mode, delivery);
+                    prepare(&paths, &meta, "11111111-1111-4111-8111-111111111111", scope).unwrap();
+                    // Inspect actual producer bytes, not an imported or repaired fixture.
+                    let raw = read(&paths.state_dir.join(REGISTRATION), MAX_SOURCE).unwrap();
+                    let registration: Value = serde_json::from_slice(&raw).unwrap();
+                    assert_eq!(registration["completion_kind"], expected);
+                    assert_eq!(registration["completion_scope"], scope);
+                    assert_eq!(registration["delivery_mode"], delivery.as_str());
+                    assert_eq!(
+                        meta.mode, mode,
+                        "local metadata must not become wire vocabulary"
+                    );
+                    let fence = value(&paths.state_dir.join(FENCE)).unwrap();
+                    assert_eq!(fence["registration_digest"], digest(&raw));
+                    assert_eq!(fence["phase"], "unreleased");
+                    assert!(fence["workload_identity"].is_null());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_rejects_unknown_local_modes_before_retaining_source() {
+        for mode in ["ready", "", "unknown"] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths =
+                StatePaths::new(fs::canonicalize(temp.path()).unwrap(), "ab_invalid".into());
+            fs::create_dir(&paths.state_dir).unwrap();
+            let meta = registration_meta(&paths, mode, state::DeliveryMode::Async);
+            let err = prepare(
+                &paths,
+                &meta,
+                "11111111-1111-4111-8111-111111111111",
+                "tree",
+            )
+            .unwrap_err();
+            assert_eq!(err.to_string(), "invalid local completion mode");
+            assert_eq!(fs::read_dir(&paths.state_dir).unwrap().count(), 0);
+        }
+    }
+
     #[test]
     fn supported_one_gib_output_publication_uses_bounded_memory() {
         if crate::test_support::private_case() {

@@ -38,6 +38,12 @@ def reconcile(path, env):
     reg = read(path/'source-registration-v2.json')
     return subprocess.run([reg['recovery']['path'], 'completion-reconcile-v2', '--registration-file', str(path/'source-registration-v2.json'), '--confirmation', str(path/'confirmation.json'), '--json'], env=env, capture_output=True, timeout=20)
 
+def assert_registration_mode(path, expected):
+    # Observe the original producer bytes without modifying fixture registration.
+    registration = read(path/'source-registration-v2.json')
+    assert registration['completion_kind'] == expected, registration
+    assert read(path/'meta.json')['mode'] == ('sentinel' if expected == 'ready' else 'exit')
+
 def suite(root):
     endpoint = root/'owner.sock'
     stop = threading.Event()
@@ -70,6 +76,7 @@ def suite(root):
             result = run(env, 'run', '--ready-sentinel', 'READY', '--', '/usr/bin/python3', str(script))
             assert result.returncode == 0, result.stderr
             item = json.loads(result.stdout); path = Path(item['state_dir'])
+            assert_registration_mode(path, 'ready')
             wait(lambda: (path/'completion-output-v2.bin').exists())
             if CASE == 'large-hash':
                 reached = wait(lambda: read(path/'fault-during-output-hash.reached.json'))
@@ -179,6 +186,7 @@ def suite(root):
             else:
                 assert result.returncode == 0, result.stderr
                 item = json.loads(result.stdout); path = Path(item['state_dir'])
+        assert_registration_mode(path, 'ready' if CASE in ['early-ready-exit', 'ready', 'publication-error', 'publication-io-error'] else 'exit')
         if CASE in ['lost-reply','channel-loss']:
             assert not side_effect.exists()
             # Reap only this fixture's already-dead adopted original worker before
