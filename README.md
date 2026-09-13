@@ -81,12 +81,12 @@ completion returns synchronously in-band or asynchronously through the agent mai
   markers directly are retired rather than supported as a compatibility path.
 - **Completion: root, tree, or sentinel.** Finite jobs use an explicit process boundary;
   never-exiting servers report ready on a stdout marker. Nothing is assumed to exit.
-- **Delivery helper boundary.** Every completion invokes the handle's pinned helper operation.
-  Agent-runner interprets the registered mode and event flags: asynchronous completion wakes
-  (headless: `resume`) or forwards (PTY), while synchronous or already-consumed completion does not
-  enter that mailbox. New `accept-output` local receipts never mark completion consumed; normal
-  duplicate notification is an accepted cost. Existing coarse consumed state is rejected, not migrated.
-  The spooler owns helper admission and process outcome, not mailbox closure.
+- **Delivery helper boundary.** Native v2 completion supplies immutable original-source evidence
+  to the pinned runner, which owns continuation and exact listener ACK. Sync controls in-band
+  presentation, not whether an unacknowledged event remains deliverable. `accept-output` receipts
+  never acknowledge mailbox events; duplicate notification is an accepted cost. No producer
+  `--consumed` flag is sent. See [the candidate protocol and pairing limits](docs/completion-continuation-v2.md).
+  The spooler retains original/local process custody independently of mailbox closure.
 - **Pinned delivery helper.** Registration snapshots the selected helper into a content-addressed,
   account-private cache and hard-links that exact version into the handle. It also records the exact
   initiating execution environment and clears later callers' ambient environment before every helper launch.

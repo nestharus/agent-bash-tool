@@ -167,18 +167,26 @@ def workload(directory, helper):
             if p.poll() is None: p.kill()
             p.wait()
     phase(directory, "routing")
-    # Actual independent handles preserve their environments and registration-only token.
+    # Native authority now requires a v2 inherited endpoint. This image-only
+    # helper has no runner domain: assert refusal before helper admission, then
+    # retain the image-sharing/routing experiment in the non-native helper lane.
+    # Positive transient-authority forwarding uses the v2 endpoint in the
+    # spooler environment/adapter fixtures, not a false native admission here.
     records = []
     for i in range(2):
         env = os.environ.copy()
         log = directory / f"routing-{i}"
         env.update(XDG_STATE_HOME=str(directory / f"spool-{i}"), AGENT_BASH_AGENT_RUNNER_BIN=helper, IMAGE_FIXTURE_LOG=str(log),
                    OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY="synthetic-private-token")
+        rejected = subprocess.run([BIN, "run", "--", "/bin/true"], env=env, capture_output=True, timeout=10)
+        assert rejected.returncode == 74 and b"native continuation endpoint missing" in rejected.stderr, rejected
+        assert not log.exists(), "rejected native request invoked the helper"
+        del env["OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY"]
         item = json.loads(run(env, "run", "--", "/bin/true"))
         meta = wait(lambda: terminal_delivery(item["meta"]))
         assert meta["delivery"].get("error") is None, meta
         lines = log.read_text().splitlines()
-        assert any("agent-bash-register authority" in line for line in lines), lines
+        assert any("agent-bash-register no-authority" in line for line in lines), lines
         assert any("agent-bash-complete no-authority" in line for line in lines), lines
         assert all(line.split()[0] == str(inodes[0]) for line in lines), lines
         assert all("authority" not in line or "register" in line or "no-authority" in line for line in lines)

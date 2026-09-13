@@ -1160,6 +1160,12 @@ fn reap_entry_is_handle_dir(entry: &fs::DirEntry) -> bool {
 }
 
 fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig, boot_id: &str) -> bool {
+    // Runner may admit a late listener or still use the recovery image. Until
+    // a paired serialized source-release contract exists, retain v2 sources;
+    // TTL, boot changes and local byte receipts are not release authority.
+    if crate::continuation::enabled(paths) {
+        return false;
+    }
     let Ok(meta) = read_meta(paths) else {
         return false;
     };
@@ -1343,7 +1349,7 @@ pub(crate) fn read_rc(paths: &StatePaths) -> io::Result<i32> {
     parse_rc_text(&contents)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = atomic_parent(path)?;
     let file_name = atomic_file_name(path)?;
     let tmp = atomic_temp_path(parent, file_name);

@@ -1,3 +1,5 @@
+#[path = "fixtures/age360/owner.rs"]
+mod continuation_fixture;
 #[path = "../src/test_support.rs"]
 mod test_support;
 
@@ -2965,10 +2967,21 @@ fn opencode_adapter_initial_dispatch_preserves_inherited_environment() {
     }
     assert_bun_available();
     let temp = tempfile::tempdir().expect("tempdir");
+    let owner = continuation_fixture::Owner::start(temp.path());
     let driver = write_adapter_driver(&temp);
     let mut command = adapter_driver_command(&temp, &driver, "inherited-env", None);
     let output = command
         .env("INHERITED_ENV_SENTINEL", "fixture-env")
+        .env(
+            "AGENT_BASH_AGENT_RUNNER_BIN",
+            continuation_fixture::Owner::helper(),
+        )
+        .env("OULIPOLY_COMPLETION_ENDPOINT", &owner.endpoint)
+        .env(
+            "AGE360_FIXTURE_INVOCATION",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .env("AGE360_FIXTURE_SESSION", "ses_adapter")
         .env(
             "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
             "fixture-authority",
@@ -5153,21 +5166,19 @@ fn later_caller_cannot_substitute_registered_helper_environment() {
         return;
     }
     let temp = tempfile::tempdir().expect("tempdir");
-    let helper = temp.path().join("environment-bound-agents");
+    let owner = continuation_fixture::Owner::start(temp.path());
+    let helper = continuation_fixture::Owner::helper();
     let log = temp.path().join("environment-bound.log");
-    fs::write(
-        &helper,
-        format!(
-            "#!/bin/sh\nauthority=absent\n[ -n \"${{OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY:-}}\" ] && authority=present\nprintf '%s:%s:%s\\n' \"${{AGENT_BASH_FAKE_ROUTE-unset}}\" \"${{2:-}}\" \"$authority\" >> {}\nexit 0\n",
-            shell_quote(&log)
-        ),
-    )
-    .expect("write environment-bound helper");
-    set_executable(&helper);
     let release = temp.path().join("environment-bound-release");
     let output = agent_bash(&temp)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", &helper)
         .env("AGENT_BASH_FAKE_ROUTE", "registered")
+        .env("AGE360_FIXTURE_LOG", &log)
+        .env("OULIPOLY_COMPLETION_ENDPOINT", &owner.endpoint)
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"id":"55555555-5555-4555-8555-555555555555"}"#,
+        )
         .env(
             "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
             "0000000000000000000000000000000000000000000000000000000000000000",
@@ -5872,7 +5883,7 @@ fn detach_does_not_rewrite_terminal_metadata_after_activation() {
 }
 
 #[test]
-fn consumed_marker_before_completion_marks_helper_operation_consumed() {
+fn legacy_consumed_marker_before_completion_does_not_acknowledge_event() {
     if test_support::private_case() {
         return;
     }
@@ -5897,14 +5908,14 @@ fn consumed_marker_before_completion_marks_helper_operation_consumed() {
     });
     let delivery = fs::read_to_string(&delivery_log).expect("event commands");
     assert_eq!(completion_helper_operation_count(&delivery_log), 1);
-    assert!(delivery.lines().any(|line| line == "--consumed"));
+    assert!(!delivery.lines().any(|line| line == "--consumed"));
     assert_eq!(meta["delivery"]["attempted"], true);
     assert_eq!(meta["delivery"]["exit_code"], 0);
     assert!(meta["delivery"]["skipped"].is_null());
 }
 
 #[test]
-fn consumed_marker_during_delivery_grace_marks_helper_operation_consumed() {
+fn legacy_consumed_marker_and_grace_setting_do_not_acknowledge_event() {
     if test_support::private_case() {
         return;
     }
@@ -5933,7 +5944,7 @@ fn consumed_marker_during_delivery_grace_marks_helper_operation_consumed() {
     });
     let delivery = fs::read_to_string(&delivery_log).expect("event commands");
     assert_eq!(completion_helper_operation_count(&delivery_log), 1);
-    assert!(delivery.lines().any(|line| line == "--consumed"));
+    assert!(!delivery.lines().any(|line| line == "--consumed"));
     let meta_path = meta_path(&json);
     let meta = wait_until(FIXTURE_DEADLINE, || {
         let meta = read_meta(&meta_path);
