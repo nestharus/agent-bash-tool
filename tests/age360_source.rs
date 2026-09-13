@@ -119,3 +119,9 @@ fn pre_capture_retry_keeps_original_selection_across_rollover() {
 fn pre_capture_owner_loss_recovers_pinned_original_selection() {
     case("pre-capture-owner-loss");
 }
+
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn transient_selected_read_denial_after_owner_loss_remains_pending_then_recovers() {
+    case("transient-read-loss");
+}

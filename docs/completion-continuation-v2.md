@@ -147,3 +147,41 @@ workload writing and cancellable, with unchanged original artifact bytes. They u
 a simulated runner, not native attachment delivery. A private publisher unit test
 copies/hashes the supported 1 GiB ceiling and checks process peak RSS below 128 MiB;
 that is a source resource experiment, not original-work reaping evidence.
+
+## Missing original output (additive wire revision 5)
+
+The runner-owned `missing-original-output-v1` contract is imported verbatim at
+`tests/fixtures/age360/missing-output-wire.json`; revision4 successful output is
+unchanged. Bash retains genuine original event/outcome bytes and rc. Missing
+output is not empty success, a new workload failure, readiness, physical drain,
+notification acceptance or ACK. If no original outcome survives, recovery remains
+pending; it never reconstructs an outcome from cancellation or later log bytes.
+
+The original selection now records device/inode/exclusive prefix and the source
+directory identity. A completion-only successor can publish missing evidence only
+after the exact original observer is gone/mismatched and a successful inventory
+of that same directory establishes loss. An explicit original selection-failure
+record with no orphaned pin yields `original_selection_not_retained`; absence of
+the selected inode across managed storage yields `selected_storage_lost`; durable
+shortening of that same inode yields `selected_storage_short`. The latter records
+its actual length after syncing/rechecking the inode. An intact live-log alias,
+replacement pin, unaccounted hard link, surviving body/copy candidate, ambiguous
+symlink or changed source directory prevents attestation. No timestamp, retry
+count, pending response or failed open is permanent-loss proof. In particular a
+transient permission/read failure with intact storage stays pending and can later
+produce the original successful bytes.
+
+`missing-output-observation-v2.json` retains the attributable producer and exact
+original observation/outcome linkage before immutable outcome/snapshot publication.
+It is source evidence, not another authority store. Recovery returns
+`source_output_missing` with exact hashes only after both public files are durable;
+`source_ready` remains exclusively successful output. Runner acceptance owns retry
+suppression, ordinary recipient delivery, late listeners and exact ACK. Bash does
+not alter physical-drain or artifact-retention duties.
+
+This is a managed local source-storage observation, not filesystem omniscience:
+Bash owns the pin/log/body/copy inventory and original writer lifetime. Unknown
+external backups, hostile concurrent filesystem mutation, unsupported old selection
+records and in-progress-copy recovery are not certified. Such ambiguities that
+are observed remain pending. No existing-domain migration or full-owner-loss policy
+is introduced here.

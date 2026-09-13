@@ -3,7 +3,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+mod missing_output;
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -32,13 +34,15 @@ pub(crate) fn select_output(paths: &StatePaths) -> io::Result<()> {
     if !enabled(paths) || paths.state_dir.join(SELECTION).try_exists()? {
         return Ok(());
     }
-    let selection = match pin_output(paths) {
-        Ok(length) => json!({"byte_len": length}),
+    let directory = fs::metadata(&paths.state_dir)?;
+    let mut selection = match pin_output(paths) {
+        Ok(selection) => selection,
         Err(err) => json!({"missing": err.to_string()}),
     };
+    selection["directory"] = json!({"device": directory.dev(), "inode": directory.ino()});
     immutable(paths, SELECTION, &bytes(&selection)?)
 }
-fn pin_output(paths: &StatePaths) -> io::Result<u64> {
+fn pin_output(paths: &StatePaths) -> io::Result<Value> {
     fault_barrier(paths, "selection-error")?;
     let destination = paths.state_dir.join(SELECTED_LOG);
     // Never adopt an orphaned pin whose original boundary was not committed.
@@ -50,7 +54,9 @@ fn pin_output(paths: &StatePaths) -> io::Result<u64> {
         ));
     }
     File::open(&paths.state_dir)?.sync_all()?;
-    Ok(metadata.len())
+    Ok(
+        json!({"byte_len": metadata.len(), "device": metadata.dev(), "inode": metadata.ino(), "link_count": metadata.nlink()}),
+    )
 }
 
 pub(crate) fn output_unavailable(paths: &StatePaths) -> io::Result<bool> {
@@ -92,7 +98,7 @@ pub(crate) fn notification_owned(paths: &StatePaths) -> io::Result<bool> {
 
 pub(crate) fn record_missing_output(paths: &StatePaths) -> io::Result<()> {
     state::atomic_write(&paths.state_dir.join("source-publication-error.txt"),
-        b"original_output_capture_incomplete: original selection unavailable; registered native continuation retains notification duty; missing-output notification requires counterpart capability\n")
+        b"original_output_capture_incomplete: original selection unavailable; registered native continuation retains notification duty; capture remains pending unless attributable permanent-loss evidence can be published\n")
 }
 
 pub(crate) fn error(detail: impl Into<String>) -> io::Error {
@@ -585,6 +591,12 @@ fn freeze_output(paths: &StatePaths) -> io::Result<()> {
             "output source is not a supported bounded regular log",
         ));
     }
+    let selection = value(&paths.state_dir.join(SELECTION))?;
+    if selection.get("inode").is_some()
+        && (selection["inode"] != metadata.ino() || selection["device"] != metadata.dev())
+    {
+        return Err(error("original selected inode identity changed"));
+    }
     if metadata.len() < length {
         return Err(error("original output selection was lost"));
     }
@@ -693,6 +705,9 @@ fn finish_observation_with_output(paths: &StatePaths, descriptor: Value) -> io::
     let (_, common) = binding(paths)?;
     exact(&common, outcome)?;
     exact(&common, &snapshot)?;
+    if descriptor["representation"] == "missing-original-output-v1" {
+        snapshot["status"] = json!("original_output_unavailable");
+    }
     snapshot["output"] = if descriptor["byte_len"].as_u64().unwrap_or(u64::MAX) <= INLINE_OUTPUT {
         json!(String::from_utf8_lossy(&read(
             &paths.state_dir.join(OUTPUT),
@@ -893,6 +908,32 @@ fn valid_digest(value: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+fn recover_output(paths: &StatePaths) -> io::Result<bool> {
+    if paths
+        .state_dir
+        .join("completion-source-bundle-v2.json")
+        .try_exists()?
+    {
+        finish_snapshot(paths)?;
+        return Ok(true);
+    }
+    // A read error is not a loss attestation. The independent inventory below
+    // must establish permanent loss before any public missing snapshot exists.
+    let Err(capture_error) = freeze_output(paths) else {
+        return Ok(true);
+    };
+    state::atomic_write(
+        &paths.state_dir.join("source-capture-error.txt"),
+        capture_error.to_string().as_bytes(),
+    )?;
+    record_missing_output(paths)?;
+    if let Some(proof) = missing_output::observe(paths)? {
+        finish_observation_with_output(paths, proof)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> io::Result<Value> {
     let parent = registration_file
         .parent()
@@ -970,17 +1011,20 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
             .state_dir
             .join("completion-output-v2.bin")
             .try_exists()?
+            && !recover_output(&paths)?
         {
-            if output_unavailable(&paths)? {
-                record_missing_output(&paths)?;
-                let mut pending = common;
-                pending["status"] = json!("pending");
-                pending["reason"] = json!("original_output_capture_incomplete");
-                return Ok(pending);
-            }
-            freeze_output(&paths)?;
+            let mut pending = common;
+            pending["status"] = json!("pending");
+            pending["reason"] = json!("original_output_capture_incomplete");
+            return Ok(pending);
         }
-        finish_observation(&paths)?;
+        if !paths
+            .state_dir
+            .join("completion-source-bundle-v2.json")
+            .try_exists()?
+        {
+            finish_observation(&paths)?;
+        }
     }
     if fence["phase"] == "revoked_never_launched" && !paths.state_dir.join(OUTCOME).try_exists()? {
         let mut meta = state::read_meta(&paths)?;
@@ -1018,7 +1062,15 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
         )?));
         result["outcome_sha256"] =
             json!(digest(&read(&paths.state_dir.join(OUTCOME), MAX_SOURCE)?));
-        result["status"] = json!("source_ready");
+        result["status"] = json!(
+            if value(&paths.state_dir.join(SNAPSHOT))?["output"]["representation"]
+                == "missing-original-output-v1"
+            {
+                "source_output_missing"
+            } else {
+                "source_ready"
+            }
+        );
     } else {
         result["status"] = json!("pending");
     }
@@ -1031,7 +1083,7 @@ mod tests {
     fn fixture() -> Value {
         serde_json::from_str(include_str!("../tests/fixtures/age360/paired-wire.json")).unwrap()
     }
-    fn source() -> (tempfile::TempDir, StatePaths, Value) {
+    pub(super) fn source() -> (tempfile::TempDir, StatePaths, Value) {
         let temp = tempfile::tempdir().unwrap();
         let paths = StatePaths::new(temp.path().to_path_buf(), "ab_fixture".into());
         fs::create_dir(&paths.state_dir).unwrap();

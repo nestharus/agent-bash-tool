@@ -82,6 +82,12 @@ def publication_second(root, env):
         wait(lambda: Path(f'/proc/{recovery.pid}/stat').read_text().split(') ')[1][0] == 'T')
     else:
         assert not (path/'completion-output-v2.bin').exists(), 'fault must precede body capture'
+    if CASE == 'header-only-loss':
+        pending = reconcile(path, env)
+        assert pending.returncode == 0, pending.stderr
+        assert json.loads(pending.stdout)['status'] == 'pending', pending.stdout
+        assert not (path/'missing-output-observation-v2.json').exists()
+        assert not (path/'completion-snapshot-v2.json').exists()
     (root/'write-more').touch()
     wait(lambda: (root/'writer-done').exists())
     wait(lambda: b'AFTER-ROLLOVER' in (path/'log').read_bytes())
@@ -89,7 +95,7 @@ def publication_second(root, env):
     if CASE != 'recovery-lock':
         assert b'READY' not in (path/'log').read_bytes(), 'must actually evict original selection'
         assert (path/'log').stat().st_size <= 65536
-    if CASE in ['header-only-loss', 'pre-capture-owner-loss']:
+    if CASE in ['header-only-loss', 'pre-capture-owner-loss', 'transient-read-loss']:
         os.kill(reached['pid'], signal.SIGKILL)
     result = run(env, 'cancel', item['handle'])
     assert result.returncode == 0 and json.loads(result.stdout)['requested'], result.stdout
@@ -100,16 +106,40 @@ def publication_second(root, env):
         wait(lambda: not Path(f'/proc/{guardian}').exists() or Path(f'/proc/{guardian}/stat').read_text().split(') ')[1][0] == 'Z')
         result = reconcile(path, env)
         assert result.returncode == 0, result.stderr
-        assert json.loads(result.stdout)['reason'] == 'original_output_capture_incomplete'
-        assert not (path/'completion-snapshot-v2.json').exists()
+        assert json.loads(result.stdout)['status'] == 'source_output_missing', result.stdout
+        snapshot = read(path/'completion-snapshot-v2.json')
+        assert snapshot['status'] == 'original_output_unavailable'
+        assert snapshot['output']['reason'] == 'original_selection_not_retained'
+        assert snapshot['output']['original_observer'] == header['outcome']['observer']
+        assert read(path/'source-outcome-v2.json') == header['outcome']
         assert not (path/'fixture-acceptance.json').exists()
         assert not (path/'completion-output-v2.bin').exists()
         assert read(path/'source-observation-v2.json') == header
         assert read(path/'continuation-v2.json')['registration'] == 'completion_only_confirmed'
         assert 'registered native continuation' in (path/'source-publication-error.txt').read_text()
     else:
+        if CASE == 'transient-read-loss':
+            selected = path/'selected-log-v2.bin'
+            # ENOENT at the expected pin is not permanent loss when another
+            # original-inode alias survives the same managed inventory.
+            alias = path/'preserved-original-alias'
+            selected.rename(alias)
+            result = reconcile(path, env)
+            assert result.returncode == 0, result.stderr
+            assert json.loads(result.stdout)['status'] == 'pending', result.stdout
+            assert not (path/'missing-output-observation-v2.json').exists()
+            assert not (path/'completion-snapshot-v2.json').exists()
+            alias.rename(selected)
+            selected.chmod(0)
+            result = reconcile(path, env)
+            assert result.returncode == 0, result.stderr
+            assert json.loads(result.stdout)['status'] == 'pending', result.stdout
+            assert not (path/'missing-output-observation-v2.json').exists()
+            assert not (path/'completion-snapshot-v2.json').exists()
+            assert not (path/'completion-output-v2.bin').exists()
+            selected.chmod(0o600)
         (path/f'fault-{fault}.release').touch()
-        if CASE == 'pre-capture-owner-loss':
+        if CASE in ['pre-capture-owner-loss', 'transient-read-loss']:
             # The original pin+boundary, not its later mutable pathname, can be
             # recovered after original observer death and real guardian drain.
             result = reconcile(path, env)
@@ -152,7 +182,7 @@ def suite(root):
                OULIPOLY_PARENT_INVOCATION=json.dumps(dict(id='55555555-5555-4555-8555-555555555555')),
                OULIPOLY_COMPLETION_ENDPOINT=str(endpoint))
     try:
-        if CASE in ['recovery-lock', 'header-only-loss', 'pre-capture-rollover', 'pre-capture-owner-loss']:
+        if CASE in ['recovery-lock', 'header-only-loss', 'pre-capture-rollover', 'pre-capture-owner-loss', 'transient-read-loss']:
             publication_second(root, env)
             return
         if CASE in ['large-escaped', 'large-raw', 'large-hash']:
