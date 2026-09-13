@@ -30,6 +30,7 @@ pub(crate) struct StatePaths {
     pub(crate) meta: PathBuf,
     pub(crate) owner: PathBuf,
     pub(crate) consumed: PathBuf,
+    pub(crate) output_lock: PathBuf,
     pub(crate) delivery_mode: PathBuf,
     pub(crate) delivery_helper: PathBuf,
     pub(crate) delivery_helper_interpreter: PathBuf,
@@ -57,6 +58,7 @@ impl StatePaths {
             meta: state_dir.join("meta.json"),
             owner: state_dir.join("owner.json"),
             consumed: state_dir.join("consumed"),
+            output_lock: state_dir.join("output.lock"),
             delivery_mode: state_dir.join("delivery-mode"),
             delivery_helper: state_dir.join("delivery-helper"),
             delivery_helper_interpreter: state_dir.join("delivery-helper-interpreter"),
@@ -628,6 +630,21 @@ pub(crate) fn lock_reconciliation(paths: &StatePaths) -> io::Result<File> {
     Ok(file)
 }
 
+// Output acquisition and acceptance exclude reaping, not appending producers.
+// Never acquire delivery/reconciliation locks while holding this lock.
+pub(crate) fn lock_output(paths: &StatePaths) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&paths.output_lock)?;
+    lock_file_exclusive(&file)?;
+    Ok(file)
+}
+
 pub(crate) fn lock_delivery(paths: &StatePaths) -> io::Result<File> {
     let file = OpenOptions::new()
         .create(true)
@@ -829,10 +846,6 @@ fn valid_boot_id(id: &str) -> bool {
 
 pub(crate) fn record_activation_attempt(paths: &StatePaths) -> io::Result<bool> {
     record_durable_create_once_marker(&paths.activation_attempted, &paths.state_dir)
-}
-
-pub(crate) fn record_consumed(paths: &StatePaths) -> io::Result<bool> {
-    record_durable_create_once_marker(&paths.consumed, &paths.state_dir)
 }
 
 pub(crate) fn durable_marker_exists(marker: &Path) -> io::Result<bool> {
@@ -1085,9 +1098,17 @@ fn reap_state_entry(
             return;
         }
     };
-    // Lock order is delivery -> custody; admission never takes delivery.
+    // Lock order is delivery -> custody -> nonblocking output; admission takes custody only.
     let Ok(_custody_lock) = lock_custody(&paths) else {
         return;
+    };
+    let _output_lock = match try_lock_file(&paths.output_lock) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return,
+        Err(_) => {
+            stats.errors += 1;
+            return;
+        }
     };
     if !state_dir_reap_eligible(&paths, config, boot_id) {
         return;
@@ -2210,6 +2231,29 @@ mod tests {
 
         assert_eq!(stats.reaped, 0);
         assert!(paths.state_dir.exists());
+    }
+
+    #[test]
+    fn reaper_excludes_output_acquisition_and_acceptance_without_pinning_retention() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_output_lock", "DONE", now - 20_000, true);
+        settle_reap_delivery(&paths);
+        let lock = lock_output(&paths).expect("output lock");
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+        assert_eq!(stats.reaped, 0);
+        assert!(paths.state_dir.exists());
+        drop(lock);
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+        assert_eq!(stats.reaped, 1);
+        assert!(!paths.state_dir.exists());
+        assert!(
+            lock_output(&paths).is_err(),
+            "must not recreate cleaned source"
+        );
     }
 
     #[test]

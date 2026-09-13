@@ -2706,7 +2706,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = StatePaths::new(temp.path().to_path_buf(), "ab_consumed_error".to_string());
         state::create_handle_state(&paths).expect("create state");
-        state::record_consumed(&paths).expect("record consumed");
+        fs::write(&paths.consumed, b"").expect("seed legacy consumed");
         fs::rename(&paths.consumed, paths.state_dir.join("retained-consumed"))
             .expect("retain consumed marker");
         symlink(&paths.consumed, &paths.consumed).expect("make consumed lookup fail");

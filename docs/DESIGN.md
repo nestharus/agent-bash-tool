@@ -78,8 +78,8 @@ finish, replace every installed adapter copy and the binary while calls remain s
 calls only after the matching pair is active. No adapter/binary overlap pair is supported, including
 the current adapter with a legacy binary or a legacy adapter with the current binary. Adapters that
 write the `consumed` marker directly are retired and unsupported; they are not a compatibility
-practice the spooler preserves. The control-route-eligible `consume` command is the sole supported
-first-party terminal-consumption operation, so future marker changes have one migration boundary.
+practice the spooler preserves. The control-route-eligible `accept-output` command records only a bounded local receipt.
+It never writes the legacy coarse marker; existing coarse state is rejected, not migrated.
 
 ### Attached-required — detached invocation bombs out
 At startup the tool captures `getppid()`. The tool itself must be a real, attached subprocess
@@ -151,7 +151,7 @@ accepted or observed. Guardian takeover intentionally starts a fresh grace clock
 durable marker carries no acceptance timestamp and the newly responsible process must first give
 the adopted tree a bounded `SIGTERM` opportunity before escalating.
 
-`cancel-requested`, `activation-attempted`, and `consumed` use one state-layer durable create-once
+`cancel-requested` and `activation-attempted` use one state-layer durable create-once
 marker primitive. It opens the state directory before marker creation, syncs the created file and
 directory, and removes plus directory-syncs the marker if either publication sync fails. A failed
 publication therefore does not become an accepted decision on a later call. Settlement observes
@@ -213,19 +213,20 @@ the PID is **harness-code polling (cheap, no LLM tokens)** — not the LLM self-
 forbidden.
 
 `status --observe-only <handle>` suppresses owner-triggered reconciliation and delivery progression.
-The bundled adapter uses it to observe a terminal asynchronous result, records `consume`, and then
-issues progress-capable status. This ordering puts the in-call consumer decision ahead of the
-completion helper request so the helper receives `--consumed` rather than admitting a duplicate
-active mailbox publication.
+The bundled adapter first observes terminal status, then acquires `snapshot <handle>` before
+requesting `accept-output <handle> --snapshot '<identity JSON>'` and progress-capable status.
+The local receipt never supplies the completion-helper `--consumed` hint. It is not a remote
+receipt, remote ACK, physical drain, or evidence that all future output was read.
+See [retained output](retained-output.md) for the exact local contract and retention limits.
 
 Handle observation and handle control are separate cooperative routing policies within the
 supported CLI. Default list visibility and control require the recorded owner session when one
 exists, falling back to the exact caller-chain predicate only for handles without session metadata.
 At every supported mutating control boundary, the
 handle's pinned helper resolves the live caller chain to its acting session; ambient owner strings
-never satisfy that supported-interface check. `list --all`, cross-owner `status`, and cross-owner `mode` may
+never satisfy that supported-interface check. `list --all`, cross-owner `status`/`snapshot`, and cross-owner `mode` may
 observe account-local handles, but they cannot publish recovery state, claim delivery, cancel work,
-or change delivery mode. Cancel, detach, and consume fail with `EX_NOPERM` for ineligible callers. Guardian recovery
+or change delivery mode. Cancel, detach, and accept-output fail with `EX_NOPERM` for ineligible callers. Guardian recovery
 remains independent of any observing caller and is the automatic cleanup/progress path after the
 originating process disappears. No unauthenticated cross-owner operator override is exposed by
 this CLI.
@@ -466,9 +467,9 @@ Activation writes a durable pending outcome before helper admission and replaces
 or failed after observing the helper process. A caller loss cannot erase that outcome, and later
 detach calls expose failed or unknown settlement without replaying the admitted activation.
 
-Before invoking the completion helper operation, the supervisor checks the best-effort `consumed`
-marker. If `AGENT_BASH_CONSUMER_GRACE_MS` is nonzero, it waits up to that bounded interval (clamped
-to ten seconds) for an in-call consumer to create the marker. A marker adds `--consumed` to the
+Before invoking the completion helper operation, the supervisor checks the legacy `consumed`
+marker. New local receipts never create it. If `AGENT_BASH_CONSUMER_GRACE_MS` is nonzero, it waits up to that bounded interval (clamped
+to ten seconds) for legacy coarse state to appear (concurrent old writers are unsupported for the new receipt guarantee). A marker adds `--consumed` to the
 `agent-bash-complete` helper operation so the opaque helper can suppress any downstream duplicate;
 the spooler still records the admitted helper-process outcome. Delivery locking keeps that operation
 atomic with detach and completion.
@@ -482,8 +483,8 @@ the state directory.
 Terminal handles use the configured state TTL only after physical-retention vetoes are discharged. Retryable pre-invocation helper failures do not
 receive a multiplied retention window, so failed delivery does not create a sevenfold retained-state
 population. Each control-route-eligible status observer may perform at most one helper-resolution retry
-for the handle it observes. The adapter requests the durable `consumed` marker through the
-control-route-eligible `consume` operation; cross-route status remains read-only and cannot suppress the
+for the handle it observes. The adapter requests a separate local receipt through the
+control-route-eligible `accept-output` operation; neither that receipt nor cross-route status suppresses the
 origin session's pending delivery. `retry_count` bounds each handle to one
 observer-triggered retry in total. The delivery lock serializes concurrently admitted eligible
 observers; the first persists either an attempt claim or a closed retry result, and later observers

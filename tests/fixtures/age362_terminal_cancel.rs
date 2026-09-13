@@ -38,12 +38,32 @@ fn terminal_live_descendants_cancel_without_rewriting_root_or_delivery() {
     wait_for_fixture_delivery(&run);
     let before = read_meta(&meta_path(&run));
     let rc = fs::read(dir.join("rc")).unwrap();
+    // AGE-363 requires acquisition of the actual bounded output before acceptance.
+    let acquired = agent_bash(&temp)
+        .args(["snapshot", handle])
+        .output()
+        .unwrap();
+    assert_command_success(&acquired);
+    let acquired = parse_stdout_json(&acquired);
+    let identity = &acquired["snapshot"];
+    let bytes = b"root output\n";
+    assert_eq!(identity["handle"], handle);
+    assert_eq!(identity["created_at_unix_ms"], before["created_at_unix_ms"]);
+    assert_eq!(identity["bytes"], bytes.len());
+    assert_eq!(identity["sha256"], format!("{:x}", Sha256::digest(bytes)));
+    assert_eq!(identity["encoding"], "hex");
+    assert_eq!(
+        acquired["output"],
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
     let consume = agent_bash(&temp)
-        .args(["consume", handle])
+        .args(["accept-output", handle, "--snapshot", &identity.to_string()])
         .output()
         .unwrap();
     assert_command_success(&consume);
-    let consumed = fs::metadata(dir.join("consumed")).unwrap().ino();
+    assert_eq!(parse_stdout_json(&consume)["snapshot"], *identity);
+    assert_eq!(parse_stdout_json(&consume)["receipt_updated"], true);
+    let consumed = fs::metadata(dir.join("output-receipt.json")).unwrap().ino();
     let start = Instant::now();
     let cancel = agent_bash(&temp).args(["cancel", handle]).output().unwrap();
     assert_command_success(&cancel);
@@ -85,7 +105,10 @@ fn terminal_live_descendants_cancel_without_rewriting_root_or_delivery() {
         assert_eq!(after[field], before[field], "changed {field}");
     }
     assert_eq!(fs::read(dir.join("rc")).unwrap(), rc);
-    assert_eq!(fs::metadata(dir.join("consumed")).unwrap().ino(), consumed);
+    assert_eq!(
+        fs::metadata(dir.join("output-receipt.json")).unwrap().ino(),
+        consumed
+    );
     let drained = agent_bash(&temp).args(["cancel", handle]).output().unwrap();
     assert_command_success(&drained);
     assert_eq!(parse_stdout_json(&drained)["requested"], false);
