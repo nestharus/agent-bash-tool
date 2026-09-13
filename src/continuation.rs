@@ -22,6 +22,78 @@ const MAX_SOURCE: u64 = 1024 * 1024;
 const MAX_OUTPUT: u64 = 1024 * MAX_SOURCE;
 const INLINE_OUTPUT: u64 = 64 * 1024;
 const OUTPUT: &str = "completion-output-v2.bin";
+const SELECTION: &str = "output-selection-v2.json";
+const SELECTED_LOG: &str = "selected-log-v2.bin";
+
+/// Select once, in the original event turn, before any retry can collect output.
+/// The logger replaces (never truncates) an inode pinned by this hard link.
+/// A failed selection is explicit missing evidence, not permission to resample.
+pub(crate) fn select_output(paths: &StatePaths) -> io::Result<()> {
+    if !enabled(paths) || paths.state_dir.join(SELECTION).try_exists()? {
+        return Ok(());
+    }
+    let selection = match pin_output(paths) {
+        Ok(length) => json!({"byte_len": length}),
+        Err(err) => json!({"missing": err.to_string()}),
+    };
+    immutable(paths, SELECTION, &bytes(&selection)?)
+}
+fn pin_output(paths: &StatePaths) -> io::Result<u64> {
+    fault_barrier(paths, "selection-error")?;
+    let destination = paths.state_dir.join(SELECTED_LOG);
+    // Never adopt an orphaned pin whose original boundary was not committed.
+    fs::hard_link(&paths.log, &destination)?;
+    let metadata = fs::symlink_metadata(&destination)?;
+    if !metadata.is_file() || metadata.len() > MAX_OUTPUT {
+        return Err(error(
+            "selected log is not a supported bounded regular file",
+        ));
+    }
+    File::open(&paths.state_dir)?.sync_all()?;
+    Ok(metadata.len())
+}
+
+pub(crate) fn output_unavailable(paths: &StatePaths) -> io::Result<bool> {
+    if paths.state_dir.join(OUTPUT).try_exists()? {
+        return Ok(false);
+    }
+    if !paths
+        .state_dir
+        .join("source-observation-v2.json")
+        .try_exists()?
+    {
+        return Ok(false);
+    }
+    let selection = paths.state_dir.join(SELECTION);
+    if !selection.try_exists()? {
+        return Ok(true);
+    }
+    let Some(length) = value(&selection)?["byte_len"].as_u64() else {
+        return Ok(true);
+    };
+    match fs::symlink_metadata(paths.state_dir.join(SELECTED_LOG)) {
+        Ok(meta) => Ok(!meta.is_file() || meta.len() < length || length > MAX_OUTPUT),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
+/// Registration owns notification recovery even when no successful source body
+/// exists. This is NOT handed_off(), acceptance, delivery, or listener ACK.
+pub(crate) fn notification_owned(paths: &StatePaths) -> io::Result<bool> {
+    let (_, common) = binding(paths)?;
+    let local = value(&paths.state_dir.join(LOCAL))?;
+    exact(&common, &local)?;
+    Ok(matches!(
+        local["registration"].as_str(),
+        Some("confirmed" | "completion_only_confirmed")
+    ))
+}
+
+pub(crate) fn record_missing_output(paths: &StatePaths) -> io::Result<()> {
+    state::atomic_write(&paths.state_dir.join("source-publication-error.txt"),
+        b"original_output_capture_incomplete: original selection unavailable; registered native continuation retains notification duty; missing-output notification requires counterpart capability\n")
+}
 
 pub(crate) fn error(detail: impl Into<String>) -> io::Error {
     io::Error::other(detail.into())
@@ -466,6 +538,9 @@ fn capture_observation(
         } else {
             "completed"
         });
+        // Direct/guardian callers select here; live callers already selected in
+        // the terminal event turn. Never select again for an existing header.
+        select_output(paths)?;
         // Retain original observation independently of later publication errors.
         immutable(
             paths,
@@ -480,14 +555,13 @@ fn capture_observation(
         .join("completion-output-v2.bin")
         .try_exists()?
     {
-        let staged = value(&staged)?;
-        let observer: CallerChainEntry =
-            serde_json::from_value(staged["outcome"]["observer"].clone())?;
-        if observer != identity(unsafe { libc::getpid() })? {
+        if output_unavailable(paths)? {
+            record_missing_output(paths)?;
             return Err(error(
-                "original output capture incomplete; successor cannot resample mutable log",
+                "original output capture incomplete; cannot resample mutable log",
             ));
         }
+        fault_barrier(paths, "before-output-capture")?;
         freeze_output(paths)?;
     }
     Ok(())
@@ -498,17 +572,26 @@ fn freeze_output(paths: &StatePaths) -> io::Result<()> {
     if destination.try_exists()? {
         return Ok(());
     }
-    let mut source = OpenOptions::new()
+    let source = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&paths.log)?;
+        .open(paths.state_dir.join(SELECTED_LOG))?;
+    let length = value(&paths.state_dir.join(SELECTION))?["byte_len"]
+        .as_u64()
+        .ok_or_else(|| error("original output selection missing"))?;
     let metadata = source.metadata()?;
     if !metadata.is_file() || metadata.len() > MAX_OUTPUT {
         return Err(error(
             "output source is not a supported bounded regular log",
         ));
     }
-    let temp = paths.state_dir.join(".completion-output-v2.bin.tmp");
+    if metadata.len() < length {
+        return Err(error("original output selection was lost"));
+    }
+    let temp = paths.state_dir.join(format!(
+        ".completion-output-{}.tmp",
+        state::generate_handle().map_err(io::Error::other)?
+    ));
     let result = (|| -> io::Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -517,9 +600,15 @@ fn freeze_output(paths: &StatePaths) -> io::Result<()> {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&temp)?;
-        io::copy(&mut source, &mut file)?;
+        if io::copy(&mut source.take(length), &mut file)? != length {
+            return Err(error("original output selection was lost during copy"));
+        }
         file.sync_all()?;
-        fs::hard_link(&temp, &destination)?;
+        match fs::hard_link(&temp, &destination) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
         File::open(&paths.state_dir)?.sync_all()
     })();
     let _ = fs::remove_file(temp);
@@ -589,6 +678,7 @@ fn output_descriptor(paths: &StatePaths) -> io::Result<Value> {
         if let Some(descriptor) = hasher.advance()? {
             return Ok(descriptor);
         }
+        recovery_hash_barrier(paths)?;
     }
 }
 
@@ -628,6 +718,32 @@ fn finish_observation_with_output(paths: &StatePaths, descriptor: Value) -> io::
         }))?,
     )?;
     finish_snapshot(paths)
+}
+
+#[cfg(feature = "source-fault-tests")]
+fn recovery_hash_barrier(paths: &StatePaths) -> io::Result<()> {
+    if std::env::var("AGENT_BASH_SOURCE_FAULT").as_deref() == Ok("recovery-lock")
+        && !paths
+            .state_dir
+            .join("fault-recovery-lock.reached.json")
+            .try_exists()?
+    {
+        // If recovery regresses to owning completion.lock here, the source test
+        // cannot progress while this exact actor is stopped.
+        immutable(
+            paths,
+            "fault-recovery-lock.reached.json",
+            &bytes(&json!(identity(unsafe { libc::getpid() })?))?,
+        )?;
+        unsafe {
+            libc::raise(libc::SIGSTOP);
+        }
+    }
+    Ok(())
+}
+#[cfg(not(feature = "source-fault-tests"))]
+fn recovery_hash_barrier(_paths: &StatePaths) -> io::Result<()> {
+    Ok(())
 }
 
 /// Nonblocking deterministic fixture barriers. Never a workload timeout or proof
@@ -833,7 +949,12 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
         }
         immutable(&paths, CONFIRMATION, &bytes(&confirmation)?)?;
     }
-    let _completion = state::lock_completion(&paths)?;
+    // Serialize recoveries (including never-launched staging), never the live
+    // observer. In particular two recoveries cannot race a new selection pin.
+    let _recovery = named_lock(&paths, "source-recovery.lock")?;
+    // Recovery never owns the live observer's completion lock. Staged evidence
+    // and final publications use immutable compare/link; hashing touches only
+    // the retained body. A stopped recovery cannot stop I/O/reaping.
     let local_lock = named_lock(&paths, "continuation.lock")?;
     let mut local = value(&paths.state_dir.join(LOCAL))?;
     local["registration"] = json!("completion_only_confirmed");
@@ -850,10 +971,14 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
             .join("completion-output-v2.bin")
             .try_exists()?
         {
-            let mut pending = common;
-            pending["status"] = json!("pending");
-            pending["reason"] = json!("original_output_capture_incomplete");
-            return Ok(pending);
+            if output_unavailable(&paths)? {
+                record_missing_output(&paths)?;
+                let mut pending = common;
+                pending["status"] = json!("pending");
+                pending["reason"] = json!("original_output_capture_incomplete");
+                return Ok(pending);
+            }
+            freeze_output(&paths)?;
         }
         finish_observation(&paths)?;
     }
@@ -1357,6 +1482,56 @@ mod tests {
         assert!(!paths.state_dir.join("completion-output-v2.bin").exists());
         assert!(!paths.state_dir.join(SNAPSHOT).exists());
     }
+    #[test]
+    fn selected_prefix_does_not_include_later_appends() {
+        let (_temp, paths, _) = source();
+        fs::write(&paths.log, b"original").unwrap();
+        select_output(&paths).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&paths.log)
+            .unwrap()
+            .write_all(b"later")
+            .unwrap();
+        select_output(&paths).unwrap();
+        freeze_output(&paths).unwrap();
+        assert_eq!(fs::read(paths.state_dir.join(OUTPUT)).unwrap(), b"original");
+    }
+
+    #[test]
+    fn lost_selection_is_missing_not_reselected_from_new_log() {
+        let (_temp, paths, common) = recovery_source("launched");
+        fs::write(&paths.log, b"original").unwrap();
+        select_output(&paths).unwrap();
+        save(
+            &paths,
+            "source-observation-v2.json",
+            &json!({"outcome":common}),
+        )
+        .unwrap();
+        // Private fault: loss of retained selected storage, not workload replay.
+        fs::remove_file(paths.state_dir.join(SELECTED_LOG)).unwrap();
+        fs::write(&paths.log, b"new log").unwrap();
+        assert!(output_unavailable(&paths).unwrap());
+        let reply = reconcile(
+            &paths.state_dir.join(REGISTRATION),
+            &paths.state_dir.join("fixture-confirmation.json"),
+        )
+        .unwrap();
+        assert_eq!(reply["reason"], "original_output_capture_incomplete");
+        assert!(!paths.state_dir.join(OUTPUT).exists());
+        assert!(!paths.state_dir.join(SELECTED_LOG).exists());
+    }
+
+    #[test]
+    fn publication_lock_attempt_does_not_join_another_actor() {
+        let (_temp, paths, _) = source();
+        let held = state::lock_completion(&paths).unwrap();
+        assert!(state::try_lock_completion(&paths).unwrap().is_none());
+        drop(held);
+        assert!(state::try_lock_completion(&paths).unwrap().is_some());
+    }
+
     #[test]
     fn wrong_completion_only_confirmation_never_changes_fence() {
         let (_temp, paths, _) = recovery_source("unreleased");

@@ -669,6 +669,25 @@ pub(crate) fn lock_completion(paths: &StatePaths) -> io::Result<File> {
     Ok(file)
 }
 
+pub(crate) fn try_lock_completion(paths: &StatePaths) -> io::Result<Option<File>> {
+    use std::os::fd::AsRawFd;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&paths.completion_lock)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::WouldBlock {
+        return Ok(None);
+    }
+    Err(err)
+}
+
 // Short physical-admission/discharge critical sections only. No helper execution
 // owns this lock, and even a stopped critical-section owner cannot block a caller
 // indefinitely. Timeout is an error/retry, not acceptance or drain evidence.

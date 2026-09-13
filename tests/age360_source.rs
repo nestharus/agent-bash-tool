@@ -98,3 +98,24 @@ fn configured_large_invalid_utf8_output_publishes_exact_full_raw_artifact() {
 fn hashing_yields_to_live_output_and_cancellation_without_relabeling_ready() {
     case("large-hash");
 }
+
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn stopped_recovery_does_not_block_original_output_publication_or_cancel() {
+    case("recovery-lock");
+}
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn header_only_owner_loss_records_actual_guardian_drain_not_delivery() {
+    case("header-only-loss");
+}
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn pre_capture_retry_keeps_original_selection_across_rollover() {
+    case("pre-capture-rollover");
+}
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn pre_capture_owner_loss_recovers_pinned_original_selection() {
+    case("pre-capture-owner-loss");
+}

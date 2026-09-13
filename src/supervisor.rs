@@ -1,3 +1,4 @@
+use std::os::unix::fs::OpenOptionsExt;
 mod descendant_signal;
 
 use std::collections::HashMap;
@@ -542,6 +543,19 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
         if adopted_tree_empty {
             crate::delivery_role::guardian_tree_drained();
         }
+        if crate::continuation::enabled(paths) && adopted_tree_empty {
+            if accepted_cancel && state::record_cancellation_drained(paths).is_err() {
+                std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                continue;
+            }
+            if crate::continuation::output_unavailable(paths).unwrap_or(false)
+                && crate::continuation::notification_owned(paths).unwrap_or(false)
+                && crate::continuation::record_missing_output(paths).is_ok()
+                && state::end_physical_custody(paths).is_ok()
+            {
+                return 0;
+            }
+        }
         if crate::continuation::enabled(paths) && adopted_tree_empty && !completion_reconciled {
             let publication = (|| -> io::Result<()> {
                 let _lock = state::lock_completion(paths)?;
@@ -832,7 +846,11 @@ fn supervisor_meta(mut meta: Meta) -> Meta {
 }
 
 fn open_supervisor_log(paths: &StatePaths) -> io::Result<BoundedLog> {
-    BoundedLog::new(state::open_log_append(paths)?, log_max_bytes())
+    BoundedLog::new(
+        state::open_log_append(paths)?,
+        paths.log.clone(),
+        log_max_bytes(),
+    )
 }
 
 fn log_max_bytes() -> u64 {
@@ -845,15 +863,17 @@ fn log_max_bytes() -> u64 {
 
 struct BoundedLog {
     file: File,
+    path: std::path::PathBuf,
     max_bytes: u64,
     len: u64,
 }
 
 impl BoundedLog {
-    fn new(file: File, max_bytes: u64) -> io::Result<Self> {
+    fn new(file: File, path: std::path::PathBuf, max_bytes: u64) -> io::Result<Self> {
         let len = file.metadata()?.len();
         let mut log = Self {
             file,
+            path,
             max_bytes: max_bytes.max(1),
             len,
         };
@@ -888,10 +908,25 @@ impl BoundedLog {
             payload_budget.saturating_sub(u64::try_from(new_tail.len()).unwrap_or(payload_budget));
         let old_tail = self.read_tail(old_budget)?;
 
-        self.file.set_len(0)?;
-        self.file.write_all(marker)?;
-        self.file.write_all(&old_tail)?;
-        self.file.write_all(new_tail)?;
+        // Rollover replaces the live pathname; a selected event's pinned inode
+        // retains its prefix, even before its bounded body copy succeeds.
+        let temp = self.path.with_extension(format!(
+            "rollover-{}",
+            state::generate_handle().map_err(io::Error::other)?
+        ));
+        let mut replacement = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o600)
+            .open(&temp)?;
+        replacement.write_all(marker)?;
+        replacement.write_all(&old_tail)?;
+        replacement.write_all(new_tail)?;
+        replacement.sync_all()?;
+        std::fs::rename(&temp, &self.path)?;
+        self.file = replacement;
         self.len =
             u64::try_from(marker.len() + old_tail.len() + new_tail.len()).unwrap_or(self.max_bytes);
         Ok(())
@@ -1625,6 +1660,13 @@ fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
         // Spawn failures remain bounded by backoff; image RPCs fail truthfully meanwhile.
         loop_state.recover_image_service();
         loop_state.maybe_finish()?;
+        if loop_state.tree_empty
+            && loop_state.output_closed()
+            && explicit_cancel_accepted(&loop_state.paths)?
+        {
+            // Actual reaping/closure evidence is independent of publication.
+            state::record_cancellation_drained(&loop_state.paths)?;
+        }
         loop_state.retry_source_publication();
         loop_state.retry_completion_integration();
         loop_state.drive_completion_delivery()?;
@@ -2134,7 +2176,9 @@ impl EventLoop {
         }
         let result = (|| -> io::Result<bool> {
             crate::continuation::fault_barrier(&self.paths, "after-terminal-metadata")?;
-            let _lock = state::lock_completion(&self.paths)?;
+            let Some(_lock) = state::try_lock_completion(&self.paths)? else {
+                return Ok(false);
+            };
             crate::continuation::advance_publication(
                 &self.paths,
                 &pending.meta,
@@ -2156,6 +2200,16 @@ impl EventLoop {
             Ok(true) => self.pending_source = None,
             Ok(false) => {}
             Err(error) => {
+                if crate::continuation::output_unavailable(&self.paths).unwrap_or(false)
+                    && crate::continuation::notification_owned(&self.paths).unwrap_or(false)
+                    && crate::continuation::record_missing_output(&self.paths).is_ok()
+                {
+                    self.pending_source = None;
+                    // Only local delivery execution retires: no successful source
+                    // handoff, enqueue, or recipient ACK is fabricated.
+                    self.mark_completion_delivery_settled();
+                    return;
+                }
                 if let Some(pending) = self.pending_source.as_mut() {
                     pending.retry_at = Instant::now() + Duration::from_secs(1);
                 }
@@ -2691,6 +2745,14 @@ fn publish_terminal_with_delivery_disposition(
         state::record_cancellation_drained(paths)?;
     }
     sync_optional_log(log)?;
+    // This is the original event turn, before fault barriers or later log I/O.
+    // Persist selection failure rather than pairing this event with retry bytes.
+    if matches!(
+        delivery_disposition,
+        CompletionDeliveryDisposition::LiveLoop { .. }
+    ) {
+        crate::continuation::select_output(paths)?;
+    }
     match proposal {
         TerminalProposal::ReadySentinel(now) => apply_ready_sentinel_metadata(meta, now),
         TerminalProposal::Exit {
@@ -3238,7 +3300,7 @@ for line in sys.stdin:
             .read(true)
             .open(&path)
             .expect("create log");
-        let mut log = BoundedLog::new(file, 128).expect("bounded log");
+        let mut log = BoundedLog::new(file, path.clone(), 128).expect("bounded log");
 
         log.write_all(&[b'a'; 100]).expect("write old output");
         log.write_all(&[b'b'; 100]).expect("write new output");
@@ -3264,7 +3326,7 @@ for line in sys.stdin:
             .read(true)
             .open(&path)
             .expect("create log");
-        let mut log = BoundedLog::new(file, 96).expect("bounded log");
+        let mut log = BoundedLog::new(file, path.clone(), 96).expect("bounded log");
 
         log.write_all(&[b'x'; 4096]).expect("write large output");
 

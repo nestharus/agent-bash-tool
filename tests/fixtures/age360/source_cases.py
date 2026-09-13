@@ -44,6 +44,92 @@ def assert_registration_mode(path, expected):
     assert registration['completion_kind'] == expected, registration
     assert read(path/'meta.json')['mode'] == ('sentinel' if expected == 'ready' else 'exit')
 
+def publication_second(root, env):
+    fault = {'recovery-lock': 'during-output-hash',
+             'header-only-loss': 'selection-error'}.get(CASE, 'before-output-capture')
+    env['AGENT_BASH_SOURCE_FAULT'] = fault
+    env['AGENT_BASH_LOG_MAX_BYTES'] = str(8*1024*1024 if CASE == 'recovery-lock' else 65536)
+    original = b'a' * (2*1024*1024 if CASE == 'recovery-lock' else 32768) + b'READY\n'
+    script = root/'second-writer.py'
+    script.write_text("import os,time\nos.write(1,b'a'*%d+b'READY\\n')\nwhile not os.path.exists(%r): time.sleep(.01)\nfor _ in range(128): os.write(1,b'z'*8192)\nos.write(1,b'AFTER-ROLLOVER\\n')\nopen(%r,'w').write('done')\nwhile True: time.sleep(1)\n" % (len(original)-6, str(root/'write-more'), str(root/'writer-done')))
+    result = run(env, 'run', '--ready-sentinel', 'READY', '--', '/usr/bin/python3', str(script))
+    assert result.returncode == 0, result.stderr
+    item = json.loads(result.stdout); path = Path(item['state_dir'])
+    reached = wait(lambda: read(path/f'fault-{fault}.reached.json'))
+    header = wait(lambda: read(path/'source-observation-v2.json'))
+    assert header['outcome']['observer'] == reached
+    assert header['outcome']['kind'] == 'ready'
+    workload = read(path/'source-launch-v2.json')['workload_identity']
+    guardian = f.stat(reached['pid'])[0]
+    assert (path/'physical-custody').exists()
+    assert not (path/'completion-snapshot-v2.json').exists()
+    recovery = None
+    if CASE == 'recovery-lock':
+        assert (path/'completion-output-v2.bin').read_bytes() == original
+        confirmation = common(path)
+        confirmation.update(status='exact_committed', authority='completion_only', registration_committed=True)
+        (path/'confirmation.json').write_text(json.dumps(confirmation))
+        reg = read(path/'source-registration-v2.json')
+        # Recovery image verifies its saved environment. Set only the test hook
+        # in that already-selected recovery invocation, not production state.
+        recovery_env = env.copy(); recovery_env['AGENT_BASH_SOURCE_FAULT'] = 'recovery-lock'
+        recovery = subprocess.Popen([reg['recovery']['path'], 'completion-reconcile-v2',
+            '--registration-file', str(path/'source-registration-v2.json'),
+            '--confirmation', str(path/'confirmation.json'), '--json'], env=recovery_env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        recovery_identity = wait(lambda: read(path/'fault-recovery-lock.reached.json'))
+        assert recovery_identity == identity(recovery.pid)
+        wait(lambda: Path(f'/proc/{recovery.pid}/stat').read_text().split(') ')[1][0] == 'T')
+    else:
+        assert not (path/'completion-output-v2.bin').exists(), 'fault must precede body capture'
+    (root/'write-more').touch()
+    wait(lambda: (root/'writer-done').exists())
+    wait(lambda: b'AFTER-ROLLOVER' in (path/'log').read_bytes())
+    assert identity(reached['pid']) == reached, 'original observer must service output'
+    if CASE != 'recovery-lock':
+        assert b'READY' not in (path/'log').read_bytes(), 'must actually evict original selection'
+        assert (path/'log').stat().st_size <= 65536
+    if CASE in ['header-only-loss', 'pre-capture-owner-loss']:
+        os.kill(reached['pid'], signal.SIGKILL)
+    result = run(env, 'cancel', item['handle'])
+    assert result.returncode == 0 and json.loads(result.stdout)['requested'], result.stdout
+    wait(lambda: not Path(f"/proc/{workload['pid']}").exists())
+    wait(lambda: (path/'cancel-workload-drained').exists())
+    if CASE == 'header-only-loss':
+        wait(lambda: not (path/'physical-custody').exists())
+        wait(lambda: not Path(f'/proc/{guardian}').exists() or Path(f'/proc/{guardian}/stat').read_text().split(') ')[1][0] == 'Z')
+        result = reconcile(path, env)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)['reason'] == 'original_output_capture_incomplete'
+        assert not (path/'completion-snapshot-v2.json').exists()
+        assert not (path/'fixture-acceptance.json').exists()
+        assert not (path/'completion-output-v2.bin').exists()
+        assert read(path/'source-observation-v2.json') == header
+        assert read(path/'continuation-v2.json')['registration'] == 'completion_only_confirmed'
+        assert 'registered native continuation' in (path/'source-publication-error.txt').read_text()
+    else:
+        (path/f'fault-{fault}.release').touch()
+        if CASE == 'pre-capture-owner-loss':
+            # The original pin+boundary, not its later mutable pathname, can be
+            # recovered after original observer death and real guardian drain.
+            result = reconcile(path, env)
+            assert result.returncode == 0, result.stderr
+            assert json.loads(result.stdout)['status'] == 'source_ready', result.stdout
+        wait(lambda: (path/'completion-snapshot-v2.json').exists())
+        assert (path/'completion-output-v2.bin').read_bytes() == original
+        assert read(path/'source-outcome-v2.json') == header['outcome']
+        if recovery:
+            assert Path(f'/proc/{recovery.pid}/stat').read_text().split(') ')[1][0] == 'T'
+            os.kill(recovery.pid, signal.SIGCONT)
+            stdout, stderr = recovery.communicate(timeout=20)
+            assert recovery.returncode == 0, stderr
+            assert json.loads(stdout)['status'] == 'source_ready', stdout
+        wait(lambda: not (path/'physical-custody').exists())
+    print(json.dumps(dict(case=CASE, original_selected_bytes=len(original),
+        capture_missing=CASE=='header-only-loss', guardian_pid=guardian,
+        actual_cancel_drain=True, physical_custody_discharged=True,
+        original_output_resampled=False, native_notification_delivery_exercised=False)), flush=True)
+
 def suite(root):
     endpoint = root/'owner.sock'
     stop = threading.Event()
@@ -66,6 +152,9 @@ def suite(root):
                OULIPOLY_PARENT_INVOCATION=json.dumps(dict(id='55555555-5555-4555-8555-555555555555')),
                OULIPOLY_COMPLETION_ENDPOINT=str(endpoint))
     try:
+        if CASE in ['recovery-lock', 'header-only-loss', 'pre-capture-rollover', 'pre-capture-owner-loss']:
+            publication_second(root, env)
+            return
         if CASE in ['large-escaped', 'large-raw', 'large-hash']:
             env['AGENT_BASH_LOG_MAX_BYTES'] = str(32*1024*1024)
             blocks = 512 if CASE in ['large-escaped', 'large-hash'] else 2560
@@ -226,7 +315,7 @@ def suite(root):
                         (path/'source-outcome-v2.json').mkdir()
                         (path/f'fault-{fault}.release').touch()
                         wait(lambda: (path/'completion-source-bundle-v2.json').exists())
-                        wait(lambda: 'bounded regular file' in (path/'source-publication-error.txt').read_text())
+                        wait(lambda: (path/'source-publication-error.txt').exists() and 'bounded regular file' in (path/'source-publication-error.txt').read_text())
                     (root/'write-more').touch()
                     wait(lambda: (root/'writer-done').exists())
                     wait(lambda: b'WRITER-STILL-ALIVE' in (path/'log').read_bytes())
