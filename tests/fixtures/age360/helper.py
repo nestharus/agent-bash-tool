@@ -56,6 +56,18 @@ elif op == 'agent-bash-complete':
     parsed = json.loads(snapshot)
     outcome = (path.parent / 'source-outcome-v2.json').read_bytes()
     assert parsed['outcome_sha256'] == sha(outcome)
+    if isinstance(parsed['output'], dict):
+        descriptor = parsed['output']
+        assert descriptor['representation'] == 'retained-output-v1'
+        assert descriptor['relative'] == 'completion-output-v2.bin'
+        assert descriptor['encoding'] == 'utf8-lossy'
+        artifact = path.parent / descriptor['relative']
+        assert not artifact.is_symlink() and artifact.is_file()
+        assert artifact.stat().st_size == descriptor['byte_len'] <= 1073741824
+        digest = hashlib.sha256()
+        with artifact.open('rb') as body:
+            while chunk := body.read(65536): digest.update(chunk)
+        assert descriptor['sha256'] == digest.hexdigest()
     payload = b'fixture retained notification'
     common.update(status='accepted', snapshot_sha256=sha(snapshot), outcome_sha256=sha(outcome),
                   payload_sha256=sha(payload), payload_byte_len=len(payload), listener_revision=1)

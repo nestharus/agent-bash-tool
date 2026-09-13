@@ -65,16 +65,85 @@ rather than an invented ACK-based cleanup rule.
 
 ## Verification and open pairing edges
 
-`tests/fixtures/age360/paired-wire.json` imports runner revision 2 byte-for-byte:
-SHA256 `f31a19425bdafb0c4609b517060b9b24569ca1a72fdac5a9840a6da7e8c39022`.
+`tests/fixtures/age360/paired-wire.json` imports runner revision 4 byte-for-byte.
+The fixture and unit test retain exact canonical bytes and digests. Revision 3
+permits genuine early-exit outcomes for ready registrations, without fake readiness.
 Source tests use native Bash processes in private user/network namespaces with an
 explicitly simulated runner. They are not native State admission, mailbox ACK,
 independent runner ownership, migration or provider-reliability evidence. Root owns
 runner's `age360_completion_continuation` paired target and final delivery.
 
-Consequential pairing edges remain visible: ready-mode exit **before** a sentinel
-needs an agreed valid actual-exit representation (not unknown status); full JSON
-notification bodies exceeding the wire's 16 MiB bound need a paired rendering
-policy distinct from full local output retention. Unsupported source publication
-retains evidence rather than silently changing the protocol. AGE365 owns production
-lineage/migration/install authority.
+Revision 4 adds a complete-body artifact alongside the bounded JSON event. Bash
+freezes `completion-output-v2.bin` as unchanged raw bytes, then streams SHA256 with
+a 64 KiB buffer in 1 MiB quanta, yielding to the original loop between quanta. Bodies above 64 KiB use the canonical `retained-output-v1`
+descriptor; smaller bodies keep the existing inline UTF-8-lossy string. The cutoff
+bounds even worst-case inline escaping independently of the 1 GiB configured log
+ceiling. Registration bytes and snapshot/outcome JSON limits are unchanged.
+
+Runner owns validation and retention of its content-addressed body copy and the
+notification's explicit attachment path/hash/length/encoding. There is no additional
+truncation, larger JSON allocation bound, prefix-as-event or Bash-owned competing
+wire. Actual attachment consumption, native delivery and late listener retrieval
+still need root paired verification. AGE365 owns production transition/reclamation.
+
+## Review correction: original observation survives publication retry
+
+The live loop retains its finalized terminal metadata and observed wait/drain
+facts separately from subsequent cancellation and status changes. Cancellation
+accepted after ordinary terminal metadata publication cannot relabel that event
+as cancelled. A cancelled certificate additionally refuses publication without
+actual original drain and output closure.
+
+Publication failures no longer unwind the original event loop or close its live
+output readers. Local delivery and supervisor retirement wait for publication;
+output collection, cancellation and reaping continue. Hashing yields to these
+duties between quanta; initial copy/fsync still uses synchronous filesystem I/O.
+Failed publication retries
+at most once per second (a retry interval, never a workload deadline). The last
+error remains in `source-publication-error.txt`, including after later success.
+
+Private `source-observation-v2.json` retains original evidence and snapshot headers;
+`completion-output-v2.bin` freezes the entire selected bounded log using a streaming
+copy before JSON publication. These are not an alternative public wire or event
+ACK. Recovery can finish this staged original observation rather than invent a
+new cessation result. Once frozen, later ready output cannot replace its bytes.
+An I/O failure before raw capture succeeds leaves an outstanding capture: retained
+observation is original, but the log may advance before the first successful
+capture. A successor cannot resample the mutable log for that incomplete
+capture; completion-only recovery returns pending instead. Loss before any durable
+observation still cannot be recovered as that exact event. Neither limitation authorizes loss of the surviving observer.
+`source_ready` replies include hashes of the exact retained snapshot/outcome files.
+
+### Executable source barriers (fixture builds only)
+
+Build the actual source binary with `cargo build --locked --features source-fault-tests`.
+Default builds contain no active hooks. Set `AGENT_BASH_SOURCE_FAULT` in the original
+Bash launch environment to one of:
+
+- `after-terminal-metadata`: yields after the first terminal publication and before
+  source completion-lock acquisition. The original loop keeps servicing I/O and
+  cancellation. Root can accept a real cancellation here before source publication.
+- `publication-error`: injects ENOSPC after the original observation and raw output
+  are retained, before the immutable public bundle/outcome/snapshot publication.
+- `during-output-hash`: yields after at least one real 1 MiB hash quantum and before
+  continuing the hash. The source test writes more than a pipe buffer and cancels
+  the original workload while this barrier remains unreleased, then verifies the
+  eventual source still contains the original ready evidence and full body.
+
+Each reached source point writes `fault-<name>.reached.json` in its registered
+handle directory, containing its actual PID/starttime/boot identity. It retries
+without advancing until `fault-<name>.release` exists in that same directory.
+No timeout, fabricated source certificate, registration acceptance or native
+runner proof is supplied by a marker. These hooks are inherited only by explicit
+fixture builds. Root must use private namespaces and actual paired candidates.
+
+The source suite additionally puts a directory at `source-outcome-v2.json` after
+the staging barrier to execute a real immutable-publication I/O failure. It proves
+more than one pipe buffer of subsequent workload output is read while publication
+fails, then removes that fixture-owned obstruction and checks exact recovery
+hashes and original ready bytes. The source cases check full artifact publication for 4 MiB NUL output (which would
+escape beyond 16 MiB) and configured 20 MiB invalid UTF-8 output. Both keep a ready
+workload writing and cancellable, with unchanged original artifact bytes. They use
+a simulated runner, not native attachment delivery. A private publisher unit test
+copies/hashes the supported 1 GiB ceiling and checks process peak RSS below 128 MiB;
+that is a source resource experiment, not original-work reaping evidence.

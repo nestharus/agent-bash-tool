@@ -1006,6 +1006,7 @@ fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
         root_status: None,
         tree_empty: false,
         completion_recorded: false,
+        pending_source: None,
         completion_transfer: None,
         reaped_completion_transfer: None,
         completion_delivery_settled: false,
@@ -1477,6 +1478,7 @@ struct EventLoop {
     root_status: Option<RootStatus>,
     tree_empty: bool,
     completion_recorded: bool,
+    pending_source: Option<PendingSource>,
     completion_transfer: Option<delivery::CompletionTransfer>,
     reaped_completion_transfer: Option<i32>,
     completion_delivery_settled: bool,
@@ -1485,6 +1487,17 @@ struct EventLoop {
     sentinel: Option<SentinelMatcher>,
     spawn_error: Option<String>,
     cancellation: Option<Cancellation>,
+}
+
+// Original finalized event stays separate from mutable status/cancellation.
+struct PendingSource {
+    progress: crate::continuation::Publication,
+    retry_at: Instant,
+    meta: Meta,
+    kind: &'static str,
+    root_wait_status: Option<i32>,
+    tree_drained: bool,
+    output_closed: bool,
 }
 
 struct Cancellation {
@@ -1612,6 +1625,7 @@ fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
         // Spawn failures remain bounded by backoff; image RPCs fail truthfully meanwhile.
         loop_state.recover_image_service();
         loop_state.maybe_finish()?;
+        loop_state.retry_source_publication();
         loop_state.retry_completion_integration();
         loop_state.drive_completion_delivery()?;
         loop_state.flush_root_status()?;
@@ -1759,6 +1773,13 @@ impl EventLoop {
     }
 
     fn poll_timeout(&self) -> Option<Duration> {
+        if self
+            .pending_source
+            .as_ref()
+            .is_some_and(|pending| Instant::now() >= pending.retry_at)
+        {
+            return Some(Duration::ZERO);
+        }
         if self.cancellation.is_some() {
             Some(CANCEL_POLL)
         } else if self.meta.cancel_owner.is_some() && self.owner_pidfd.is_none() {
@@ -2013,6 +2034,7 @@ impl EventLoop {
 
     fn drive_completion_delivery(&mut self) -> io::Result<()> {
         if !self.completion_recorded
+            || self.pending_source.is_some()
             || self.completion_delivery_settled
             || self.completion_transfer.is_some()
         {
@@ -2094,12 +2116,57 @@ impl EventLoop {
 
     fn should_exit(&self) -> bool {
         self.completion_recorded
+            && self.pending_source.is_none()
             && self.completion_delivery_settled
             && (!self.completion_tree_pending || self.tree_empty)
             && !self.root_status_pending
             && self.root_status.is_some()
             && self.completion_scope.is_complete(self.tree_empty)
             && self.output_closed()
+    }
+
+    fn retry_source_publication(&mut self) {
+        let Some(pending) = &mut self.pending_source else {
+            return;
+        };
+        if Instant::now() < pending.retry_at {
+            return;
+        }
+        let result = (|| -> io::Result<bool> {
+            crate::continuation::fault_barrier(&self.paths, "after-terminal-metadata")?;
+            let _lock = state::lock_completion(&self.paths)?;
+            crate::continuation::advance_publication(
+                &self.paths,
+                &pending.meta,
+                crate::continuation::Observation {
+                    kind: pending.kind,
+                    root_wait_status: pending.root_wait_status,
+                    tree_drained: pending.tree_drained,
+                    output_closed: pending.output_closed,
+                    ready_sentinel: if pending.kind == "ready" {
+                        pending.meta.ready_sentinel.as_deref()
+                    } else {
+                        None
+                    },
+                },
+                &mut pending.progress,
+            )
+        })();
+        match result {
+            Ok(true) => self.pending_source = None,
+            Ok(false) => {}
+            Err(error) => {
+                if let Some(pending) = self.pending_source.as_mut() {
+                    pending.retry_at = Instant::now() + Duration::from_secs(1);
+                }
+                // Never unwind the original observer/output FDs for notification
+                // publication failure. Poll/reaping/cancellation continue normally.
+                let _ = state::atomic_write(
+                    &self.paths.state_dir.join("source-publication-error.txt"),
+                    format!("{error}\n").as_bytes(),
+                );
+            }
+        }
     }
 
     fn record_ready_sentinel(&mut self) -> io::Result<()> {
@@ -2115,18 +2182,17 @@ impl EventLoop {
         if matches!(result, TerminalPublishResult::Published)
             && self.meta.completion_reason.as_deref() == Some("ready-sentinel")
         {
-            let _lock = state::lock_completion(&self.paths)?;
-            crate::continuation::publish(
-                &self.paths,
-                &self.meta,
-                crate::continuation::Observation {
+            self.pending_source =
+                crate::continuation::enabled(&self.paths).then(|| PendingSource {
+                    progress: crate::continuation::Publication::default(),
+                    retry_at: Instant::now(),
+                    meta: self.meta.clone(),
                     kind: "ready",
                     root_wait_status: None,
                     tree_drained: false,
                     output_closed: false,
-                    ready_sentinel: self.meta.ready_sentinel.as_deref(),
-                },
-            )?;
+                });
+            self.retry_source_publication();
         }
         self.integrate_terminal_publication(result);
         Ok(())
@@ -2159,12 +2225,19 @@ impl EventLoop {
             },
         )?;
         if matches!(result, TerminalPublishResult::Published) {
-            let _lock = state::lock_completion(&self.paths)?;
-            let cancelled = self.cancellation.is_some() || explicit_cancel_accepted(&self.paths)?;
-            crate::continuation::publish(
-                &self.paths,
-                &self.meta,
-                crate::continuation::Observation {
+            // The first publication selected the event under completion.lock.
+            // A later accepted cancellation cannot relabel that original event.
+            let cancelled = self
+                .meta
+                .completion_reason
+                .as_deref()
+                .and_then(CancellationCause::from_completion_reason)
+                .is_some();
+            self.pending_source =
+                crate::continuation::enabled(&self.paths).then(|| PendingSource {
+                    progress: crate::continuation::Publication::default(),
+                    retry_at: Instant::now(),
+                    meta: self.meta.clone(),
                     kind: if cancelled {
                         "cancelled"
                     } else if self.completion_scope == CompletionScope::Root {
@@ -2175,9 +2248,8 @@ impl EventLoop {
                     root_wait_status: Some(root_status.raw),
                     tree_drained: self.tree_empty,
                     output_closed: self.output_closed(),
-                    ready_sentinel: None,
-                },
-            )?;
+                });
+            self.retry_source_publication();
         }
         self.integrate_terminal_publication(result);
         Ok(())
@@ -2197,18 +2269,17 @@ impl EventLoop {
             && self.tree_empty
             && self.output_closed()
         {
-            let _lock = state::lock_completion(&self.paths)?;
-            crate::continuation::publish(
-                &self.paths,
-                &self.meta,
-                crate::continuation::Observation {
+            self.pending_source =
+                crate::continuation::enabled(&self.paths).then(|| PendingSource {
+                    progress: crate::continuation::Publication::default(),
+                    retry_at: Instant::now(),
+                    meta: self.meta.clone(),
                     kind: "ceased_status_unknown",
                     root_wait_status: None,
                     tree_drained: true,
                     output_closed: true,
-                    ready_sentinel: None,
-                },
-            )?;
+                });
+            self.retry_source_publication();
         }
         self.integrate_terminal_publication(result);
         Ok(())

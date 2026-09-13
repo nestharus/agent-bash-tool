@@ -60,6 +60,58 @@ def suite(root):
                OULIPOLY_PARENT_INVOCATION=json.dumps(dict(id='55555555-5555-4555-8555-555555555555')),
                OULIPOLY_COMPLETION_ENDPOINT=str(endpoint))
     try:
+        if CASE in ['large-escaped', 'large-raw', 'large-hash']:
+            env['AGENT_BASH_LOG_MAX_BYTES'] = str(32*1024*1024)
+            blocks = 512 if CASE in ['large-escaped', 'large-hash'] else 2560
+            if CASE == 'large-hash': env['AGENT_BASH_SOURCE_FAULT'] = 'during-output-hash'
+            byte = b'\0' if CASE == 'large-escaped' else b'\xff'
+            script = root/'large-writer.py'
+            script.write_text("import os,time\nfor _ in range(%d): os.write(1,%r*8192)\nos.write(1,b'READY\\n')\nwhile not os.path.exists(%r): time.sleep(.01)\nfor _ in range(128): os.write(1,b'x'*8192)\nos.write(1,b'LARGE-WRITER-ALIVE\\n')\nopen(%r,'w').write('done')\ntime.sleep(60)\n" % (blocks, byte, str(root/'write-more'), str(root/'writer-done')))
+            result = run(env, 'run', '--ready-sentinel', 'READY', '--', '/usr/bin/python3', str(script))
+            assert result.returncode == 0, result.stderr
+            item = json.loads(result.stdout); path = Path(item['state_dir'])
+            wait(lambda: (path/'completion-output-v2.bin').exists())
+            if CASE == 'large-hash':
+                reached = wait(lambda: read(path/'fault-during-output-hash.reached.json'))
+                assert reached == identity(read(path/'meta.json')['supervisor_pid'])
+                (root/'write-more').touch()
+                wait(lambda: (root/'writer-done').exists())
+                wait(lambda: b'LARGE-WRITER-ALIVE' in (path/'log').read_bytes())
+                result = run(env, 'cancel', item['handle'])
+                assert result.returncode == 0 and json.loads(result.stdout)['requested'], result.stdout
+                workload = read(path/'source-launch-v2.json')['workload_identity']
+                wait(lambda: not Path(f"/proc/{workload['pid']}").exists())
+                assert identity(reached['pid']) == reached
+                assert not (path/'completion-snapshot-v2.json').exists()
+                (path/'fault-during-output-hash.release').touch()
+            wait(lambda: read(path/'fixture-acceptance.json'))
+            frozen = (path/'completion-output-v2.bin').read_bytes()
+            assert frozen == byte*(blocks*8192) + b'READY\n'
+            snapshot_bytes = (path/'completion-snapshot-v2.json').read_bytes()
+            snapshot = json.loads(snapshot_bytes)
+            expected_descriptor = dict(representation='retained-output-v1',relative='completion-output-v2.bin',
+                sha256=hashlib.sha256(frozen).hexdigest(),byte_len=len(frozen),encoding='utf8-lossy')
+            assert snapshot['output'] == expected_descriptor, snapshot
+            assert len(snapshot_bytes) < 4096
+            assert read(path/'source-outcome-v2.json')['kind'] == 'ready'
+            original = identity(read(path/'meta.json')['supervisor_pid']) if CASE != 'large-hash' else reached
+            workload = read(path/'source-launch-v2.json')['workload_identity']
+            (root/'write-more').touch()
+            wait(lambda: (root/'writer-done').exists())
+            wait(lambda: b'LARGE-WRITER-ALIVE' in (path/'log').read_bytes())
+            if CASE != 'large-hash': assert identity(original['pid']) == original
+            assert (path/'completion-output-v2.bin').read_bytes() == frozen
+            assert (path/'completion-snapshot-v2.json').read_bytes() == snapshot_bytes
+            if CASE != 'large-hash':
+                result = run(env, 'cancel', item['handle'])
+                assert result.returncode == 0 and json.loads(result.stdout)['requested'], result.stdout
+            wait(lambda: not Path(f"/proc/{workload['pid']}").exists())
+            wait(lambda: not (path/'physical-custody').exists())
+            print(json.dumps(dict(case=CASE, raw_bytes=len(frozen), escaped_json_bytes=blocks*8192*6+9,
+                original_observer_alive=True, further_output_bytes=1024*1024, workload_cancelled=True,
+                source_publication_accepted_by_simulated_runner=True, snapshot_bytes=len(snapshot_bytes), output_descriptor=expected_descriptor,
+                native_attachment_delivery_exercised=False)), flush=True)
+            return
         if CASE == 'resources':
             fd_before = len(list(Path('/proc/self/fd').iterdir()))
             sources = []
@@ -75,6 +127,7 @@ def suite(root):
                 pinned_bash_images=len(sources),pinned_bash_bytes=sum((p/'agent-bash-recovery-v2').stat().st_size for p in sources),
                 source_snapshots=len([p for p in sources if (p/'completion-snapshot-v2.json').exists()]),
                 source_snapshot_bytes=sum((p/'completion-snapshot-v2.json').stat().st_size for p in sources),
+                source_body_bytes=sum((p/'completion-output-v2.bin').stat().st_size for p in sources),
                 attempt_intents=sum(len(list(p.glob('continuation-*.intent.json'))) for p in sources),
                 retained_files=sum(len(list(p.iterdir())) for p in sources),
                 native_listener_ACKs_exercised=0)),flush=True)
@@ -92,12 +145,21 @@ def suite(root):
             env['AGE360_FIXTURE_FAULT'] = CASE
         side_effect = root/'workload-ran'
         command = ['run','--delivery','sync','--','/bin/sh','-c',f'echo ran > {side_effect}; echo fixture-output']
+        if CASE == 'early-ready-exit':
+            command = ['run','--ready-sentinel','READY','--','/bin/sh','-c','echo not-ready; exit 7']
         if CASE == 'ready':
             command = ['run','--ready-sentinel','READY','--','/bin/sh','-c','echo READY; exec sleep 60']
-        if CASE == 'root':
+        if CASE in ['root', 'publication-race']:
             command = ['run','--completion-scope','root','--','/bin/sh','-c',f'sleep 60 >/dev/null 2>&1 & echo child=$!; echo fixture-output']
         if CASE == 'guardian':
             command = ['run','--','/bin/sh','-c',f'echo started > {side_effect}; sleep 60']
+        if CASE == 'publication-race':
+            env['AGENT_BASH_SOURCE_FAULT'] = 'after-terminal-metadata'
+        if CASE in ['publication-error', 'publication-io-error']:
+            env['AGENT_BASH_SOURCE_FAULT'] = 'publication-error'
+            script = root/'writer.py'
+            script.write_text("import os,time\nos.write(1,b'READY\\n')\nwhile not os.path.exists(%r): time.sleep(.01)\nfor _ in range(128): os.write(1,b'x'*8192)\nos.write(1,b'WRITER-STILL-ALIVE\\n')\nopen(%r,'w').write('done')\ntime.sleep(60)\n" % (str(root/'write-more'), str(root/'writer-done')))
+            command = ['run','--ready-sentinel','READY','--','/usr/bin/python3',str(script)]
         if CASE == 'blocked-registration':
             caller = subprocess.Popen([BIN,*command], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             path = wait(lambda: next((p for p in (root/'state'/'agent-bash').glob('ab_*') if (p/'fixture-helper-identity.json').exists()), None))
@@ -127,12 +189,45 @@ def suite(root):
                 except ChildProcessError: break
             result = reconcile(path, env)
             assert result.returncode == 0, result.stderr
-            assert json.loads(result.stdout)['status'] == 'source_ready', result.stdout
+            reply = json.loads(result.stdout)
+            assert reply['status'] == 'source_ready', result.stdout
+            for field, name in [('snapshot_sha256','completion-snapshot-v2.json'), ('outcome_sha256','source-outcome-v2.json')]:
+                assert reply[field] == hashlib.sha256((path/name).read_bytes()).hexdigest(), reply
             assert read(path/'source-outcome-v2.json')['kind'] == 'never_launched'
             assert read(path/'source-launch-v2.json')['phase'] == 'revoked_never_launched'
             assert not side_effect.exists()
             assert not (path/'registration-receipt-v2.json').exists()
         else:
+            if CASE in ['publication-race', 'publication-error', 'publication-io-error']:
+                fault = env['AGENT_BASH_SOURCE_FAULT']
+                reached = wait(lambda: read(path/f'fault-{fault}.reached.json'))
+                assert reached == identity(read(path/'meta.json')['supervisor_pid']), reached
+                assert (path/'physical-custody').exists()
+                assert not (path/'completion-snapshot-v2.json').exists()
+                if CASE == 'publication-race':
+                    # Real terminal metadata -> accepted cancellation -> source lock.
+                    result = run(env, 'cancel', item['handle'])
+                    assert result.returncode == 0 and json.loads(result.stdout)['requested'], result.stdout
+                    assert (path/'cancel-requested').exists()
+                else:
+                    frozen = (path/'completion-output-v2.bin').read_bytes()
+                    assert frozen == b'READY\n', frozen
+                    if CASE == 'publication-io-error':
+                        # Force the real immutable publication syscall/read path to
+                        # fail, beyond the injected staging fault.
+                        (path/'source-outcome-v2.json').mkdir()
+                        (path/f'fault-{fault}.release').touch()
+                        wait(lambda: (path/'completion-source-bundle-v2.json').exists())
+                        wait(lambda: 'bounded regular file' in (path/'source-publication-error.txt').read_text())
+                    (root/'write-more').touch()
+                    wait(lambda: (root/'writer-done').exists())
+                    wait(lambda: b'WRITER-STILL-ALIVE' in (path/'log').read_bytes())
+                    assert identity(reached['pid']) == reached
+                    assert not (path/'completion-snapshot-v2.json').exists()
+                    assert (path/'completion-output-v2.bin').read_bytes() == frozen
+                    if CASE == 'publication-io-error':
+                        (path/'source-outcome-v2.json').rmdir()
+                (path/f'fault-{fault}.release').touch()
             if CASE == 'guardian':
                 wait(lambda: side_effect.exists())
                 meta = read(path/'meta.json')
@@ -146,10 +241,14 @@ def suite(root):
             local = wait(lambda: (v if (v:=read(path/'continuation-v2.json')) and v['enqueue']=='accepted' else None))
             outcome = read(path/'source-outcome-v2.json')
             assert acceptance['source_id'] == outcome['source_id']
-            if CASE == 'ready':
+            if CASE in ['ready', 'publication-error', 'publication-io-error']:
                 assert outcome['kind']=='ready' and not outcome['original_tree_drained'] and not outcome['output_closed'], outcome
-            elif CASE == 'root':
+            elif CASE in ['root', 'publication-race']:
                 assert outcome['kind']=='exit_root' and not outcome['original_tree_drained'], outcome
+            elif CASE == 'early-ready-exit':
+                assert outcome['kind']=='exit_tree' and outcome['root_wait_status']==7 << 8, outcome
+                assert read(path/'completion-snapshot-v2.json')['rc']==7
+                assert outcome['ready_sentinel'] is None
             elif CASE == 'guardian':
                 assert outcome['kind']=='cancelled' and outcome['original_tree_drained'], outcome
             else:
@@ -162,7 +261,15 @@ def suite(root):
                 assert (path/'completion-snapshot-v2.json').read_bytes() != json.dumps(prefix['snapshot']).encode()
                 assert local['enqueue']=='accepted'
                 assert 'acknowledged' not in local, 'byte acquisition must not invent event ACK'
-            if CASE in ['ready','root']:
+            if CASE in ['publication-error', 'publication-io-error']:
+                assert read(path/'completion-snapshot-v2.json')['output'] == 'READY\n'
+                reply = reconcile(path, env)
+                assert reply.returncode == 0, reply.stderr
+                recovered = json.loads(reply.stdout)
+                assert recovered['status'] == 'source_ready', recovered
+                for key, name in [('snapshot_sha256','completion-snapshot-v2.json'), ('outcome_sha256','source-outcome-v2.json')]:
+                    assert recovered[key] == hashlib.sha256((path/name).read_bytes()).hexdigest()
+            if CASE in ['ready','root','publication-error','publication-io-error']:
                 result = run(env,'cancel',item['handle']); assert result.returncode==0,result.stderr
             wait(lambda: not (path/'physical-custody').exists())
         print(json.dumps(dict(case=CASE, source=read(path/'source-registration-v2.json')['source_id'], fence=read(path/'source-launch-v2.json'), outcome=read(path/'source-outcome-v2.json'), retained_files=len(list(path.iterdir())))),flush=True)

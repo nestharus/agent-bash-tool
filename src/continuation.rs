@@ -19,6 +19,9 @@ const FENCE: &str = "source-launch-v2.json";
 const CONFIRMATION: &str = "registration-confirmation-v2.json";
 const LOCAL: &str = "continuation-v2.json";
 const MAX_SOURCE: u64 = 1024 * 1024;
+const MAX_OUTPUT: u64 = 1024 * MAX_SOURCE;
+const INLINE_OUTPUT: u64 = 64 * 1024;
+const OUTPUT: &str = "completion-output-v2.bin";
 
 pub(crate) fn error(detail: impl Into<String>) -> io::Error {
     io::Error::other(detail.into())
@@ -318,6 +321,7 @@ pub(crate) fn launched(paths: &StatePaths, pid: i32) -> io::Result<()> {
 }
 
 /// Evidence supplied only by the original live loop or actual adopting guardian.
+#[derive(Clone, Copy)]
 pub(crate) struct Observation<'a> {
     pub(crate) kind: &'a str,
     pub(crate) root_wait_status: Option<i32>,
@@ -325,7 +329,78 @@ pub(crate) struct Observation<'a> {
     pub(crate) output_closed: bool,
     pub(crate) ready_sentinel: Option<&'a str>,
 }
+/// Incremental publication work belongs to the surviving live observer, not a
+/// new workload or helper tree. Each quantum yields back to cancellation/I/O.
+#[derive(Default)]
+pub(crate) struct Publication {
+    hasher: Option<OutputHasher>,
+    descriptor: Option<Value>,
+}
+
+pub(crate) fn advance_publication(
+    paths: &StatePaths,
+    meta: &Meta,
+    observation: Observation<'_>,
+    progress: &mut Publication,
+) -> io::Result<bool> {
+    if !enabled(paths) {
+        return Ok(true);
+    }
+    if paths
+        .state_dir
+        .join("completion-source-bundle-v2.json")
+        .try_exists()?
+    {
+        finish_snapshot(paths)?;
+        return Ok(true);
+    }
+    capture_observation(paths, meta, observation)?;
+    fault_barrier(paths, "publication-error")?;
+    if progress.descriptor.is_none() {
+        if progress.hasher.is_none() {
+            progress.hasher = Some(OutputHasher::new(paths)?);
+        }
+        let hasher = progress.hasher.as_mut().expect("initialized hasher");
+        if hasher.count >= 1024 * 1024 {
+            fault_barrier(paths, "during-output-hash")?;
+        }
+        progress.descriptor = hasher.advance()?;
+        if progress.descriptor.is_none() {
+            return Ok(false);
+        }
+        progress.hasher = None;
+    }
+    finish_observation_with_output(
+        paths,
+        progress
+            .descriptor
+            .as_ref()
+            .expect("completed descriptor")
+            .clone(),
+    )?;
+    Ok(true)
+}
+
 pub(crate) fn publish(
+    paths: &StatePaths,
+    meta: &Meta,
+    observation: Observation<'_>,
+) -> io::Result<()> {
+    if !enabled(paths) {
+        return Ok(());
+    }
+    if paths
+        .state_dir
+        .join("completion-source-bundle-v2.json")
+        .try_exists()?
+    {
+        return finish_snapshot(paths);
+    }
+    capture_observation(paths, meta, observation)?;
+    finish_observation(paths)
+}
+
+fn capture_observation(
     paths: &StatePaths,
     meta: &Meta,
     observation: Observation<'_>,
@@ -342,40 +417,190 @@ pub(crate) fn publish(
     {
         return finish_snapshot(paths);
     }
+    let staged = paths.state_dir.join("source-observation-v2.json");
+    if !staged.try_exists()? {
+        let (_, common) = binding(paths)?;
+        let fence = value(&paths.state_dir.join(FENCE))?;
+        exact(&common, &fence)?;
+        if observation.kind == "cancelled"
+            && (!observation.tree_drained || !observation.output_closed)
+        {
+            return Err(error(
+                "cancellation observation requires original drain and output close",
+            ));
+        }
+        let mut outcome = common;
+        outcome["completion_revision"] = json!(1);
+        outcome["launch_fence_revision"] = fence["revision"].clone();
+        outcome["kind"] = json!(observation.kind);
+        outcome["root_wait_status"] = json!(observation.root_wait_status);
+        outcome["original_tree_drained"] = json!(observation.tree_drained);
+        outcome["output_closed"] = json!(observation.output_closed);
+        outcome["observer"] = json!(identity(unsafe { libc::getpid() })?);
+        outcome["ready_sentinel"] = json!(observation.ready_sentinel);
+        outcome["cancellation_id"] = if observation.kind == "cancelled" {
+            json!(cancellation_identity(paths, meta)?)
+        } else {
+            Value::Null
+        };
+        let mut snapshot = outcome_identity(&outcome);
+        snapshot["rc"] = json!(meta.rc);
+        snapshot["status"] = json!(if observation.kind == "ready" {
+            "ready"
+        } else if matches!(
+            observation.kind,
+            "never_launched" | "ceased_status_unknown" | "cancelled"
+        ) {
+            "error"
+        } else {
+            "completed"
+        });
+        // Retain original observation independently of later publication errors.
+        immutable(
+            paths,
+            "source-observation-v2.json",
+            &bytes(&json!({
+                "outcome": outcome, "snapshot": snapshot
+            }))?,
+        )?;
+    }
+    if !paths
+        .state_dir
+        .join("completion-output-v2.bin")
+        .try_exists()?
+    {
+        let staged = value(&staged)?;
+        let observer: CallerChainEntry =
+            serde_json::from_value(staged["outcome"]["observer"].clone())?;
+        if observer != identity(unsafe { libc::getpid() })? {
+            return Err(error(
+                "original output capture incomplete; successor cannot resample mutable log",
+            ));
+        }
+        freeze_output(paths)?;
+    }
+    Ok(())
+}
+
+fn freeze_output(paths: &StatePaths) -> io::Result<()> {
+    let destination = paths.state_dir.join("completion-output-v2.bin");
+    if destination.try_exists()? {
+        return Ok(());
+    }
+    let mut source = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&paths.log)?;
+    let metadata = source.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_OUTPUT {
+        return Err(error(
+            "output source is not a supported bounded regular log",
+        ));
+    }
+    let temp = paths.state_dir.join(".completion-output-v2.bin.tmp");
+    let result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temp)?;
+        io::copy(&mut source, &mut file)?;
+        file.sync_all()?;
+        fs::hard_link(&temp, &destination)?;
+        File::open(&paths.state_dir)?.sync_all()
+    })();
+    let _ = fs::remove_file(temp);
+    result
+}
+
+// Wire revision 4: complete raw body, fixed buffers and one MiB CPU/I/O quanta.
+// No worker/thread is forked into original custody and no workload deadline exists.
+struct OutputHasher {
+    file: File,
+    expected_len: u64,
+    hash: Sha256,
+    count: u64,
+}
+impl OutputHasher {
+    fn new(paths: &StatePaths) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(paths.state_dir.join(OUTPUT))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > MAX_OUTPUT {
+            return Err(error(
+                "output artifact is not a supported bounded regular file",
+            ));
+        }
+        Ok(Self {
+            file,
+            expected_len: metadata.len(),
+            hash: Sha256::new(),
+            count: 0,
+        })
+    }
+    fn advance(&mut self) -> io::Result<Option<Value>> {
+        let mut buffer = [0u8; 64 * 1024];
+        let mut quantum = 0;
+        while quantum < 1024 * 1024 {
+            let length = match self.file.read(&mut buffer) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                other => other?,
+            };
+            if length == 0 {
+                return self.finish().map(Some);
+            }
+            self.count += length as u64;
+            quantum += length;
+            if self.count > MAX_OUTPUT {
+                return Err(error("output artifact grew beyond bound"));
+            }
+            self.hash.update(&buffer[..length]);
+        }
+        Ok(None)
+    }
+    fn finish(&self) -> io::Result<Value> {
+        if self.count != self.expected_len || self.file.metadata()?.len() != self.count {
+            return Err(error("output artifact length changed while hashing"));
+        }
+        Ok(
+            json!({"representation":"retained-output-v1", "relative":OUTPUT,
+            "sha256":format!("{:x}", self.hash.clone().finalize()), "byte_len":self.count, "encoding":"utf8-lossy"}),
+        )
+    }
+}
+fn output_descriptor(paths: &StatePaths) -> io::Result<Value> {
+    let mut hasher = OutputHasher::new(paths)?;
+    loop {
+        if let Some(descriptor) = hasher.advance()? {
+            return Ok(descriptor);
+        }
+    }
+}
+
+fn finish_observation(paths: &StatePaths) -> io::Result<()> {
+    fault_barrier(paths, "publication-error")?;
+    finish_observation_with_output(paths, output_descriptor(paths)?)
+}
+fn finish_observation_with_output(paths: &StatePaths, descriptor: Value) -> io::Result<()> {
+    let staged = value(&paths.state_dir.join("source-observation-v2.json"))?;
+    let outcome = &staged["outcome"];
+    let mut snapshot = staged["snapshot"].clone();
     let (_, common) = binding(paths)?;
-    let fence = value(&paths.state_dir.join(FENCE))?;
-    exact(&common, &fence)?;
-    let mut outcome = common;
-    outcome["completion_revision"] = json!(1);
-    outcome["launch_fence_revision"] = fence["revision"].clone();
-    outcome["kind"] = json!(observation.kind);
-    outcome["root_wait_status"] = json!(observation.root_wait_status);
-    outcome["original_tree_drained"] = json!(observation.tree_drained);
-    outcome["output_closed"] = json!(observation.output_closed);
-    outcome["observer"] = json!(identity(unsafe { libc::getpid() })?);
-    outcome["ready_sentinel"] = json!(observation.ready_sentinel);
-    outcome["cancellation_id"] = if observation.kind == "cancelled" {
-        json!(cancellation_identity(paths, meta)?)
+    exact(&common, outcome)?;
+    exact(&common, &snapshot)?;
+    snapshot["output"] = if descriptor["byte_len"].as_u64().unwrap_or(u64::MAX) <= INLINE_OUTPUT {
+        json!(String::from_utf8_lossy(&read(
+            &paths.state_dir.join(OUTPUT),
+            INLINE_OUTPUT
+        )?))
     } else {
-        Value::Null
+        descriptor
     };
-    // Retain the snapshot's event data before publishing its outcome. Recovery
-    // must not reconstruct it from mutable list/status metadata or a changing log.
-    let output = read(&paths.log, 16 * MAX_SOURCE)?;
-    let mut snapshot = outcome_identity(&outcome);
-    snapshot["rc"] = json!(meta.rc);
-    snapshot["status"] = json!(if observation.kind == "ready" {
-        "ready"
-    } else if matches!(
-        observation.kind,
-        "never_launched" | "ceased_status_unknown" | "cancelled"
-    ) {
-        "error"
-    } else {
-        "completed"
-    });
-    snapshot["output"] = json!(String::from_utf8_lossy(&output));
-    let outcome_bytes = bytes(&outcome)?;
+    let outcome_bytes = bytes(outcome)?;
     snapshot["outcome_sha256"] = json!(digest(&outcome_bytes));
     snapshot["outcome_byte_len"] = json!(outcome_bytes.len());
     if bytes(&snapshot)?.len() as u64 > 16 * MAX_SOURCE {
@@ -393,6 +618,42 @@ pub(crate) fn publish(
     )?;
     finish_snapshot(paths)
 }
+
+/// Nonblocking deterministic fixture barriers. Never a workload timeout or proof
+/// supplied by a harness: the source reaches this point and writes its identity.
+#[cfg(feature = "source-fault-tests")]
+pub(crate) fn fault_barrier(paths: &StatePaths, name: &str) -> io::Result<()> {
+    if std::env::var("AGENT_BASH_SOURCE_FAULT").as_deref() != Ok(name) {
+        return Ok(());
+    }
+    let reached = format!("fault-{name}.reached.json");
+    if !paths.state_dir.join(&reached).try_exists()? {
+        immutable(
+            paths,
+            &reached,
+            &bytes(&json!(identity(unsafe { libc::getpid() })?))?,
+        )?;
+    }
+    if paths
+        .state_dir
+        .join(format!("fault-{name}.release"))
+        .try_exists()?
+    {
+        return Ok(());
+    }
+    Err(io::Error::from_raw_os_error(
+        if name == "publication-error" {
+            libc::ENOSPC
+        } else {
+            libc::EAGAIN
+        },
+    ))
+}
+#[cfg(not(feature = "source-fault-tests"))]
+pub(crate) fn fault_barrier(_paths: &StatePaths, _name: &str) -> io::Result<()> {
+    Ok(())
+}
+
 fn cancellation_identity(paths: &StatePaths, meta: &Meta) -> io::Result<String> {
     let (_, mut receipt) = binding(paths)?;
     if state::durable_marker_exists(&paths.accepted_cancel)? {
@@ -568,6 +829,23 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
     save(&paths, LOCAL, &local)?;
     drop(local_lock);
     let fence = value(&paths.state_dir.join(FENCE))?;
+    if paths
+        .state_dir
+        .join("source-observation-v2.json")
+        .try_exists()?
+    {
+        if !paths
+            .state_dir
+            .join("completion-output-v2.bin")
+            .try_exists()?
+        {
+            let mut pending = common;
+            pending["status"] = json!("pending");
+            pending["reason"] = json!("original_output_capture_incomplete");
+            return Ok(pending);
+        }
+        finish_observation(&paths)?;
+    }
     if fence["phase"] == "revoked_never_launched" && !paths.state_dir.join(OUTCOME).try_exists()? {
         let mut meta = state::read_meta(&paths)?;
         meta.schema_version = 4;
@@ -597,11 +875,17 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
         finish_snapshot(&paths)?;
     }
     let mut result = common;
-    result["status"] = json!(if paths.state_dir.join(SNAPSHOT).try_exists()? {
-        "source_ready"
+    if paths.state_dir.join(SNAPSHOT).try_exists()? {
+        result["snapshot_sha256"] = json!(digest(&read(
+            &paths.state_dir.join(SNAPSHOT),
+            16 * MAX_SOURCE
+        )?));
+        result["outcome_sha256"] =
+            json!(digest(&read(&paths.state_dir.join(OUTCOME), MAX_SOURCE)?));
+        result["status"] = json!("source_ready");
     } else {
-        "pending"
-    });
+        result["status"] = json!("pending");
+    }
     Ok(result)
 }
 
@@ -623,9 +907,144 @@ mod tests {
         (temp, paths, common)
     }
     #[test]
-    fn canonical_revision_two_exact_byte_digests() {
+    fn supported_one_gib_output_publication_uses_bounded_memory() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        let (_temp, paths, common) = source();
+        fence(&paths, &common, "launched");
+        File::create(&paths.log)
+            .unwrap()
+            .set_len(MAX_OUTPUT)
+            .unwrap();
+        let mut meta = Meta::new(
+            paths.handle.clone(),
+            1,
+            1,
+            vec![],
+            paths.root.clone(),
+            "exit",
+            state::DeliveryMode::Sync,
+            None,
+            vec![],
+            None,
+        );
+        meta.rc = Some(0);
+        // Source publisher unit exercise, not an actual original-work wait proof.
+        let start = std::time::Instant::now();
+        let mut progress = Publication::default();
+        let mut steps = 0;
+        let mut max_step = std::time::Duration::ZERO;
+        loop {
+            let step = std::time::Instant::now();
+            let done = advance_publication(
+                &paths,
+                &meta,
+                Observation {
+                    kind: "exit_tree",
+                    root_wait_status: Some(0),
+                    tree_drained: true,
+                    output_closed: true,
+                    ready_sentinel: None,
+                },
+                &mut progress,
+            )
+            .unwrap();
+            max_step = max_step.max(step.elapsed());
+            steps += 1;
+            if done {
+                break;
+            }
+        }
+        assert!(steps >= 1024, "large hash did not yield between quanta");
+        let data = read(&paths.state_dir.join(SNAPSHOT), MAX_SOURCE).unwrap();
+        let snapshot: Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(snapshot["output"]["byte_len"], MAX_OUTPUT);
+        // Independently computed with Python hashlib over 1024 x 1MiB zero chunks.
+        assert_eq!(
+            snapshot["output"]["sha256"],
+            "49bc20df15e412a64472421e13fe86ff1c5165e18b2afccf160d4dc19fe68a14"
+        );
+        assert!(data.len() < 4096);
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        let peak = status
+            .lines()
+            .find(|line| line.starts_with("VmHWM:"))
+            .unwrap();
+        let kib: u64 = peak.split_whitespace().nth(1).unwrap().parse().unwrap();
+        assert!(
+            kib < 128 * 1024,
+            "source publisher allocated proportional to output: {peak}"
+        );
+        println!(
+            "publisher-unit only: raw={} snapshot={} elapsed_ms={} hash_steps={} max_step_ms={} {peak}",
+            MAX_OUTPUT,
+            data.len(),
+            start.elapsed().as_millis(),
+            steps,
+            max_step.as_millis()
+        );
+    }
+
+    #[test]
+    fn artifact_descriptor_rejects_symlinks_directories_and_unsupported_size() {
+        let (_temp, paths, _) = source();
+        let output = paths.state_dir.join(OUTPUT);
+        fs::create_dir(&output).unwrap();
+        assert!(output_descriptor(&paths).is_err());
+        fs::remove_dir(&output).unwrap();
+        std::os::unix::fs::symlink(&paths.log, &output).unwrap();
+        assert!(output_descriptor(&paths).is_err());
+        fs::remove_file(&output).unwrap();
+        File::create(&output)
+            .unwrap()
+            .set_len(MAX_OUTPUT + 1)
+            .unwrap();
+        assert!(output_descriptor(&paths).is_err());
+    }
+
+    #[test]
+    fn undrained_cancellation_cannot_freeze_source_evidence() {
+        let (_temp, paths, common) = source();
+        fence(&paths, &common, "launched");
+        let meta = Meta::new(
+            paths.handle.clone(),
+            1,
+            1,
+            vec![],
+            paths.root.clone(),
+            "exit",
+            state::DeliveryMode::Sync,
+            None,
+            vec![],
+            None,
+        );
+        for (tree_drained, output_closed) in [(false, true), (true, false)] {
+            let result = publish(
+                &paths,
+                &meta,
+                Observation {
+                    kind: "cancelled",
+                    root_wait_status: Some(0),
+                    tree_drained,
+                    output_closed,
+                    ready_sentinel: None,
+                },
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires original drain")
+            );
+            assert!(!paths.state_dir.join("source-observation-v2.json").exists());
+            assert!(!paths.state_dir.join(OUTCOME).exists());
+        }
+    }
+    #[test]
+    fn canonical_wire_exact_byte_digests() {
         let fixture = fixture();
-        assert_eq!(fixture["fixture_revision"], 2);
+        assert_eq!(fixture["fixture_revision"], 4);
         for (key, receipt, field) in [
             (
                 "registration_bytes_utf8",
@@ -640,6 +1059,35 @@ mod tests {
             let parsed: Value = serde_json::from_slice(data).unwrap();
             assert_eq!(bytes(&parsed).unwrap(), data);
         }
+        assert_eq!(
+            digest(
+                fixture["artifact_snapshot_bytes_utf8"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes()
+            ),
+            fixture["artifact_snapshot_sha256"]
+        );
+        let (_temp, paths, _) = source();
+        fs::write(
+            paths.state_dir.join(OUTPUT),
+            fixture["artifact_output_bytes_utf8"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            output_descriptor(&paths).unwrap(),
+            fixture["output_artifact_example"]
+        );
+        let parsed: Value =
+            serde_json::from_str(fixture["artifact_snapshot_bytes_utf8"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            bytes(&parsed).unwrap(),
+            fixture["artifact_snapshot_bytes_utf8"]
+                .as_str()
+                .unwrap()
+                .as_bytes()
+        );
         assert_eq!(
             fixture["registration"]["listeners"][0]["listener_id"],
             fixture["registration"]["owner_invocation_uuid"]
@@ -795,6 +1243,26 @@ mod tests {
             assert!(!paths.state_dir.join(OUTCOME).exists());
             assert!(!paths.state_dir.join(SNAPSHOT).exists());
         }
+    }
+    #[test]
+    fn recovery_never_captures_mutable_log_for_an_incomplete_original_snapshot() {
+        let (_temp, paths, common) = recovery_source("launched");
+        save(
+            &paths,
+            "source-observation-v2.json",
+            &json!({"outcome": common}),
+        )
+        .unwrap();
+        fs::write(&paths.log, b"later mutable output").unwrap();
+        let reply = reconcile(
+            &paths.state_dir.join(REGISTRATION),
+            &paths.state_dir.join("fixture-confirmation.json"),
+        )
+        .unwrap();
+        assert_eq!(reply["status"], "pending");
+        assert_eq!(reply["reason"], "original_output_capture_incomplete");
+        assert!(!paths.state_dir.join("completion-output-v2.bin").exists());
+        assert!(!paths.state_dir.join(SNAPSHOT).exists());
     }
     #[test]
     fn wrong_completion_only_confirmation_never_changes_fence() {

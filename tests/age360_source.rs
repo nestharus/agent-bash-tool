@@ -61,3 +61,40 @@ fn dead_endpoint_rejects_before_admission() {
 fn bounded_source_resource_inventory() {
     case("resources");
 }
+
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn cancellation_between_metadata_and_source_publication() {
+    case("publication-race");
+}
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn publication_failure_keeps_live_observer_and_original_ready_output() {
+    case("publication-error");
+}
+#[test]
+fn ready_exit_before_sentinel_preserves_raw_wait() {
+    case("early-ready-exit");
+}
+
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn real_publication_io_failure_keeps_live_output_and_recovers_hashes() {
+    case("publication-io-error");
+}
+
+#[test]
+fn large_escaped_output_publishes_full_artifact_and_keeps_live_observer() {
+    case("large-escaped");
+}
+
+#[test]
+fn configured_large_invalid_utf8_output_publishes_exact_full_raw_artifact() {
+    case("large-raw");
+}
+
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn hashing_yields_to_live_output_and_cancellation_without_relabeling_ready() {
+    case("large-hash");
+}
