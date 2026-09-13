@@ -33,7 +33,7 @@ pub(super) fn observe(paths: &StatePaths) -> io::Result<Option<Value>> {
     if entries.iter().any(|(name, meta)| {
         name == OUTPUT
             || (name.starts_with(".completion-output-")
-                && !capture::incomplete_dead_copy(paths, name, meta, &selection))
+                && !capture::inactive_short_copy(paths, name, meta, &selection))
     }) {
         return Ok(None);
     }
