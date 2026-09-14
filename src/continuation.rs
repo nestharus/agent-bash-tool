@@ -896,6 +896,34 @@ pub(crate) fn accept(paths: &StatePaths, reply: &Value) -> io::Result<()> {
     local["enqueue"] = json!("accepted");
     save(paths, LOCAL, &local)
 }
+/// Readback proves a prior explicit original-listener request, not ACK, source
+/// acceptance, or local Async. Runner owns request admission and idempotency.
+pub(crate) fn activation_committed(paths: &StatePaths, reply: &Value) -> io::Result<bool> {
+    let (registration, common) = binding(paths)?;
+    exact(&common, reply)?;
+    if reply["status"] != "exact_committed" || reply["registration_committed"] != true {
+        return Ok(false);
+    }
+    let owner = registration["owner_invocation_uuid"]
+        .as_str()
+        .filter(|owner| !owner.is_empty())
+        .ok_or_else(|| error("missing original activation listener"))?;
+    let Some(dispositions) = reply["notification_dispositions"].as_array() else {
+        return Ok(false);
+    };
+    let mut original = dispositions
+        .iter()
+        .filter(|row| row["listener_id"] == owner);
+    let Some(request) = original.next() else {
+        return Ok(false);
+    };
+    Ok(original.next().is_none()
+        && request["requested_at"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+        && request["request_basis"] == "explicit_listener_activation_unattributed")
+}
+
 fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1106,6 +1134,62 @@ mod tests {
         let common = binding(&paths).unwrap().1;
         (temp, paths, common)
     }
+    #[test]
+    fn activation_readback_requires_exact_original_explicit_request() {
+        let (_temp, paths, mut reply) = source();
+        let registration = value(&paths.state_dir.join(REGISTRATION)).unwrap();
+        reply["status"] = json!("exact_committed");
+        reply["registration_committed"] = json!(true);
+        reply["notification_dispositions"] = json!([{
+            "listener_id": registration["owner_invocation_uuid"],
+            "requested_at": "2026-09-13T00:00:00Z",
+            "request_basis": "explicit_listener_activation_unattributed",
+            "disposition": "handled"
+        }]);
+        assert!(activation_committed(&paths, &reply).unwrap());
+        // No active owner or current mailbox sequence is needed to read a
+        // prior committed request, even after genuine handling/retirement.
+        for (key, replacement) in [
+            ("listener_id", json!("independent-listener")),
+            ("requested_at", Value::Null),
+            ("requested_at", json!("")),
+            (
+                "request_basis",
+                json!("explicit_event_activation_unattributed"),
+            ),
+            ("request_basis", Value::Null),
+        ] {
+            let mut invalid = reply.clone();
+            invalid["notification_dispositions"][0][key] = replacement;
+            assert!(!activation_committed(&paths, &invalid).unwrap());
+        }
+        for key in [
+            "protocol",
+            "domain_id",
+            "source_id",
+            "handle",
+            "registration_id",
+            "registration_digest",
+        ] {
+            let mut invalid = reply.clone();
+            invalid[key] = json!("foreign");
+            assert!(activation_committed(&paths, &invalid).is_err());
+        }
+        for status in ["absent", "unavailable", "conflict"] {
+            let mut invalid = reply.clone();
+            invalid["status"] = json!(status);
+            assert!(!activation_committed(&paths, &invalid).unwrap());
+        }
+        let mut duplicate = reply.clone();
+        duplicate["notification_dispositions"]
+            .as_array_mut()
+            .unwrap()
+            .push(reply["notification_dispositions"][0].clone());
+        assert!(!activation_committed(&paths, &duplicate).unwrap());
+        reply["registration_committed"] = json!(false);
+        assert!(!activation_committed(&paths, &reply).unwrap());
+    }
+
     fn registration_meta(paths: &StatePaths, mode: &str, delivery: state::DeliveryMode) -> Meta {
         let mut meta = Meta::new(
             paths.handle.clone(),

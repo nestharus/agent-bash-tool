@@ -103,13 +103,19 @@ semantics and liveness, and all mailbox behavior. See [`docs/DESIGN.md`](docs/DE
 architecture and ownership boundary.
 
 The spooler transfers each helper operation to a local delivery transfer worker before persisting its
-write-ahead claim and guarantees at most one admitted helper invocation per handle operation.
+write-ahead claim. Completion and legacy activation keep at-most-once admitted invocation;
+v2 activation permits explicit same-target reconciliation after a failed or unknown reply.
 Live supervisors acquire completion images and run the helper in that worker asynchronously, so
 image recovery and child reaping continue during delivery. Pending delivery retains the supervisor
 even for Root scope; ready-mode workload exit metadata is merged after the transfer lock releases.
 Conclusive process-launch failures remain pre-admission. Automatic completion progression permits
 one bounded status-triggered retry; activation instead restores sync mode and requires another
-explicit control-route-eligible `detach` request before retrying. Agent-runner is the authority for
+explicit control-route-eligible `detach` request before retrying. For v2, a later explicit detach
+can also retry a failed/unknown activation through the same pinned helper and original handle.
+Helper success, or an exact pinned readback of the prior original-listener request after
+retry failure, settles that local handoff. Unconfirmed rejection/unavailable authority preserves
+the obligation. Status/mode observation never selects this retry, and no anonymous owner is started.
+Agent-runner is the authority for
 mailbox transactions and deduplication after accepting an invocation. The helper is an opaque,
 trusted same-account extension; its internal mailbox effects are outside this repository's state
 machine. State directories and the helper cache are protected between Unix accounts, not between

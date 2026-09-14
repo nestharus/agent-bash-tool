@@ -1618,6 +1618,7 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
     settle_orphaned_activation(paths)?;
     let activation = state::activation_transfer_state(paths)?;
     if activation.mode == DeliveryMode::Async {
+        retry_uncertain_activation(paths, &delivery_lock)?;
         require_settled_activation(paths)?;
         let meta = repair_delivery_mode_mirror(paths, DeliveryMode::Async)?;
         drop(delivery_lock);
@@ -1672,6 +1673,67 @@ pub(crate) fn detach(paths: &StatePaths) -> std::io::Result<DetachOutcome> {
         true,
         terminal_activation_requests_notification,
     ))
+}
+
+// Only an authorized explicit detach retries this monotonic v2 operation.
+// Mode/status observers must not select notification or bootstrap an owner.
+// The pinned Runner resolves the handle to its immutable original listener;
+// successful activation is its committed/already-applied response, not evidence
+// that output was consumed or any physical custody was discharged.
+fn retry_uncertain_activation(
+    paths: &StatePaths,
+    delivery_lock: &DeliveryLockGuard,
+) -> io::Result<()> {
+    if !crate::continuation::enabled(paths)
+        || !matches!(
+            state::activation_transfer_state(paths)?.outcome,
+            state::ActivationTransferOutcome::Failed(_)
+                | state::ActivationTransferOutcome::TransferOutcomeUnknown
+        )
+    {
+        return Ok(());
+    }
+    let meta = state::read_meta(paths)?;
+    let request = activate_request(&meta, paths).map_err(io::Error::other)?;
+    run_delivery_transfer_worker_holding_lock(delivery_lock, || {
+        // Preserve the previous uncertain/failed outcome on every unsuccessful
+        // retry (including non-admission and worker loss). Never roll it back to
+        // sync or erase incurred obligations. Optional lossy diagnostics observe
+        // the new helper result; external custody has its own exact waits.
+        if let Err(error) = run_required_delivery_helper_command_detailed(&request, Some(paths)) {
+            // A committed request may have been handled and its owner retired
+            // before retry. Readback can confirm that prior request, but cannot
+            // authorize a new one or turn response-only/ACK alone into detach.
+            if !readback_activation_committed(&meta, paths).unwrap_or(false) {
+                return Err(match error {
+                    DeliveryHelperCommandError::NotStarted(error)
+                    | DeliveryHelperCommandError::Admitted(error) => error,
+                });
+            }
+        }
+        state::write_activation_succeeded(paths)
+    })
+}
+
+fn readback_activation_committed(meta: &Meta, paths: &StatePaths) -> io::Result<bool> {
+    let request = DeliveryHelperRequest {
+        paths,
+        operation: "activation-readback",
+        helper: HandleBoundDeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)
+            .map_err(io::Error::other)?,
+        args: vec![
+            "notify".into(),
+            "agent-bash-completion-state".into(),
+            "--registration-file".into(),
+            path_arg(&paths.state_dir.join(crate::continuation::REGISTRATION)),
+        ],
+        transient_environment: Vec::new(),
+    };
+    let reply = run_structured_helper(&request, Some(paths)).map_err(|error| match error {
+        DeliveryHelperCommandError::NotStarted(error)
+        | DeliveryHelperCommandError::Admitted(error) => error,
+    })?;
+    crate::continuation::activation_committed(paths, &reply)
 }
 
 pub(crate) fn require_settled_activation(paths: &StatePaths) -> io::Result<()> {
@@ -2240,6 +2302,184 @@ mod tests {
             Vec::new(),
             None,
         )
+    }
+
+    fn activation_retry_fixture(helper: &str, v2: bool) -> (tempfile::TempDir, StatePaths) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_activation_retry".into());
+        state::create_handle_state(&paths).unwrap();
+        let mut meta = continuity_meta(&paths);
+        meta.delivery_helper = Some(
+            ConfiguredDeliveryHelper::from_resolved_path(Path::new(helper))
+                .unwrap()
+                .pin_to_handle(&paths)
+                .unwrap()
+                .provenance,
+        );
+        state::write_meta_atomic(&paths, &meta).unwrap();
+        state::write_delivery_mode_atomic(&paths, DeliveryMode::Async).unwrap();
+        state::record_activation_attempt(&paths).unwrap();
+        if v2 {
+            // Local protocol selector only. The fake native helper models its
+            // response; this is not evidence of real Runner admission.
+            fs::write(
+                paths.state_dir.join(crate::continuation::REGISTRATION),
+                b"{}",
+            )
+            .unwrap();
+        }
+        (temp, paths)
+    }
+
+    #[test]
+    fn explicit_v2_detach_reconciles_failed_unknown_and_orphaned_pending_activation() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        for outcome in [
+            "failed: lost reply\n",
+            "transfer_outcome_unknown\n",
+            "pending\n",
+        ] {
+            let (_temp, paths) = activation_retry_fixture("/usr/bin/true", true);
+            fs::write(&paths.activation_outcome, outcome).unwrap();
+            // Retained unknown physical custody must survive logical success.
+            fs::write(
+                &paths.external_transfer_custody,
+                b"prior unresolved custody",
+            )
+            .unwrap();
+            assert!(observed_delivery_mode(&paths).is_err());
+            assert_eq!(
+                fs::read_to_string(&paths.activation_outcome).unwrap(),
+                outcome
+            );
+            let result = detach(&paths).unwrap();
+            assert!(!result.transitioned);
+            assert_eq!(observed_delivery_mode(&paths).unwrap(), DeliveryMode::Async);
+            assert_eq!(
+                fs::read(&paths.external_transfer_custody).unwrap(),
+                b"prior unresolved custody"
+            );
+            // Once settled, even an unavailable helper is not consulted again.
+            fs::remove_file(&paths.delivery_helper).unwrap();
+            assert!(detach(&paths).is_ok());
+            assert!(paths.activation_attempted.exists());
+        }
+    }
+
+    #[test]
+    fn rejected_v2_activation_retry_preserves_failure_unknown_and_custody() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        for outcome in [
+            "failed: completion_owner_closed_retryable\n",
+            "transfer_outcome_unknown\n",
+        ] {
+            let (_temp, paths) = activation_retry_fixture("/usr/bin/false", true);
+            fs::write(&paths.activation_outcome, outcome).unwrap();
+            fs::write(&paths.external_transfer_custody, b"prior custody").unwrap();
+            for _ in 0..2 {
+                assert!(detach(&paths).is_err());
+                assert!(observed_delivery_mode(&paths).is_err());
+                assert_eq!(
+                    fs::read_to_string(&paths.activation_outcome).unwrap(),
+                    outcome
+                );
+                assert_eq!(
+                    fs::read(&paths.external_transfer_custody).unwrap(),
+                    b"prior custody"
+                );
+                assert!(paths.activation_attempted.exists());
+            }
+            // A pinned-image failure must also retain the original obligation.
+            fs::remove_file(&paths.delivery_helper).unwrap();
+            assert!(detach(&paths).is_err());
+            assert_eq!(
+                fs::read_to_string(&paths.activation_outcome).unwrap(),
+                outcome
+            );
+        }
+    }
+
+    #[test]
+    fn closed_owner_retry_can_read_back_prior_commit_but_not_unrequested_sync() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        let fake = tempfile::tempdir().unwrap();
+        let reply_path = fake.path().join("reply.json");
+        let helper = fake.path().join("helper");
+        fs::write(&helper, format!(
+            "#!/bin/sh\ncase \"$2\" in\nagent-bash-activate) echo completion_owner_closed_retryable >&2; exit 1;;\nagent-bash-completion-state) cat '{}';;\n*) exit 99;;\nesac\n",
+            reply_path.display()
+        )).unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let (_temp, paths) = activation_retry_fixture(helper.to_str().unwrap(), true);
+        let mut registration: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/age360/paired-wire.json"))
+                .unwrap();
+        registration = registration["registration"].clone();
+        registration["handle"] = serde_json::json!(paths.handle);
+        registration["handle_dir"] = serde_json::json!(paths.state_dir);
+        registration["spool_root"] = serde_json::json!(paths.root);
+        let data = serde_json::to_vec(&registration).unwrap();
+        fs::write(
+            paths.state_dir.join(crate::continuation::REGISTRATION),
+            &data,
+        )
+        .unwrap();
+        let mut reply = serde_json::json!({
+            "status": "exact_committed", "registration_committed": true,
+            "registration_digest": crate::continuation::digest(&data),
+            "notification_dispositions": [{
+                "listener_id": registration["owner_invocation_uuid"],
+                "requested_at": null, "request_basis": null,
+                "disposition": "no_notification_required"
+            }]
+        });
+        for key in [
+            "protocol",
+            "domain_id",
+            "source_id",
+            "handle",
+            "registration_id",
+        ] {
+            reply[key] = registration[key].clone();
+        }
+        state::write_activation_transfer_outcome_unknown(&paths).unwrap();
+        fs::write(&reply_path, serde_json::to_vec(&reply).unwrap()).unwrap();
+        assert!(detach(&paths).is_err());
+        assert!(observed_delivery_mode(&paths).is_err());
+        reply["notification_dispositions"][0]["requested_at"] =
+            serde_json::json!("2026-09-13T00:00:00Z");
+        reply["notification_dispositions"][0]["request_basis"] =
+            serde_json::json!("explicit_listener_activation_unattributed");
+        reply["notification_dispositions"][0]["disposition"] = serde_json::json!("handled");
+        fs::write(&reply_path, serde_json::to_vec(&reply).unwrap()).unwrap();
+        fs::write(&paths.external_transfer_custody, b"unknown prior helper").unwrap();
+        assert!(detach(&paths).is_ok());
+        assert_eq!(
+            fs::read(&paths.external_transfer_custody).unwrap(),
+            b"unknown prior helper"
+        );
+        // This is a fake API-response control, not a real owner-retirement run.
+        assert_eq!(observed_delivery_mode(&paths).unwrap(), DeliveryMode::Async);
+    }
+
+    #[test]
+    fn legacy_activation_failure_is_not_retried_under_the_v2_contract() {
+        if crate::test_support::private_case() {
+            return;
+        }
+        let (_temp, paths) = activation_retry_fixture("/usr/bin/true", false);
+        state::write_activation_failed(&paths, "legacy rejection").unwrap();
+        assert!(detach(&paths).is_err());
+        assert!(matches!(
+            state::activation_transfer_state(&paths).unwrap().outcome,
+            state::ActivationTransferOutcome::Failed(_)
+        ));
     }
 
     #[test]
