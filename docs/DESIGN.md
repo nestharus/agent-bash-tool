@@ -356,9 +356,11 @@ persisted before that decision so detach can safely observe a completion that wo
 - If sync completion wins, it invokes `agent-bash-complete` for the inactive event; a later detach
   transitions the terminal handle and invokes `agent-bash-activate`.
 - If detach observes terminal state before completion's delivery step, the helper operations remain
-  serialized and each event type is admitted at most once.
-- Repeated detach calls observe `async` and are no-ops. If a caller died between the canonical mode
-  write and the `meta.json` mirror, the retry repairs the mirror without repeating activation.
+  serialized; activation retries target the same original event/listener.
+- Repeated detach calls with settled activation are no-ops. If a caller died after successful
+  activation but before the `meta.json` mirror, retry repairs the mirror without another helper call.
+  A failed/unknown v2 activation instead permits one pinned same-target activation call per explicit
+  detach. Runner success confirms committed/already-applied activation; local `async` alone does not.
 
 The source fact `terminal_activation_requests_notification` reports whether a successful
 sync-to-async transition observes a terminal handle, allowing activation to request an immediate
@@ -421,12 +423,13 @@ immutable while cancellation terminates workload descendants and preserves compl
 The conservative physical-custody/drained markers remain until the entire owned tree, including
 any unfinished helper role, has settled. They do not assert remote notification or ACK success.
 
-These are write-ahead transfer claims: once present, a successor never hands the same one-shot
-obligation to the helper again, including after a nonzero exit or unknown admitted outcome.
+Completion and legacy activation use one-shot write-ahead transfer claims: after admission,
+a successor does not repeat them. V2 activation is a monotonic Runner operation and allows
+explicit same-target retry after a failed/unknown reply, without repeating original work.
 Conclusive helper-resolution, fork, spawn, or pre-exec failures remain `attempted=false`; detach
 restores sync mode, while completion records a typed result and permits one bounded retry because no
-helper process received the operation. This chooses at-most-once invocation after admission without
-discarding a provably pre-admission obligation.
+helper process received the operation. These pre-admission cases remain distinct from
+v2 reconciliation of a possibly committed activation.
 
 The pre-admission retry policies intentionally diverge at the command-authority boundary.
 Completion progression can be entered automatically by the live supervisor, guardian, or a
@@ -434,7 +437,13 @@ control-route-eligible status call, so `CompletionDeliveryMeta::completion_lifec
 retry budget and closes the operation after that budget is spent. Activation is entered only by an explicit
 control-route-eligible `detach`; a conclusive pre-admission failure restores sync mode and removes its
 claim, so each later retry requires a new explicit caller decision. Admitted or unknown activation
-never rolls back and cannot be retried. The delivery module owns both policies at the shared
+never rolls back. For v2 only, an explicit detach retries the original activation through its pinned
+helper; unsuccessful retry preserves the previous failure/unknown state and incurred custody.
+After retry failure, exact pinned completion-state readback can confirm a prior explicit
+original-listener request, including after genuine handling/owner retirement. Source acceptance,
+ACK alone, a different listener or response-only disposition cannot confirm activation. Without
+that prior request, a closed-owner rejection requires proper independent-entry authority; Bash
+does not bootstrap an anonymous owner. Logical activation success is neither recipient ACK nor physical drain. The delivery module owns both policies at the shared
 `delivery.lock` and local-worker transfer boundary; changes to helper admission or retry semantics
 must preserve this automatic-progression versus explicit-command distinction.
 

@@ -669,6 +669,25 @@ pub(crate) fn lock_completion(paths: &StatePaths) -> io::Result<File> {
     Ok(file)
 }
 
+pub(crate) fn try_lock_completion(paths: &StatePaths) -> io::Result<Option<File>> {
+    use std::os::fd::AsRawFd;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&paths.completion_lock)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::WouldBlock {
+        return Ok(None);
+    }
+    Err(err)
+}
+
 // Short physical-admission/discharge critical sections only. No helper execution
 // owns this lock, and even a stopped critical-section owner cannot block a caller
 // indefinitely. Timeout is an error/retry, not acceptance or drain evidence.
@@ -1160,6 +1179,12 @@ fn reap_entry_is_handle_dir(entry: &fs::DirEntry) -> bool {
 }
 
 fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig, boot_id: &str) -> bool {
+    // Runner may admit a late listener or still use the recovery image. Until
+    // a paired serialized source-release contract exists, retain v2 sources;
+    // TTL, boot changes and local byte receipts are not release authority.
+    if crate::continuation::enabled(paths) {
+        return false;
+    }
     let Ok(meta) = read_meta(paths) else {
         return false;
     };
@@ -1343,7 +1368,7 @@ pub(crate) fn read_rc(paths: &StatePaths) -> io::Result<i32> {
     parse_rc_text(&contents)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = atomic_parent(path)?;
     let file_name = atomic_file_name(path)?;
     let tmp = atomic_temp_path(parent, file_name);

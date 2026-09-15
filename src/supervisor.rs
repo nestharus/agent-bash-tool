@@ -1,3 +1,4 @@
+use std::os::unix::fs::OpenOptionsExt;
 mod descendant_signal;
 
 use std::collections::HashMap;
@@ -131,9 +132,34 @@ unsafe fn register_and_start_supervisor(
     config: SupervisorConfig,
     registration: delivery::DeliveryRegistration,
 ) -> ! {
+    let scope = match config.completion_scope {
+        CompletionScope::Tree => "tree",
+        CompletionScope::Root => "root",
+    };
+    if let Err(err) = registration.prepare_continuation(&config.paths, &config.meta, scope) {
+        let _ =
+            record_pre_admission_registration_error(&config.paths, &config.meta, &err.to_string());
+        send_registration_result(result_fd, 0, err.to_string().as_bytes());
+        unsafe {
+            libc::close(result_fd);
+            libc::_exit(EX_SOFTWARE)
+        };
+    }
+    if crate::continuation::enabled(&config.paths) {
+        let mut meta = config.meta.clone();
+        meta.schema_version = 4;
+        if state::write_meta_atomic(&config.paths, &meta).is_err() {
+            let _ = crate::continuation::abandon(&config.paths);
+            unsafe {
+                libc::close(result_fd);
+                libc::_exit(EX_SOFTWARE)
+            };
+        }
+    }
     match delivery::register(&config.paths, &config.meta, registration) {
         Ok(()) => {}
         Err(delivery::RegistrationError::NotStarted(err)) => {
+            let _ = crate::continuation::abandon(&config.paths);
             let detail = err.to_string();
             let _ = record_pre_admission_registration_error(&config.paths, &config.meta, &detail);
             send_registration_result(result_fd, 0, detail.as_bytes());
@@ -141,6 +167,7 @@ unsafe fn register_and_start_supervisor(
             unsafe { libc::_exit(EX_SOFTWARE) };
         }
         Err(delivery::RegistrationError::Admitted(err)) => {
+            let _ = crate::continuation::abandon(&config.paths);
             let detail = err.to_string();
             let _ = record_admitted_registration_unknown(&config.paths, &config.meta, &detail);
             send_registration_result(result_fd, 2, &[]);
@@ -264,6 +291,14 @@ fn request_cancel_using(
     };
     let Some(supervisor) = captured else {
         drop(completion_lock);
+        if crate::continuation::enabled(paths) {
+            // Original guardian custody survives missing supervisor metadata or
+            // identity. Admit to its durable poll route, never a stale PID.
+            let outcome = request_terminal_cancel(paths)?;
+            if outcome.requested {
+                return Ok(outcome);
+            }
+        }
         reconcile_lost_supervisor(paths)?;
         return Ok(CancelOutcome::not_requested());
     };
@@ -404,6 +439,9 @@ unsafe fn daemonization_child(config: SupervisorConfig) -> ! {
     }
     if let Err(err) = set_subreaper() {
         let mut meta = config.meta.clone();
+        if crate::continuation::enabled(&config.paths) {
+            meta.schema_version = 4;
+        }
         let _ = record_supervisor_error(
             &config.paths,
             &mut meta,
@@ -422,6 +460,9 @@ unsafe fn daemonization_child(config: SupervisorConfig) -> ! {
         -1 => {
             let _ = state::end_physical_custody(&config.paths);
             let mut meta = config.meta.clone();
+            if crate::continuation::enabled(&config.paths) {
+                meta.schema_version = 4;
+            }
             let _ = record_supervisor_error(
                 &config.paths,
                 &mut meta,
@@ -451,7 +492,11 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
     };
     // A normal Root completion may still leave adopted descendants. Logical
     // completion does not discharge this guardian's physical reaping custody.
-    let mut completion_reconciled = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    let mut completion_reconciled = if crate::continuation::enabled(paths) {
+        crate::continuation::handed_off(paths).unwrap_or(false)
+    } else {
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    };
     let mut recovered_cancel_escalation = None;
     let mut completion_transfer = None;
     let mut reaped_transfer = None;
@@ -497,6 +542,58 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
         }
         if adopted_tree_empty {
             crate::delivery_role::guardian_tree_drained();
+        }
+        if crate::continuation::enabled(paths) && adopted_tree_empty {
+            if accepted_cancel && state::record_cancellation_drained(paths).is_err() {
+                std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                continue;
+            }
+            if crate::continuation::output_unavailable(paths).unwrap_or(false)
+                && crate::continuation::notification_owned(paths).unwrap_or(false)
+                && crate::continuation::record_missing_output(paths).is_ok()
+                && state::end_physical_custody(paths).is_ok()
+            {
+                return 0;
+            }
+        }
+        if crate::continuation::enabled(paths) && adopted_tree_empty && !completion_reconciled {
+            let publication = (|| -> io::Result<()> {
+                let _lock = state::lock_completion(paths)?;
+                let mut meta = state::read_meta(paths)?;
+                if !paths
+                    .state_dir
+                    .join(crate::continuation::OUTCOME)
+                    .try_exists()?
+                {
+                    if accepted_cancel {
+                        apply_cancellation_metadata(&mut meta, CancellationCause::ExplicitRequest);
+                    } else {
+                        apply_lost_supervisor_metadata(&mut meta);
+                    }
+                    crate::continuation::publish(
+                        paths,
+                        &meta,
+                        crate::continuation::Observation {
+                            kind: if accepted_cancel {
+                                "cancelled"
+                            } else {
+                                "ceased_status_unknown"
+                            },
+                            root_wait_status: None,
+                            tree_drained: true,
+                            output_closed: true,
+                            ready_sentinel: None,
+                        },
+                    )?;
+                    state::write_rc_atomic(paths, meta.rc.unwrap_or(EX_SOFTWARE))?;
+                    state::write_meta_atomic(paths, &meta)?;
+                }
+                Ok(())
+            })();
+            if publication.is_err() {
+                std::thread::sleep(SUPERVISOR_RECOVERY_POLL);
+                continue;
+            }
         }
         // Durable helper handback can precede the worker's _exit. After abnormal
         // supervisor loss this guardian is its sole adopting reaper. Do not
@@ -612,6 +709,9 @@ fn redirect_stdio_to_devnull() {
 fn run_supervisor(config: SupervisorConfig) -> i32 {
     set_private_umask();
     let mut meta = supervisor_meta(config.meta);
+    if crate::continuation::enabled(&config.paths) {
+        meta.schema_version = 4;
+    }
 
     let mut log = match open_supervisor_log(&config.paths) {
         Ok(file) => file,
@@ -693,6 +793,11 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
     let root_pidfd = pidfd_open(spawn.pid);
     let owner_pidfd = owner_pidfd(&meta);
     apply_spawn_metadata(&mut meta, &spawn, root_pidfd);
+    // Failure to bind a post-fork identity remains may_launch uncertainty; the
+    // actual original supervisor still observes/reaps this already launched root.
+    if let Err(err) = crate::continuation::launched(&config.paths, spawn.pid) {
+        meta.error = Some(format!("launch identity publication failed: {err}"));
+    }
     persist_supervisor_meta_best_effort(&config.paths, &meta);
 
     let sentinel = match sentinel_matcher(config.ready_sentinel.as_deref()) {
@@ -741,7 +846,11 @@ fn supervisor_meta(mut meta: Meta) -> Meta {
 }
 
 fn open_supervisor_log(paths: &StatePaths) -> io::Result<BoundedLog> {
-    BoundedLog::new(state::open_log_append(paths)?, log_max_bytes())
+    BoundedLog::new(
+        state::open_log_append(paths)?,
+        paths.log.clone(),
+        log_max_bytes(),
+    )
 }
 
 fn log_max_bytes() -> u64 {
@@ -754,15 +863,17 @@ fn log_max_bytes() -> u64 {
 
 struct BoundedLog {
     file: File,
+    path: std::path::PathBuf,
     max_bytes: u64,
     len: u64,
 }
 
 impl BoundedLog {
-    fn new(file: File, max_bytes: u64) -> io::Result<Self> {
+    fn new(file: File, path: std::path::PathBuf, max_bytes: u64) -> io::Result<Self> {
         let len = file.metadata()?.len();
         let mut log = Self {
             file,
+            path,
             max_bytes: max_bytes.max(1),
             len,
         };
@@ -797,10 +908,25 @@ impl BoundedLog {
             payload_budget.saturating_sub(u64::try_from(new_tail.len()).unwrap_or(payload_budget));
         let old_tail = self.read_tail(old_budget)?;
 
-        self.file.set_len(0)?;
-        self.file.write_all(marker)?;
-        self.file.write_all(&old_tail)?;
-        self.file.write_all(new_tail)?;
+        // Rollover replaces the live pathname; a selected event's pinned inode
+        // retains its prefix, even before its bounded body copy succeeds.
+        let temp = self.path.with_extension(format!(
+            "rollover-{}",
+            state::generate_handle().map_err(io::Error::other)?
+        ));
+        let mut replacement = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o600)
+            .open(&temp)?;
+        replacement.write_all(marker)?;
+        replacement.write_all(&old_tail)?;
+        replacement.write_all(new_tail)?;
+        replacement.sync_all()?;
+        std::fs::rename(&temp, &self.path)?;
+        self.file = replacement;
         self.len =
             u64::try_from(marker.len() + old_tail.len() + new_tail.len()).unwrap_or(self.max_bytes);
         Ok(())
@@ -915,7 +1041,9 @@ fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
         root_status: None,
         tree_empty: false,
         completion_recorded: false,
+        pending_source: None,
         completion_transfer: None,
+        reaped_completion_transfer: None,
         completion_delivery_settled: false,
         completion_tree_pending: false,
         root_status_pending: false,
@@ -1320,6 +1448,7 @@ fn pidfd_open(pid: libc::pid_t) -> Option<RawFd> {
 
 #[derive(Clone, Copy)]
 struct RootStatus {
+    raw: i32,
     rc: i32,
     signal: Option<i32>,
 }
@@ -1384,13 +1513,26 @@ struct EventLoop {
     root_status: Option<RootStatus>,
     tree_empty: bool,
     completion_recorded: bool,
+    pending_source: Option<PendingSource>,
     completion_transfer: Option<delivery::CompletionTransfer>,
+    reaped_completion_transfer: Option<i32>,
     completion_delivery_settled: bool,
     completion_tree_pending: bool,
     root_status_pending: bool,
     sentinel: Option<SentinelMatcher>,
     spawn_error: Option<String>,
     cancellation: Option<Cancellation>,
+}
+
+// Original finalized event stays separate from mutable status/cancellation.
+struct PendingSource {
+    progress: crate::continuation::Publication,
+    retry_at: Instant,
+    meta: Meta,
+    kind: &'static str,
+    root_wait_status: Option<i32>,
+    tree_drained: bool,
+    output_closed: bool,
 }
 
 struct Cancellation {
@@ -1518,6 +1660,15 @@ fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
         // Spawn failures remain bounded by backoff; image RPCs fail truthfully meanwhile.
         loop_state.recover_image_service();
         loop_state.maybe_finish()?;
+        if loop_state.tree_empty
+            && loop_state.output_closed()
+            && explicit_cancel_accepted(&loop_state.paths)?
+        {
+            // Actual reaping/closure evidence is independent of publication.
+            state::record_cancellation_drained(&loop_state.paths)?;
+        }
+        loop_state.retry_source_publication();
+        loop_state.retry_completion_integration();
         loop_state.drive_completion_delivery()?;
         loop_state.flush_root_status()?;
         if loop_state.should_exit() {
@@ -1664,6 +1815,13 @@ impl EventLoop {
     }
 
     fn poll_timeout(&self) -> Option<Duration> {
+        if self
+            .pending_source
+            .as_ref()
+            .is_some_and(|pending| Instant::now() >= pending.retry_at)
+        {
+            return Some(Duration::ZERO);
+        }
         if self.cancellation.is_some() {
             Some(CANCEL_POLL)
         } else if self.meta.cancel_owner.is_some() && self.owner_pidfd.is_none() {
@@ -1918,6 +2076,7 @@ impl EventLoop {
 
     fn drive_completion_delivery(&mut self) -> io::Result<()> {
         if !self.completion_recorded
+            || self.pending_source.is_some()
             || self.completion_delivery_settled
             || self.completion_transfer.is_some()
         {
@@ -1943,10 +2102,27 @@ impl EventLoop {
         {
             return Ok(());
         }
-        let transfer = self.completion_transfer.take().expect("matched transfer");
-        transfer.finish(&self.paths, &mut self.meta, status)?;
-        self.mark_completion_delivery_settled();
+        self.reaped_completion_transfer = Some(status);
+        self.retry_completion_integration();
         Ok(())
+    }
+
+    fn retry_completion_integration(&mut self) {
+        let Some(status) = self.reaped_completion_transfer else {
+            return;
+        };
+        let Some(transfer) = self.completion_transfer.as_ref() else {
+            return;
+        };
+        if transfer
+            .finish(&self.paths, &mut self.meta, status)
+            .is_err()
+        {
+            return;
+        }
+        self.reaped_completion_transfer = None;
+        self.completion_transfer = None;
+        self.mark_completion_delivery_settled();
     }
 
     fn mark_completion_delivery_settled(&mut self) {
@@ -1982,12 +2158,110 @@ impl EventLoop {
 
     fn should_exit(&self) -> bool {
         self.completion_recorded
+            && self.pending_source.is_none()
             && self.completion_delivery_settled
             && (!self.completion_tree_pending || self.tree_empty)
             && !self.root_status_pending
             && self.root_status.is_some()
             && self.completion_scope.is_complete(self.tree_empty)
             && self.output_closed()
+    }
+
+    fn select_initial_source_event(&self) -> io::Result<()> {
+        let Some(pending) = &self.pending_source else {
+            return Ok(());
+        };
+        // This first, bounded selection cannot yield to further log I/O even if
+        // another completion-lock user intervenes. No capture/hash occurs here.
+        let _lock = state::lock_completion(&self.paths)?;
+        crate::continuation::select_observed_event(
+            &self.paths,
+            &pending.meta,
+            crate::continuation::Observation {
+                kind: pending.kind,
+                root_wait_status: pending.root_wait_status,
+                tree_drained: pending.tree_drained,
+                output_closed: pending.output_closed,
+                ready_sentinel: if pending.kind == "ready" {
+                    pending.meta.ready_sentinel.as_deref()
+                } else {
+                    None
+                },
+            },
+        )
+    }
+
+    fn retry_source_publication(&mut self) {
+        let Some(pending) = &mut self.pending_source else {
+            return;
+        };
+        if Instant::now() < pending.retry_at {
+            return;
+        }
+        let result = (|| -> io::Result<bool> {
+            // Original selection was committed before any further log I/O.
+            // A retry only projects its bound header, never a later event.
+            let Some(_lock) = state::try_lock_completion(&self.paths)? else {
+                return Ok(false);
+            };
+            crate::continuation::retain_event(
+                &self.paths,
+                &pending.meta,
+                crate::continuation::Observation {
+                    kind: pending.kind,
+                    root_wait_status: pending.root_wait_status,
+                    tree_drained: pending.tree_drained,
+                    output_closed: pending.output_closed,
+                    ready_sentinel: if pending.kind == "ready" {
+                        pending.meta.ready_sentinel.as_deref()
+                    } else {
+                        None
+                    },
+                },
+            )?;
+            crate::continuation::fault_barrier(&self.paths, "after-terminal-metadata")?;
+            crate::continuation::advance_publication(
+                &self.paths,
+                &pending.meta,
+                crate::continuation::Observation {
+                    kind: pending.kind,
+                    root_wait_status: pending.root_wait_status,
+                    tree_drained: pending.tree_drained,
+                    output_closed: pending.output_closed,
+                    ready_sentinel: if pending.kind == "ready" {
+                        pending.meta.ready_sentinel.as_deref()
+                    } else {
+                        None
+                    },
+                },
+                &mut pending.progress,
+            )
+        })();
+        match result {
+            Ok(true) => self.pending_source = None,
+            Ok(false) => {}
+            Err(error) => {
+                if crate::continuation::output_unavailable(&self.paths).unwrap_or(false)
+                    && crate::continuation::notification_owned(&self.paths).unwrap_or(false)
+                    && crate::continuation::record_missing_output(&self.paths).is_ok()
+                {
+                    self.pending_source = None;
+                    // Only local delivery execution retires: no successful source
+                    // handoff, enqueue, or recipient ACK is fabricated.
+                    self.mark_completion_delivery_settled();
+                    return;
+                }
+                if let Some(pending) = self.pending_source.as_mut() {
+                    pending.retry_at = Instant::now() + Duration::from_secs(1);
+                }
+                // Never unwind the original observer/output FDs for notification
+                // publication failure. Poll/reaping/cancellation continue normally.
+                let _ = state::atomic_write(
+                    &self.paths.state_dir.join("source-publication-error.txt"),
+                    format!("{error}\n").as_bytes(),
+                );
+            }
+        }
     }
 
     fn record_ready_sentinel(&mut self) -> io::Result<()> {
@@ -2000,6 +2274,22 @@ impl EventLoop {
                 tree_empty: self.tree_empty,
             },
         )?;
+        if matches!(result, TerminalPublishResult::Published)
+            && self.meta.completion_reason.as_deref() == Some("ready-sentinel")
+        {
+            self.pending_source =
+                crate::continuation::enabled(&self.paths).then(|| PendingSource {
+                    progress: crate::continuation::Publication::default(),
+                    retry_at: Instant::now(),
+                    meta: self.meta.clone(),
+                    kind: "ready",
+                    root_wait_status: None,
+                    tree_drained: false,
+                    output_closed: false,
+                });
+            self.select_initial_source_event()?;
+            self.retry_source_publication();
+        }
         self.integrate_terminal_publication(result);
         Ok(())
     }
@@ -2030,6 +2320,34 @@ impl EventLoop {
                 tree_empty: self.tree_empty,
             },
         )?;
+        if matches!(result, TerminalPublishResult::Published) {
+            // The first publication selected the event under completion.lock.
+            // A later accepted cancellation cannot relabel that original event.
+            let cancelled = self
+                .meta
+                .completion_reason
+                .as_deref()
+                .and_then(CancellationCause::from_completion_reason)
+                .is_some();
+            self.pending_source =
+                crate::continuation::enabled(&self.paths).then(|| PendingSource {
+                    progress: crate::continuation::Publication::default(),
+                    retry_at: Instant::now(),
+                    meta: self.meta.clone(),
+                    kind: if cancelled {
+                        "cancelled"
+                    } else if self.completion_scope == CompletionScope::Root {
+                        "exit_root"
+                    } else {
+                        "exit_tree"
+                    },
+                    root_wait_status: Some(root_status.raw),
+                    tree_drained: self.tree_empty,
+                    output_closed: self.output_closed(),
+                });
+            self.select_initial_source_event()?;
+            self.retry_source_publication();
+        }
         self.integrate_terminal_publication(result);
         Ok(())
     }
@@ -2044,6 +2362,23 @@ impl EventLoop {
                 tree_empty: self.tree_empty,
             },
         )?;
+        if matches!(result, TerminalPublishResult::Published)
+            && self.tree_empty
+            && self.output_closed()
+        {
+            self.pending_source =
+                crate::continuation::enabled(&self.paths).then(|| PendingSource {
+                    progress: crate::continuation::Publication::default(),
+                    retry_at: Instant::now(),
+                    meta: self.meta.clone(),
+                    kind: "ceased_status_unknown",
+                    root_wait_status: None,
+                    tree_drained: true,
+                    output_closed: true,
+                });
+            self.select_initial_source_event()?;
+            self.retry_source_publication();
+        }
         self.integrate_terminal_publication(result);
         Ok(())
     }
@@ -2227,17 +2562,20 @@ fn apply_cancellation_metadata(meta: &mut Meta, cause: CancellationCause) {
 fn status_to_root_status(status: i32) -> RootStatus {
     if libc::WIFEXITED(status) {
         RootStatus {
+            raw: status,
             rc: libc::WEXITSTATUS(status),
             signal: None,
         }
     } else if libc::WIFSIGNALED(status) {
         let signal = libc::WTERMSIG(status);
         RootStatus {
+            raw: status,
             rc: signal_to_shell_rc(signal),
             signal: Some(signal),
         }
     } else {
         RootStatus {
+            raw: status,
             rc: EX_SOFTWARE,
             signal: None,
         }
@@ -2402,7 +2740,16 @@ fn publish_terminal_with_delivery_disposition(
 ) -> io::Result<TerminalPublishResult> {
     let completion_lock = state::lock_completion(paths)?;
     let current = state::read_meta(paths)?;
-    if state::terminal(&current) {
+    // A diagnostic list/status terminal projection is not original v2
+    // evidence. The actual observer may still publish the real event; an
+    // existing immutable bundle, including ready, is never relabeled.
+    if state::terminal(&current)
+        && (!crate::continuation::enabled(paths)
+            || paths
+                .state_dir
+                .join("completion-source-bundle-v2.json")
+                .try_exists()?)
+    {
         *meta = current;
         drop(completion_lock);
         if delivery_disposition == CompletionDeliveryDisposition::ClaimPending {
@@ -2824,6 +3171,7 @@ for line in sys.stdin:
         state::record_explicit_cancel_acceptance(&paths).expect("late accepted request");
         let proposal = || TerminalProposal::Exit {
             root_status: RootStatus {
+                raw: 0,
                 rc: 0,
                 signal: None,
             },
@@ -2988,7 +3336,7 @@ for line in sys.stdin:
             .read(true)
             .open(&path)
             .expect("create log");
-        let mut log = BoundedLog::new(file, 128).expect("bounded log");
+        let mut log = BoundedLog::new(file, path.clone(), 128).expect("bounded log");
 
         log.write_all(&[b'a'; 100]).expect("write old output");
         log.write_all(&[b'b'; 100]).expect("write new output");
@@ -3014,7 +3362,7 @@ for line in sys.stdin:
             .read(true)
             .open(&path)
             .expect("create log");
-        let mut log = BoundedLog::new(file, 96).expect("bounded log");
+        let mut log = BoundedLog::new(file, path.clone(), 96).expect("bounded log");
 
         log.write_all(&[b'x'; 4096]).expect("write large output");
 

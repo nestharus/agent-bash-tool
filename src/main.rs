@@ -2,6 +2,7 @@
 
 mod cgroup;
 mod config;
+mod continuation;
 mod delivery;
 mod delivery_role;
 mod guard;
@@ -75,6 +76,15 @@ enum Command {
         /// The command and its arguments (after `--`).
         #[arg(last = true, required = true)]
         argv: Vec<String>,
+    },
+    /// Internal completion-only source recovery; cannot launch or register work.
+    CompletionReconcileV2 {
+        #[arg(long)]
+        registration_file: PathBuf,
+        #[arg(long)]
+        confirmation: PathBuf,
+        #[arg(long, required = true)]
+        json: bool,
     },
     /// Convert a running synchronous call to asynchronous mailbox delivery.
     Detach { handle: String },
@@ -180,8 +190,20 @@ fn main() {
 }
 
 fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
+    if let Command::CompletionReconcileV2 {
+        registration_file,
+        confirmation,
+        ..
+    } = &cli.command
+    {
+        let result = continuation::reconcile(registration_file, confirmation)
+            .map_err(completion_event_registration_error)?;
+        println!("{result}");
+        return Ok(());
+    }
     validate_guard(&guard)?;
     match cli.command {
+        Command::CompletionReconcileV2 { .. } => unreachable!(),
         Command::Run {
             delivery,
             completion_scope,
@@ -298,7 +320,9 @@ fn run_command(
     let startup_outcome = match supervisor::fork_registered_supervisor(config, registration) {
         Ok(outcome) => outcome,
         Err(err) => {
-            let _ = fs::remove_dir_all(&paths.state_dir);
+            // The channel can disappear AFTER durable runner admission. Keep
+            // exact source, launch fence and pinned recovery image; EOF grants
+            // neither deletion nor registration/workload replay.
             return Err(completion_event_registration_error(err));
         }
     };
