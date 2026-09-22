@@ -12,11 +12,12 @@ A short read or missing source fails; it is not an empty successful snapshot. Th
 acquired bytes, not a file's eventual size, a workload's physical cessation, or an atomic snapshot
 of the log or all metadata. Terminal ready-sentinel/root-completion output may still grow. A rewritten source
 can prevent future recovery/acceptance, even though bytes already acquired by a caller remain useful.
-Normal `BoundedLog` rollover truncates the same inode and rewrites a marker plus retained tail at
+Normal `BoundedLog` rollover replaces the live pathname with a new inode containing a marker plus retained tail at
 its configured cap. It can invalidate an earlier prefix **before cleanup/TTL expiry**. Producers
-are not locked: acquisition concurrent with rollover can fail short, or return equal-length/mixed
-bytes that are not an atomic historical final log image. The hash identifies exactly the bytes
-actually acquired; a later acceptance read may reject them. Acceptance likewise validates the
+are not locked: an open reader can retain the preceding inode across normal rollover,
+while a later acceptance opens the replacement. External in-place rewrites can still
+produce short or mixed reads. The hash identifies exactly the bytes actually acquired;
+a later acceptance read may reject them. Acceptance likewise validates the
 bytes it reads, not an immutable historical image. Sequential append/replacement/truncation tests
 do not establish behavior under concurrent producer rollover; that interleaving is not tested.
 
@@ -108,3 +109,35 @@ races terminal state and exact acquisition fails, only the acquired tail text is
 Wire hex expands bytes 2x; acquisition/adapter memory is proportional to the acquired prefix, as with
 full status. Persistent storage remains the existing log plus a small lock file and bounded receipt record,
 not a copy per read/acceptance. No aggregate capacity or universal reliability claim is made.
+
+
+### Completion continuation: original-event selection
+
+The v2 source selects the bounded log in the original live terminal-event turn:
+`selected-log-v2.bin` pins its inode and `output-selection-v2.json` records the
+exclusive byte boundary. Later appends are outside that selection. Rollover
+replaces the live log inode, so delayed body capture (including a successor after
+observer loss) copies only the retained original prefix. Neither the pin nor the
+boundary is a recipient receipt. The public full-body representation is unchanged.
+
+Recovery hashes retained bytes without `completion.lock`; original incremental
+publication attempts that lock nonblockingly. A stopped recovery has no whole-body
+critical section on the live observer's I/O/cancellation/reaping path. Initial
+copy/fsync still uses synchronous filesystem I/O, not a cancellation-latency bound.
+
+If the original selection is unavailable, Bash preserves the original header,
+reports `pending / original_output_capture_incomplete` through the existing
+recovery interface, and never samples the current log as replacement output.
+Actual cancellation drain and physical guardian discharge do not certify source
+publication. Once physically drained, a guardian may retire local execution with
+notification duty still held by the exact confirmed native registration. This
+creates no enqueue, source acceptance, delivery or listener ACK. Explicit native
+missing-output notification is a **pairing dependency**: the current source reply
+preserves the failure but does not itself materialize it for the recipient.
+
+A pin can retain an additional bounded-log inode after rollover; the full body
+retains another copy. Log caps, disk capacity, existing retained-tail allocation,
+and storage-loss uncertainty remain visible limits. No new TTL or reclamation
+policy is introduced. Unrecoverable selection loss is not retried by the Bash
+physical guardian; the native continuation remains responsible for its retained
+notification obligation, pending the coordinated missing-output capability.

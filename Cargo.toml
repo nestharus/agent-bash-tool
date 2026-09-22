@@ -11,6 +11,10 @@ repository = "https://github.com/nestharus/agent-bash-tool"
 name = "agent-bash"
 path = "src/main.rs"
 
+[features]
+# Explicit fixture build only; default executable contains no source fault hooks.
+source-fault-tests = []
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
