@@ -1463,21 +1463,49 @@ struct SentinelMatcher {
     regex: Regex,
     buffer: Vec<u8>,
     limit: usize,
+    literal_len: Option<usize>,
+    previous_match: bool,
 }
 
 impl SentinelMatcher {
     fn new(regex: Regex, pattern_len: usize) -> Self {
+        // Deliberately recognize only nonempty ASCII word literals. All regex
+        // syntax (including escapes, flags, anchors and Unicode) keeps the full
+        // rolling-window search; pattern length cannot bound arbitrary regexes.
+        let pattern = regex.as_str().as_bytes();
+        let literal_len = (!pattern.is_empty()
+            && pattern
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'_'))
+        .then_some(pattern.len());
         Self {
             regex,
             buffer: Vec::new(),
             limit: ONE_MIB.max(pattern_len.saturating_mul(4)),
+            literal_len,
+            previous_match: false,
         }
     }
 
     fn push_stdout(&mut self, bytes: &[u8]) -> bool {
+        let old_len = self.buffer.len();
         self.append_stdout(bytes);
+        let removed = self.buffer.len().saturating_sub(self.limit);
         self.trim_buffer();
-        self.matches()
+        let start = self.search_start(old_len.saturating_sub(removed));
+        self.previous_match = self.regex.is_match(&self.buffer[start..]);
+        self.previous_match
+    }
+
+    fn search_start(&self, retained_old_len: usize) -> usize {
+        // After a negative literal search, a new match must end in new bytes.
+        // Keep L-1 old bytes for split matches, measured AFTER window trimming.
+        // After a positive search, scan the whole window again: callers may
+        // push more data, and the old match may remain or may have rolled out.
+        match (self.literal_len, self.previous_match) {
+            (Some(len), false) => retained_old_len.saturating_sub(len - 1),
+            _ => 0,
+        }
     }
 
     fn append_stdout(&mut self, bytes: &[u8]) {
@@ -1489,10 +1517,6 @@ impl SentinelMatcher {
             let excess = self.buffer.len() - self.limit;
             self.buffer.drain(..excess);
         }
-    }
-
-    fn matches(&self) -> bool {
-        self.regex.is_match(&self.buffer)
     }
 }
 
@@ -3267,6 +3291,181 @@ for line in sys.stdin:
         let regex = Regex::new("ERRREADY").expect("regex");
         let matcher = SentinelMatcher::new(regex, "ERRREADY".len());
         assert!(!matcher.regex.is_match(b"stderr is not passed here"));
+    }
+
+    // Independent reference: append, retain the existing window, then search
+    // the entire window on EVERY push, including empty and post-match pushes.
+    fn assert_sentinel_matches_reference(pattern: &str, limit: usize, chunks: &[&[u8]]) {
+        let regex = Regex::new(pattern).expect("regex");
+        let mut matcher = SentinelMatcher::new(regex.clone(), pattern.len());
+        matcher.limit = limit;
+        let mut window = Vec::new();
+        for chunk in chunks {
+            append_sentinel_reference_window(&mut window, chunk, limit);
+            assert_eq!(
+                matcher.push_stdout(chunk),
+                regex.is_match(&window),
+                "pattern={pattern:?} chunk={chunk:?} window={window:?}"
+            );
+        }
+    }
+
+    fn append_sentinel_reference_window(window: &mut Vec<u8>, chunk: &[u8], limit: usize) {
+        window.extend_from_slice(chunk);
+        if window.len() > limit {
+            window.drain(..window.len() - limit);
+        }
+    }
+
+    #[test]
+    fn sentinel_literal_split_and_rolling_window_equivalence() {
+        for split in 0..=5 {
+            let literal = b"READY";
+            assert_sentinel_matches_reference(
+                "READY",
+                8,
+                &[
+                    b"xxxxxxxx",
+                    &literal[..split],
+                    &literal[split..],
+                    b"",
+                    b"x",
+                    b"xx",
+                    b"xxx",
+                    b"READYxxxxxxxx",
+                    b"RE",
+                    b"AD",
+                    b"Y",
+                ],
+            );
+        }
+        // A match trimmed away BEFORE search must not be reported, even when
+        // the incoming chunk alone contained it. Invalid UTF-8 is raw input.
+        for limit in [1, 4, 5, 6, 8, 32] {
+            assert_sentinel_matches_reference(
+                "READY",
+                limit,
+                &[
+                    b"\xffRE",
+                    b"AD",
+                    b"Y",
+                    b"",
+                    b"READYxxxxxxxx",
+                    b"READY",
+                    b"xxxxxxxx",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn sentinel_regex_syntax_keeps_full_window_semantics() {
+        for pattern in [
+            "",
+            "^READY",
+            "READY$",
+            r"\AREADY",
+            r"READY\z",
+            r"\bREADY\b",
+            "(?i)ready",
+            "RE.*Y",
+            "RE[AD]+Y",
+            "RE(AD)?Y",
+            "READY|GO",
+            r"RE\x41DY",
+            "é",
+            "(?-u:.)",
+            "READY.",
+        ] {
+            assert_sentinel_regex_window_examples(pattern);
+        }
+        assert_sentinel_matches_reference("^READY", 5, &[b"xREADY", b""]);
+        // Unbounded regex match starts much farther back than pattern length.
+        assert_sentinel_matches_reference("R.*Y", 64, &[b"R", b"aaaaaaaaaaaaaaaa", b"Y"]);
+    }
+
+    fn assert_sentinel_regex_window_examples(pattern: &str) {
+        let matcher = SentinelMatcher::new(Regex::new(pattern).unwrap(), pattern.len());
+        assert_eq!(matcher.literal_len, None, "{pattern}");
+        for limit in [4, 5, 8, 32] {
+            assert_sentinel_matches_reference(
+                pattern,
+                limit,
+                &[
+                    b"xxxx",
+                    b"RE",
+                    b"AD",
+                    b"Y",
+                    b"",
+                    b"x",
+                    b"\n",
+                    b"ready",
+                    b"GO",
+                    b"\xff",
+                    b"READYxxxxxxxx",
+                    b"READY",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn sentinel_literal_negative_search_excludes_previously_searched_prefix() {
+        let mut matcher = SentinelMatcher::new(Regex::new("READY").unwrap(), 5);
+        assert!(!matcher.push_stdout(&vec![0xff; ONE_MIB]));
+        assert_eq!(matcher.search_start(ONE_MIB - 8192), ONE_MIB - 8192 - 4);
+        assert!(!matcher.push_stdout(b"RE"));
+        assert!(matcher.push_stdout(b"ADY"));
+        assert_eq!(matcher.search_start(ONE_MIB), 0);
+        assert!(matcher.push_stdout(b""));
+        assert!(!matcher.push_stdout(&vec![0xff; ONE_MIB + 8192]));
+    }
+
+    #[test]
+    fn sentinel_literal_exhaustive_small_streams_match_reference() {
+        // Enumerate all five-byte streams and all chunk partitions, with a
+        // small window that forces shifts; do not stop checking after a match.
+        for pattern in ["A", "AA", "AB", "ABA", "ABABA", "A_B"] {
+            assert_sentinel_small_streams(pattern);
+        }
+    }
+
+    fn assert_sentinel_small_streams(pattern: &str) {
+        for code in 0..243 {
+            assert_sentinel_partitions(pattern, &sentinel_small_stream(code));
+        }
+    }
+
+    fn sentinel_small_stream(mut code: usize) -> [u8; 5] {
+        let mut stream = [0; 5];
+        for byte in &mut stream {
+            *byte = [b'A', b'B', 0xff][code % 3];
+            code /= 3;
+        }
+        stream
+    }
+
+    fn assert_sentinel_partitions(pattern: &str, stream: &[u8; 5]) {
+        for partition in 0..16 {
+            assert_sentinel_small_windows(pattern, &sentinel_partition(stream, partition));
+        }
+    }
+
+    fn sentinel_partition(stream: &[u8; 5], partition: usize) -> Vec<&[u8]> {
+        let mut chunks: Vec<&[u8]> = vec![b""];
+        let mut start = 0;
+        for end in (1..=5).filter(|end| *end == 5 || partition & (1 << (end - 1)) != 0) {
+            chunks.push(&stream[start..end]);
+            chunks.push(b"");
+            start = end;
+        }
+        chunks
+    }
+
+    fn assert_sentinel_small_windows(pattern: &str, chunks: &[&[u8]]) {
+        for limit in [2, 3, 5] {
+            assert_sentinel_matches_reference(pattern, limit, chunks);
+        }
     }
 
     #[test]
