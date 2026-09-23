@@ -105,6 +105,49 @@ pub(crate) fn notification_owned(paths: &StatePaths) -> io::Result<bool> {
     ))
 }
 
+/// A later helper may reuse the original owner witness only after the exact
+/// source registration was committed. Neither an intent nor a launch fence is
+/// a substitute for this receipt.
+pub(crate) fn confirmed_owner_binding(
+    paths: &StatePaths,
+    session: &str,
+    invocation: &str,
+    helper_sha256: &str,
+) -> io::Result<()> {
+    let (registration, common) = binding(paths)?;
+    if registration["owner_session_id"] != session
+        || registration["owner_invocation_uuid"] != invocation
+        || registration["helper"]["sha256"] != helper_sha256
+    {
+        return Err(error("registration owner or helper binding conflict"));
+    }
+    let receipt = paths.state_dir.join("registration-receipt-v2.json");
+    let confirmation = paths.state_dir.join(CONFIRMATION);
+    let (reply, recovered) = match value(&receipt) {
+        Ok(reply) => (reply, false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => (value(&confirmation)?, true),
+        Err(err) => return Err(err),
+    };
+    exact(&common, &reply)?;
+    if reply["registration_committed"] != true {
+        return Err(error("registration receipt does not prove commitment"));
+    }
+    if recovered {
+        if reply["status"] != "exact_committed" || reply["authority"] != "completion_only" {
+            return Err(error("registration confirmation has wrong authority"));
+        }
+    } else if !matches!(
+        reply["status"].as_str(),
+        Some("registered" | "already_registered")
+    ) || reply["continuation_owner_domain"] != common["domain_id"]
+        || reply["listener_revision"] != registration["listener_revision"]
+        || reply["listeners"] != registration["listeners"]
+    {
+        return Err(error("registration receipt does not match original source"));
+    }
+    Ok(())
+}
+
 pub(crate) fn record_missing_output(paths: &StatePaths) -> io::Result<()> {
     state::atomic_write(&paths.state_dir.join("source-publication-error.txt"),
         b"original_output_capture_incomplete: original selection unavailable; registered native continuation retains notification duty; capture remains pending unless attributable permanent-loss evidence can be published\n")

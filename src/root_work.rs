@@ -35,6 +35,80 @@ const ENDPOINT_ENV: &str = "OULIPOLY_COMPLETION_ENDPOINT";
 const REQUIRED_ENV: &str = "OULIPOLY_ORIGINAL_WORK_REQUIRED_V1";
 const INTENT_FILE: &str = "root-work-intent-v1.json";
 pub(crate) const ACCEPTED_FILE: &str = "root-work-accepted-v1.json";
+
+pub(crate) struct CompletionOwnerWitness {
+    pub(crate) session_id: String,
+    pub(crate) invocation_uuid: String,
+    pub(crate) registration_authority: OsString,
+}
+
+/// Restore only the witness that H pinned from this exact accepted intent.
+/// The helper receives it transiently; the broker still checks the live V
+/// caller against the consumed K grant and sealed image.
+pub(crate) fn completion_owner_witness(
+    paths: &StatePaths,
+    meta: &Meta,
+    helper_sha256: &str,
+) -> io::Result<Option<CompletionOwnerWitness>> {
+    let intent_path = paths.state_dir.join(INTENT_FILE);
+    let accepted_path = paths.state_dir.join(ACCEPTED_FILE);
+    if !intent_path.exists() {
+        if accepted_path.exists() {
+            return Err(io::Error::other("accepted work has no original intent"));
+        }
+        return Ok(None);
+    }
+    let intent_bytes = crate::continuation::read(&intent_path, 1024 * 1024)?;
+    let intent: WorkIntent = serde_json::from_slice(&intent_bytes)?;
+    let accepted: serde_json::Value =
+        serde_json::from_slice(&crate::continuation::read(&accepted_path, 1024 * 1024)?)?;
+    if intent.protocol != PROTOCOL
+        || intent.handle != paths.handle
+        || intent.work_id != paths.handle
+        || intent.state_root != paths.root
+        || accepted["protocol"] != PROTOCOL
+        || accepted["work_id"] != paths.handle
+        || accepted["root_id"] != intent.root_id
+        || accepted["supervisor_authority_id"] != intent.supervisor_authority_id
+        || accepted["request_sha256"] != hex_digest(&intent_bytes)
+    {
+        return Err(io::Error::other("accepted owner intent binding conflict"));
+    }
+    let (Some(session), Some(invocation), Some(authority), Some(helper)) = (
+        intent.meta.owner_session_id.as_deref(),
+        intent.meta.owner_invocation_uuid.as_deref(),
+        intent.registration_authority.as_deref(),
+        intent.meta.delivery_helper.as_ref(),
+    ) else {
+        return Err(io::Error::other("accepted owner witness is incomplete"));
+    };
+    if session.is_empty()
+        || invocation.is_empty()
+        || authority.len() != 64
+        || !authority
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || meta.owner_session_id.as_deref() != Some(session)
+        || meta.owner_invocation_uuid.as_deref() != Some(invocation)
+        || meta
+            .delivery_helper
+            .as_ref()
+            .map(|helper| helper.sha256.as_str())
+            != Some(helper_sha256)
+        || helper.sha256 != helper_sha256
+        || helper.path != paths.delivery_helper.to_string_lossy()
+    {
+        return Err(io::Error::other(
+            "accepted owner witness differs from handle",
+        ));
+    }
+    crate::continuation::confirmed_owner_binding(paths, session, invocation, helper_sha256)?;
+    Ok(Some(CompletionOwnerWitness {
+        session_id: session.to_owned(),
+        invocation_uuid: invocation.to_owned(),
+        registration_authority: OsString::from_vec(authority.to_vec()),
+    }))
+}
 const DIAGNOSTIC_FILE: &str = "root-work-diagnostic-v1.jsonl";
 const DIAGNOSTIC_LOCK_FILE: &str = "root-work-diagnostic-v1.lock";
 const DIAGNOSTIC_ROTATED_FILE: &str = "root-work-diagnostic-v1.jsonl.1";
@@ -1633,6 +1707,209 @@ fn hex_digest(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) mod owner_witness_tests {
+    use super::*;
+    use crate::state::{DeliveryHelperProvenance, DeliveryMode};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+
+    pub(crate) fn fixture() -> (tempfile::TempDir, StatePaths, Meta, Value) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let paths = StatePaths::new(root, "ab_owner_witness".into());
+        state::create_handle_state(&paths).unwrap();
+        let helper_sha = "b".repeat(64);
+        let provenance = DeliveryHelperProvenance {
+            schema_version: 5,
+            path: paths.delivery_helper.to_string_lossy().into_owned(),
+            device: 1,
+            inode: 2,
+            size: 3,
+            modified_seconds: 0,
+            modified_nanoseconds: 0,
+            mode: 0o500,
+            sha256: helper_sha.clone(),
+            environment: BTreeMap::new(),
+            environment_sha256: Some("c".repeat(64)),
+            interpreter: None,
+        };
+        let meta = Meta::new(
+            paths.handle.clone(),
+            1,
+            1,
+            vec!["true".into()],
+            paths.root.clone(),
+            "exit",
+            DeliveryMode::Async,
+            None,
+            Vec::new(),
+            None,
+        )
+        .with_owner_context(
+            Some("session-original".into()),
+            Some("11111111-1111-4111-8111-111111111111".into()),
+        )
+        .with_delivery_helper(provenance);
+        crate::continuation::prepare(&paths, &meta, "domain-original", "tree").unwrap();
+        let registration = crate::continuation::read(
+            &paths.state_dir.join(crate::continuation::REGISTRATION),
+            1024 * 1024,
+        )
+        .unwrap();
+        let source: Value = serde_json::from_slice(&registration).unwrap();
+        let receipt = json!({
+            "protocol":crate::continuation::PROTOCOL,
+            "domain_id":source["domain_id"],
+            "source_id":source["source_id"],
+            "handle":source["handle"],
+            "registration_id":source["registration_id"],
+            "registration_digest":crate::continuation::digest(&registration),
+            "status":"registered",
+            "registration_committed":true,
+            "continuation_owner_domain":source["domain_id"],
+            "listener_revision":source["listener_revision"],
+            "listeners":source["listeners"],
+        });
+        crate::continuation::confirm_launch(&paths, &receipt).unwrap();
+        let intent = WorkIntent {
+            protocol: PROTOCOL.into(),
+            work_id: paths.handle.clone(),
+            root_id: "root-original".into(),
+            domain_id: "domain-original".into(),
+            control_protocol: SOURCE_CONTROL_PROTOCOL.into(),
+            root_identity: None,
+            root_endpoint: Vec::new(),
+            supervisor_authority_id: "supervisor-original".into(),
+            guardian_identity: ProcessIdentity {
+                pid: 1,
+                boot_id: "boot".into(),
+                starttime_ticks: 1,
+            },
+            cancel_capability: "cancel".into(),
+            handle: paths.handle.clone(),
+            state_root: paths.root.clone(),
+            meta: meta.clone(),
+            argv: Vec::new(),
+            completion_scope: "tree".into(),
+            ready_sentinel: None,
+            registration_authority: Some(vec![b'a'; 64]),
+            environment: Vec::new(),
+            cancel_owner: None,
+        };
+        let intent_bytes = serde_json::to_vec(&intent).unwrap();
+        state::atomic_write(&paths.state_dir.join(INTENT_FILE), &intent_bytes).unwrap();
+        let accepted = json!({
+            "protocol":PROTOCOL,
+            "work_id":paths.handle,
+            "root_id":intent.root_id,
+            "supervisor_authority_id":intent.supervisor_authority_id,
+            "request_sha256":hex_digest(&intent_bytes),
+        });
+        state::atomic_write(
+            &paths.state_dir.join(ACCEPTED_FILE),
+            &serde_json::to_vec(&accepted).unwrap(),
+        )
+        .unwrap();
+        (temp, paths, meta, accepted)
+    }
+
+    #[test]
+    fn exact_committed_accepted_witness_survives_readback() {
+        let (_temp, paths, meta, _) = fixture();
+        let witness = completion_owner_witness(&paths, &meta, "b".repeat(64).as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(witness.session_id, "session-original");
+        assert_eq!(
+            witness.invocation_uuid,
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(witness.registration_authority.as_bytes(), &[b'a'; 64]);
+    }
+
+    #[test]
+    fn missing_wrong_stale_and_sibling_witnesses_refuse() {
+        let (_temp, paths, meta, mut accepted) = fixture();
+        let good = "b".repeat(64);
+        let mut wrong_meta = meta.clone();
+        wrong_meta.owner_session_id = Some("session-sibling".into());
+        assert!(completion_owner_witness(&paths, &wrong_meta, &good).is_err());
+        assert!(completion_owner_witness(&paths, &meta, &"d".repeat(64)).is_err());
+        let intent_path = paths.state_dir.join(INTENT_FILE);
+        let original_intent = crate::continuation::read(&intent_path, 1024 * 1024).unwrap();
+        let mut changed_intent: Value = serde_json::from_slice(&original_intent).unwrap();
+        changed_intent["registration_authority"][0] = json!(b'd');
+        state::atomic_write(&intent_path, &serde_json::to_vec(&changed_intent).unwrap()).unwrap();
+        assert!(completion_owner_witness(&paths, &meta, &good).is_err());
+        state::atomic_write(&intent_path, &original_intent).unwrap();
+        accepted["root_id"] = json!("root-sibling");
+        state::atomic_write(
+            &paths.state_dir.join(ACCEPTED_FILE),
+            &serde_json::to_vec(&accepted).unwrap(),
+        )
+        .unwrap();
+        assert!(completion_owner_witness(&paths, &meta, &good).is_err());
+        accepted["root_id"] = json!("root-original");
+        accepted["request_sha256"] = json!("0".repeat(64));
+        state::atomic_write(
+            &paths.state_dir.join(ACCEPTED_FILE),
+            &serde_json::to_vec(&accepted).unwrap(),
+        )
+        .unwrap();
+        assert!(completion_owner_witness(&paths, &meta, &good).is_err());
+        std::fs::remove_file(paths.state_dir.join(ACCEPTED_FILE)).unwrap();
+        assert!(completion_owner_witness(&paths, &meta, &good).is_err());
+        let intent =
+            crate::continuation::read(&paths.state_dir.join(INTENT_FILE), 1024 * 1024).unwrap();
+        accepted["request_sha256"] = json!(hex_digest(&intent));
+        state::atomic_write(
+            &paths.state_dir.join(ACCEPTED_FILE),
+            &serde_json::to_vec(&accepted).unwrap(),
+        )
+        .unwrap();
+        let receipt_path = paths.state_dir.join("registration-receipt-v2.json");
+        let receipt = crate::continuation::read(&receipt_path, 1024 * 1024).unwrap();
+        let mut changed_receipt: Value = serde_json::from_slice(&receipt).unwrap();
+        changed_receipt["source_id"] = json!("sibling-source");
+        state::atomic_write(
+            &receipt_path,
+            &serde_json::to_vec(&changed_receipt).unwrap(),
+        )
+        .unwrap();
+        assert!(completion_owner_witness(&paths, &meta, &good).is_err());
+        state::atomic_write(&receipt_path, &receipt).unwrap();
+        std::fs::remove_file(receipt_path).unwrap();
+        assert!(completion_owner_witness(&paths, &meta, &good).is_err());
+        let mut confirmation: Value = serde_json::from_slice(&receipt).unwrap();
+        confirmation["status"] = json!("exact_committed");
+        confirmation["authority"] = json!("completion_only");
+        state::atomic_write(
+            &paths.state_dir.join("registration-confirmation-v2.json"),
+            &serde_json::to_vec(&confirmation).unwrap(),
+        )
+        .unwrap();
+        assert!(completion_owner_witness(&paths, &meta, &good).is_ok());
+        let sibling = tempfile::tempdir().unwrap();
+        let sibling_paths = StatePaths::new(
+            std::fs::canonicalize(sibling.path()).unwrap(),
+            paths.handle.clone(),
+        );
+        state::create_handle_state(&sibling_paths).unwrap();
+        std::fs::copy(
+            paths.state_dir.join(INTENT_FILE),
+            sibling_paths.state_dir.join(INTENT_FILE),
+        )
+        .unwrap();
+        std::fs::copy(
+            paths.state_dir.join(ACCEPTED_FILE),
+            sibling_paths.state_dir.join(ACCEPTED_FILE),
+        )
+        .unwrap();
+        assert!(completion_owner_witness(&sibling_paths, &meta, &good).is_err());
+    }
 }
 
 fn new_capability() -> io::Result<String> {

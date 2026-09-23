@@ -36,6 +36,7 @@ const DELIVERY_HELPER_ENV_ALLOWLIST_ENV: &str = "AGENT_BASH_DELIVERY_HELPER_ENV_
 const COMPLETION_REGISTRATION_AUTHORITY_ENV: &str = "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY";
 const OWNER_SESSION_ID_ENV: &str = "AGENT_BASH_OWNER_SESSION_ID";
 const OWNER_INVOCATION_UUID_ENV: &str = "AGENT_BASH_OWNER_INVOCATION_UUID";
+const OWNER_WORK_ID_ENV: &str = "AGENT_BASH_OWNER_WORK_ID_V1";
 const DELIVERY_HELPER_CACHE_DIR: &str = ".delivery-helpers";
 const DELIVERY_HELPER_LEGACY_UNSUPPORTED: &str = "delivery_helper_legacy_unsupported";
 const DELIVERY_HELPER_UNAVAILABLE: &str = "delivery_helper_unavailable";
@@ -909,6 +910,7 @@ fn delivery_helper_environment_name_is_transient(name: &str) -> bool {
         COMPLETION_REGISTRATION_AUTHORITY_ENV
             | OWNER_SESSION_ID_ENV
             | OWNER_INVOCATION_UUID_ENV
+            | OWNER_WORK_ID_ENV
             | DELIVERY_HELPER_ENV_ALLOWLIST_ENV
     )
 }
@@ -924,7 +926,9 @@ fn validate_delivery_helper_environment_name(name: &str) -> Result<(), DeliveryH
     // fresh captures omit them and registration overrides them from Meta.
     if matches!(
         name,
-        COMPLETION_REGISTRATION_AUTHORITY_ENV | DELIVERY_HELPER_ENV_ALLOWLIST_ENV
+        COMPLETION_REGISTRATION_AUTHORITY_ENV
+            | OWNER_WORK_ID_ENV
+            | DELIVERY_HELPER_ENV_ALLOWLIST_ENV
     ) {
         return Err(DeliveryHelperError::invalid(format!(
             "delivery helper environment variable {name} is reserved"
@@ -1537,12 +1541,7 @@ fn execute_completion_transfer(
     if crate::continuation::enabled(paths) {
         return execute_continuation_transfer(paths, persisted, external);
     }
-    let request = match completion_request(
-        persisted.caller_ppid,
-        &persisted.handle,
-        paths,
-        persisted.delivery_helper.as_ref(),
-    ) {
+    let request = match completion_request(&persisted, paths) {
         Ok(request) => request,
         Err(err) => {
             persisted.delivery = completion_delivery_meta_from_helper_error(err, retry_count);
@@ -1569,13 +1568,7 @@ fn execute_continuation_transfer(
     mut meta: Meta,
     external: bool,
 ) -> io::Result<()> {
-    let request = completion_request(
-        meta.caller_ppid,
-        &meta.handle,
-        paths,
-        meta.delivery_helper.as_ref(),
-    )
-    .map_err(io::Error::other)?;
+    let request = completion_request(&meta, paths).map_err(io::Error::other)?;
     meta.delivery = provisional_completion_delivery_transfer_meta();
     state::write_meta_atomic(paths, &meta)?;
     let result = run_structured_helper(&request, external.then_some(paths))
@@ -1749,18 +1742,20 @@ fn retry_uncertain_activation(
 }
 
 fn readback_activation_committed(meta: &Meta, paths: &StatePaths) -> io::Result<bool> {
+    let helper = HandleBoundDeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)
+        .map_err(io::Error::other)?;
+    let transient_environment = completion_owner_environment(paths, meta, &helper)?;
     let request = DeliveryHelperRequest {
         paths,
         operation: "activation-readback",
-        helper: HandleBoundDeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)
-            .map_err(io::Error::other)?,
+        helper,
         args: vec![
             "notify".into(),
             "agent-bash-completion-state".into(),
             "--registration-file".into(),
             path_arg(&paths.state_dir.join(crate::continuation::REGISTRATION)),
         ],
-        transient_environment: Vec::new(),
+        transient_environment,
     };
     let reply = run_structured_helper(&request, Some(paths)).map_err(|error| match error {
         DeliveryHelperCommandError::NotStarted(error)
@@ -1927,6 +1922,17 @@ fn register_request<'a>(
         ));
         transient_environment.push((OsString::from(OWNER_SESSION_ID_ENV), session.into()));
         transient_environment.push((OsString::from(OWNER_INVOCATION_UUID_ENV), invocation.into()));
+        if crate::continuation::enabled(paths)
+            && paths
+                .state_dir
+                .join(crate::root_work::ACCEPTED_FILE)
+                .exists()
+        {
+            transient_environment.push((
+                OsString::from(OWNER_WORK_ID_ENV),
+                meta.handle.clone().into(),
+            ));
+        }
     }
     Ok(DeliveryHelperRequest {
         paths,
@@ -1941,28 +1947,65 @@ fn activate_request<'a>(
     meta: &Meta,
     paths: &'a StatePaths,
 ) -> Result<DeliveryHelperRequest<'a>, DeliveryHelperError> {
+    let helper = HandleBoundDeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)?;
+    let transient_environment = completion_owner_environment(paths, meta, &helper)
+        .map_err(|error| DeliveryHelperError::invalid(error.to_string()))?;
     Ok(DeliveryHelperRequest {
         paths,
         operation: "activate",
-        helper: HandleBoundDeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)?,
+        helper,
         args: activate_args(&meta.handle),
-        transient_environment: Vec::new(),
+        transient_environment,
     })
 }
 
 fn completion_request<'a>(
-    caller_ppid: libc::pid_t,
-    handle: &str,
+    meta: &Meta,
     paths: &'a StatePaths,
-    provenance: Option<&DeliveryHelperProvenance>,
 ) -> Result<DeliveryHelperRequest<'a>, DeliveryHelperError> {
+    let helper = HandleBoundDeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)?;
+    let transient_environment = completion_owner_environment(paths, meta, &helper)
+        .map_err(|error| DeliveryHelperError::invalid(error.to_string()))?;
     Ok(DeliveryHelperRequest {
         paths,
         operation: "complete",
-        helper: HandleBoundDeliveryHelper::from_provenance(provenance, paths)?,
-        args: completion_args(caller_ppid, handle, paths),
-        transient_environment: Vec::new(),
+        helper,
+        args: completion_args(meta.caller_ppid, &meta.handle, paths),
+        transient_environment,
     })
+}
+
+fn completion_owner_environment(
+    paths: &StatePaths,
+    meta: &Meta,
+    helper: &HandleBoundDeliveryHelper,
+) -> io::Result<Vec<(OsString, OsString)>> {
+    if !crate::continuation::enabled(paths) {
+        return Ok(Vec::new());
+    }
+    let Some(witness) =
+        crate::root_work::completion_owner_witness(paths, meta, &helper.provenance.sha256)?
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![
+        (
+            OsString::from(COMPLETION_REGISTRATION_AUTHORITY_ENV),
+            witness.registration_authority,
+        ),
+        (
+            OsString::from(OWNER_SESSION_ID_ENV),
+            witness.session_id.into(),
+        ),
+        (
+            OsString::from(OWNER_INVOCATION_UUID_ENV),
+            witness.invocation_uuid.into(),
+        ),
+        (
+            OsString::from(OWNER_WORK_ID_ENV),
+            paths.handle.clone().into(),
+        ),
+    ])
 }
 
 fn register_args(meta: &Meta, paths: &StatePaths) -> Vec<OsString> {
@@ -2975,6 +3018,10 @@ mod tests {
                 OsString::from("ambient-invocation"),
             ),
             (
+                OsString::from(OWNER_WORK_ID_ENV),
+                OsString::from("ambient-work"),
+            ),
+            (
                 OsString::from(DELIVERY_HELPER_ENV_ALLOWLIST_ENV),
                 OsString::from("WU_D_WORK_DIR"),
             ),
@@ -2988,6 +3035,7 @@ mod tests {
         assert!(!captured.contains_key(COMPLETION_REGISTRATION_AUTHORITY_ENV));
         assert!(!captured.contains_key(OWNER_SESSION_ID_ENV));
         assert!(!captured.contains_key(OWNER_INVOCATION_UUID_ENV));
+        assert!(!captured.contains_key(OWNER_WORK_ID_ENV));
         assert!(!captured.contains_key(DELIVERY_HELPER_ENV_ALLOWLIST_ENV));
         validate_delivery_helper_environment(&captured).unwrap();
     }
@@ -3055,10 +3103,12 @@ mod tests {
             .pin_to_handle(&paths)
             .unwrap();
         let provenance = helper.provenance.clone();
-        let meta = continuity_meta(&paths).with_owner_context(
-            Some("resolved-session".into()),
-            Some("11111111-1111-4111-8111-111111111111".into()),
-        );
+        let meta = continuity_meta(&paths)
+            .with_owner_context(
+                Some("resolved-session".into()),
+                Some("11111111-1111-4111-8111-111111111111".into()),
+            )
+            .with_delivery_helper(provenance.clone());
         state::write_meta_atomic(&paths, &meta).unwrap();
         let meta = state::read_meta(&paths).unwrap();
         let registration =
@@ -3078,13 +3128,46 @@ mod tests {
             String::from_utf8(output.stdout).unwrap(),
             "agent-bash-register|unset|unset|unset\n"
         );
-        let completion = completion_request(1, &paths.handle, &paths, Some(&provenance)).unwrap();
+        let completion = completion_request(&meta, &paths).unwrap();
         let output = completion.command().output().unwrap();
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
             "agent-bash-complete|unset|unset|unset\n"
         );
+    }
+
+    #[test]
+    fn accepted_completion_injects_only_exact_transient_owner_witness() {
+        let (_temp, paths, meta, _) = crate::root_work::owner_witness_tests::fixture();
+        let helper = HandleBoundDeliveryHelper {
+            provenance: meta.delivery_helper.as_ref().unwrap().clone(),
+            environment: BTreeMap::new(),
+            executable: File::open("/bin/true").unwrap(),
+            interpreter: None,
+        };
+        let environment = completion_owner_environment(&paths, &meta, &helper).unwrap();
+        assert_eq!(environment.len(), 4);
+        assert_eq!(environment[0].0, COMPLETION_REGISTRATION_AUTHORITY_ENV);
+        assert_eq!(environment[0].1.as_bytes(), &[b'a'; 64]);
+        assert_eq!(
+            environment[1],
+            (OWNER_SESSION_ID_ENV.into(), "session-original".into())
+        );
+        assert_eq!(
+            environment[2],
+            (
+                OWNER_INVOCATION_UUID_ENV.into(),
+                "11111111-1111-4111-8111-111111111111".into()
+            )
+        );
+        assert_eq!(
+            environment[3],
+            (OWNER_WORK_ID_ENV.into(), paths.handle.clone().into())
+        );
+        let mut stale = meta.clone();
+        stale.owner_invocation_uuid = Some("22222222-2222-4222-8222-222222222222".into());
+        assert!(completion_owner_environment(&paths, &stale, &helper).is_err());
     }
 
     #[test]
