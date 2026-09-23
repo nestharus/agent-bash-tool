@@ -457,7 +457,7 @@ fn has_paired_custodian_ancestor() -> io::Result<bool> {
                 Some(fields.get(6)?.to_string())
             })
             .collect();
-    let mut pid = unsafe { libc::getppid() };
+    let mut pid = state::observer_parent_pid()?;
     for _ in 0..256 {
         if pid <= 1 {
             return Ok(false);
@@ -1707,7 +1707,10 @@ mod tests {
             let witness: serde_json::Value =
                 serde_json::from_slice(&bytes[17..size as usize]).unwrap();
             assert_eq!(witness["scope"]["kind"], expected_scope);
-            assert_eq!(witness["source"]["host_pid"], std::process::id());
+            assert_eq!(
+                witness["source"]["host_pid"],
+                host_observed_source().unwrap().pid
+            );
             for (pointer, value) in expected_fields {
                 assert_eq!(witness.pointer(pointer), Some(&value));
             }
@@ -1830,6 +1833,55 @@ mod tests {
             );
             broker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn v2_source_witness_uses_observer_pid_inside_child_pidns() {
+        const CHILD: &str = "AGE319_SOURCE_WITNESS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new("timeout")
+                .args([
+                    "--kill-after=5s",
+                    "30s",
+                    "unshare",
+                    "--user",
+                    "--map-current-user",
+                    "--pid",
+                    "--fork",
+                    "--",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "root_work::tests::v2_source_witness_uses_observer_pid_inside_child_pidns",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let observed = host_observed_source().unwrap();
+        assert_ne!(observed.pid, unsafe { libc::getpid() });
+        let temp = tempfile::tempdir().unwrap();
+        let guardian_listener = UnixListener::bind(temp.path().join("guardian.sock")).unwrap();
+        let broker_listener = UnixListener::bind(temp.path().join("broker.sock")).unwrap();
+        let broker = broker_mock(broker_listener, true, "root", vec![]);
+        let source = UnixStream::connect(temp.path().join("guardian.sock")).unwrap();
+        let (_guardian, _) = guardian_listener.accept().unwrap();
+        verify_source_socket_v2_at(
+            &temp.path().join("broker.sock"),
+            &source,
+            &test_witness(&observed, SourceScope::Root),
+            unsafe { libc::geteuid() },
+        )
+        .unwrap();
+        broker.join().unwrap();
     }
 
     #[test]

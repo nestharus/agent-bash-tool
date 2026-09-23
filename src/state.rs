@@ -3,7 +3,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1545,8 +1545,75 @@ fn atomic_temp_path(parent: &Path, file_name: &OsStr) -> PathBuf {
 
 #[derive(Debug)]
 struct ProcStat {
+    pid: libc::pid_t,
     ppid: libc::pid_t,
     starttime_ticks: u64,
+}
+
+/// Resolve the attached parent through the mounted procfs observer while
+/// proving that it is also our namespace-local parent. Procfs can be mounted
+/// from an ancestor PID namespace, so getppid() is not a /proc lookup key.
+pub(crate) fn attached_parent_identity(local_ppid: libc::pid_t) -> io::Result<CallerChainEntry> {
+    if local_ppid <= 1 {
+        return Err(io::Error::other("detached local parent"));
+    }
+    let observer = fs::metadata("/proc")?;
+    let self_stat = read_proc_self_stat_result()?;
+    if self_stat.ppid <= 1
+        || local_pid_for_observer_path(Path::new("/proc/self"))? != unsafe { libc::getpid() }
+        || fs::read_link("/proc/self/ns/pid")?
+            != fs::read_link(format!("/proc/{}/ns/pid", self_stat.ppid))?
+        || local_pid_for_observer_path(Path::new(&format!("/proc/{}", self_stat.ppid)))?
+            != local_ppid
+    {
+        return Err(io::Error::other(
+            "procfs parent is not the attached local parent",
+        ));
+    }
+    let parent = read_proc_stat_result(self_stat.ppid)?;
+    let boot_id = read_boot_id();
+    if parent.starttime_ticks == 0 || boot_id.is_empty() {
+        return Err(io::Error::other("attached parent incarnation unavailable"));
+    }
+    let after = read_proc_self_stat_result()?;
+    if after.pid != self_stat.pid
+        || after.starttime_ticks != self_stat.starttime_ticks
+        || after.ppid != self_stat.ppid
+        || unsafe { libc::getppid() } != local_ppid
+        || read_proc_stat_result(parent.pid)?.starttime_ticks != parent.starttime_ticks
+        || fs::metadata("/proc")?.dev() != observer.dev()
+        || fs::metadata("/proc")?.ino() != observer.ino()
+    {
+        return Err(io::Error::other(
+            "attached parent changed during observation",
+        ));
+    }
+    Ok(caller_chain_entry_from_proc_stat(
+        parent.pid, &parent, &boot_id,
+    ))
+}
+
+pub(crate) fn observer_parent_pid() -> io::Result<libc::pid_t> {
+    Ok(attached_parent_identity(unsafe { libc::getppid() })?.pid)
+}
+
+pub(crate) fn local_pid_for_observer_pid(pid: libc::pid_t) -> Option<libc::pid_t> {
+    let path = format!("/proc/{pid}");
+    if fs::read_link("/proc/self/ns/pid").ok()? != fs::read_link(format!("{path}/ns/pid")).ok()? {
+        return None;
+    }
+    local_pid_for_observer_path(Path::new(&path)).ok()
+}
+
+fn local_pid_for_observer_path(path: &Path) -> io::Result<libc::pid_t> {
+    let status = fs::read_to_string(path.join("status"))?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))
+        .and_then(|value| value.split_whitespace().last())
+        .and_then(|value| value.parse::<libc::pid_t>().ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| io::Error::other("procfs NSpid unavailable"))
 }
 
 pub(crate) fn capture_caller_chain(start_pid: libc::pid_t) -> Vec<CallerChainEntry> {
@@ -1584,7 +1651,14 @@ fn read_proc_stat(pid: libc::pid_t) -> Option<ProcStat> {
 fn read_proc_stat_result(pid: libc::pid_t) -> io::Result<ProcStat> {
     let contents = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     parse_proc_stat(&contents)
+        .filter(|stat| stat.pid == pid)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid /proc stat"))
+}
+
+fn read_proc_self_stat_result() -> io::Result<ProcStat> {
+    let contents = fs::read_to_string("/proc/self/stat")?;
+    parse_proc_stat(&contents)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid /proc/self/stat"))
 }
 
 fn read_boot_id() -> String {
@@ -1719,10 +1793,16 @@ fn caller_chain_entry_from_proc_stat(
 
 fn parse_proc_stat(contents: &str) -> Option<ProcStat> {
     let end_comm = contents.rfind(") ")?;
+    let pid = contents
+        .split_whitespace()
+        .next()?
+        .parse::<libc::pid_t>()
+        .ok()?;
     let fields: Vec<&str> = contents[end_comm + 2..].split_whitespace().collect();
     let ppid = fields.get(1)?.parse::<libc::pid_t>().ok()?;
     let starttime_ticks = fields.get(19)?.parse::<u64>().ok()?;
     Some(ProcStat {
+        pid,
         ppid,
         starttime_ticks,
     })
@@ -2700,6 +2780,7 @@ mod tests {
         let stat =
             parse_proc_stat("42 (name with ) paren) S 7 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12345 0")
                 .expect("stat");
+        assert_eq!(stat.pid, 42);
         assert_eq!(stat.ppid, 7);
         assert_eq!(stat.starttime_ticks, 12345);
     }

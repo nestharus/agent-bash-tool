@@ -224,13 +224,13 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
             owner_pid,
             argv,
         ),
-        Command::Detach { handle } => detach_command(handle, control_route_caller(&guard)),
-        Command::Cancel { handle } => cancel_command(handle, control_route_caller(&guard)),
+        Command::Detach { handle } => detach_command(handle, control_route_caller(&guard)?),
+        Command::Cancel { handle } => cancel_command(handle, control_route_caller(&guard)?),
         Command::AcceptOutput { handle, snapshot } => {
-            accept_output_command(handle, snapshot, control_route_caller(&guard))
+            accept_output_command(handle, snapshot, control_route_caller(&guard)?)
         }
         Command::Snapshot { handle, bytes } => snapshot_command(handle, bytes),
-        Command::Mode { handle } => mode_command(handle, control_route_caller(&guard)),
+        Command::Mode { handle } => mode_command(handle, control_route_caller(&guard)?),
         Command::Status {
             tail_bytes,
             full,
@@ -241,19 +241,21 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
             tail_bytes.unwrap_or(65_536),
             full,
             observe_only,
-            control_route_caller(&guard),
+            control_route_caller(&guard)?,
         ),
-        Command::List { all, json } => list_command(control_route_caller(&guard), all, json),
+        Command::List { all, json } => list_command(control_route_caller(&guard)?, all, json),
     }
 }
 
 fn validate_guard(guard: &AttachedGuard) -> Result<(), AppError> {
-    guard.validate().map_err(|_| {
-        AppError::new(
-            EX_USAGE,
-            "agent-bash: must be called as an attached subprocess",
-        )
-    })
+    guard.validate().map_err(|_| attached_guard_error())
+}
+
+fn attached_guard_error() -> AppError {
+    AppError::new(
+        EX_USAGE,
+        "agent-bash: must be called as an attached subprocess",
+    )
 }
 
 fn run_command(
@@ -279,7 +281,8 @@ fn run_command(
     let handle = state::generate_handle().map_err(supervisor_bootstrap_error)?;
     let paths = state_paths(state_root, handle.clone());
 
-    let caller_chain = state::capture_caller_chain(guard.startup_ppid());
+    let caller_chain = guard.caller_chain().map_err(|_| attached_guard_error())?;
+    let observer_parent_pid = caller_chain[0].pid;
     let cancel_owner = resolve_cancel_owner(&caller_chain, cancel_on_owner_exit, owner_pid)?;
     let cwd = current_directory().map_err(current_directory_error)?;
     let mode = run_mode(&ready_sentinel);
@@ -296,7 +299,7 @@ fn run_command(
     };
     let meta = Meta::new(
         handle,
-        guard.startup_ppid(),
+        observer_parent_pid,
         unsafe { libc::getpid() },
         argv.clone(),
         cwd,
@@ -372,7 +375,10 @@ fn resolve_cancel_owner(
     })?;
     caller_chain
         .iter()
-        .find(|entry| entry.pid == owner_pid)
+        .find(|entry| {
+            state::process_identity_is_live(entry)
+                && state::local_pid_for_observer_pid(entry.pid) == Some(owner_pid)
+        })
         .cloned()
         .map(Some)
         .ok_or_else(|| {
@@ -1212,10 +1218,10 @@ fn caller_chain_matches_handle(meta: &Meta, caller_chain: &[state::CallerChainEn
     })
 }
 
-fn control_route_caller(guard: &AttachedGuard) -> ControlRouteCaller {
-    ControlRouteCaller {
-        caller_chain: state::capture_caller_chain(guard.startup_ppid()),
-    }
+fn control_route_caller(guard: &AttachedGuard) -> Result<ControlRouteCaller, AppError> {
+    Ok(ControlRouteCaller {
+        caller_chain: guard.caller_chain().map_err(|_| attached_guard_error())?,
+    })
 }
 
 fn caller_is_control_eligible(
