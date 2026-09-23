@@ -23,7 +23,6 @@ const CONFIRMATION: &str = "registration-confirmation-v2.json";
 const LOCAL: &str = "continuation-v2.json";
 const MAX_SOURCE: u64 = 1024 * 1024;
 const MAX_OUTPUT: u64 = 1024 * MAX_SOURCE;
-const INLINE_OUTPUT: u64 = 64 * 1024;
 const OUTPUT: &str = "completion-output-v2.bin";
 const SELECTION: &str = "output-selection-v2.json";
 const SELECTED_LOG: &str = "selected-log-v2.bin";
@@ -670,7 +669,7 @@ impl OutputHasher {
         }
         Ok(
             json!({"representation":"retained-output-v1", "relative":OUTPUT,
-            "sha256":format!("{:x}", self.hash.clone().finalize()), "byte_len":self.count, "encoding":"utf8-lossy"}),
+            "sha256":format!("{:x}", self.hash.clone().finalize()), "byte_len":self.count, "encoding":"raw"}),
         )
     }
 }
@@ -698,14 +697,10 @@ fn finish_observation_with_output(paths: &StatePaths, descriptor: Value) -> io::
     if descriptor["representation"] == "missing-original-output-v1" {
         snapshot["status"] = json!("original_output_unavailable");
     }
-    snapshot["output"] = if descriptor["byte_len"].as_u64().unwrap_or(u64::MAX) <= INLINE_OUTPUT {
-        json!(String::from_utf8_lossy(&read(
-            &paths.state_dir.join(OUTPUT),
-            INLINE_OUTPUT
-        )?))
-    } else {
-        descriptor
-    };
+    // Keep the selected bytes authoritative even for small/non-UTF-8 output.
+    // Older inline snapshots remain readable by Runner as explicitly lossy
+    // legacy content; new snapshots always name the pinned raw artifact.
+    snapshot["output"] = descriptor;
     let outcome_bytes = bytes(outcome)?;
     snapshot["outcome_sha256"] = json!(digest(&outcome_bytes));
     snapshot["outcome_byte_len"] = json!(outcome_bytes.len());
@@ -1135,6 +1130,16 @@ mod tests {
         (temp, paths, common)
     }
     #[test]
+    fn small_binary_selection_keeps_raw_descriptor() {
+        let (_temp, paths, _) = source();
+        let selected = b"before\xff\x00after\n";
+        fs::write(paths.state_dir.join(OUTPUT), selected).unwrap();
+        let descriptor = output_descriptor(&paths).unwrap();
+        assert_eq!(descriptor["encoding"], "raw");
+        assert_eq!(descriptor["byte_len"], selected.len());
+        assert_eq!(descriptor["sha256"], digest(selected));
+    }
+    #[test]
     fn activation_readback_requires_exact_original_explicit_request() {
         let (_temp, paths, mut reply) = source();
         let registration = value(&paths.state_dir.join(REGISTRATION)).unwrap();
@@ -1463,10 +1468,9 @@ mod tests {
             fixture["artifact_output_bytes_utf8"].as_str().unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            output_descriptor(&paths).unwrap(),
-            fixture["output_artifact_example"]
-        );
+        let mut expected = fixture["output_artifact_example"].clone();
+        expected["encoding"] = json!("raw");
+        assert_eq!(output_descriptor(&paths).unwrap(), expected);
         let parsed: Value =
             serde_json::from_str(fixture["artifact_snapshot_bytes_utf8"].as_str().unwrap())
                 .unwrap();
