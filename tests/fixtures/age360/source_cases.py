@@ -231,7 +231,15 @@ def capture_schedule(root, env):
         assert (path/'selected-log-v2.bin').read_bytes().startswith(original)
     if CASE == 'capture-partial':
         snapshot = read(path/'completion-snapshot-v2.json')
-        assert snapshot['output']['reason'] == 'selected_storage_lost'
+        reason = snapshot['output']['reason']
+        assert reason in ('selected_storage_lost', 'selected_storage_short'), snapshot['output']
+        assert snapshot['output']['selection'] == {
+            'device': selection['device'], 'inode': selection['inode'],
+            'byte_len': selection['byte_len']}
+        if reason == 'selected_storage_short':
+            assert 0 <= snapshot['output']['observed_byte_len'] < selection['byte_len']
+        else:
+            assert snapshot['output']['observed_byte_len'] is None
         assert not (path/'completion-output-v2.bin').exists()
         assert len(list(path.glob('.completion-output-*.tmp'))) == 1
         assert list(path.glob('.completion-output-*.tmp'))[0].stat().st_size == 4096
