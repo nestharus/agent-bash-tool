@@ -232,13 +232,13 @@ pub(crate) fn selected(paths: &StatePaths, meta: &Meta) -> io::Result<bool> {
     // second owner. Inspect the live, incarnation-stable ancestor chain before
     // treating missing ambient grant/marker as genuine standalone entry.
     if !required && std::env::var_os(ROOT_AUTHORITY_ENV).is_none() {
-        match has_paired_worker_ancestor() {
+        match has_paired_custodian_ancestor() {
             Ok(true) => {
                 return Err(preaccept_failure(
                     paths,
                     meta,
                     io::Error::other(
-                        "paired worker ancestor is live but inherited original-work authority is missing",
+                        "paired worker or guardian ancestor is live but inherited original-work authority is missing",
                     ),
                 ));
             }
@@ -392,8 +392,28 @@ fn valid_paired_ring_uuid(uuid: &str) -> bool {
         && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
 }
 
-fn has_paired_worker_ancestor() -> io::Result<bool> {
+fn has_paired_custodian_ancestor() -> io::Result<bool> {
     let own_image = std::fs::metadata("/proc/self/exe")?;
+    // The guardian is the kernel subreaper for an accepted worker. A child
+    // adopted after worker exit retains this ancestor even if its session
+    // keyring was replaced by keyctl session or PAM keyinit.
+    let uid = unsafe { libc::geteuid() };
+    let socket_prefix = format!("/tmp/oulipoly-completion-{uid}-");
+    let guardian_sockets: std::collections::HashSet<String> =
+        std::fs::read_to_string("/proc/net/unix")?
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                let path = fields.get(7)?;
+                let domain = path
+                    .strip_prefix(&socket_prefix)?
+                    .strip_suffix("/owner.sock")?;
+                if !valid_paired_ring_uuid(domain) {
+                    return None;
+                }
+                Some(fields.get(6)?.to_string())
+            })
+            .collect();
     let mut pid = unsafe { libc::getppid() };
     for _ in 0..256 {
         if pid <= 1 {
@@ -426,6 +446,27 @@ fn has_paired_worker_ancestor() -> io::Result<bool> {
                 return Err(io::Error::other(
                     "paired ancestor identity changed during classification",
                 ));
+            }
+        }
+        // A bound owner.sock inode held by this exact ancestor identifies the
+        // live root guardian, not a client connection or a process name.
+        let fd_dir = format!("/proc/{pid}/fd");
+        for fd in std::fs::read_dir(fd_dir)? {
+            let fd = fd?;
+            let target = std::fs::read_link(fd.path())?;
+            if let Some(inode) = target
+                .to_string_lossy()
+                .strip_prefix("socket:[")
+                .and_then(|v| v.strip_suffix(']'))
+            {
+                if guardian_sockets.contains(inode) {
+                    if state::process_starttime_ticks(pid) == Some(before) {
+                        return Ok(true);
+                    }
+                    return Err(io::Error::other(
+                        "paired guardian identity changed during classification",
+                    ));
+                }
             }
         }
         if state::process_starttime_ticks(pid) != Some(before) || parent == pid {

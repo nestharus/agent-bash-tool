@@ -14,7 +14,7 @@ completion returns synchronously in-band or asynchronously through the agent mai
   guardian. The guardian exclusively accepts and grants execution, owns cancellation and exact
   child settlement, and directly reaps the short-lived agent-bash worker; agent-bash does not
   create its standalone guardian/supervisor pair. A marked tree fails closed if either required
-  value is missing or invalid. A live paired-worker ancestor also blocks standalone
+  value is missing or invalid. A live paired-worker or adopting guardian ancestor also blocks standalone
   selection when a wrapper strips the marker and grant; genuinely unpaired endpoint-only
   legacy callers retain completion-continuation-v2 behavior. See [root original work](docs/root-original-work-v1.md).
 - **Explicit result delivery.** `run --delivery sync` keeps completion in-band;

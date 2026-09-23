@@ -10,9 +10,11 @@ existing spooler behavior. An endpoint-only legacy
 completion-continuation-v2 caller also remains standalone, while a grant with
 no endpoint is always rejected as malformed paired context.
 Before standalone selection with a missing grant, agent-bash checks its live
-same-UID ancestor chain for the exact paired-worker image and internal argument.
-A descendant whose wrapper removed its marker and grant is rejected while that
-worker remains an ancestor, including when the endpoint survives. Before admitting a missing-grant caller as standalone, agent-bash also
+same-UID ancestor chain for the exact paired-worker image and internal argument,
+or for the live guardian holding its bound private owner socket. A descendant
+whose wrapper removed its marker and grant is rejected while either remains an
+ancestor, including after the worker exits and an ordinary session-keyring
+reset replaces its ring. Before admitting a missing-grant caller as standalone, agent-bash also
 queries its inherited Linux session keyring. A same-UID ring named
 `oulipoly-paired-original-work-v1:` plus a canonical random v4 UUID rejects
 standalone even after the paired worker has exited, the process has execed or
@@ -23,6 +25,12 @@ than proving independence; an unrelated/default readable ring permits genuine
 independent entry. The runner must establish this uniquely named inheritable
 ring before launching each provider child; absent that paired prerequisite,
 this selector cannot protect a descendant after all other context disappears.
+The entry/provider branch is not a child of the guardian. If it is reparented
+outside that tree and resets its ring after losing the environment markers,
+the current topology cannot distinguish it from independent work. A bare
+independent Bash invocation also cannot register async completion with the
+current Runner helper: Runner and State require an actual owner session and
+invocation binding. The exact-pair independent registration control remains red.
 
 ## Submit boundary
 
