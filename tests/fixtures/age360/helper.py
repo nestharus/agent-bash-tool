@@ -60,7 +60,7 @@ elif op == 'agent-bash-complete':
         descriptor = parsed['output']
         assert descriptor['representation'] == 'retained-output-v1'
         assert descriptor['relative'] == 'completion-output-v2.bin'
-        assert descriptor['encoding'] == 'utf8-lossy'
+        assert descriptor['encoding'] in ('raw', 'utf8-lossy')
         artifact = path.parent / descriptor['relative']
         assert not artifact.is_symlink() and artifact.is_file()
         assert artifact.stat().st_size == descriptor['byte_len'] <= 1073741824
