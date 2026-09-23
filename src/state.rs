@@ -1632,6 +1632,23 @@ pub(crate) fn observer_direct_child_identity(
     ))
 }
 
+/// The calling thread has exactly this live direct child, observed through
+/// the mounted procfs. The local PID is used only for the pinned pidfd and
+/// NSpid comparison; procfs child-list entries are observer PIDs.
+pub(crate) fn observer_only_direct_child_identity(
+    local_pid: libc::pid_t,
+) -> io::Result<CallerChainEntry> {
+    let before = observer_thread_children()?;
+    if before.len() != 1 {
+        return Err(io::Error::other("not the only direct child"));
+    }
+    let child = observer_direct_child_identity(local_pid)?;
+    if before[0] != child.pid || observer_thread_children()? != before {
+        return Err(io::Error::other("direct-child list changed"));
+    }
+    Ok(child)
+}
+
 fn observer_thread_children() -> io::Result<Vec<libc::pid_t>> {
     const MAX_BYTES: u64 = 65536;
     const MAX_CHILDREN: usize = 4096;

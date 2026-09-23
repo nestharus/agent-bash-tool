@@ -813,13 +813,11 @@ impl Owner {
         let Some(child) = &self.child else {
             return false;
         };
-        let pid = unsafe { libc::getpid() };
-        let Ok(children) = fs::read_to_string(format!("/proc/self/task/{pid}/children")) else {
-            return false;
-        };
-        let expected = child.id().to_string();
-        let pids: Vec<_> = children.split_whitespace().collect();
-        pids == [expected.as_str()]
+        // Child remains unreaped until reap_children calls reaped(), so its
+        // namespace-local PID cannot be reused here. The observer helper pins
+        // that PID with a pidfd and verifies the sole calling-thread child,
+        // parent, namespace, and procfs starttime. Any read failure is unknown.
+        crate::state::observer_only_direct_child_identity(child.id() as libc::pid_t).is_ok()
     }
 }
 impl Drop for Owner {
@@ -835,6 +833,92 @@ impl Drop for Owner {
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
+
+    #[test]
+    fn sole_custodian_tracks_observer_and_local_pid_domains() {
+        const STAGE: &str = "AGE319_IMAGE_ONLY_CHILD_STAGE";
+        if std::env::var_os(STAGE).is_none() {
+            sole_custodian_case(false);
+            let output = Command::new("timeout")
+                .args([
+                    "--kill-after=5s",
+                    "30s",
+                    "unshare",
+                    "--user",
+                    "--map-current-user",
+                    "--pid",
+                    "--fork",
+                    "--",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "image::tests::sole_custodian_tracks_observer_and_local_pid_domains",
+                ])
+                .env(STAGE, "inherited-procfs")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        sole_custodian_case(true);
+    }
+
+    fn sole_custodian_case(cross_domain: bool) {
+        let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let local_pid = child.id() as libc::pid_t;
+        let mut owner = Owner {
+            child: Some(child),
+            listener: None,
+            limits: Limits {
+                bytes: 4,
+                count: 1,
+                deadline: Duration::from_secs(1),
+            },
+            recovery: Recovery::new(Instant::now()),
+        };
+        let observed = crate::state::observer_only_direct_child_identity(local_pid).unwrap();
+        assert_eq!(observed.pid != local_pid, cross_domain);
+        assert!(owner.only_child());
+
+        // A child of another thread is not a child of the supervisor thread.
+        let (spawned, ready) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let sibling = std::thread::spawn(move || {
+            let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+            spawned.send(()).unwrap();
+            released.recv().unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
+        });
+        ready.recv().unwrap();
+        assert!(owner.only_child());
+        release.send(()).unwrap();
+        sibling.join().unwrap();
+
+        let mut extra = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        assert!(!owner.only_child());
+        extra.kill().unwrap();
+        extra.wait().unwrap();
+        assert!(owner.only_child());
+
+        // A different thread cannot claim this thread's child as its own.
+        owner = std::thread::spawn(move || {
+            assert!(!owner.only_child());
+            owner
+        })
+        .join()
+        .unwrap();
+        assert!(owner.only_child());
+
+        // An exited/reaped child and a cleared custodian slot cannot certify
+        // tree emptiness, even if a stale Child handle still carries its PID.
+        owner.child.as_mut().unwrap().kill().unwrap();
+        owner.child.as_mut().unwrap().wait().unwrap();
+        assert!(!owner.only_child());
+        owner.reaped(local_pid);
+        assert!(!owner.only_child());
+    }
 
     fn source(bytes: &[u8]) -> File {
         let mut file = tempfile::tempfile().unwrap();
