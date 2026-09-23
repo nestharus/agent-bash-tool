@@ -18,19 +18,26 @@ const tool = Object.assign(d => d, { schema: { string: () => ({ describe: () => 
 mock.module("@opencode-ai/plugin", () => ({ tool }))
 const adapter = (await import(process.argv[2])).default
 const args = JSON.parse(process.argv[3])
+const abort = new AbortController()
+if (process.env.TEST_ABORT_AFTER_MS) setTimeout(() => abort.abort(), Number(process.env.TEST_ABORT_AFTER_MS))
 try {
-  const result = await adapter.execute(args, {sessionID: "private-owner", abort: new AbortController().signal})
+  const result = await adapter.execute(args, {sessionID: "private-owner", abort: abort.signal})
   console.log(JSON.stringify({result, fields: Object.keys(adapter.args)}))
 } catch (error) { console.log(JSON.stringify({error: String(error)})) }
 '''
 FAKE = '''#!/usr/bin/python3
-import hashlib, json, os, sys
+import hashlib, json, os, sys, time
 args = sys.argv[1:]
 with open(os.environ['FAKE_LOG'], 'a') as f:
     f.write(json.dumps({'args': args, 'cwd': os.getcwd(), 'owner': os.environ.get('AGENT_BASH_OWNER_SESSION_ID'), 'custom': os.environ.get('TEST_CUSTOM')}) + '\\n')
 mode = os.environ.get('FAKE_MODE', '')
-if args[0] == 'run': print(json.dumps({'handle': 'ab_fixture', 'dispatch_state': 'running'}))
+if args[0] == 'run':
+    if mode == 'slow-dispatch': time.sleep(0.05)
+    dispatch = mode if mode in ('root-accepted', 'effects-possible-no-replay', 'registration-outcome-unknown') else 'running'
+    print(json.dumps({'handle': 'ab_fixture', 'dispatch_state': dispatch,
+                      'retry_safe': False, 'effects_possible': dispatch != 'running'}))
 elif args[0] == 'status':
+    if mode in ('cancel-pending', 'cancel-rejected', 'cancel-accepted'): time.sleep(0.1)
     if mode == 'progress-failure' and '--observe-only' not in args: sys.exit(42)
     print('DONE rc=0 handle=ab_fixture')
 elif args[0] == 'snapshot':
@@ -41,6 +48,9 @@ elif args[0] == 'snapshot':
 elif args[0] == 'accept-output':
     if mode == 'receipt-failure': sys.exit(43)
     print(json.dumps(dict(version=1, handle='ab_fixture', local_receipt='durable', receipt_updated=True, snapshot=json.loads(args[3]), remote_ack='unconfirmed', physical_drain='unconfirmed')))
+elif args[0] == 'cancel':
+    status = {'cancel-pending': 'cancellation_pending_receipt', 'cancel-rejected': 'rejected', 'cancel-accepted': 'cancellation_accepted'}[mode]
+    print(json.dumps(dict(handle='ab_fixture', requested=status == 'cancellation_accepted', root_status=status, root_detail='fixture')))
 else: sys.exit(99)
 '''
 
@@ -68,10 +78,12 @@ class WorkdirTest(unittest.TestCase):
                         AGENT_BASH_AGENT_RUNNER_BIN=str(self.root / 'absent-runner'),
                         FAKE_LOG=str(self.log), TEST_CUSTOM='preserved')
 
-    def execute(self, args, mode=''):
+    def execute(self, args, mode='', abort_delay=None, extra_env=None):
         self.log.write_text('')
         result = subprocess.run([BUN, '--no-install', str(self.driver), str(ADAPTER), json.dumps(args)],
-                                cwd=self.root / 'launch', env={**self.env, 'FAKE_MODE': mode},
+                                cwd=self.root / 'launch', env={**self.env, 'FAKE_MODE': mode,
+                                    **({'TEST_ABORT_AFTER_MS': str(abort_delay)} if abort_delay is not None else {}),
+                                    **(extra_env or {})},
                                 text=True, capture_output=True, check=True)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
         reply = json.loads(result.stdout)
@@ -125,6 +137,37 @@ class WorkdirTest(unittest.TestCase):
         self.assertIn('hash mismatch', reply['error'])
         self.assertEqual([c['args'][0] for c in calls], ['run', 'status', 'snapshot'])
 
+    def test_root_acceptance_and_ambiguous_no_replay_are_agent_visible(self):
+        accepted, calls = self.execute(dict(command='printf probe', delivery='async'), 'root-accepted')
+        self.assertIn('Dispatch accepted by root guardian', accepted['result'])
+        self.assertIn('retry safe: no', accepted['result'])
+        self.assertEqual([c['args'][0] for c in calls], ['run'])
+
+        ambiguous, calls = self.execute(dict(command='printf probe'), 'effects-possible-no-replay')
+        self.assertIn('root acceptance reply was lost or ambiguous', ambiguous['result'])
+        self.assertIn('Effects possible: yes; retry safe: no', ambiguous['result'])
+        self.assertIn('Do not replay', ambiguous['result'])
+        self.assertEqual([c['args'][0] for c in calls], ['run'])
+
+    def test_sync_abort_uses_actual_cancellation_receipt(self):
+        for mode, expected in (
+            ('cancel-pending', 'Cancellation pending durable receipt'),
+            ('cancel-rejected', 'Cancellation rejected'),
+            ('cancel-accepted', 'Cancellation accepted'),
+        ):
+            with self.subTest(mode=mode):
+                reply, calls = self.execute(dict(command='printf probe'), mode, abort_delay=20)
+                self.assertIn(expected, reply['result'])
+                self.assertIn('"requested": false' if mode != 'cancel-accepted' else '"requested": true', reply['result'])
+                self.assertEqual(calls[-1]['args'][0], 'cancel')
+
+    def test_submission_has_no_fixed_process_deadline(self):
+        reply, calls = self.execute(
+            dict(command='printf probe', delivery='async'), 'slow-dispatch',
+            extra_env={'AGENT_BASH_TOOL_PROCESS_TIMEOUT_MS': '10'},
+        )
+        self.assertIn('Running asynchronously', reply['result'])
+        self.assertEqual([c['args'][0] for c in calls], ['run'])
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

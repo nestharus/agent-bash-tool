@@ -23,7 +23,9 @@ type CompletionScope = "root" | "tree"
 
 type RunDispatch = {
   handle: string
-  dispatchState: "running" | "registration-outcome-unknown"
+  dispatchState: "running" | "registration-outcome-unknown" | "root-accepted" | "effects-possible-no-replay"
+  retrySafe: boolean
+  effectsPossible: boolean
 }
 
 type StatusReadPolicy = {
@@ -224,6 +226,7 @@ async function runProcess(
   operation = "subprocess",
   environment: Record<string, string> = {},
   workdir?: string,
+  timeoutMs: number | null = PROCESS_TIMEOUT_MS,
 ): Promise<ProcessResult> {
   const child = Bun.spawn(argv, {
     env: { ...runEnv(ownerSessionId), ...environment },
@@ -237,7 +240,9 @@ async function runProcess(
       child.kill()
       reject(new Error(message))
     }
-    timeout = setTimeout(() => stop(`${operation} timed out after ${PROCESS_TIMEOUT_MS}ms`), PROCESS_TIMEOUT_MS)
+    if (timeoutMs !== null) {
+      timeout = setTimeout(() => stop(`${operation} timed out after ${timeoutMs}ms`), timeoutMs)
+    }
     if (abort) {
       if (abort.aborted) stop("subprocess aborted")
       else abort.addEventListener("abort", () => stop("subprocess aborted"), { once: true })
@@ -267,8 +272,9 @@ async function checkedProcessText(
   abort?: AbortSignal,
   environment?: Record<string, string>,
   workdir?: string,
+  timeoutMs?: number | null,
 ): Promise<string> {
-  const result = await runProcess(argv, ownerSessionId, abort, operation, environment, workdir)
+  const result = await runProcess(argv, ownerSessionId, abort, operation, environment, workdir, timeoutMs)
   if (result.exitCode !== 0) throw processFailure(operation, result)
   return result.stdout.trim()
 }
@@ -495,8 +501,14 @@ function parseRunDispatch(runOut: string): RunDispatch | undefined {
   try {
     const parsed = JSON.parse(runOut)
     return typeof parsed.handle === "string" &&
-      (parsed.dispatch_state === "running" || parsed.dispatch_state === "registration-outcome-unknown")
-      ? { handle: parsed.handle, dispatchState: parsed.dispatch_state }
+      ["running", "registration-outcome-unknown", "root-accepted", "effects-possible-no-replay"].includes(parsed.dispatch_state) &&
+      typeof parsed.retry_safe === "boolean" && typeof parsed.effects_possible === "boolean"
+      ? {
+          handle: parsed.handle,
+          dispatchState: parsed.dispatch_state,
+          retrySafe: parsed.retry_safe,
+          effectsPossible: parsed.effects_possible,
+        }
       : undefined
   } catch {
     return undefined
@@ -507,11 +519,25 @@ function dispatchErrorResponse(runOut: string): string {
   return `agent-bash spooler error (could not dispatch): ${runOut}`
 }
 
-function registrationOutcomeUnknownResponse(handle: string): string {
+function noReplayResponse(dispatch: RunDispatch): string {
+  if (dispatch.dispatchState === "registration-outcome-unknown") {
+    return (
+      `Dispatch unresolved (handle=${dispatch.handle}): completion registration was admitted but its outcome is unknown. ` +
+      `Effects possible: ${dispatch.effectsPossible ? "yes" : "no"}; retry safe: ${dispatch.retrySafe ? "yes" : "no"}. ` +
+      "The retained handle is terminal, the workload was not started, and registration will not be replayed."
+    )
+  }
   return (
-    `Dispatch unresolved (handle=${handle}): completion registration was admitted but its outcome is unknown. ` +
-    "The retained handle is terminal, the workload was not started, and registration will not be replayed."
+    `Dispatch unresolved (handle=${dispatch.handle}): root acceptance reply was lost or ambiguous. ` +
+    `Effects possible: ${dispatch.effectsPossible ? "yes" : "no"}; retry safe: ${dispatch.retrySafe ? "yes" : "no"}. ` +
+    "Do not replay this command. Inspect or poll the retained handle for its terminal disposition."
   )
+}
+
+function acceptedDispatchDetail(dispatch: RunDispatch): string {
+  const owner = dispatch.dispatchState === "root-accepted" ? "root guardian" : "local supervisor"
+  return `Dispatch accepted by ${owner} (handle=${dispatch.handle}); effects possible: ` +
+    `${dispatch.effectsPossible ? "yes" : "no"}; retry safe: ${dispatch.retrySafe ? "yes" : "no"}.`
 }
 
 function startsWithToken(command: string, token: string): boolean {
@@ -695,7 +721,7 @@ async function dispatchCommand(
     throw new Error("explicit agent-bash run requires structured arguments without shell expansion")
   }
   if (admission.kind === "direct") {
-    return checkedProcessText(admission.argv, "agent-bash dispatch", ownerSessionId, undefined, undefined, workdir)
+    return checkedProcessText(admission.argv, "agent-bash dispatch", ownerSessionId, undefined, undefined, workdir, null)
   }
   const command = pinAgentRunnerBinary(admission.command)
   const args = [AGENT_BASH, "run"]
@@ -713,7 +739,7 @@ async function dispatchCommand(
     )
   }
   args.push("--", "bash", "-lc", command)
-  return checkedProcessText(args, "agent-bash dispatch", ownerSessionId, undefined, undefined, workdir)
+  return checkedProcessText(args, "agent-bash dispatch", ownerSessionId, undefined, undefined, workdir, null)
 }
 
 async function cancelResult(handle: string, ownerSessionId: string): Promise<string> {
@@ -722,7 +748,19 @@ async function cancelResult(handle: string, ownerSessionId: string): Promise<str
     "agent-bash cancel",
     ownerSessionId,
   )
-  return `Cancellation requested (handle=${handle}). ${result}`
+  let receipt: { requested?: unknown; root_status?: unknown; root_detail?: unknown }
+  try {
+    receipt = JSON.parse(result)
+  } catch {
+    return `Cancellation unconfirmed (handle=${handle}): invalid cancel receipt. ${result}`
+  }
+  if (receipt.requested === true) return `Cancellation accepted (handle=${handle}). ${result}`
+  if (receipt.requested !== false) return `Cancellation unconfirmed (handle=${handle}). ${result}`
+  if (receipt.root_status === "cancellation_pending_receipt") {
+    return `Cancellation pending durable receipt (handle=${handle}); no cancellation effect is confirmed. ${result}`
+  }
+  if (receipt.root_status === "rejected") return `Cancellation rejected (handle=${handle}). ${result}`
+  return `Cancellation was not accepted by this request (handle=${handle}). ${result}`
 }
 
 async function waitForSyncResult(
@@ -811,13 +849,17 @@ export default tool({
     const runOut = await dispatchCommand(admission, context.sessionID, args.workdir)
     const dispatch = parseRunDispatch(runOut)
     if (!dispatch) return dispatchErrorResponse(runOut)
-    if (dispatch.dispatchState === "registration-outcome-unknown") {
-      return registrationOutcomeUnknownResponse(dispatch.handle)
+    if (dispatch.dispatchState === "registration-outcome-unknown" ||
+        dispatch.dispatchState === "effects-possible-no-replay") {
+      return noReplayResponse(dispatch)
     }
-    if (context.abort.aborted) return cancelResult(dispatch.handle, context.sessionID)
+    const accepted = dispatch.dispatchState === "root-accepted"
+      ? `${acceptedDispatchDetail(dispatch)}\n`
+      : ""
+    if (context.abort.aborted) return `${accepted}${await cancelResult(dispatch.handle, context.sessionID)}`
     if (admission.delivery === "async") {
-      return asyncDispatchResponse(dispatch.handle, admission.agentDispatch && isHeadlessCaller())
+      return `${accepted}${asyncDispatchResponse(dispatch.handle, admission.agentDispatch && isHeadlessCaller())}`
     }
-    return waitForSyncResult(dispatch.handle, context.abort, context.sessionID)
+    return `${accepted}${await waitForSyncResult(dispatch.handle, context.abort, context.sessionID)}`
   },
 })

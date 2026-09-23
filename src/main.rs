@@ -8,6 +8,7 @@ mod delivery_role;
 mod guard;
 mod image;
 mod retained_output;
+mod root_work;
 mod state;
 mod supervisor;
 #[cfg(test)]
@@ -179,6 +180,9 @@ fn main() {
     if let Some(code) = image::internal_main() {
         std::process::exit(code);
     }
+    if let Some(code) = root_work::internal_main() {
+        std::process::exit(code);
+    }
     let guard = AttachedGuard::capture();
     let cli = Cli::parse();
     if let Err(err) = run_cli(cli, guard) {
@@ -317,12 +321,25 @@ fn run_command(
         completion_scope,
         ready_sentinel.clone(),
     );
-    let startup_outcome = match supervisor::fork_registered_supervisor(config, registration) {
+    let paired = root_work::selected(&paths, &meta).map_err(completion_event_registration_error)?;
+    let startup_outcome = match if paired {
+        root_work::submit(
+            &paths,
+            &meta,
+            config.argv.clone(),
+            config.completion_scope,
+            config.ready_sentinel.clone(),
+            registration,
+        )
+    } else {
+        supervisor::fork_registered_supervisor(config, registration)
+    } {
         Ok(outcome) => outcome,
         Err(err) => {
-            // The channel can disappear AFTER durable runner admission. Keep
-            // exact source, launch fence and pinned recovery image; EOF grants
-            // neither deletion nor registration/workload replay.
+            // The paired submit path terminalizes failures proven pre-accept.
+            // The channel can also disappear AFTER durable runner admission;
+            // that outcome stays retained and EOF grants neither deletion nor
+            // registration/workload replay.
             return Err(completion_event_registration_error(err));
         }
     };
@@ -369,6 +386,27 @@ fn resolve_cancel_owner(
 fn cancel_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
     require_control_eligibility(&paths, &handle, &caller)?;
+    if root_work::is_root_owned(&paths) {
+        let response = root_work::cancel(&paths)
+            .map_err(|err| cancel_request_error(&handle, err))?
+            .ok_or_else(|| {
+                cancel_request_error(
+                    &handle,
+                    io::Error::other("root-owned work lost its acceptance receipt"),
+                )
+            })?;
+        serde_json::to_writer(
+            io::stdout(),
+            &serde_json::json!({
+                "handle": handle,
+                "requested": response.status == "cancellation_accepted",
+                "root_status": response.status,
+                "root_detail": response.detail,
+            }),
+        )
+        .map_err(json_write_error)?;
+        return io::stdout().write_all(b"\n").map_err(json_write_error);
+    }
     let outcome =
         supervisor::request_cancel(&paths).map_err(|err| cancel_request_error(&handle, err))?;
     serde_json::to_writer(

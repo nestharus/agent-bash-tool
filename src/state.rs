@@ -426,6 +426,8 @@ pub(crate) struct RunOutput {
     delivery_mode: DeliveryMode,
     ready_sentinel: Option<String>,
     dispatch_state: String,
+    retry_safe: bool,
+    effects_possible: bool,
 }
 
 impl RunOutput {
@@ -449,6 +451,11 @@ impl RunOutput {
             delivery_mode,
             ready_sentinel,
             dispatch_state: dispatch_state.to_string(),
+            retry_safe: dispatch_state == "rejected-preaccept",
+            effects_possible: matches!(
+                dispatch_state,
+                "root-accepted" | "effects-possible-no-replay" | "registration-outcome-unknown"
+            ),
         }
     }
 }
@@ -1179,10 +1186,25 @@ fn reap_entry_is_handle_dir(entry: &fs::DirEntry) -> bool {
 }
 
 fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig, boot_id: &str) -> bool {
-    // Runner may admit a late listener or still use the recovery image. Until
-    // a paired serialized source-release contract exists, retain v2 sources;
-    // TTL, boot changes and local byte receipts are not release authority.
-    if crate::continuation::enabled(paths) {
+    // A nested handle remains causal evidence for as long as its parent handle
+    // remains retained.  Missing or malformed accepted-work evidence fails
+    // closed; a later reap pass can reconsider it after the parent retires.
+    if causal_parent_retains(paths).unwrap_or(true) {
+        return false;
+    }
+    // Source release and local TTL do not discharge the private original-work
+    // result. The accepted root handle remains its causal evidence until the
+    // exact root result exists; nested handles retain their separate parent
+    // gate above.
+    if accepted_root_result_pending(paths).unwrap_or(true) {
+        return false;
+    }
+    // V2 sources become eligible only through the separate exact, durable
+    // source-release record written after runner custody acceptance.  TTL,
+    // reboot, or a local byte receipt alone are never release authority.
+    if crate::continuation::enabled(paths)
+        && !crate::continuation::retention_released(paths).unwrap_or(false)
+    {
         return false;
     }
     let Ok(meta) = read_meta(paths) else {
@@ -1211,6 +1233,79 @@ fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig, boot_id: &str
         return !meta.delivery.completion_lifecycle().needs_progress();
     }
     meta.state == "RUNNING" && meta_processes_are_gone_or_reused(&meta, boot_id)
+}
+
+#[derive(Deserialize)]
+struct ReapAcceptance {
+    registration: ReapRegistration,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ReapRegistration {
+    Root,
+    Nested { parent_work_id: String },
+}
+
+fn accepted_root_result_pending(paths: &StatePaths) -> io::Result<bool> {
+    let accepted = paths.state_dir.join(crate::root_work::ACCEPTED_FILE);
+    if !accepted.try_exists()? {
+        return Ok(false);
+    }
+    let acceptance: serde_json::Value =
+        serde_json::from_slice(&crate::continuation::read(&accepted, 1024 * 1024)?)?;
+    if acceptance["protocol"] != crate::root_work::PROTOCOL
+        || acceptance["work_id"] != paths.handle
+        || acceptance["root_id"].as_str().is_none_or(str::is_empty)
+        || acceptance["registration"]["kind"].as_str().is_none()
+    {
+        return Ok(true);
+    }
+    if acceptance["registration"]["kind"] != "root" {
+        return Ok(false);
+    }
+    let result = paths.state_dir.join("root-work-result-v1.json");
+    if !result.try_exists()? {
+        return Ok(true);
+    }
+    let result: serde_json::Value =
+        serde_json::from_slice(&crate::continuation::read(&result, 1024 * 1024)?)?;
+    Ok(result["protocol"] != crate::root_work::PROTOCOL
+        || result["work_id"] != paths.handle
+        || result["root_id"] != acceptance["root_id"]
+        || result["result_nonce"].as_str().is_none_or(str::is_empty)
+        || result["physical_tree_drained"] != true
+        || result["outcome"].as_str().is_none_or(str::is_empty))
+}
+
+fn causal_parent_retains(paths: &StatePaths) -> io::Result<bool> {
+    let accepted = paths.state_dir.join(crate::root_work::ACCEPTED_FILE);
+    if !accepted.try_exists()? {
+        return Ok(false);
+    }
+    let bytes = fs::read(accepted)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "root acceptance exceeds retention bound",
+        ));
+    }
+    let acceptance: ReapAcceptance = serde_json::from_slice(&bytes)?;
+    let ReapRegistration::Nested { parent_work_id } = acceptance.registration else {
+        return Ok(false);
+    };
+    let parent = Path::new(&parent_work_id);
+    if parent.components().count() != 1 || !parent_work_id.starts_with("ab_") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid causal parent handle",
+        ));
+    }
+    match fs::symlink_metadata(paths.root.join(parent)) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn meta_is_reap_terminal(meta: &Meta, boot_id: &str) -> bool {
@@ -2220,6 +2315,107 @@ mod tests {
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_error", "ERROR", now - 20_000, true);
         settle_reap_delivery(&paths);
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 1);
+        assert!(!paths.state_dir.exists());
+    }
+
+    #[test]
+    fn released_v2_source_is_reaped_after_terminal_retention_obligations_settle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_released_v2", "DONE", now - 20_000, true);
+        settle_reap_delivery(&paths);
+        crate::continuation::seed_exact_retention_release(&paths);
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 1);
+        assert!(!paths.state_dir.exists());
+    }
+
+    #[test]
+    fn accepted_root_survives_release_and_ttl_until_separate_process_writes_result() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_root_pending", "DONE", now - 20_000, true);
+        settle_reap_delivery(&paths);
+        crate::continuation::seed_exact_retention_release(&paths);
+        fs::write(
+            paths.state_dir.join(crate::root_work::ACCEPTED_FILE),
+            br#"{"protocol":"original-work-v1","work_id":"ab_root_pending","root_id":"root-1","registration":{"kind":"root"}}"#,
+        )
+        .unwrap();
+        let config = test_reap_config(now, 10, 10);
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 0);
+        assert!(paths.state_dir.exists());
+        fs::write(paths.state_dir.join("root-work-result-v1.json"), b"{}").unwrap();
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 0);
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("printf '%s\\n' '{\"protocol\":\"original-work-v1\",\"work_id\":\"ab_root_pending\",\"root_id\":\"root-1\",\"result_nonce\":\"nonce-1\",\"physical_tree_drained\":true,\"outcome\":\"terminal\"}' > \"$1\"")
+            .arg("sh")
+            .arg(paths.state_dir.join("root-work-result-v1.json"))
+            .status()
+            .expect("separate result writer");
+        assert!(status.success());
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 1);
+    }
+
+    #[test]
+    fn retained_parent_handle_protects_nested_child_evidence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let parent = write_reap_state(temp.path(), "ab_parent", "DONE", now - 20_000, true);
+        let child = write_reap_state(temp.path(), "ab_child", "DONE", now - 20_000, true);
+        settle_reap_delivery(&child);
+        fs::write(
+            child.state_dir.join(crate::root_work::ACCEPTED_FILE),
+            br#"{"protocol":"original-work-v1","work_id":"ab_child","root_id":"root-1","registration":{"kind":"nested","parent_work_id":"ab_parent"}}"#,
+        )
+        .unwrap();
+
+        assert!(!state_dir_reap_eligible(
+            &child,
+            test_reap_config(now, 10, 10),
+            &current_boot_id(),
+        ));
+        fs::remove_dir_all(&parent.state_dir).unwrap();
+        assert!(state_dir_reap_eligible(
+            &child,
+            test_reap_config(now, 10, 10),
+            &current_boot_id(),
+        ));
+    }
+
+    #[test]
+    fn reaper_owns_root_protocol_artifacts_with_the_handle_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_root_artifacts", "DONE", now - 20_000, true);
+        settle_reap_delivery(&paths);
+        for artifact in [
+            "root-work-intent-v1.json",
+            "root-work-cancel-v1.json",
+            "root-work-result-v1.json",
+            "root-work-diagnostic-v1.jsonl",
+            "root-work-diagnostic-v1.jsonl.1",
+            "root-work-diagnostic-v1.lock",
+        ] {
+            fs::write(paths.state_dir.join(artifact), b"retained evidence").unwrap();
+        }
+        fs::write(
+            paths.state_dir.join("root-work-accepted-v1.json"),
+            br#"{"protocol":"original-work-v1","work_id":"ab_root_artifacts","root_id":"root-1","registration":{"kind":"root"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            paths.state_dir.join("root-work-result-v1.json"),
+            br#"{"protocol":"original-work-v1","work_id":"ab_root_artifacts","root_id":"root-1","result_nonce":"nonce-1","physical_tree_drained":true,"outcome":"terminal"}"#,
+        )
+        .unwrap();
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
 
