@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
@@ -23,6 +24,9 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const PROTOCOL: &str = "original-work-v1";
 const ROOT_PROTOCOL: &str = "root-authority-v1";
+const LEGACY_CONTROL_PROTOCOL: &str = "stream-control-v1";
+const SOURCE_CONTROL_PROTOCOL: &str = "source-control-v2";
+const BROKER_SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
 pub(crate) const EXECUTOR_ARG: &str = "__root-original-work-v1";
 pub(crate) const ROOT_AUTHORITY_ENV: &str = "OULIPOLY_ROOT_AUTHORITY_V1";
 pub(crate) const ROOT_WORK_ID_ENV: &str = "OULIPOLY_ROOT_WORK_ID";
@@ -38,6 +42,8 @@ const MAX_DIAGNOSTIC_BYTES: u64 = 1024 * 1024;
 const MAX_DIAGNOSTIC_RECORD_BYTES: usize = 128 * 1024;
 const FD_COUNT: usize = 4;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_SOURCE_WITNESS_BYTES: usize = 2048;
+const MAX_WORK_FRAME_BYTES: usize = 64 * 1024;
 const PAIRED_RING_PREFIX: &str = "oulipoly-paired-original-work-v1:";
 const MAX_KEY_DESCRIPTION_BYTES: usize = 256;
 
@@ -63,6 +69,8 @@ impl From<&CallerChainEntry> for ProcessIdentity {
 #[serde(deny_unknown_fields)]
 struct RootAuthorityGrant {
     protocol: String,
+    #[serde(default = "legacy_control_protocol")]
+    control_protocol: String,
     completion_protocol: String,
     domain_id: String,
     supervisor_authority_id: String,
@@ -70,6 +78,35 @@ struct RootAuthorityGrant {
     capability: String,
     root_identity: ProcessIdentity,
     guardian_identity: ProcessIdentity,
+}
+
+fn legacy_control_protocol() -> String {
+    LEGACY_CONTROL_PROTOCOL.into()
+}
+
+#[derive(Serialize)]
+struct ProcessWitness<'a> {
+    host_pid: i32,
+    boot_id: &'a str,
+    starttime_ticks: u64,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SourceScope<'a> {
+    Root,
+    Nested { parent_work_id: &'a str },
+    CancelOutside { work_id: &'a str },
+}
+
+#[derive(Serialize)]
+struct SourceSocketWitness<'a> {
+    root_id: &'a str,
+    domain_id: &'a str,
+    supervisor_id: &'a str,
+    guardian: ProcessWitness<'a>,
+    source: ProcessWitness<'a>,
+    scope: SourceScope<'a>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -168,6 +205,12 @@ struct WorkIntent {
     protocol: String,
     work_id: String,
     root_id: String,
+    #[serde(default)]
+    domain_id: String,
+    #[serde(default = "legacy_control_protocol")]
+    control_protocol: String,
+    #[serde(default)]
+    root_identity: Option<ProcessIdentity>,
     root_endpoint: Vec<u8>,
     supervisor_authority_id: String,
     guardian_identity: ProcessIdentity,
@@ -500,6 +543,8 @@ pub(crate) fn submit(
             io::Error::other("unsupported root authority protocol"),
         ));
     }
+    control_route(&grant.control_protocol)
+        .map_err(|error| preaccept_failure(paths, meta, error))?;
     let parent = std::env::var(ROOT_WORK_ID_ENV)
         .ok()
         .filter(|value| !value.is_empty());
@@ -535,6 +580,9 @@ pub(crate) fn submit(
         protocol: PROTOCOL.into(),
         work_id: paths.handle.clone(),
         root_id: grant.root_id.clone(),
+        domain_id: grant.domain_id.clone(),
+        control_protocol: grant.control_protocol.clone(),
+        root_identity: Some(grant.root_identity.clone()),
         root_endpoint: endpoint.as_os_str().as_bytes().to_vec(),
         supervisor_authority_id: grant.supervisor_authority_id.clone(),
         guardian_identity: grant.guardian_identity.clone(),
@@ -655,7 +703,34 @@ pub(crate) fn submit(
         );
         preaccept_failure(paths, meta, error)
     })?;
-    authenticate_peer(&socket, &grant.guardian_identity).map_err(|error| {
+    let mut frame = b"work!\n".to_vec();
+    frame.extend(
+        serde_json::to_vec(&submission)
+            .map_err(io::Error::other)
+            .map_err(|error| preaccept_failure(paths, meta, error))?,
+    );
+    frame.push(b'\n');
+    if frame.len() >= MAX_WORK_FRAME_BYTES {
+        return Err(preaccept_failure(
+            paths,
+            meta,
+            io::Error::other("root work frame exceeds bounded size"),
+        ));
+    }
+    let source_scope = match &submission.registration {
+        WorkRegistration::Root => SourceScope::Root,
+        WorkRegistration::Nested { parent_work_id, .. } => SourceScope::Nested { parent_work_id },
+    };
+    authenticate_control(
+        &socket,
+        &grant.control_protocol,
+        &grant.root_id,
+        &grant.domain_id,
+        &grant.supervisor_authority_id,
+        &grant.guardian_identity,
+        source_scope,
+    )
+    .map_err(|error| {
         let detail = error.to_string();
         let _ = append_diagnostic(
             paths,
@@ -673,13 +748,6 @@ pub(crate) fn submit(
         );
         preaccept_failure(paths, meta, error)
     })?;
-    let mut frame = b"work!\n".to_vec();
-    frame.extend(
-        serde_json::to_vec(&submission)
-            .map_err(io::Error::other)
-            .map_err(|error| preaccept_failure(paths, meta, error))?,
-    );
-    frame.push(b'\n');
     if let Err(error) = send_with_fds(
         &mut socket,
         &frame,
@@ -703,6 +771,25 @@ pub(crate) fn submit(
                 worker_pid: None,
                 worker_starttime_ticks: None,
                 detail: Some(&detail),
+            },
+        );
+        return Ok(StartupOutcome::RootEffectsPossibleNoReplay);
+    }
+    if grant.control_protocol == SOURCE_CONTROL_PROTOCOL
+        && socket.shutdown(Shutdown::Write).is_err()
+    {
+        let _ = append_diagnostic(
+            paths,
+            &Diagnostic {
+                protocol: PROTOCOL,
+                work_id: &paths.handle,
+                phase: "acceptance_outcome_unknown",
+                initiator_pid: std::process::id(),
+                root_id: Some(&grant.root_id),
+                supervisor_authority_id: Some(&grant.supervisor_authority_id),
+                worker_pid: None,
+                worker_starttime_ticks: None,
+                detail: Some("root frame half-close failed; replay forbidden"),
             },
         );
         return Ok(StartupOutcome::RootEffectsPossibleNoReplay);
@@ -790,13 +877,14 @@ pub(crate) fn cancel(paths: &StatePaths) -> io::Result<Option<WorkResponse>> {
     }
     let intent: WorkIntent =
         serde_json::from_slice(&std::fs::read(paths.state_dir.join(INTENT_FILE))?)?;
+    control_route(&intent.control_protocol)?;
     let endpoint = OsString::from_vec(intent.root_endpoint.clone());
     let submission = CancelSubmission {
         protocol: PROTOCOL.into(),
         root_id: intent.root_id.clone(),
         supervisor_authority_id: intent.supervisor_authority_id.clone(),
-        work_id: intent.work_id,
-        cancel_capability: intent.cancel_capability,
+        work_id: intent.work_id.clone(),
+        cancel_capability: intent.cancel_capability.clone(),
     };
     append_diagnostic(
         paths,
@@ -830,11 +918,65 @@ pub(crate) fn cancel(paths: &StatePaths) -> io::Result<Option<WorkResponse>> {
         );
         error
     })?;
+    let parent_work_id = std::env::var(ROOT_WORK_ID_ENV).ok();
+    let prewire = (|| {
+        let frame = if intent.control_protocol == SOURCE_CONTROL_PROTOCOL {
+            let mut frame = b"cancel\n".to_vec();
+            frame.extend(serde_json::to_vec(&submission)?);
+            frame.push(b'\n');
+            if frame.len() >= MAX_WORK_FRAME_BYTES {
+                return Err(io::Error::other(
+                    "root cancellation frame exceeds bounded size",
+                ));
+            }
+            Some(frame)
+        } else {
+            None
+        };
+        let scope = if intent.control_protocol == SOURCE_CONTROL_PROTOCOL {
+            cancel_scope(&intent, parent_work_id.as_deref())?
+        } else {
+            SourceScope::CancelOutside {
+                work_id: &submission.work_id,
+            }
+        };
+        authenticate_control(
+            &socket,
+            &intent.control_protocol,
+            &intent.root_id,
+            &intent.domain_id,
+            &intent.supervisor_authority_id,
+            &intent.guardian_identity,
+            scope,
+        )?;
+        Ok::<_, io::Error>(frame)
+    })();
+    let v2_frame = prewire.inspect_err(|error| {
+        let detail = error.to_string();
+        let _ = append_diagnostic(
+            paths,
+            &Diagnostic {
+                protocol: PROTOCOL,
+                work_id: &submission.work_id,
+                phase: "cancellation_source_refused_pre_wire",
+                initiator_pid: std::process::id(),
+                root_id: Some(&submission.root_id),
+                supervisor_authority_id: Some(&submission.supervisor_authority_id),
+                worker_pid: None,
+                worker_starttime_ticks: None,
+                detail: Some(&detail),
+            },
+        );
+    })?;
     let response_result = (|| {
-        authenticate_peer(&socket, &intent.guardian_identity)?;
-        socket.write_all(b"cancel\n")?;
-        serde_json::to_writer(&mut socket, &submission)?;
-        socket.write_all(b"\n")?;
+        if let Some(frame) = v2_frame {
+            socket.write_all(&frame)?;
+            socket.shutdown(Shutdown::Write)?;
+        } else {
+            socket.write_all(b"cancel\n")?;
+            serde_json::to_writer(&mut socket, &submission)?;
+            socket.write_all(b"\n")?;
+        }
         read_response(&mut socket)
     })();
     let response: WorkResponse = response_result.map_err(|error| {
@@ -988,6 +1130,223 @@ fn parse_grant() -> io::Result<RootAuthorityGrant> {
     let value = std::env::var(ROOT_AUTHORITY_ENV)
         .map_err(|_| io::Error::other("root authority capability missing"))?;
     serde_json::from_str(&value).map_err(io::Error::other)
+}
+
+fn control_route(protocol: &str) -> io::Result<()> {
+    match protocol {
+        LEGACY_CONTROL_PROTOCOL | SOURCE_CONTROL_PROTOCOL => Ok(()),
+        _ => Err(io::Error::other("unsupported root control protocol")),
+    }
+}
+
+fn cancel_scope<'a>(
+    intent: &'a WorkIntent,
+    parent_work_id: Option<&'a str>,
+) -> io::Result<SourceScope<'a>> {
+    if intent.domain_id.is_empty() || intent.root_identity.is_none() {
+        return Err(io::Error::other(
+            "pinned cancellation intent has no root/domain binding",
+        ));
+    }
+    let current_ns = std::fs::read_link("/proc/self/ns/pid")?;
+    let guardian_ns = std::fs::read_link(format!("/proc/{}/ns/pid", intent.guardian_identity.pid))?;
+    Ok(scope_for_namespaces(
+        &current_ns,
+        &guardian_ns,
+        parent_work_id,
+        &intent.work_id,
+    ))
+}
+
+fn scope_for_namespaces<'a>(
+    current_ns: &Path,
+    guardian_ns: &Path,
+    parent_work_id: Option<&'a str>,
+    work_id: &'a str,
+) -> SourceScope<'a> {
+    if current_ns == guardian_ns {
+        SourceScope::CancelOutside { work_id }
+    } else if let Some(parent_work_id) = parent_work_id.filter(|value| !value.is_empty()) {
+        SourceScope::Nested { parent_work_id }
+    } else {
+        // A root Runner process can exit while its PID1 and work remain. The
+        // broker verifies this candidate against the caller's current scope.
+        SourceScope::Root
+    }
+}
+
+fn authenticate_control(
+    socket: &UnixStream,
+    protocol: &str,
+    root_id: &str,
+    domain_id: &str,
+    supervisor_id: &str,
+    guardian: &ProcessIdentity,
+    scope: SourceScope<'_>,
+) -> io::Result<()> {
+    match protocol {
+        LEGACY_CONTROL_PROTOCOL => authenticate_peer(socket, guardian),
+        SOURCE_CONTROL_PROTOCOL => {
+            // The legacy SO_PEERCRED PID comparison crosses PID domains here.
+            // Broker `s` checks this exact FD against the host guardian stamp
+            // and the caller's live host-observed incarnation instead.
+            let source = host_observed_source()?;
+            let host_pid = i32::try_from(guardian.pid)
+                .map_err(|_| io::Error::other("invalid guardian host PID"))?;
+            let witness = SourceSocketWitness {
+                root_id,
+                domain_id,
+                supervisor_id,
+                guardian: ProcessWitness {
+                    host_pid,
+                    boot_id: &guardian.boot_id,
+                    starttime_ticks: guardian.starttime_ticks,
+                },
+                source: ProcessWitness {
+                    host_pid: source.pid,
+                    boot_id: &source.boot_id,
+                    starttime_ticks: source.starttime_ticks,
+                },
+                scope,
+            };
+            verify_source_socket_v2_at(&broker_socket_path(), socket, &witness, 0)
+        }
+        _ => Err(io::Error::other("unsupported root control protocol")),
+    }
+}
+
+struct ObservedSource {
+    pid: i32,
+    boot_id: String,
+    starttime_ticks: u64,
+}
+
+fn host_observed_source() -> io::Result<ObservedSource> {
+    // getpid() is namespace-local. The first field of /proc/self/stat is a
+    // key in the mounted procfs observer; the host broker authenticates this
+    // assertion against the actual request sender in its own PID domain.
+    let observer = std::fs::metadata("/proc")?;
+    let stat = std::fs::read_to_string("/proc/self/stat")?;
+    let pid = stat
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| io::Error::other("invalid procfs observer source PID"))?;
+    let starttime_ticks = stat_starttime(&stat)
+        .ok_or_else(|| io::Error::other("invalid procfs observer source starttime"))?;
+    let direct = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    if direct
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<i32>().ok())
+        != Some(pid)
+        || stat_starttime(&direct) != Some(starttime_ticks)
+        || std::fs::metadata("/proc")?.dev() != observer.dev()
+        || std::fs::metadata("/proc")?.ino() != observer.ino()
+    {
+        return Err(io::Error::other("procfs source observer changed"));
+    }
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_owned();
+    if boot_id.is_empty() {
+        return Err(io::Error::other("procfs source boot identity missing"));
+    }
+    Ok(ObservedSource {
+        pid,
+        boot_id,
+        starttime_ticks,
+    })
+}
+
+fn stat_starttime(stat: &str) -> Option<u64> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+}
+
+fn broker_socket_path() -> PathBuf {
+    #[cfg(feature = "source-fault-tests")]
+    if unsafe { libc::geteuid() } == 0
+        && std::fs::read_to_string("/proc/self/uid_map")
+            .ok()
+            .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+        && let Some(path) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+    {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(BROKER_SOCKET)
+}
+
+fn verify_source_socket_v2_at(
+    broker_path: &Path,
+    source_socket: &UnixStream,
+    witness: &SourceSocketWitness<'_>,
+    expected_broker_uid: u32,
+) -> io::Result<()> {
+    let body = serde_json::to_vec(witness)?;
+    if body.len() > MAX_SOURCE_WITNESS_BYTES {
+        return Err(io::Error::other("source socket witness too large"));
+    }
+    let mut broker = UnixStream::connect(broker_path)?;
+    let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut peer_len = std::mem::size_of_val(&peer) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            broker.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut peer as *mut libc::ucred).cast(),
+            &mut peer_len,
+        )
+    } != 0
+        || peer_len as usize != std::mem::size_of_val(&peer)
+        || peer.uid != expected_broker_uid
+    {
+        return Err(io::Error::other("broker peer is not host root"));
+    }
+    let mut challenge = [0u8; 16];
+    broker.read_exact(&mut challenge)?;
+    let mut request = Vec::with_capacity(17 + body.len());
+    request.push(b's');
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(&body);
+    let mut iov = libc::iovec {
+        iov_base: request.as_mut_ptr().cast(),
+        iov_len: request.len(),
+    };
+    let mut control = [0usize; 8];
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&message);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize;
+        *libc::CMSG_DATA(header).cast::<RawFd>() = source_socket.as_raw_fd();
+    }
+    if unsafe { libc::sendmsg(broker.as_raw_fd(), &message, libc::MSG_NOSIGNAL) }
+        != request.len() as isize
+    {
+        return Err(io::Error::other(
+            "short source control verification request",
+        ));
+    }
+    let mut response = Vec::new();
+    (&mut broker).take(257).read_to_end(&mut response)?;
+    if response != format!("verified-source-v2 {}\n", witness.root_id).as_bytes() {
+        return Err(io::Error::other("host source control verification refused"));
+    }
+    Ok(())
 }
 
 fn parse_fd(value: Option<String>) -> io::Result<RawFd> {
@@ -1297,6 +1656,406 @@ pub(crate) fn is_root_owned(paths: &StatePaths) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixListener;
+
+    fn test_witness<'a>(
+        source: &'a ObservedSource,
+        scope: SourceScope<'a>,
+    ) -> SourceSocketWitness<'a> {
+        SourceSocketWitness {
+            root_id: "root",
+            domain_id: "domain",
+            supervisor_id: "supervisor",
+            guardian: ProcessWitness {
+                host_pid: 123,
+                boot_id: &source.boot_id,
+                starttime_ticks: 456,
+            },
+            source: ProcessWitness {
+                host_pid: source.pid,
+                boot_id: &source.boot_id,
+                starttime_ticks: source.starttime_ticks,
+            },
+            scope,
+        }
+    }
+
+    fn broker_mock(
+        listener: UnixListener,
+        accepted: bool,
+        expected_scope: &'static str,
+        expected_fields: Vec<(&'static str, serde_json::Value)>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (mut broker, _) = listener.accept().unwrap();
+            broker.write_all(&[7u8; 16]).unwrap();
+            let mut bytes = [0u8; 4096];
+            let mut iov = libc::iovec {
+                iov_base: bytes.as_mut_ptr().cast(),
+                iov_len: bytes.len(),
+            };
+            let mut control = [0usize; 8];
+            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen =
+                unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+            let size = unsafe { libc::recvmsg(broker.as_raw_fd(), &mut message, 0) };
+            assert!(size > 17);
+            assert_eq!(&bytes[..17], &[&[b's'][..], &[7u8; 16]].concat());
+            let witness: serde_json::Value =
+                serde_json::from_slice(&bytes[17..size as usize]).unwrap();
+            assert_eq!(witness["scope"]["kind"], expected_scope);
+            assert_eq!(witness["source"]["host_pid"], std::process::id());
+            for (pointer, value) in expected_fields {
+                assert_eq!(witness.pointer(pointer), Some(&value));
+            }
+            let passed = unsafe {
+                let header = libc::CMSG_FIRSTHDR(&message);
+                assert!(!header.is_null());
+                assert_eq!((*header).cmsg_level, libc::SOL_SOCKET);
+                assert_eq!((*header).cmsg_type, libc::SCM_RIGHTS);
+                assert_eq!(
+                    (*header).cmsg_len,
+                    libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize
+                );
+                *libc::CMSG_DATA(header).cast::<RawFd>()
+            };
+            let mut source_copy = unsafe { UnixStream::from_raw_fd(passed) };
+            if accepted {
+                source_copy
+                    .write_all(&[&[b'@'][..], &[1u8; 16]].concat())
+                    .unwrap();
+                broker.write_all(b"verified-source-v2 root\n").unwrap();
+            } else {
+                broker.write_all(b"refused\n").unwrap();
+            }
+        })
+    }
+
+    fn receive_frame_first_byte(socket: &UnixStream, expected_fds: usize) -> u8 {
+        let mut byte = [0u8];
+        let mut iov = libc::iovec {
+            iov_base: byte.as_mut_ptr().cast(),
+            iov_len: 1,
+        };
+        let mut control = [0usize; 16];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control.len() * std::mem::size_of::<usize>();
+        assert_eq!(
+            unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, 0) },
+            1
+        );
+        let mut count = 0;
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            if !header.is_null() {
+                assert_eq!((*header).cmsg_type, libc::SCM_RIGHTS);
+                count = ((*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize)
+                    / std::mem::size_of::<RawFd>();
+                for index in 0..count {
+                    libc::close(*libc::CMSG_DATA(header).cast::<RawFd>().add(index));
+                }
+            }
+        }
+        assert_eq!(count, expected_fds);
+        byte[0]
+    }
+
+    #[test]
+    fn v2_challenge_one_socket_fd_and_complete_work_or_cancel_frame() {
+        for cancel in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let guardian_listener = UnixListener::bind(temp.path().join("guardian.sock")).unwrap();
+            let broker_listener = UnixListener::bind(temp.path().join("broker.sock")).unwrap();
+            let broker = broker_mock(
+                broker_listener,
+                true,
+                if cancel { "cancel_outside" } else { "root" },
+                vec![],
+            );
+            let mut source = UnixStream::connect(temp.path().join("guardian.sock")).unwrap();
+            let (mut guardian, _) = guardian_listener.accept().unwrap();
+            let observed = host_observed_source().unwrap();
+            let scope = if cancel {
+                SourceScope::CancelOutside { work_id: "work" }
+            } else {
+                SourceScope::Root
+            };
+            verify_source_socket_v2_at(
+                &temp.path().join("broker.sock"),
+                &source,
+                &test_witness(&observed, scope),
+                unsafe { libc::geteuid() },
+            )
+            .unwrap();
+            let mut marker = [0u8; 17];
+            guardian.read_exact(&mut marker).unwrap();
+            assert_eq!(marker, [&[b'@'][..], &[1u8; 16]].concat().as_slice());
+            if cancel {
+                source
+                    .write_all(b"cancel\n{\"work_id\":\"work\"}\n")
+                    .unwrap();
+            } else {
+                let files: Vec<File> = (0..4).map(|_| File::open("/dev/null").unwrap()).collect();
+                send_with_fds(
+                    &mut source,
+                    b"work!\n{\"work_id\":\"work\"}\n",
+                    &[
+                        files[0].as_raw_fd(),
+                        files[1].as_raw_fd(),
+                        files[2].as_raw_fd(),
+                        files[3].as_raw_fd(),
+                    ],
+                )
+                .unwrap();
+            }
+            source.shutdown(Shutdown::Write).unwrap();
+            let first = receive_frame_first_byte(&guardian, if cancel { 0 } else { 4 });
+            let mut rest = Vec::new();
+            guardian.read_to_end(&mut rest).unwrap();
+            let mut frame = vec![first];
+            frame.extend(rest);
+            assert_eq!(
+                frame,
+                if cancel {
+                    &b"cancel\n{\"work_id\":\"work\"}\n"[..]
+                } else {
+                    &b"work!\n{\"work_id\":\"work\"}\n"[..]
+                }
+            );
+            broker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn v2_refused_or_lost_pre_wire_response_sends_no_guardian_frame() {
+        for refused in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let guardian_listener = UnixListener::bind(temp.path().join("guardian.sock")).unwrap();
+            let broker_listener = UnixListener::bind(temp.path().join("broker.sock")).unwrap();
+            let broker = if refused {
+                broker_mock(broker_listener, false, "root", vec![])
+            } else {
+                std::thread::spawn(move || {
+                    let (mut stream, _) = broker_listener.accept().unwrap();
+                    stream.write_all(&[7u8; 16]).unwrap();
+                    let mut bytes = [0u8; 4096];
+                    let _ = stream.read(&mut bytes).unwrap();
+                })
+            };
+            let source = UnixStream::connect(temp.path().join("guardian.sock")).unwrap();
+            let (mut guardian, _) = guardian_listener.accept().unwrap();
+            let observed = host_observed_source().unwrap();
+            assert!(
+                verify_source_socket_v2_at(
+                    &temp.path().join("broker.sock"),
+                    &source,
+                    &test_witness(&observed, SourceScope::Root),
+                    unsafe { libc::geteuid() }
+                )
+                .is_err()
+            );
+            source.shutdown(Shutdown::Write).unwrap();
+            let mut bytes = Vec::new();
+            guardian.read_to_end(&mut bytes).unwrap();
+            assert!(bytes.is_empty());
+            broker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn v2_wrong_guardian_stale_and_sibling_witnesses_leave_guardian_unwritten() {
+        for case in [
+            "wrong_guardian",
+            "stale_guardian",
+            "sibling_root",
+            "sibling_work",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let guardian_listener = UnixListener::bind(temp.path().join("guardian.sock")).unwrap();
+            let broker_listener = UnixListener::bind(temp.path().join("broker.sock")).unwrap();
+            let source = UnixStream::connect(temp.path().join("guardian.sock")).unwrap();
+            let (mut guardian, _) = guardian_listener.accept().unwrap();
+            let observed = host_observed_source().unwrap();
+            let mut witness = test_witness(&observed, SourceScope::Root);
+            let (scope, field, value) = match case {
+                "wrong_guardian" => {
+                    witness.guardian.host_pid = 999;
+                    ("root", "/guardian/host_pid", serde_json::json!(999))
+                }
+                "stale_guardian" => {
+                    witness.guardian.starttime_ticks = 999;
+                    ("root", "/guardian/starttime_ticks", serde_json::json!(999))
+                }
+                "sibling_root" => {
+                    witness.root_id = "sibling-root";
+                    ("root", "/root_id", serde_json::json!("sibling-root"))
+                }
+                _ => {
+                    witness.scope = SourceScope::Nested {
+                        parent_work_id: "sibling-work",
+                    };
+                    (
+                        "nested",
+                        "/scope/parent_work_id",
+                        serde_json::json!("sibling-work"),
+                    )
+                }
+            };
+            let broker = broker_mock(broker_listener, false, scope, vec![(field, value)]);
+            assert!(
+                verify_source_socket_v2_at(
+                    &temp.path().join("broker.sock"),
+                    &source,
+                    &witness,
+                    unsafe { libc::geteuid() }
+                )
+                .is_err()
+            );
+            source.shutdown(Shutdown::Write).unwrap();
+            let mut bytes = Vec::new();
+            guardian.read_to_end(&mut bytes).unwrap();
+            assert!(bytes.is_empty(), "{case}");
+            broker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn v2_broker_absence_or_wrong_broker_uid_leaves_guardian_unwritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let guardian_listener = UnixListener::bind(temp.path().join("guardian.sock")).unwrap();
+        let source = UnixStream::connect(temp.path().join("guardian.sock")).unwrap();
+        let (mut guardian, _) = guardian_listener.accept().unwrap();
+        let observed = host_observed_source().unwrap();
+        assert!(
+            verify_source_socket_v2_at(
+                &temp.path().join("absent.sock"),
+                &source,
+                &test_witness(&observed, SourceScope::Root),
+                unsafe { libc::geteuid() }
+            )
+            .is_err()
+        );
+        let broker_listener = UnixListener::bind(temp.path().join("broker.sock")).unwrap();
+        let broker = std::thread::spawn(move || {
+            let _ = broker_listener.accept().unwrap();
+        });
+        assert!(
+            verify_source_socket_v2_at(
+                &temp.path().join("broker.sock"),
+                &source,
+                &test_witness(&observed, SourceScope::Root),
+                unsafe { libc::geteuid() } + 1
+            )
+            .is_err()
+        );
+        source.shutdown(Shutdown::Write).unwrap();
+        let mut bytes = Vec::new();
+        guardian.read_to_end(&mut bytes).unwrap();
+        assert!(bytes.is_empty());
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn versioned_grant_and_intent_binding_round_trip() {
+        let identity = ProcessIdentity {
+            pid: 10,
+            boot_id: "boot".into(),
+            starttime_ticks: 20,
+        };
+        let grant: RootAuthorityGrant = serde_json::from_value(serde_json::json!({
+            "protocol": ROOT_PROTOCOL, "control_protocol": SOURCE_CONTROL_PROTOCOL,
+            "completion_protocol": "completion-continuation-v2", "domain_id": "domain",
+            "supervisor_authority_id": "supervisor", "root_id": "root", "capability": "secret",
+            "root_identity": identity, "guardian_identity": identity
+        }))
+        .unwrap();
+        control_route(&grant.control_protocol).unwrap();
+        assert!(control_route("unknown-control").is_err());
+        let meta = Meta::new(
+            "work".into(),
+            1,
+            2,
+            vec![],
+            PathBuf::from("/"),
+            "tree",
+            state::DeliveryMode::Async,
+            None,
+            vec![],
+            None,
+        );
+        let intent = WorkIntent {
+            protocol: PROTOCOL.into(),
+            work_id: "work".into(),
+            root_id: grant.root_id.clone(),
+            domain_id: grant.domain_id.clone(),
+            control_protocol: grant.control_protocol.clone(),
+            root_identity: Some(grant.root_identity.clone()),
+            root_endpoint: b"/guardian".to_vec(),
+            supervisor_authority_id: grant.supervisor_authority_id.clone(),
+            guardian_identity: grant.guardian_identity.clone(),
+            cancel_capability: "independent-cancel".into(),
+            handle: "work".into(),
+            state_root: PathBuf::from("/tmp"),
+            meta,
+            argv: vec![],
+            completion_scope: "tree".into(),
+            ready_sentinel: None,
+            registration_authority: None,
+            environment: vec![],
+            cancel_owner: None,
+        };
+        let saved: WorkIntent =
+            serde_json::from_slice(&serde_json::to_vec(&intent).unwrap()).unwrap();
+        assert_eq!(saved.domain_id, "domain");
+        assert_eq!(saved.control_protocol, SOURCE_CONTROL_PROTOCOL);
+        assert_eq!(saved.root_identity, Some(identity));
+        assert_eq!(saved.cancel_capability, "independent-cancel");
+        let mut old = serde_json::to_value(&grant).unwrap();
+        old.as_object_mut().unwrap().remove("control_protocol");
+        let old: RootAuthorityGrant = serde_json::from_value(old).unwrap();
+        assert_eq!(old.control_protocol, LEGACY_CONTROL_PROTOCOL);
+    }
+
+    #[test]
+    fn cancel_scope_uses_observed_namespace_and_real_parent() {
+        let root = Path::new("pid:[root]");
+        let host = Path::new("pid:[host]");
+        let work = Path::new("pid:[work]");
+        let kind = |scope: SourceScope<'_>| serde_json::to_value(scope).unwrap();
+        assert_eq!(
+            kind(scope_for_namespaces(
+                host,
+                host,
+                Some("false-parent"),
+                "target"
+            )),
+            serde_json::json!({"kind":"cancel_outside","work_id":"target"})
+        );
+        assert_eq!(
+            kind(scope_for_namespaces(root, host, None, "target")),
+            serde_json::json!({"kind":"root"})
+        );
+        assert_eq!(
+            kind(scope_for_namespaces(work, host, Some("parent"), "target")),
+            serde_json::json!({"kind":"nested","parent_work_id":"parent"})
+        );
+        // Without a causal parent, the broker will validate the root
+        // candidate; a nested caller cannot acquire root scope by omission.
+        assert_eq!(
+            kind(scope_for_namespaces(work, host, None, "target")),
+            serde_json::json!({"kind":"root"})
+        );
+        assert_eq!(
+            kind(scope_for_namespaces(work, host, Some(""), "target")),
+            serde_json::json!({"kind":"root"})
+        );
+    }
 
     #[test]
     fn explicit_root_and_nested_registration_do_not_overlap() {
@@ -1328,6 +2087,7 @@ mod tests {
             protocol: PROTOCOL.into(),
             root_authority: RootAuthorityGrant {
                 protocol: ROOT_PROTOCOL.into(),
+                control_protocol: LEGACY_CONTROL_PROTOCOL.into(),
                 completion_protocol: "completion-continuation-v2".into(),
                 domain_id: "domain".into(),
                 supervisor_authority_id: "supervisor".into(),
