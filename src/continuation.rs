@@ -198,18 +198,8 @@ fn named_lock(paths: &StatePaths, name: &str) -> io::Result<File> {
         }
     }
 }
-fn identity(pid: i32) -> io::Result<CallerChainEntry> {
-    let boot_id = state::current_boot_id();
-    let starttime_ticks =
-        state::process_starttime_ticks(pid).ok_or_else(|| error("process identity unavailable"))?;
-    if boot_id.is_empty() {
-        return Err(error("boot identity unavailable"));
-    }
-    Ok(CallerChainEntry {
-        pid,
-        boot_id,
-        starttime_ticks,
-    })
+fn identity() -> io::Result<CallerChainEntry> {
+    state::observer_self_identity()
 }
 fn uuid() -> io::Result<String> {
     Ok(fs::read_to_string("/proc/sys/kernel/random/uuid")?
@@ -322,7 +312,7 @@ pub(crate) fn prepare(
     io::copy(&mut source, &mut recovery)?;
     recovery.sync_all()?;
     let recovery_hash = digest(&read(&recovery_path, 512 * MAX_SOURCE)?);
-    let worker = identity(unsafe { libc::getpid() })?;
+    let worker = identity()?;
     let registration = json!({
         "protocol": PROTOCOL, "domain_id": domain, "source_id": uuid()?, "registration_id": uuid()?,
         "handle": paths.handle, "handle_dir": paths.state_dir, "spool_root": paths.state_dir.parent(),
@@ -367,7 +357,7 @@ pub(crate) fn confirm_launch(paths: &StatePaths, reply: &Value) -> io::Result<()
     let mut fence = value(&paths.state_dir.join(FENCE))?;
     exact(&common, &fence)?;
     let worker: CallerChainEntry = serde_json::from_value(fence["registration_worker"].clone())?;
-    if worker != identity(unsafe { libc::getpid() })? || fence["phase"] != "unreleased" {
+    if worker != identity()? || fence["phase"] != "unreleased" {
         return Err(error("original launch authority is not spendable"));
     }
     immutable(paths, "registration-receipt-v2.json", &bytes(reply)?)?;
@@ -398,14 +388,14 @@ pub(crate) fn abandon(paths: &StatePaths) -> io::Result<()> {
     let mut fence = value(&paths.state_dir.join(FENCE))?;
     exact(&common, &fence)?;
     let worker: CallerChainEntry = serde_json::from_value(fence["registration_worker"].clone())?;
-    if worker == identity(unsafe { libc::getpid() })? && fence["phase"] == "unreleased" {
+    if worker == identity()? && fence["phase"] == "unreleased" {
         transition(paths, &mut fence, "revoked_never_launched")?;
     }
     Ok(())
 }
-pub(crate) fn launched(paths: &StatePaths, pid: i32) -> io::Result<()> {
+pub(crate) fn launched(paths: &StatePaths, pid: i32) -> io::Result<Option<CallerChainEntry>> {
     if !enabled(paths) {
-        return Ok(());
+        return Ok(None);
     }
     let _lock = lock(paths)?;
     let (_, common) = binding(paths)?;
@@ -414,8 +404,10 @@ pub(crate) fn launched(paths: &StatePaths, pid: i32) -> io::Result<()> {
     if fence["phase"] != "may_launch" {
         return Err(error("launch fence conflict"));
     }
-    fence["workload_identity"] = json!(identity(pid)?);
-    transition(paths, &mut fence, "launched")
+    let identity = state::observer_direct_child_identity(pid)?;
+    fence["workload_identity"] = json!(identity);
+    transition(paths, &mut fence, "launched")?;
+    Ok(Some(identity))
 }
 
 /// Evidence supplied only by the original live loop or actual adopting guardian.
@@ -576,7 +568,7 @@ pub(crate) fn select_observed_event(
         outcome["root_wait_status"] = json!(observation.root_wait_status);
         outcome["original_tree_drained"] = json!(observation.tree_drained);
         outcome["output_closed"] = json!(observation.output_closed);
-        outcome["observer"] = json!(identity(unsafe { libc::getpid() })?);
+        outcome["observer"] = json!(identity()?);
         outcome["ready_sentinel"] = json!(observation.ready_sentinel);
         outcome["cancellation_id"] = if observation.kind == "cancelled" {
             json!(cancellation_identity(paths, meta)?)
@@ -739,7 +731,7 @@ fn recovery_hash_barrier(paths: &StatePaths) -> io::Result<()> {
         immutable(
             paths,
             "fault-recovery-lock.reached.json",
-            &bytes(&json!(identity(unsafe { libc::getpid() })?))?,
+            &bytes(&json!(identity()?))?,
         )?;
         unsafe {
             libc::raise(libc::SIGSTOP);
@@ -760,17 +752,13 @@ pub(crate) fn fault_barrier(paths: &StatePaths, name: &str) -> io::Result<()> {
     let guardian_capture = configured.starts_with("guardian-capture-")
         && name == "before-output-capture"
         && value(&paths.state_dir.join("source-observation-v2.json"))?["outcome"]["observer"]
-            == json!(identity(unsafe { libc::getpid() })?);
+            == json!(identity()?);
     if configured != name && !guardian_capture {
         return Ok(());
     }
     let reached = format!("fault-{name}.reached.json");
     if !paths.state_dir.join(&reached).try_exists()? {
-        immutable(
-            paths,
-            &reached,
-            &bytes(&json!(identity(unsafe { libc::getpid() })?))?,
-        )?;
+        immutable(paths, &reached, &bytes(&json!(identity()?))?)?;
     }
     if paths
         .state_dir
@@ -1252,6 +1240,7 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     fn fixture() -> Value {
         serde_json::from_str(include_str!("../tests/fixtures/age360/paired-wire.json")).unwrap()
     }
@@ -1265,6 +1254,134 @@ mod tests {
         immutable(&paths, REGISTRATION, &bytes(&registration).unwrap()).unwrap();
         let common = binding(&paths).unwrap().1;
         (temp, paths, common)
+    }
+    #[test]
+    fn launch_fence_requires_exact_live_direct_child_in_observer_domain() {
+        const STAGE: &str = "AGE319_LAUNCH_OBSERVER_CHILD";
+        if std::env::var_os(STAGE).is_none() {
+            launch_observer_case(false);
+            let output = Command::new("timeout")
+                .args([
+                    "--kill-after=5s", "30s", "unshare", "--user", "--map-current-user",
+                    "--pid", "--fork", "--",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "continuation::tests::launch_fence_requires_exact_live_direct_child_in_observer_domain",
+                ])
+                .env(STAGE, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        launch_observer_case(true);
+    }
+
+    fn launch_observer_case(cross_domain: bool) {
+        let worker = identity().unwrap();
+        assert_eq!(worker.pid != unsafe { libc::getpid() }, cross_domain);
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(fs::canonicalize(temp.path()).unwrap(), "ab_observer".into());
+        fs::create_dir(&paths.state_dir).unwrap();
+        let meta = registration_meta(&paths, "exit", state::DeliveryMode::Async);
+        prepare(
+            &paths,
+            &meta,
+            "11111111-1111-4111-8111-111111111111",
+            "tree",
+        )
+        .unwrap();
+        let registration = value(&paths.state_dir.join(REGISTRATION)).unwrap();
+        assert_eq!(registration["registering_caller"], json!(worker));
+        let common = binding(&paths).unwrap().1;
+        let recorded: CallerChainEntry = serde_json::from_value(
+            value(&paths.state_dir.join(FENCE)).unwrap()["registration_worker"].clone(),
+        )
+        .unwrap();
+        assert_eq!(recorded, worker);
+        let mut stale_fence = value(&paths.state_dir.join(FENCE)).unwrap();
+        stale_fence["registration_worker"]["starttime_ticks"] = json!(worker.starttime_ticks + 1);
+        save(&paths, FENCE, &stale_fence).unwrap();
+        assert!(confirm_launch(&paths, &registration_reply(&paths, &common)).is_err());
+        assert_eq!(
+            value(&paths.state_dir.join(FENCE)).unwrap()["phase"],
+            "unreleased"
+        );
+        stale_fence["registration_worker"] = json!(worker);
+        save(&paths, FENCE, &stale_fence).unwrap();
+        confirm_launch(&paths, &registration_reply(&paths, &common)).unwrap();
+        assert_eq!(
+            value(&paths.state_dir.join(FENCE)).unwrap()["phase"],
+            "may_launch"
+        );
+
+        let (pid_sender, pid_receiver) = std::sync::mpsc::channel();
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let sibling = std::thread::spawn(move || {
+            let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+            pid_sender.send(child.id() as i32).unwrap();
+            done_receiver.recv().unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
+        });
+        let sibling_pid = pid_receiver.recv().unwrap();
+        assert!(launched(&paths, unsafe { libc::getpid() }).is_err());
+        assert!(launched(&paths, sibling_pid).is_err());
+        assert!(value(&paths.state_dir.join(FENCE)).unwrap()["workload_identity"].is_null());
+
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let local_child = child.id() as i32;
+        launched(&paths, local_child).unwrap();
+        let launch = value(&paths.state_dir.join(FENCE)).unwrap();
+        assert_eq!(launch["phase"], "launched");
+        let observed: CallerChainEntry =
+            serde_json::from_value(launch["workload_identity"].clone()).unwrap();
+        assert_eq!(observed.pid != local_child, cross_domain);
+        assert_eq!(observed.boot_id, worker.boot_id);
+        assert_eq!(
+            state::process_starttime_ticks(observed.pid),
+            Some(observed.starttime_ticks)
+        );
+        assert_eq!(
+            state::local_pid_for_observer_pid(observed.pid),
+            Some(local_child)
+        );
+        assert_eq!(state::process_parent_pid(observed.pid), Some(worker.pid));
+        let mut reused = observed.clone();
+        reused.starttime_ticks += 1;
+        assert!(matches!(
+            state::process_identity_evidence(&reused),
+            state::ProcessIdentityEvidence::Mismatch
+        ));
+
+        child.kill().unwrap();
+        // An exited, unreaped child still has a procfs entry; it cannot become
+        // positive launch identity after its pidfd reports death.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    local_child as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            },
+            0
+        );
+        let (_dead_temp, dead_paths, dead_common) = source();
+        fence(&dead_paths, &dead_common, "may_launch");
+        assert!(launched(&dead_paths, local_child).is_err());
+        assert!(value(&dead_paths.state_dir.join(FENCE)).unwrap()["workload_identity"].is_null());
+        child.wait().unwrap();
+        let (_stale_temp, stale_paths, stale_common) = source();
+        fence(&stale_paths, &stale_common, "may_launch");
+        assert!(launched(&stale_paths, local_child).is_err());
+        assert!(value(&stale_paths.state_dir.join(FENCE)).unwrap()["workload_identity"].is_null());
+        done_sender.send(()).unwrap();
+        sibling.join().unwrap();
     }
     #[test]
     fn paired_causal_and_root_loss_cancellation_have_distinct_exact_bases() {
@@ -1739,7 +1856,7 @@ mod tests {
         let mut fence = common.clone();
         fence["phase"] = json!(phase);
         fence["revision"] = json!(0);
-        fence["registration_worker"] = json!(identity(unsafe { libc::getpid() }).unwrap());
+        fence["registration_worker"] = json!(identity().unwrap());
         save(paths, FENCE, &fence).unwrap();
         let mut local = common.clone();
         local["registration"] = json!("intent");

@@ -51,7 +51,7 @@ pub(super) fn observe(paths: &StatePaths) -> io::Result<Option<Value>> {
         "representation": "missing-original-output-v1", "capture_state": "irrecoverable",
         "reason": reason,
         "detail": "Exact original observer is gone. Original selection record and same source directory were inspected; no complete body or in-progress copy survives. Managed retained inode inventory establishes selection loss; later log bytes were not substituted.",
-        "producer": identity(unsafe { libc::getpid() })?,
+        "producer": identity()?,
         "original_observer": observer, "completion_revision": outcome["completion_revision"],
         "outcome_sha256": digest(&bytes(outcome)?),
         "selection": selected, "observed_byte_len": observed
@@ -158,7 +158,7 @@ mod tests {
         let (temp, paths, common) = super::super::tests::source();
         fs::write(&paths.log, b"original evidence").unwrap();
         select_output(&paths).unwrap();
-        let mut observer = identity(unsafe { libc::getpid() }).unwrap();
+        let mut observer = identity().unwrap();
         // Unit fixture only: exact identity mismatch, not a live-process loss test.
         observer.starttime_ticks += 1;
         let mut outcome = common;
@@ -193,7 +193,7 @@ mod tests {
         rollover(&paths);
         fs::remove_file(paths.state_dir.join(SELECTED_LOG)).unwrap();
         let mut staged = value(&paths.state_dir.join("source-observation-v2.json")).unwrap();
-        staged["outcome"]["observer"] = json!(identity(unsafe { libc::getpid() }).unwrap());
+        staged["outcome"]["observer"] = json!(identity().unwrap());
         save(&paths, "source-observation-v2.json", &staged).unwrap();
         assert!(observe(&paths).unwrap().is_none());
     }
@@ -205,10 +205,7 @@ mod tests {
         fs::remove_file(paths.state_dir.join(SELECTED_LOG)).unwrap();
         let proof = observe(&paths).unwrap().unwrap();
         assert_eq!(proof["reason"], "selected_storage_lost");
-        assert_eq!(
-            proof["producer"],
-            json!(identity(unsafe { libc::getpid() }).unwrap())
-        );
+        assert_eq!(proof["producer"], json!(identity().unwrap()));
         let staged = value(&paths.state_dir.join("source-observation-v2.json")).unwrap();
         assert_eq!(proof["original_observer"], staged["outcome"]["observer"]);
         assert_eq!(

@@ -308,7 +308,7 @@ impl<'a> Attempt<'a> {
         let meta = file.metadata()?;
         let mut record = json!({"device": meta.dev(), "inode": meta.ino(),
             "selection_sha256": digest(&bytes(selection)?), "byte_len": length,
-            "writer": identity(unsafe { libc::getpid() })?, "complete": false});
+            "writer": identity()?, "complete": false});
         self.save_receipt(&record)?;
         copy_selected(self.paths, source, &mut file, length)?;
         record["complete"] = json!(true);
@@ -392,7 +392,7 @@ fn stop_barrier(paths: &StatePaths, name: &str) -> io::Result<()> {
         immutable(
             paths,
             &format!("fault-{name}.reached.json"),
-            &bytes(&json!(identity(unsafe { libc::getpid() })?))?,
+            &bytes(&json!(identity()?))?,
         )?;
         unsafe {
             libc::raise(libc::SIGSTOP);

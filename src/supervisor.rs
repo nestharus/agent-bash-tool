@@ -368,7 +368,22 @@ fn request_terminal_cancel(paths: &StatePaths) -> io::Result<CancelOutcome> {
 }
 
 fn capture_cancel_supervisor(identity: &state::CallerChainEntry) -> io::Result<Option<OwnedFd>> {
-    capture_cancel_supervisor_using(identity, open_pidfd, state::process_identity_evidence)
+    capture_cancel_supervisor_using(
+        identity,
+        |observer_pid| {
+            let local_pid = if let Some(pid) = state::local_pid_for_observer_pid(observer_pid) {
+                pid
+            } else if state::observer_self_identity()?.pid == current_pid() {
+                observer_pid
+            } else {
+                return Err(io::Error::other(
+                    "supervisor PID is outside the local PID domain",
+                ));
+            };
+            open_pidfd(local_pid)
+        },
+        state::process_identity_evidence,
+    )
 }
 
 fn capture_cancel_supervisor_using(
@@ -1053,7 +1068,7 @@ fn run_supervisor(config: SupervisorConfig, root_control_fd: Option<RawFd>) -> i
             return EX_SOFTWARE;
         }
     };
-    let spawn = match spawn_workload(
+    let mut spawn = match spawn_workload(
         &c_argv,
         cgroup_setup.active.as_ref().map(ActiveCgroup::procs_fd),
     ) {
@@ -1076,11 +1091,20 @@ fn run_supervisor(config: SupervisorConfig, root_control_fd: Option<RawFd>) -> i
         .is_none()
         .then(|| owner_pidfd(&meta))
         .flatten();
-    apply_spawn_metadata(&mut meta, &spawn, root_pidfd);
-    // Failure to bind a post-fork identity remains may_launch uncertainty; the
-    // actual original supervisor still observes/reaps this already launched root.
-    if let Err(err) = crate::continuation::launched(&config.paths, spawn.pid) {
+    // Failure to bind a post-fork identity remains may_launch uncertainty. The
+    // original supervisor still waits for the gated child, which cannot exec.
+    let launch = crate::continuation::launched(&config.paths, spawn.pid);
+    let observed_workload = match &launch {
+        Ok(Some(identity)) => Some(identity.clone()),
+        Ok(None) => state::observer_direct_child_identity(spawn.pid).ok(),
+        Err(_) => None,
+    };
+    apply_spawn_metadata(&mut meta, &spawn, root_pidfd, observed_workload.as_ref());
+    if let Err(err) = &launch {
         meta.error = Some(format!("launch identity publication failed: {err}"));
+    }
+    if let Err(err) = release_workload(&mut spawn, launch.is_ok()) {
+        meta.error = Some(format!("workload start gate failed: {err}"));
     }
     persist_supervisor_meta_best_effort(&config.paths, &meta);
 
@@ -1121,11 +1145,11 @@ fn set_private_umask() {
 }
 
 fn supervisor_meta(mut meta: Meta) -> Meta {
-    let pid = current_pid();
-    meta.supervisor_pid = Some(pid);
-    meta.supervisor_pid_starttime_ticks = state::process_starttime_ticks(pid);
-    let boot_id = state::current_boot_id();
-    meta.process_boot_id = (!boot_id.is_empty()).then_some(boot_id);
+    let identity = state::observer_self_identity().ok();
+    meta.supervisor_pid = identity.as_ref().map(|identity| identity.pid);
+    meta.supervisor_pid_starttime_ticks =
+        identity.as_ref().map(|identity| identity.starttime_ticks);
+    meta.process_boot_id = identity.map(|identity| identity.boot_id);
     meta.touch();
     meta
 }
@@ -1270,9 +1294,14 @@ fn persist_supervisor_meta_best_effort(paths: &StatePaths, meta: &Meta) {
     let _ = state::write_meta_atomic(paths, meta);
 }
 
-fn apply_spawn_metadata(meta: &mut Meta, spawn: &WorkloadSpawn, root_pidfd: Option<RawFd>) {
-    meta.workload_pid = Some(spawn.pid);
-    meta.workload_pid_starttime_ticks = state::process_starttime_ticks(spawn.pid);
+fn apply_spawn_metadata(
+    meta: &mut Meta,
+    spawn: &WorkloadSpawn,
+    root_pidfd: Option<RawFd>,
+    observed_workload: Option<&state::CallerChainEntry>,
+) {
+    meta.workload_pid = observed_workload.map(|identity| identity.pid);
+    meta.workload_pid_starttime_ticks = observed_workload.map(|identity| identity.starttime_ticks);
     meta.workload_pgid = Some(spawn.pid);
     meta.workload_pidfd = root_pidfd.is_some();
     meta.touch();
@@ -1349,7 +1378,10 @@ fn owner_pidfd(meta: &Meta) -> Option<RawFd> {
     if !state::process_identity_is_live(owner) {
         return None;
     }
-    let fd = pidfd_open(owner.pid)?;
+    // The attached owner is in our PID namespace; its durable identity uses
+    // the procfs observer PID, while pidfd_open uses a local PID here.
+    let local_pid = state::local_pid_for_observer_pid(owner.pid)?;
+    let fd = pidfd_open(local_pid)?;
     if state::process_identity_is_live(owner) {
         Some(fd)
     } else {
@@ -1401,6 +1433,7 @@ fn validated_arg_to_cstring(arg: &str) -> CString {
 
 struct WorkloadSpawn {
     pid: libc::pid_t,
+    launch_gate_fd: RawFd,
     stdout_fd: RawFd,
     stderr_fd: RawFd,
     exec_err_fd: RawFd,
@@ -1408,16 +1441,31 @@ struct WorkloadSpawn {
 
 fn spawn_workload(c_argv: &[CString], cgroup_procs_fd: Option<RawFd>) -> io::Result<WorkloadSpawn> {
     let mut stdout_pipe = make_pipe()?;
-    let mut stderr_pipe = make_pipe()?;
-    let mut exec_err_pipe = make_pipe()?;
+    let mut stderr_pipe = make_pipe().inspect_err(|_| close_pipe(stdout_pipe))?;
+    let mut exec_err_pipe = make_pipe().inspect_err(|_| {
+        close_pipe(stdout_pipe);
+        close_pipe(stderr_pipe);
+    })?;
+    let launch_gate = make_start_gate().inspect_err(|_| {
+        close_pipe(stdout_pipe);
+        close_pipe(stderr_pipe);
+        close_pipe(exec_err_pipe);
+    })?;
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        close_pipe(stdout_pipe);
+        close_pipe(stderr_pipe);
+        close_pipe(exec_err_pipe);
+        close_pipe(launch_gate);
+        return Err(err);
     }
     if pid == 0 {
+        close_fd(launch_gate.write);
         unsafe {
             workload_child(
                 c_argv,
+                launch_gate.read,
                 &mut stdout_pipe,
                 &mut stderr_pipe,
                 &mut exec_err_pipe,
@@ -1425,14 +1473,24 @@ fn spawn_workload(c_argv: &[CString], cgroup_procs_fd: Option<RawFd>) -> io::Res
             )
         };
     }
+    close_fd(launch_gate.read);
     close_fd(stdout_pipe.write);
     close_fd(stderr_pipe.write);
     close_fd(exec_err_pipe.write);
-    set_nonblocking(stdout_pipe.read)?;
-    set_nonblocking(stderr_pipe.read)?;
-    set_nonblocking(exec_err_pipe.read)?;
+    if let Err(err) = set_nonblocking(stdout_pipe.read)
+        .and_then(|_| set_nonblocking(stderr_pipe.read))
+        .and_then(|_| set_nonblocking(exec_err_pipe.read))
+    {
+        close_fd(launch_gate.write);
+        close_fd(stdout_pipe.read);
+        close_fd(stderr_pipe.read);
+        close_fd(exec_err_pipe.read);
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        return Err(err);
+    }
     Ok(workload_spawn(
         pid,
+        launch_gate.write,
         stdout_pipe.read,
         stderr_pipe.read,
         exec_err_pipe.read,
@@ -1441,12 +1499,14 @@ fn spawn_workload(c_argv: &[CString], cgroup_procs_fd: Option<RawFd>) -> io::Res
 
 fn workload_spawn(
     pid: libc::pid_t,
+    launch_gate_fd: RawFd,
     stdout_fd: RawFd,
     stderr_fd: RawFd,
     exec_err_fd: RawFd,
 ) -> WorkloadSpawn {
     WorkloadSpawn {
         pid,
+        launch_gate_fd,
         stdout_fd,
         stderr_fd,
         exec_err_fd,
@@ -1455,12 +1515,14 @@ fn workload_spawn(
 
 unsafe fn workload_child(
     c_argv: &[CString],
+    launch_gate_fd: RawFd,
     stdout_pipe: &mut Pipe,
     stderr_pipe: &mut Pipe,
     exec_err_pipe: &mut Pipe,
     cgroup_procs_fd: Option<RawFd>,
 ) -> ! {
     unblock_supervisor_signals();
+    wait_for_workload_release(launch_gate_fd);
     set_workload_process_group();
     enroll_workload_in_cgroup(cgroup_procs_fd, exec_err_pipe.write);
     redirect_workload_output(stdout_pipe, stderr_pipe, exec_err_pipe);
@@ -1469,6 +1531,46 @@ unsafe fn workload_child(
     let pointers = argv_pointers(c_argv);
     exec_workload(&pointers);
     write_errno_and_exit(exec_err_pipe.write, 127);
+}
+
+fn wait_for_workload_release(fd: RawFd) {
+    let mut byte = 0u8;
+    loop {
+        let rc = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        close_fd(fd);
+        if rc != 1 || byte != 1 {
+            unsafe { libc::_exit(126) };
+        }
+        return;
+    }
+}
+
+fn release_workload(spawn: &mut WorkloadSpawn, launch_published: bool) -> io::Result<()> {
+    let fd = std::mem::replace(&mut spawn.launch_gate_fd, -1);
+    let result = if launch_published {
+        let byte = 1u8;
+        loop {
+            let rc = unsafe { libc::send(fd, (&byte as *const u8).cast(), 1, libc::MSG_NOSIGNAL) };
+            if rc == 1 {
+                break Ok(());
+            }
+            let err = if rc == 0 {
+                io::Error::from(io::ErrorKind::WriteZero)
+            } else {
+                io::Error::last_os_error()
+            };
+            if err.kind() != io::ErrorKind::Interrupted {
+                break Err(err);
+            }
+        }
+    } else {
+        Ok(())
+    };
+    close_fd(fd);
+    result
 }
 
 fn set_workload_process_group() {
@@ -1624,9 +1726,34 @@ struct Pipe {
     write: RawFd,
 }
 
+fn close_pipe(pipe: Pipe) {
+    close_fd(pipe.read);
+    close_fd(pipe.write);
+}
+
 fn make_pipe() -> io::Result<Pipe> {
     let mut fds = [0; 2];
     let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(Pipe {
+            read: fds[0],
+            write: fds[1],
+        })
+    }
+}
+
+fn make_start_gate() -> io::Result<Pipe> {
+    let mut fds = [0; 2];
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
     if rc < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -3295,8 +3422,134 @@ impl Drop for EventLoop {
 mod tests {
     use std::os::unix::fs::symlink;
     use std::os::unix::net::UnixStream;
+    use std::process::Command;
 
     use super::*;
+
+    #[test]
+    fn persisted_process_identity_uses_observer_pid_and_local_wait_stays_local() {
+        const STAGE: &str = "AGE319_SUPERVISOR_OBSERVER_CHILD";
+        if std::env::var_os(STAGE).is_none() {
+            persisted_process_identity_case(false);
+            let output = Command::new("timeout")
+                .args([
+                    "--kill-after=5s", "30s", "unshare", "--user", "--map-current-user",
+                    "--pid", "--fork", "--",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "supervisor::tests::persisted_process_identity_uses_observer_pid_and_local_wait_stays_local",
+                ])
+                .env(STAGE, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        persisted_process_identity_case(true);
+    }
+
+    fn persisted_process_identity_case(cross_domain: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let meta = Meta::new(
+            "ab_observer".into(),
+            1,
+            1,
+            vec![],
+            temp.path().into(),
+            "exit",
+            state::DeliveryMode::Async,
+            None,
+            vec![],
+            None,
+        );
+        let mut meta = supervisor_meta(meta);
+        let self_identity = state::observer_self_identity().unwrap();
+        assert_eq!(meta.supervisor_pid, Some(self_identity.pid));
+        assert_eq!(
+            meta.supervisor_pid_starttime_ticks,
+            Some(self_identity.starttime_ticks)
+        );
+        assert_eq!(self_identity.pid != current_pid(), cross_domain);
+        assert!(capture_cancel_supervisor(&self_identity).unwrap().is_some());
+        meta.cancel_owner = Some(self_identity);
+        close_fd(owner_pidfd(&meta).unwrap());
+
+        let argv = argv_to_cstrings(&["/bin/sleep".into(), "30".into()]).unwrap();
+        let mut spawn = spawn_workload(&argv, None).unwrap();
+        let observed = state::observer_direct_child_identity(spawn.pid).unwrap();
+        apply_spawn_metadata(&mut meta, &spawn, None, Some(&observed));
+        assert_eq!(meta.workload_pid, Some(observed.pid));
+        assert_eq!(
+            meta.workload_pid_starttime_ticks,
+            Some(observed.starttime_ticks)
+        );
+        assert_eq!(meta.workload_pgid, Some(spawn.pid));
+        assert_eq!(observed.pid != spawn.pid, cross_domain);
+        release_workload(&mut spawn, false).unwrap();
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(spawn.pid, &mut status, 0) },
+            spawn.pid
+        );
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 126);
+        for fd in [spawn.stdout_fd, spawn.stderr_fd, spawn.exec_err_fd] {
+            close_fd(fd);
+        }
+    }
+
+    #[test]
+    fn workload_start_gate_runs_only_after_identity_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let effect = temp.path().join("effect");
+        let script = format!("printf executed > '{}'", effect.display());
+        let argv = argv_to_cstrings(&["/bin/sh".into(), "-c".into(), script]).unwrap();
+        let mut spawn = spawn_workload(&argv, None).unwrap();
+        assert!(state::observer_direct_child_identity(spawn.pid).is_ok());
+        assert!(!effect.exists());
+        release_workload(&mut spawn, true).unwrap();
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(spawn.pid, &mut status, 0) },
+            spawn.pid
+        );
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert_eq!(fs::read(&effect).unwrap(), b"executed");
+        for fd in [spawn.stdout_fd, spawn.stderr_fd, spawn.exec_err_fd] {
+            close_fd(fd);
+        }
+
+        fs::remove_file(&effect).unwrap();
+        let mut refused = spawn_workload(&argv, None).unwrap();
+        release_workload(&mut refused, false).unwrap();
+        assert_eq!(
+            unsafe { libc::waitpid(refused.pid, &mut status, 0) },
+            refused.pid
+        );
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 126);
+        assert!(!effect.exists());
+        for fd in [refused.stdout_fd, refused.stderr_fd, refused.exec_err_fd] {
+            close_fd(fd);
+        }
+
+        let mut dead = spawn_workload(&argv, None).unwrap();
+        assert_eq!(unsafe { libc::kill(dead.pid, libc::SIGKILL) }, 0);
+        assert_eq!(unsafe { libc::waitpid(dead.pid, &mut status, 0) }, dead.pid);
+        assert_eq!(
+            release_workload(&mut dead, true)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPIPE)
+        );
+        assert!(!effect.exists());
+        for fd in [dead.stdout_fd, dead.stderr_fd, dead.exec_err_fd] {
+            close_fd(fd);
+        }
+    }
 
     /// Private child with an acknowledged signal counter. No models, shared
     /// signal handlers, host PID reuse, or production fixture knobs.
