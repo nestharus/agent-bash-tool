@@ -104,6 +104,14 @@ without degradation because the subreaper remains authoritative. Process-group +
 (already used in agent-runner) is only a teardown fallback.
 
 ### Detached supervisor
+
+This section is the standalone path. In a paired runner process tree, the
+[`original-work-v1`](root-original-work-v1.md) protocol replaces the private
+guardian/supervisor fork with one root-owned worker under agent-runner's existing
+completion guardian. Output capture and completion publication remain here;
+root acceptance, execution grant, causal settlement, cancellation succession,
+and exact worker/session drain move to the shared root authority.
+
 `run` forks a supervisor that **survives the tool's return**. The supervisor owns the workload
 (via subreaper reparenting plus a root `pidfd`, and optionally a cgroup-v2 live set), tees
 stdout/stderr to a per-handle log, and records exit code. The `run` invocation itself returns
@@ -498,6 +506,16 @@ origin session's pending delivery. `retry_count` bounds each handle to one
 observer-triggered retry in total. The delivery lock serializes concurrently admitted eligible
 observers; the first persists either an attempt claim or a closed retry result, and later observers
 cannot repeat it.
+
+For accepted paired work, the handle-local live/history inventory includes the
+original-work intent, acceptance, optional cancellation, result and bounded
+diagnostic files; the current-v2 source bundle and its separate exact
+`source-retention-release-v1.json` witness; and the ordinary handle metadata,
+output, delivery and custody files. Reaping an accepted root requires its exact
+private result even after source release and TTL. A nested handle remains while
+its accepted parent handle exists. Source release, root result, parent retention,
+delivery settlement, process custody and TTL each retain their own veto; none
+is inferred from a neighboring file or from local `DONE` alone.
 
 ### Physical retention is independent of logical settlement
 

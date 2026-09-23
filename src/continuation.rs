@@ -21,6 +21,7 @@ pub(crate) const SNAPSHOT: &str = "completion-snapshot-v2.json";
 const FENCE: &str = "source-launch-v2.json";
 const CONFIRMATION: &str = "registration-confirmation-v2.json";
 const LOCAL: &str = "continuation-v2.json";
+pub(crate) const RETENTION_RELEASE: &str = "source-retention-release-v1.json";
 const MAX_SOURCE: u64 = 1024 * 1024;
 const MAX_OUTPUT: u64 = 1024 * MAX_SOURCE;
 const INLINE_OUTPUT: u64 = 64 * 1024;
@@ -802,6 +803,54 @@ fn cancellation_identity(paths: &StatePaths, meta: &Meta) -> io::Result<String> 
         // Do not fabricate an explicit user cancellation marker for this cause.
         receipt["basis"] = json!("registered_owner_lease");
         receipt["owner_identity"] = json!(meta.cancel_owner);
+    } else if matches!(
+        meta.completion_reason.as_deref(),
+        Some("causal-parent-cancelled" | "root-authority-lost")
+    ) {
+        let intent = read(
+            &paths.state_dir.join("root-work-intent-v1.json"),
+            MAX_SOURCE,
+        )?;
+        let accepted = read(
+            &paths.state_dir.join(crate::root_work::ACCEPTED_FILE),
+            MAX_SOURCE,
+        )?;
+        let intent_value: Value = serde_json::from_slice(&intent)?;
+        let accepted_value: Value = serde_json::from_slice(&accepted)?;
+        if intent_value["protocol"] != crate::root_work::PROTOCOL
+            || accepted_value["protocol"] != crate::root_work::PROTOCOL
+            || intent_value["work_id"] != paths.handle
+            || accepted_value["work_id"] != paths.handle
+            || intent_value["root_id"] != accepted_value["root_id"]
+            || accepted_value["request_sha256"] != digest(&intent)
+        {
+            return Err(error("paired cancellation acceptance identity conflict"));
+        }
+        receipt["accepted_work_sha256"] = json!(digest(&accepted));
+        receipt["root_id"] = accepted_value["root_id"].clone();
+        if meta.completion_reason.as_deref() == Some("causal-parent-cancelled") {
+            let causal = read(
+                &paths.state_dir.join("root-work-cancel-v1.json"),
+                MAX_SOURCE,
+            )?;
+            let causal_value: Value = serde_json::from_slice(&causal)?;
+            if causal_value["protocol"] != crate::root_work::PROTOCOL
+                || causal_value["work_id"] != paths.handle
+                || causal_value["root_id"] != accepted_value["root_id"]
+                || causal_value["cause"] != "causal_parent_cancelled"
+                || !causal_value["requester"].is_null()
+            {
+                return Err(error("causal cancellation receipt identity conflict"));
+            }
+            receipt["basis"] = json!("root_causal_receipt");
+            receipt["root_cancel_sha256"] = json!(digest(&causal));
+        } else {
+            // A dead guardian cannot create a later root-side receipt. The
+            // paired worker's original, immutable source observation is the
+            // witness that its control authority was lost or sent F.
+            receipt["basis"] = json!("paired_worker_root_loss_observation");
+            receipt["guardian_identity"] = intent_value["guardian_identity"].clone();
+        }
     } else {
         return Err(error("missing accepted cancellation basis"));
     }
@@ -894,7 +943,90 @@ pub(crate) fn accept(paths: &StatePaths, reply: &Value) -> io::Result<()> {
         local[key] = reply[key].clone();
     }
     local["enqueue"] = json!("accepted");
-    save(paths, LOCAL, &local)
+    save(paths, LOCAL, &local)?;
+
+    // This separate artifact is the serialized source-release boundary.  It
+    // deliberately does not change any completion-continuation-v2 schema: the
+    // source remains retained until an exact durable acceptance receipt has
+    // been validated and its local state has been fsynced.
+    let mut release = common;
+    release["release_protocol"] = json!("source-retention-release-v1");
+    for key in [
+        "snapshot_sha256",
+        "outcome_sha256",
+        "payload_sha256",
+        "payload_byte_len",
+    ] {
+        release[key] = local[key].clone();
+    }
+    immutable(paths, RETENTION_RELEASE, &bytes(&release)?)
+}
+
+/// True only after the runner has durably accepted the exact v2 source
+/// snapshot and the source has serialized that receipt into a distinct release
+/// record.  Invalid or incomplete evidence fails closed and remains retained.
+pub(crate) fn retention_released(paths: &StatePaths) -> io::Result<bool> {
+    let (_, common) = binding(paths)?;
+    let local = value(&paths.state_dir.join(LOCAL))?;
+    exact(&common, &local)?;
+    if local["enqueue"] != "accepted" {
+        return Ok(false);
+    }
+    let release = value(&paths.state_dir.join(RETENTION_RELEASE))?;
+    exact(&common, &release)?;
+    if release["release_protocol"] != "source-retention-release-v1" {
+        return Ok(false);
+    }
+    for key in [
+        "snapshot_sha256",
+        "outcome_sha256",
+        "payload_sha256",
+        "payload_byte_len",
+    ] {
+        if release[key] != local[key] {
+            return Ok(false);
+        }
+    }
+    Ok(release["snapshot_sha256"]
+        == digest(&read(&paths.state_dir.join(SNAPSHOT), 16 * MAX_SOURCE)?)
+        && release["outcome_sha256"] == digest(&read(&paths.state_dir.join(OUTCOME), MAX_SOURCE)?))
+}
+
+#[cfg(test)]
+pub(crate) fn seed_exact_retention_release(paths: &StatePaths) {
+    let registration = json!({
+        "protocol": PROTOCOL,
+        "domain_id": "test-domain",
+        "source_id": "test-source",
+        "handle": paths.handle,
+        "registration_id": "test-registration",
+        "handle_dir": paths.state_dir,
+        "spool_root": paths.root,
+        "meta_relative": "meta.json",
+        "log_relative": "log",
+        "rc_relative": "rc",
+        "registration_relative": REGISTRATION,
+        "outcome_relative": OUTCOME,
+        "snapshot_relative": SNAPSHOT,
+        "source_evidence_protocol": PROTOCOL,
+        "listener_revision": 1,
+    });
+    immutable(paths, REGISTRATION, &bytes(&registration).unwrap()).unwrap();
+    let common = binding(paths).unwrap().1;
+    let mut local = common.clone();
+    local["registration"] = json!("confirmed");
+    local["enqueue"] = json!("waiting_evidence");
+    save(paths, LOCAL, &local).unwrap();
+    immutable(paths, OUTCOME, b"test-outcome").unwrap();
+    immutable(paths, SNAPSHOT, b"test-snapshot").unwrap();
+    let mut reply = common;
+    reply["status"] = json!("accepted");
+    reply["snapshot_sha256"] = json!(digest(b"test-snapshot"));
+    reply["outcome_sha256"] = json!(digest(b"test-outcome"));
+    reply["payload_sha256"] = json!(digest(b"test-payload"));
+    reply["payload_byte_len"] = json!(12);
+    reply["listener_revision"] = json!(1);
+    accept(paths, &reply).unwrap();
 }
 /// Readback proves a prior explicit original-listener request, not ACK, source
 /// acceptance, or local Async. Runner owns request admission and idempotency.
@@ -1133,6 +1265,94 @@ mod tests {
         immutable(&paths, REGISTRATION, &bytes(&registration).unwrap()).unwrap();
         let common = binding(&paths).unwrap().1;
         (temp, paths, common)
+    }
+    #[test]
+    fn paired_causal_and_root_loss_cancellation_have_distinct_exact_bases() {
+        let (_temp, paths, common) = source();
+        let mut meta = registration_meta(&paths, "exit", state::DeliveryMode::Sync);
+        meta.completion_reason = Some("causal-parent-cancelled".into());
+        let intent = json!({
+            "protocol": crate::root_work::PROTOCOL,
+            "work_id": paths.handle,
+            "root_id": "root-fixture",
+            "guardian_identity": {"pid": 123, "boot_id": "boot", "starttime_ticks": 456}
+        });
+        let intent_bytes = bytes(&intent).unwrap();
+        fs::write(
+            paths.state_dir.join("root-work-intent-v1.json"),
+            &intent_bytes,
+        )
+        .unwrap();
+        let accepted = json!({
+            "protocol": crate::root_work::PROTOCOL,
+            "work_id": paths.handle,
+            "root_id": "root-fixture",
+            "request_sha256": digest(&intent_bytes)
+        });
+        fs::write(
+            paths.state_dir.join(crate::root_work::ACCEPTED_FILE),
+            bytes(&accepted).unwrap(),
+        )
+        .unwrap();
+        assert!(cancellation_identity(&paths, &meta).is_err());
+        let mut causal = json!({
+            "protocol": crate::root_work::PROTOCOL,
+            "work_id": paths.handle,
+            "root_id": "root-fixture",
+            "cause": "causal_parent_cancelled",
+            "requester": null
+        });
+        fs::write(
+            paths.state_dir.join("root-work-cancel-v1.json"),
+            bytes(&causal).unwrap(),
+        )
+        .unwrap();
+        let causal_id = cancellation_identity(&paths, &meta).unwrap();
+        let causal_source: Value =
+            value(&paths.state_dir.join("source-cancellation-v2.json")).unwrap();
+        assert_eq!(causal_source["basis"], "root_causal_receipt");
+        assert_eq!(causal_id, digest(&bytes(&causal_source).unwrap()));
+        fence(&paths, &common, "may_launch");
+        fs::write(&paths.log, b"").unwrap();
+        retain_event(
+            &paths,
+            &meta,
+            Observation {
+                kind: "cancelled",
+                root_wait_status: None,
+                tree_drained: true,
+                output_closed: true,
+                ready_sentinel: None,
+            },
+        )
+        .unwrap();
+        let selected = value(&paths.state_dir.join("source-observation-v2.json")).unwrap();
+        assert_eq!(selected["outcome"]["kind"], "cancelled");
+        assert_eq!(selected["outcome"]["cancellation_id"], causal_id);
+        causal["root_id"] = json!("other-root");
+        fs::write(
+            paths.state_dir.join("root-work-cancel-v1.json"),
+            bytes(&causal).unwrap(),
+        )
+        .unwrap();
+        assert!(cancellation_identity(&paths, &meta).is_err());
+
+        let (_other_temp, other_paths, _) = source();
+        fs::write(
+            other_paths.state_dir.join("root-work-intent-v1.json"),
+            &intent_bytes,
+        )
+        .unwrap();
+        fs::write(
+            other_paths.state_dir.join(crate::root_work::ACCEPTED_FILE),
+            bytes(&accepted).unwrap(),
+        )
+        .unwrap();
+        meta.completion_reason = Some("root-authority-lost".into());
+        let root_loss_id = cancellation_identity(&other_paths, &meta).unwrap();
+        let root_loss = value(&other_paths.state_dir.join("source-cancellation-v2.json")).unwrap();
+        assert_eq!(root_loss["basis"], "paired_worker_root_loss_observation");
+        assert_eq!(root_loss_id, digest(&bytes(&root_loss).unwrap()));
     }
     #[test]
     fn activation_readback_requires_exact_original_explicit_request() {
@@ -1587,6 +1807,8 @@ mod tests {
         reply["payload_byte_len"] = json!(7);
         reply["listener_revision"] = json!(1);
         accept(&paths, &reply).unwrap();
+        assert!(retention_released(&paths).unwrap());
+        assert!(paths.state_dir.join(RETENTION_RELEASE).exists());
         reply["status"] = json!("already_accepted");
         accept(&paths, &reply).unwrap();
         reply["payload_sha256"] = json!(digest(b"changed"));

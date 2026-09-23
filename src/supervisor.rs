@@ -40,6 +40,8 @@ pub(crate) struct SupervisorConfig {
 pub(crate) enum StartupOutcome {
     Running,
     RegistrationOutcomeUnknown,
+    RootAccepted,
+    RootEffectsPossibleNoReplay,
 }
 
 impl StartupOutcome {
@@ -47,6 +49,8 @@ impl StartupOutcome {
         match self {
             Self::Running => "running",
             Self::RegistrationOutcomeUnknown => "registration-outcome-unknown",
+            Self::RootAccepted => "root-accepted",
+            Self::RootEffectsPossibleNoReplay => "effects-possible-no-replay",
         }
     }
 }
@@ -205,6 +209,24 @@ fn record_pre_admission_registration_error(
         apply_supervisor_error_metadata(
             &mut meta,
             format!("completion event registration failed: {detail}"),
+        );
+        state::write_rc_atomic(paths, EX_SOFTWARE)?;
+        state::write_meta_atomic(paths, &meta)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn record_root_preaccept_failure(
+    paths: &StatePaths,
+    initial_meta: &Meta,
+    detail: &str,
+) -> io::Result<()> {
+    let _lock = state::lock_completion(paths)?;
+    let mut meta = state::read_meta(paths).unwrap_or_else(|_| initial_meta.clone());
+    if !state::terminal(&meta) {
+        apply_supervisor_error_metadata(
+            &mut meta,
+            format!("root original-work failed before acceptance: {detail}"),
         );
         state::write_rc_atomic(paths, EX_SOFTWARE)?;
         state::write_meta_atomic(paths, &meta)?;
@@ -475,7 +497,7 @@ unsafe fn daemonization_child(config: SupervisorConfig) -> ! {
             unsafe { libc::_exit(EX_SOFTWARE) };
         }
         0 => {
-            let code = run_supervisor(config);
+            let code = run_supervisor(config, None);
             unsafe { libc::_exit(code) };
         }
         supervisor_pid => {
@@ -706,7 +728,264 @@ fn redirect_stdio_to_devnull() {
     }
 }
 
-fn run_supervisor(config: SupervisorConfig) -> i32 {
+pub(crate) fn run_root_worker(
+    config: SupervisorConfig,
+    registration: delivery::DeliveryRegistration,
+    control_fd: RawFd,
+    child_capability: String,
+) -> i32 {
+    let scope = match config.completion_scope {
+        CompletionScope::Tree => "tree",
+        CompletionScope::Root => "root",
+    };
+    if let Err(error) = registration.prepare_continuation(&config.paths, &config.meta, scope) {
+        let _ = record_pre_admission_registration_error(
+            &config.paths,
+            &config.meta,
+            &error.to_string(),
+        );
+        let _ = root_terminal_handshake(control_fd);
+        return EX_SOFTWARE;
+    }
+    if crate::continuation::enabled(&config.paths) {
+        let mut meta = config.meta.clone();
+        meta.schema_version = 4;
+        if let Err(error) = state::write_meta_atomic(&config.paths, &meta) {
+            let _ = crate::continuation::abandon(&config.paths);
+            let _ = record_pre_admission_registration_error(
+                &config.paths,
+                &config.meta,
+                &error.to_string(),
+            );
+            let _ = root_terminal_handshake(control_fd);
+            return EX_SOFTWARE;
+        }
+    }
+    match delivery::register(&config.paths, &config.meta, registration) {
+        Ok(()) => {}
+        Err(delivery::RegistrationError::NotStarted(error)) => {
+            let _ = crate::continuation::abandon(&config.paths);
+            let _ = record_pre_admission_registration_error(
+                &config.paths,
+                &config.meta,
+                &error.to_string(),
+            );
+            let _ = root_terminal_handshake(control_fd);
+            return EX_SOFTWARE;
+        }
+        Err(delivery::RegistrationError::Admitted(error)) => {
+            let _ = crate::continuation::abandon(&config.paths);
+            let _ = record_admitted_registration_unknown(
+                &config.paths,
+                &config.meta,
+                &error.to_string(),
+            );
+            let _ = root_terminal_handshake(control_fd);
+            return EX_SOFTWARE;
+        }
+    }
+    match await_root_execution_grant(control_fd) {
+        Ok(RootExecutionGrant::Granted) => {
+            unsafe {
+                std::env::set_var(
+                    crate::root_work::ROOT_PARENT_CAPABILITY_ENV,
+                    child_capability,
+                );
+            }
+            run_supervisor(config, Some(control_fd))
+        }
+        Ok(RootExecutionGrant::Cancelled(cause)) => {
+            complete_without_launch(config, control_fd, cause)
+        }
+        Err(error) => complete_root_loss_before_launch(config, control_fd, error),
+    }
+}
+
+enum RootExecutionGrant {
+    Granted,
+    Cancelled(CancellationCause),
+}
+
+fn await_root_execution_grant(control_fd: RawFd) -> io::Result<RootExecutionGrant> {
+    write_control_byte_wait(control_fd, b'P')?;
+    loop {
+        match read_control_byte_wait(control_fd)? {
+            b'G' => return Ok(RootExecutionGrant::Granted),
+            b'C' => {
+                return Ok(RootExecutionGrant::Cancelled(
+                    CancellationCause::ExplicitRequest,
+                ));
+            }
+            b'O' => return Ok(RootExecutionGrant::Cancelled(CancellationCause::OwnerExit)),
+            b'K' => {
+                return Ok(RootExecutionGrant::Cancelled(
+                    CancellationCause::CausalParent,
+                ));
+            }
+            b'F' => {
+                return Ok(RootExecutionGrant::Cancelled(
+                    CancellationCause::RootAuthorityLost,
+                ));
+            }
+            _ => return Err(io::Error::other("invalid root execution-grant phase")),
+        }
+    }
+}
+
+fn complete_without_launch(
+    config: SupervisorConfig,
+    control_fd: RawFd,
+    cause: CancellationCause,
+) -> i32 {
+    set_private_umask();
+    let mut meta = supervisor_meta(config.meta);
+    let mut log = match open_supervisor_log(&config.paths) {
+        Ok(log) => log,
+        Err(_) => {
+            let _ = root_terminal_handshake(control_fd);
+            return EX_SOFTWARE;
+        }
+    };
+    persist_supervisor_meta_best_effort(&config.paths, &meta);
+    // Registration and its may_launch fence were already admitted before P.
+    // Keep this exact worker as the source owner until the cancelled v2
+    // observation is durable. A failed write is pending work, not a terminal
+    // root result with a permanently missing completion source.
+    let mut delay = std::time::Duration::from_millis(50);
+    loop {
+        if cause == CancellationCause::ExplicitRequest
+            && state::record_explicit_cancel_acceptance(&config.paths).is_err()
+        {
+            std::thread::sleep(delay);
+            delay = delay
+                .saturating_mul(2)
+                .min(std::time::Duration::from_secs(5));
+            continue;
+        }
+        let terminal = publish_terminal_with_delivery_disposition(
+            &config.paths,
+            &mut meta,
+            Some(&mut log),
+            TerminalProposal::Cancellation(cause),
+            CompletionDeliveryDisposition::ClaimPending,
+        );
+        if terminal.is_ok() {
+            let source = (|| {
+                let _lock = state::lock_completion(&config.paths)?;
+                crate::continuation::publish(
+                    &config.paths,
+                    &meta,
+                    crate::continuation::Observation {
+                        kind: "cancelled",
+                        root_wait_status: None,
+                        tree_drained: true,
+                        output_closed: true,
+                        ready_sentinel: None,
+                    },
+                )
+            })();
+            if source.is_ok() {
+                let _ = delivery::reconcile_completion_delivery(&config.paths, &mut meta);
+                break;
+            }
+        }
+        std::thread::sleep(delay);
+        delay = delay
+            .saturating_mul(2)
+            .min(std::time::Duration::from_secs(5));
+    }
+    let _ = root_terminal_handshake(control_fd);
+    cancellation_terminal_status().rc
+}
+
+fn complete_root_loss_before_launch(
+    config: SupervisorConfig,
+    control_fd: RawFd,
+    error: io::Error,
+) -> i32 {
+    let _ = error;
+    complete_without_launch(config, control_fd, CancellationCause::RootAuthorityLost)
+}
+
+fn root_terminal_handshake(control_fd: RawFd) -> io::Result<()> {
+    write_control_byte_wait(control_fd, b'R')?;
+    loop {
+        if matches!(
+            read_control_byte_wait(control_fd),
+            Ok(b'S' | b'C' | b'O') | Err(_)
+        ) {
+            break;
+        }
+    }
+    write_control_byte_wait(control_fd, b'T')
+}
+
+fn write_control_byte_wait(fd: RawFd, byte: u8) -> io::Result<()> {
+    loop {
+        match write_control_byte(fd, byte) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                poll_control(fd, libc::POLLOUT)?
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn read_control_byte_wait(fd: RawFd) -> io::Result<u8> {
+    loop {
+        let mut byte = [0];
+        let count = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+        if count == 1 {
+            return Ok(byte[0]);
+        }
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "root control closed",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == io::ErrorKind::WouldBlock {
+            poll_control(fd, libc::POLLIN)?;
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+fn poll_control(fd: RawFd, events: libc::c_short) -> io::Result<()> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
+        if result > 0 {
+            return Ok(());
+        }
+        if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(io::Error::last_os_error());
+    }
+}
+
+fn write_control_byte(fd: RawFd, byte: u8) -> io::Result<()> {
+    let result = unsafe { libc::send(fd, (&byte as *const u8).cast(), 1, libc::MSG_NOSIGNAL) };
+    if result == 1 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn run_supervisor(config: SupervisorConfig, root_control_fd: Option<RawFd>) -> i32 {
     set_private_umask();
     let mut meta = supervisor_meta(config.meta);
     if crate::continuation::enabled(&config.paths) {
@@ -791,7 +1070,12 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
     };
 
     let root_pidfd = pidfd_open(spawn.pid);
-    let owner_pidfd = owner_pidfd(&meta);
+    // In paired mode the runner is the sole live observer for cancel-owner
+    // death. The worker receives the durable accepted cause over root control.
+    let owner_pidfd = root_control_fd
+        .is_none()
+        .then(|| owner_pidfd(&meta))
+        .flatten();
     apply_spawn_metadata(&mut meta, &spawn, root_pidfd);
     // Failure to bind a post-fork identity remains may_launch uncertainty; the
     // actual original supervisor still observes/reaps this already launched root.
@@ -825,6 +1109,7 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
         completion_scope: config.completion_scope,
         sentinel,
         image_owner,
+        root_control_fd,
     });
     event_loop_exit_code(event_loop(loop_state))
 }
@@ -1021,6 +1306,7 @@ struct EventLoopSeed {
     owner_pidfd: Option<RawFd>,
     completion_scope: CompletionScope,
     sentinel: Option<SentinelMatcher>,
+    root_control_fd: Option<RawFd>,
 }
 
 fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
@@ -1050,6 +1336,11 @@ fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
         sentinel: seed.sentinel,
         spawn_error: None,
         cancellation: None,
+        root_control_fd: seed.root_control_fd,
+        root_local_ready_sent: false,
+        root_settlement_granted: seed.root_control_fd.is_none(),
+        root_terminal_sent: false,
+        deferred_ready_at: None,
     }
 }
 
@@ -1546,6 +1837,11 @@ struct EventLoop {
     sentinel: Option<SentinelMatcher>,
     spawn_error: Option<String>,
     cancellation: Option<Cancellation>,
+    root_control_fd: Option<RawFd>,
+    root_local_ready_sent: bool,
+    root_settlement_granted: bool,
+    root_terminal_sent: bool,
+    deferred_ready_at: Option<u64>,
 }
 
 // Original finalized event stays separate from mutable status/cancellation.
@@ -1596,14 +1892,26 @@ impl CancellationEscalation {
 pub(crate) enum CancellationCause {
     OwnerExit,
     ExplicitRequest,
+    CausalParent,
+    RootAuthorityLost,
 }
 
 impl CancellationCause {
     fn with_precedence_over(self, other: Self) -> Self {
-        if matches!(self, Self::ExplicitRequest) || matches!(other, Self::ExplicitRequest) {
-            Self::ExplicitRequest
+        fn rank(cause: CancellationCause) -> u8 {
+            match cause {
+                // Transport loss is a fallback only; it must never relabel a
+                // cancellation cause already accepted by the root authority.
+                CancellationCause::RootAuthorityLost => 0,
+                CancellationCause::OwnerExit => 1,
+                CancellationCause::CausalParent => 2,
+                CancellationCause::ExplicitRequest => 4,
+            }
+        }
+        if rank(self) >= rank(other) {
+            self
         } else {
-            Self::OwnerExit
+            other
         }
     }
 
@@ -1619,6 +1927,8 @@ impl CancellationCause {
         match reason {
             "cancel-request" => Some(Self::ExplicitRequest),
             "owner-exit" => Some(Self::OwnerExit),
+            "causal-parent-cancelled" => Some(Self::CausalParent),
+            "root-authority-lost" => Some(Self::RootAuthorityLost),
             _ => None,
         }
     }
@@ -1627,6 +1937,8 @@ impl CancellationCause {
         match self {
             Self::ExplicitRequest => "cancel-request",
             Self::OwnerExit => "owner-exit",
+            Self::CausalParent => "causal-parent-cancelled",
+            Self::RootAuthorityLost => "root-authority-lost",
         }
     }
 }
@@ -1667,6 +1979,7 @@ enum PollKey {
     Pidfd,
     OwnerPidfd,
     Cgroup,
+    RootControl,
 }
 
 struct PollEntry {
@@ -1683,6 +1996,8 @@ fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
         // Recovery is single-flight under this owner, never under acquiring clients.
         // Spawn failures remain bounded by backoff; image RPCs fail truthfully meanwhile.
         loop_state.recover_image_service();
+        loop_state.retry_root_terminal();
+        loop_state.retry_deferred_ready()?;
         loop_state.maybe_finish()?;
         if loop_state.tree_empty
             && loop_state.output_closed()
@@ -1728,6 +2043,11 @@ fn poll_entries(loop_state: &EventLoop) -> Vec<PollEntry> {
     ));
     push_optional_poll_entry(&mut entries, loop_state.root_pidfd, PollKey::Pidfd);
     push_optional_poll_entry(&mut entries, cgroup_inotify_fd(loop_state), PollKey::Cgroup);
+    push_optional_poll_entry(
+        &mut entries,
+        loop_state.root_control_fd,
+        PollKey::RootControl,
+    );
     entries
 }
 
@@ -1820,6 +2140,7 @@ impl EventLoop {
                 self.handle_cgroup_event();
                 Ok(())
             }
+            PollKey::RootControl => self.read_root_control(),
         }
     }
 
@@ -1864,7 +2185,10 @@ impl EventLoop {
     }
 
     fn check_polled_owner(&mut self) {
-        if self.owner_pidfd.is_some() || self.cancellation.is_some() {
+        if self.root_control_fd.is_some()
+            || self.owner_pidfd.is_some()
+            || self.cancellation.is_some()
+        {
             return;
         }
         let Some(owner) = self.meta.cancel_owner.as_ref() else {
@@ -2166,7 +2490,12 @@ impl EventLoop {
     }
 
     fn maybe_finish(&mut self) -> io::Result<()> {
-        match finish_decision(self) {
+        let decision = finish_decision(self);
+        if !matches!(decision, FinishDecision::None) && !self.root_settlement_granted {
+            self.announce_root_local_ready()?;
+            return Ok(());
+        }
+        match decision {
             FinishDecision::None => Ok(()),
             FinishDecision::SpawnError(message) => self.record_supervisor_error_in_loop(message),
             FinishDecision::Exit {
@@ -2188,6 +2517,8 @@ impl EventLoop {
             && !self.root_status_pending
             && self.root_status.is_some()
             && self.completion_scope.is_complete(self.tree_empty)
+            && (self.root_control_fd.is_none() || self.tree_empty)
+            && (self.root_control_fd.is_none() || self.root_terminal_sent)
             && self.output_closed()
     }
 
@@ -2289,11 +2620,30 @@ impl EventLoop {
     }
 
     fn record_ready_sentinel(&mut self) -> io::Result<()> {
+        if !self.root_settlement_granted {
+            self.deferred_ready_at.get_or_insert_with(state::unix_ms);
+            return self.announce_root_local_ready();
+        }
+        self.publish_ready_sentinel(state::unix_ms())
+    }
+
+    fn retry_deferred_ready(&mut self) -> io::Result<()> {
+        let Some(at) = self.deferred_ready_at else {
+            return Ok(());
+        };
+        if !self.root_settlement_granted {
+            return Ok(());
+        }
+        self.deferred_ready_at = None;
+        self.publish_ready_sentinel(at)
+    }
+
+    fn publish_ready_sentinel(&mut self, at: u64) -> io::Result<()> {
         let result = publish_terminal_with_delivery_disposition(
             &self.paths,
             &mut self.meta,
             Some(&mut self.log),
-            TerminalProposal::ReadySentinel(state::unix_ms()),
+            TerminalProposal::ReadySentinel(at),
             CompletionDeliveryDisposition::LiveLoop {
                 tree_empty: self.tree_empty,
             },
@@ -2320,10 +2670,92 @@ impl EventLoop {
 
     fn integrate_terminal_publication(&mut self, result: TerminalPublishResult) {
         match result {
-            TerminalPublishResult::Published => self.completion_recorded = true,
+            TerminalPublishResult::Published => {
+                self.completion_recorded = true;
+                self.retry_root_terminal();
+            }
             TerminalPublishResult::DeferredForAcceptedCancel => {
                 self.request_cancellation(CancellationCause::ExplicitRequest);
             }
+        }
+    }
+
+    fn retry_root_terminal(&mut self) {
+        if !self.completion_recorded || self.root_terminal_sent {
+            return;
+        }
+        let Some(fd) = self.root_control_fd else {
+            return;
+        };
+        match write_control_byte(fd, b'T') {
+            Ok(()) => self.root_terminal_sent = true,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                close_fd(fd);
+                self.root_control_fd = None;
+                self.root_settlement_granted = true;
+            }
+        }
+    }
+
+    fn announce_root_local_ready(&mut self) -> io::Result<()> {
+        if self.root_local_ready_sent {
+            return Ok(());
+        }
+        let Some(fd) = self.root_control_fd else {
+            self.root_settlement_granted = true;
+            return Ok(());
+        };
+        match write_control_byte(fd, b'R') {
+            Ok(()) => self.root_local_ready_sent = true,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                close_fd(fd);
+                self.root_control_fd = None;
+                self.root_settlement_granted = true;
+                self.request_cancellation(CancellationCause::RootAuthorityLost);
+            }
+        }
+        Ok(())
+    }
+
+    fn read_root_control(&mut self) -> io::Result<()> {
+        let Some(fd) = self.root_control_fd else {
+            return Ok(());
+        };
+        let mut bytes = [0; 32];
+        loop {
+            let count = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+            if count > 0 {
+                for byte in &bytes[..count as usize] {
+                    match *byte {
+                        b'S' => self.root_settlement_granted = true,
+                        b'C' => self.request_cancellation(CancellationCause::ExplicitRequest),
+                        b'O' => self.request_cancellation(CancellationCause::OwnerExit),
+                        b'K' => self.request_cancellation(CancellationCause::CausalParent),
+                        b'F' => self.request_cancellation(CancellationCause::RootAuthorityLost),
+                        _ => return Err(io::Error::other("invalid root control phase")),
+                    }
+                }
+                continue;
+            }
+            if count == 0 {
+                // Root loss never leaves accepted work unowned: this worker is
+                // the last live custodian, cancels/drains, and publishes a
+                // failure rather than waiting on an absent authority.
+                self.root_control_fd = None;
+                self.root_settlement_granted = true;
+                self.request_cancellation(CancellationCause::RootAuthorityLost);
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(());
+            }
+            return Err(error);
         }
     }
 
@@ -2862,6 +3294,7 @@ impl Drop for EventLoop {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixStream;
 
     use super::*;
 
@@ -3572,6 +4005,56 @@ for line in sys.stdin:
             retained[LOG_TRUNCATED_MARKER.len()..]
                 .iter()
                 .all(|byte| *byte == b'x')
+        );
+    }
+
+    fn exercise_root_grant(command: u8) -> RootExecutionGrant {
+        let (worker, mut authority) = UnixStream::pair().expect("root control pair");
+        let thread = std::thread::spawn(move || {
+            let mut prepared = [0];
+            authority.read_exact(&mut prepared).expect("prepared phase");
+            assert_eq!(prepared, [b'P']);
+            authority.write_all(&[command]).expect("authority decision");
+        });
+        let outcome = await_root_execution_grant(worker.as_raw_fd()).expect("grant outcome");
+        thread.join().unwrap();
+        outcome
+    }
+
+    #[test]
+    fn root_worker_never_executes_before_an_explicit_grant() {
+        assert!(matches!(
+            exercise_root_grant(b'G'),
+            RootExecutionGrant::Granted
+        ));
+    }
+
+    #[test]
+    fn cancellation_before_grant_preserves_distinct_causes() {
+        assert!(matches!(
+            exercise_root_grant(b'C'),
+            RootExecutionGrant::Cancelled(CancellationCause::ExplicitRequest)
+        ));
+        assert!(matches!(
+            exercise_root_grant(b'O'),
+            RootExecutionGrant::Cancelled(CancellationCause::OwnerExit)
+        ));
+        assert!(matches!(
+            exercise_root_grant(b'K'),
+            RootExecutionGrant::Cancelled(CancellationCause::CausalParent)
+        ));
+        assert!(matches!(
+            exercise_root_grant(b'F'),
+            RootExecutionGrant::Cancelled(CancellationCause::RootAuthorityLost)
+        ));
+        assert_eq!(
+            CancellationCause::CausalParent
+                .with_precedence_over(CancellationCause::RootAuthorityLost),
+            CancellationCause::CausalParent
+        );
+        assert_eq!(
+            CancellationCause::OwnerExit.with_precedence_over(CancellationCause::RootAuthorityLost),
+            CancellationCause::OwnerExit
         );
     }
 }

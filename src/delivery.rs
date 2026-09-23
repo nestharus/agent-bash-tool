@@ -7,7 +7,7 @@ use std::fmt;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -101,6 +101,28 @@ impl DeliveryLockGuard {
 impl DeliveryRegistration {
     pub(crate) fn provenance(&self) -> DeliveryHelperProvenance {
         self.helper.provenance.clone()
+    }
+
+    /// Moves the single-use completion registration authority into the
+    /// descriptor-pinned root request. It is never restored to the ambient
+    /// environment of the submitting process.
+    pub(crate) fn into_root_authority(self) -> Option<Vec<u8>> {
+        self.authority.map(OsString::into_vec)
+    }
+
+    /// Rebuilds the already handle-bound registration inside the root-owned
+    /// worker. The helper image and its environment are revalidated against
+    /// the immutable handle snapshot before any registration or launch.
+    pub(crate) fn from_root_request(
+        paths: &StatePaths,
+        provenance: Option<&DeliveryHelperProvenance>,
+        authority: Option<Vec<u8>>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            helper: HandleBoundDeliveryHelper::from_provenance(provenance, paths)
+                .map_err(io::Error::other)?,
+            authority: authority.map(OsString::from_vec),
+        })
     }
 }
 

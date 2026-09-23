@@ -45,6 +45,112 @@ fn run_cmd(temp: &tempfile::TempDir, args: &[&str]) -> (Output, Duration) {
     (output, start.elapsed())
 }
 
+#[test]
+fn paired_context_halves_fail_closed_and_terminalize_preaccept() {
+    for (present, absent, expected) in [
+        (
+            "OULIPOLY_COMPLETION_ENDPOINT",
+            "OULIPOLY_ROOT_AUTHORITY_V1",
+            "paired root endpoint is present but root authority is missing",
+        ),
+        (
+            "OULIPOLY_ROOT_AUTHORITY_V1",
+            "OULIPOLY_COMPLETION_ENDPOINT",
+            "paired root authority is present but endpoint is missing",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let output = agent_bash(&temp)
+            .env("OULIPOLY_ORIGINAL_WORK_REQUIRED_V1", "1")
+            .env(present, "paired-context-present")
+            .env_remove(absent)
+            .args(["run", "--delivery", "async", "--", "/bin/true"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{}",
+            command_failure_message(&output)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{stderr}");
+        let state_root = temp.path().join("agent-bash");
+        let handle = fs::read_dir(&state_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("ab_"))
+            .unwrap()
+            .path();
+        let meta: Value =
+            serde_json::from_slice(&fs::read(handle.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["state"], "ERROR", "{meta}");
+        assert_eq!(meta["completion_reason"], "supervisor-error", "{meta}");
+        assert!(handle.join("root-work-diagnostic-v1.jsonl").exists());
+    }
+}
+
+#[test]
+fn paired_session_ring_blocks_erased_context_even_after_setsid_reparent() {
+    for case in ["paired", "orphan", "invalid", "independent", "default"] {
+        let temp = tempfile::tempdir().unwrap();
+        let effect = temp.path().join("second-root-effect");
+        let output = StdCommand::new("python3")
+            .arg("-c")
+            .arg(include_str!("fixtures/age319_session_ring.py"))
+            .arg(case)
+            .arg(assert_cmd::cargo::cargo_bin("agent-bash"))
+            .env("XDG_STATE_HOME", temp.path())
+            .env("XDG_CONFIG_HOME", temp.path().join("config"))
+            .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+            .env("AGENT_BASH_TEST_EFFECT", &effect)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{case}: {}",
+            command_failure_message(&output)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let rejected = matches!(case, "paired" | "orphan" | "invalid");
+        if rejected {
+            assert_ne!(report["rc"], 0, "{case}: {report}");
+            assert!(
+                !effect.exists(),
+                "{case} started an unauthorized second root"
+            );
+            let stderr = report["stderr"].as_str().unwrap();
+            assert!(
+                stderr.contains(if case == "invalid" {
+                    "invalid paired session keyring UUID"
+                } else {
+                    "inherited paired session keyring"
+                }),
+                "{case}: {stderr}"
+            );
+            let handle = fs::read_dir(temp.path().join("agent-bash"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| entry.file_name().to_string_lossy().starts_with("ab_"))
+                .unwrap()
+                .path();
+            let meta: Value =
+                serde_json::from_slice(&fs::read(handle.join("meta.json")).unwrap()).unwrap();
+            assert_eq!(meta["state"], "ERROR", "{case}: {meta}");
+            assert!(handle.join("root-work-diagnostic-v1.jsonl").exists());
+        } else {
+            assert_eq!(report["rc"], 0, "{case}: {report}");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !effect.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                effect.exists(),
+                "{case}: independent launch did not execute"
+            );
+        }
+    }
+}
+
 fn completion_evidence(path: &Path, meta: &Value) -> Value {
     let root = path.parent().expect("metadata directory");
     json!({
@@ -3303,7 +3409,7 @@ fn opencode_adapter_abort_signal_cancels_sync_workload() {
 
     let result = run_adapter_driver(&temp, &driver, "abort", None);
 
-    assert_adapter_result_contains(&result, "Cancellation requested");
+    assert_adapter_result_contains(&result, "Cancellation accepted");
     let handle = adapter_result_handle(&result);
     let state_dir = temp.path().join("agent-bash").join(handle);
     let meta = read_meta(&state_dir.join("meta.json"));
