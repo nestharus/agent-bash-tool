@@ -1,5 +1,7 @@
 //! Private user-namespace exercise of the real Bash binary and v30 child
-//! registration. Deliberately absent from ordinary builds and the `run` path.
+//! registration. The ordinary `run` entry may register its listener here,
+//! but cannot launch work until a broker-owned command/handle route exists.
+use crate::state::DeliveryMode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -42,7 +44,42 @@ struct Child {
     parent_work_id: String,
     actor: Actor,
     registration_authority: String,
+    #[serde(default, skip_serializing_if = "ListenerPolicy::is_response_only")]
+    listener_policy: ListenerPolicy,
     session: Session,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ListenerPolicy {
+    ResponseOnly,
+    Notify,
+}
+
+impl Default for ListenerPolicy {
+    fn default() -> Self {
+        Self::ResponseOnly
+    }
+}
+
+impl ListenerPolicy {
+    fn from_delivery(mode: DeliveryMode) -> Self {
+        match mode {
+            DeliveryMode::Sync => Self::ResponseOnly,
+            DeliveryMode::Async => Self::Notify,
+        }
+    }
+
+    fn wire_byte(self) -> u8 {
+        match self {
+            Self::ResponseOnly => 0,
+            Self::Notify => 1,
+        }
+    }
+
+    fn is_response_only(&self) -> bool {
+        *self == Self::ResponseOnly
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -64,6 +101,80 @@ fn private_user_namespace() -> bool {
             .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
 }
 
+/// Called only for a resolved v30 owner in the private feature build. The
+/// broker authenticates the connected process and consumed parent work; an
+/// ambient owner marker or local handle never authorizes C. Returning this
+/// receipt does not grant a command K, source W, or recipient F.
+pub(crate) fn register_ordinary_run(
+    mode: DeliveryMode,
+) -> Result<Option<(String, String)>, String> {
+    if !private_user_namespace() {
+        return Ok(None);
+    }
+    let Ok(control) = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1") else {
+        return Ok(None);
+    };
+    let socket = Path::new(&control).with_file_name("v30.sock");
+    let request_id = random_uuid()?;
+    let request = uuid_bytes(&request_id)?;
+    let policy = ListenerPolicy::from_delivery(mode);
+    let child =
+        register_child(&socket, &request_id, &request, policy, true, false).map_err(|error| {
+            format!("fresh C outcome refused or unknown; request_id={request_id}: {error}")
+        })?;
+    Ok(Some((request_id, child.handle)))
+}
+
+fn register_child(
+    socket: &Path,
+    request_id: &str,
+    request: &[u8; 16],
+    policy: ListenerPolicy,
+    explicit_policy: bool,
+    drop_first_reply: bool,
+) -> Result<Child, String> {
+    let mut registration = request.to_vec();
+    if explicit_policy {
+        registration.push(policy.wire_byte());
+    }
+    let admitted = if drop_first_reply {
+        request_frame(socket, b'C', &registration, false)?;
+        request_frame(socket, b'c', request, true)?
+    } else {
+        match request_frame(socket, b'C', &registration, true) {
+            Ok(reply) => reply,
+            Err(first_error) => {
+                // A lost reply may follow a durable C. Read only the same
+                // request; never submit C again or infer acceptance from EOF.
+                request_frame(socket, b'c', request, true).map_err(|read_error| {
+                    format!("C reply uncertain: {first_error}; c readback: {read_error}")
+                })?
+            }
+        }
+    };
+    let child: Child = serde_json::from_str(
+        admitted
+            .strip_prefix("fresh-bash-child ")
+            .ok_or("Bash child registration refused")?
+            .trim_end(),
+    )
+    .map_err(|e| e.to_string())?;
+    let read = request_frame(socket, b'c', request, true)?;
+    if read != admitted
+        || child.request_id != request_id
+        || child.session.request_id != child.d_key
+        || !child.handle.starts_with("ab30_")
+        || child.invocation_uuid == child.parent_invocation_uuid
+        || child.d_key == child.session.session_id
+        || child.parent_work_grant_id.is_empty()
+        || child.parent_work_id.is_empty()
+        || child.listener_policy != policy
+    {
+        return Err("Bash child durable readback or listener policy mismatch".into());
+    }
+    Ok(child)
+}
+
 pub(crate) fn internal_main() -> Option<i32> {
     if std::env::args().nth(1).as_deref() != Some("__age319-private-admit-child-v1") {
         return None;
@@ -75,8 +186,21 @@ pub(crate) fn internal_main() -> Option<i32> {
         // Arguments are fixture routing data only. The broker never trusts
         // their contents without its challenged peer and consumed work K.
         let args: Vec<_> = std::env::args().collect();
-        let no_cancel = args.len() == 6 && args[5] == "no-cancel";
-        let (socket, request_id, marker) = if args.len() == 5 || no_cancel {
+        let explicit = args.len() >= 5;
+        if explicit
+            && args[5..]
+                .iter()
+                .any(|arg| arg != "no-cancel" && arg != "notify")
+        {
+            return Err("invalid private Bash child option".into());
+        }
+        let no_cancel = explicit && args[5..].iter().any(|arg| arg == "no-cancel");
+        let policy = if explicit && args[5..].iter().any(|arg| arg == "notify") {
+            ListenerPolicy::Notify
+        } else {
+            ListenerPolicy::ResponseOnly
+        };
+        let (socket, request_id, marker) = if explicit {
             std::thread::sleep(std::time::Duration::from_millis(250));
             (
                 Path::new(&args[2]).to_path_buf(),
@@ -103,33 +227,14 @@ pub(crate) fn internal_main() -> Option<i32> {
             .trim()
             .parse()
             .map_err(|error: std::num::ParseIntError| error.to_string())?;
-        let first = request_frame(&socket, b'C', &request, false)?;
-        let admitted = if first.is_empty() {
-            // Simulate a lost C reply. Only the same process/key may recover
-            // the exact durable row; this never authorizes work by itself.
-            request_frame(&socket, b'C', &request, true)?
-        } else {
-            first
-        };
-        let child: Child = serde_json::from_str(
-            admitted
-                .strip_prefix("fresh-bash-child ")
-                .ok_or("Bash child registration refused")?
-                .trim_end(),
-        )
-        .map_err(|e| e.to_string())?;
-        let read = request_frame(&socket, b'c', &request, true)?;
-        if read != admitted
-            || child.request_id != request_id
-            || child.session.request_id != child.d_key
-            || !child.handle.starts_with("ab30_")
-            || child.invocation_uuid == child.parent_invocation_uuid
-            || child.d_key == child.session.session_id
-            || child.parent_work_grant_id.is_empty()
-            || child.parent_work_id.is_empty()
-        {
-            return Err("Bash child durable readback mismatch".into());
-        }
+        let child = register_child(
+            &socket,
+            &request_id,
+            &request,
+            policy,
+            policy == ListenerPolicy::Notify,
+            true,
+        )?;
         if Path::new(&marker).exists() {
             return Err("private effect marker exists before grant".into());
         }
@@ -407,4 +512,127 @@ fn uuid_bytes(value: &str) -> Result<[u8; 16], String> {
         return Err("nil UUID".into());
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    fn sample_child(request_id: &str, policy: ListenerPolicy) -> Child {
+        let d_key = "22222222-2222-4222-8222-222222222222".to_owned();
+        Child {
+            request_id: request_id.into(),
+            d_key: d_key.clone(),
+            invocation_uuid: "33333333-3333-4333-8333-333333333333".into(),
+            handle: "ab30_44444444444444444444444444444444".into(),
+            root_handoff_id: "55555555-5555-4555-8555-555555555555".into(),
+            root_id: "66666666-6666-4666-8666-666666666666".into(),
+            parent_invocation_uuid: "77777777-7777-4777-8777-777777777777".into(),
+            parent_work_grant_id: "88888888-8888-4888-8888-888888888888".into(),
+            parent_work_id: "99999999-9999-4999-8999-999999999999".into(),
+            actor: Actor {
+                host_pid: 42,
+                boot_id: "boot".into(),
+                starttime_ticks: 1,
+                pidns_dev: 1,
+                pidns_ino: 1,
+            },
+            registration_authority: "authority".into(),
+            listener_policy: policy,
+            session: Session {
+                lane_id: "lane".into(),
+                source_generation: "generation".into(),
+                session_id: "session".into(),
+                request_id: d_key,
+                allocation_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn ordinary_delivery_selects_an_immutable_c_policy() {
+        assert_eq!(
+            ListenerPolicy::from_delivery(DeliveryMode::Sync).wire_byte(),
+            0
+        );
+        assert_eq!(
+            ListenerPolicy::from_delivery(DeliveryMode::Async).wire_byte(),
+            1
+        );
+        assert_eq!(
+            serde_json::from_str::<ListenerPolicy>("\"response_only\"").unwrap(),
+            ListenerPolicy::ResponseOnly
+        );
+        assert_eq!(
+            serde_json::from_str::<ListenerPolicy>("\"notify\"").unwrap(),
+            ListenerPolicy::Notify
+        );
+        assert!(serde_json::from_str::<ListenerPolicy>("\"unknown\"").is_err());
+    }
+
+    #[test]
+    fn c_lost_reply_reads_back_exact_original_listener_policy() {
+        for (requested, admitted, expected_success, drop_first_reply) in [
+            (
+                ListenerPolicy::ResponseOnly,
+                ListenerPolicy::ResponseOnly,
+                true,
+                false,
+            ),
+            (ListenerPolicy::Notify, ListenerPolicy::Notify, true, false),
+            (ListenerPolicy::Notify, ListenerPolicy::Notify, true, true),
+            (
+                ListenerPolicy::Notify,
+                ListenerPolicy::ResponseOnly,
+                false,
+                true,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("broker.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let request_id = "11111111-1111-4111-8111-111111111111";
+            let request = uuid_bytes(request_id).unwrap();
+            let child = sample_child(request_id, admitted);
+            let reply = format!(
+                "fresh-bash-child {}\n",
+                serde_json::to_string(&child).unwrap()
+            );
+            let server = std::thread::spawn(move || {
+                for index in 0..if drop_first_reply { 3 } else { 2 } {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream.write_all(&[1; 16]).unwrap();
+                    let mut frame = vec![0; if index == 0 { 34 } else { 33 }];
+                    stream.read_exact(&mut frame).unwrap();
+                    assert_eq!(&frame[1..17], &[1; 16]);
+                    assert_eq!(&frame[17..33], &request);
+                    if index == 0 {
+                        assert_eq!(frame[0], b'C');
+                        assert_eq!(frame[33], requested.wire_byte());
+                        stream
+                            .write_all(if drop_first_reply {
+                                b"f"
+                            } else {
+                                reply.as_bytes()
+                            })
+                            .unwrap();
+                    } else {
+                        assert_eq!(frame[0], b'c');
+                        stream.write_all(reply.as_bytes()).unwrap();
+                    }
+                }
+            });
+            let result = register_child(
+                &socket,
+                request_id,
+                &request,
+                requested,
+                true,
+                drop_first_reply,
+            );
+            assert_eq!(result.is_ok(), expected_success, "{result:?}");
+            server.join().unwrap();
+        }
+    }
 }

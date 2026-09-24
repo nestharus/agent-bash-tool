@@ -301,6 +301,27 @@ fn run_command(
             ))
         })?;
     let owner = owner_context(&caller_chain, &registration_candidate)?;
+    if is_fresh_owner(&owner) {
+        validate_guard(&guard)?;
+        #[cfg(feature = "private-v30-admission")]
+        match private_v30::register_ordinary_run(delivery_mode) {
+            Ok(Some((request_id, handle))) => {
+                return Err(AppError::new(
+                    EX_UNAVAILABLE,
+                    format!(
+                        "agent-bash: fresh C/D listener registered; request_id={request_id} handle={handle}; ordinary child command K and handle controls unavailable; no work launched"
+                    ),
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(AppError::new(
+                    EX_IOERR,
+                    format!("agent-bash: {error}; no work launched"),
+                ));
+            }
+        }
+    }
     require_legacy_source_route(&owner)?;
     // Owner routing precedes even local handle allocation and stale-state
     // maintenance. A fresh child cannot leave an ab_ handle that a later
@@ -503,9 +524,11 @@ fn accept_output_command(
     snapshot: String,
     caller: ControlRouteCaller,
 ) -> Result<(), AppError> {
+    // Resolve the handle version before even interpreting local receipt data.
+    // A v30 source has no v29 output slot to acknowledge.
+    let paths = paths_for_existing_handle(&handle)?;
     let identity: retained_output::Identity =
         serde_json::from_str(&snapshot).map_err(output_error)?;
-    let paths = paths_for_existing_handle(&handle)?;
     let _lock = state::lock_output(&paths).map_err(output_error)?;
     require_control_eligibility(&paths, &handle, &caller)?;
     let meta = terminal_output_meta(&paths, &handle)?;
@@ -689,17 +712,20 @@ fn owner_context(
 /// Until that route returns an exact committed registration receipt, the
 /// old helper and supervisor must never turn it into an `ab_` workload.
 fn require_legacy_source_route(owner: &OwnerContext) -> Result<(), AppError> {
-    if owner
-        .session_id
-        .as_deref()
-        .is_some_and(|session| session.starts_with("v30:"))
-    {
+    if is_fresh_owner(owner) {
         return Err(AppError::new(
             EX_UNAVAILABLE,
             "agent-bash: fresh owner requires committed v30 source registration",
         ));
     }
     Ok(())
+}
+
+fn is_fresh_owner(owner: &OwnerContext) -> bool {
+    owner
+        .session_id
+        .as_deref()
+        .is_some_and(|session| session.starts_with("v30:"))
 }
 
 fn owner_attestation_error() -> AppError {

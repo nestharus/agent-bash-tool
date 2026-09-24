@@ -57,6 +57,9 @@ fn v30_handle_never_uses_local_v29_metadata_as_authority() {
             vec!["snapshot", handle],
             vec!["status", "--observe-only", handle],
             vec!["cancel", handle],
+            vec!["detach", handle],
+            vec!["mode", handle],
+            vec!["accept-output", handle, "--snapshot", "{}"],
         ] {
             let (output, _) = run_cmd(&temp, &args);
             assert_eq!(output.status.code(), Some(69), "{args:?}: {output:?}");
