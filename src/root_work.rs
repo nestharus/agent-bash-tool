@@ -329,39 +329,11 @@ pub(crate) fn selected(paths: &StatePaths, meta: &Meta) -> io::Result<bool> {
     // It only vetoes standalone admission; it never supplies submit authority.
     // Inspect it even for endpoint-only legacy callers, before ancestry can
     // incorrectly declare an orphaned paired descendant independent.
-    if !required && std::env::var_os(ROOT_AUTHORITY_ENV).is_none() {
-        match inherited_paired_session_ring() {
-            Ok(true) => {
-                return Err(preaccept_failure(
-                    paths,
-                    meta,
-                    io::Error::other(
-                        "inherited paired session keyring but original-work authority is missing",
-                    ),
-                ));
-            }
-            Err(error) => return Err(preaccept_failure(paths, meta, error)),
-            Ok(false) => {}
-        }
-    }
-    // A wrapper can erase its own environment while remaining a descendant
-    // of the accepted paired worker. In that case standalone would create a
-    // second owner. Inspect the live, incarnation-stable ancestor chain before
+    // Then inspect the live, incarnation-stable ancestor chain before
     // treating missing ambient grant/marker as genuine standalone entry.
     if !required && std::env::var_os(ROOT_AUTHORITY_ENV).is_none() {
-        match has_paired_custodian_ancestor() {
-            Ok(true) => {
-                return Err(preaccept_failure(
-                    paths,
-                    meta,
-                    io::Error::other(
-                        "paired worker or guardian ancestor is live but inherited original-work authority is missing",
-                    ),
-                ));
-            }
-            Err(error) => return Err(preaccept_failure(paths, meta, error)),
-            Ok(false) => {}
-        }
+        classify_standalone(inherited_paired_session_ring, has_paired_custodian_ancestor)
+            .map_err(|error| preaccept_failure(paths, meta, error))?;
     }
     match (
         std::env::var_os(ENDPOINT_ENV),
@@ -394,12 +366,47 @@ pub(crate) fn selected(paths: &StatePaths, meta: &Meta) -> io::Result<bool> {
     }
 }
 
+fn classify_standalone(
+    ring: impl FnOnce() -> io::Result<bool>,
+    ancestor: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<()> {
+    match ring() {
+        Ok(true) => {
+            return Err(io::Error::other(
+                "inherited paired session keyring but original-work authority is missing",
+            ));
+        }
+        Err(error) => {
+            return Err(operation_error(
+                "standalone selection: session keyring classification",
+                error,
+            ));
+        }
+        Ok(false) => {}
+    }
+    match ancestor() {
+        Ok(true) => Err(io::Error::other(
+            "paired worker or guardian ancestor is live but inherited original-work authority is missing",
+        )),
+        Err(error) => Err(operation_error(
+            "standalone selection: ancestor classification",
+            error,
+        )),
+        Ok(false) => Ok(()),
+    }
+}
+
+fn operation_error(operation: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{operation}: {error}"))
+}
+
 // KEYCTL_GET_KEYRING_ID with create=0 does not join or create a ring. The
 // kernel description is a bounded, NUL-terminated
 // `keyring;uid;gid;permissions;name` record. Never interpret a failed query,
 // truncated description, changed ring, or malformed identity as independence.
 fn inherited_paired_session_ring() -> io::Result<bool> {
-    let session_id = session_ring_id()?;
+    let session_id = session_ring_id()
+        .map_err(|error| operation_error("keyctl GET_KEYRING_ID initial", error))?;
     let mut description = [0u8; MAX_KEY_DESCRIPTION_BYTES];
     let length = unsafe {
         libc::syscall(
@@ -411,7 +418,10 @@ fn inherited_paired_session_ring() -> io::Result<bool> {
         )
     };
     if length < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(operation_error(
+            "keyctl DESCRIBE session keyring",
+            io::Error::last_os_error(),
+        ));
     }
     let length = usize::try_from(length).map_err(io::Error::other)?;
     if length == 0 || length > description.len() || description[length - 1] != 0 {
@@ -419,7 +429,9 @@ fn inherited_paired_session_ring() -> io::Result<bool> {
             "session keyring description is missing or truncated",
         ));
     }
-    if session_ring_id()? != session_id {
+    if session_ring_id().map_err(|error| operation_error("keyctl GET_KEYRING_ID recheck", error))?
+        != session_id
+    {
         return Err(io::Error::other(
             "session keyring identity changed during classification",
         ));
@@ -510,14 +522,16 @@ fn valid_paired_ring_uuid(uuid: &str) -> bool {
 }
 
 fn has_paired_custodian_ancestor() -> io::Result<bool> {
-    let own_image = std::fs::metadata("/proc/self/exe")?;
+    let own_image = std::fs::metadata("/proc/self/exe")
+        .map_err(|error| operation_error("stat /proc/self/exe", error))?;
     // The guardian is the kernel subreaper for an accepted worker. A child
     // adopted after worker exit retains this ancestor even if its session
     // keyring was replaced by keyctl session or PAM keyinit.
     let uid = unsafe { libc::geteuid() };
     let socket_prefix = format!("/tmp/oulipoly-completion-{uid}-");
     let guardian_sockets: std::collections::HashSet<String> =
-        std::fs::read_to_string("/proc/net/unix")?
+        std::fs::read_to_string("/proc/net/unix")
+            .map_err(|error| operation_error("read /proc/net/unix", error))?
             .lines()
             .filter_map(|line| {
                 let fields: Vec<_> = line.split_whitespace().collect();
@@ -531,31 +545,43 @@ fn has_paired_custodian_ancestor() -> io::Result<bool> {
                 Some(fields.get(6)?.to_string())
             })
             .collect();
-    let mut pid = state::observer_parent_pid()?;
+    let mut pid = state::observer_parent_pid()
+        .map_err(|error| operation_error("read observer parent PID", error))?;
     for _ in 0..256 {
         if pid <= 1 {
             return Ok(false);
         }
         let before = state::process_starttime_ticks(pid).ok_or_else(|| {
-            io::Error::other("ancestor identity unavailable during paired classification")
+            io::Error::other(format!(
+                "read/parse /proc/{pid}/stat starttime unavailable during paired classification"
+            ))
         })?;
         let parent = state::process_parent_pid(pid).ok_or_else(|| {
-            io::Error::other("ancestor parent unavailable during paired classification")
+            io::Error::other(format!(
+                "read/parse /proc/{pid}/stat parent unavailable during paired classification"
+            ))
         })?;
-        if std::fs::metadata(format!("/proc/{pid}"))?.uid() != unsafe { libc::geteuid() } {
+        if std::fs::metadata(format!("/proc/{pid}"))
+            .map_err(|error| operation_error(&format!("stat /proc/{pid}"), error))?
+            .uid()
+            != unsafe { libc::geteuid() }
+        {
             // The paired worker is a same-UID ancestor. An older, different
             // UID process cannot be that worker in this one-user topology.
             return Ok(false);
         }
         let mut command = Vec::new();
-        File::open(format!("/proc/{pid}/cmdline"))?
+        File::open(format!("/proc/{pid}/cmdline"))
+            .map_err(|error| operation_error(&format!("open /proc/{pid}/cmdline"), error))?
             .take(4096)
-            .read_to_end(&mut command)?;
+            .read_to_end(&mut command)
+            .map_err(|error| operation_error(&format!("read /proc/{pid}/cmdline"), error))?;
         if command.split(|byte| *byte == 0).nth(1) == Some(EXECUTOR_ARG.as_bytes()) {
             // Some legitimate caller ancestors hide /proc/PID/exe under
             // non-dumpable credentials. Inspect the image only for the exact
             // internal-worker argv, which must remain readable when paired.
-            let image = std::fs::metadata(format!("/proc/{pid}/exe"))?;
+            let image = std::fs::metadata(format!("/proc/{pid}/exe"))
+                .map_err(|error| operation_error(&format!("stat /proc/{pid}/exe"), error))?;
             if image.dev() == own_image.dev() && image.ino() == own_image.ino() {
                 if state::process_starttime_ticks(pid) == Some(before) {
                     return Ok(true);
@@ -568,23 +594,15 @@ fn has_paired_custodian_ancestor() -> io::Result<bool> {
         // A bound owner.sock inode held by this exact ancestor identifies the
         // live root guardian, not a client connection or a process name.
         let fd_dir = format!("/proc/{pid}/fd");
-        for fd in std::fs::read_dir(fd_dir)? {
-            let fd = fd?;
-            let target = std::fs::read_link(fd.path())?;
-            if let Some(inode) = target
-                .to_string_lossy()
-                .strip_prefix("socket:[")
-                .and_then(|v| v.strip_suffix(']'))
-            {
-                if guardian_sockets.contains(inode) {
-                    if state::process_starttime_ticks(pid) == Some(before) {
-                        return Ok(true);
-                    }
-                    return Err(io::Error::other(
-                        "paired guardian identity changed during classification",
-                    ));
-                }
+        if ancestor_holds_guardian_socket(Path::new(&fd_dir), &guardian_sockets, |path| {
+            std::fs::read_link(path)
+        })? {
+            if state::process_starttime_ticks(pid) == Some(before) {
+                return Ok(true);
             }
+            return Err(io::Error::other(
+                "paired guardian identity changed during classification",
+            ));
         }
         if state::process_starttime_ticks(pid) != Some(before) || parent == pid {
             return Err(io::Error::other(
@@ -596,6 +614,33 @@ fn has_paired_custodian_ancestor() -> io::Result<bool> {
     Err(io::Error::other(
         "paired ancestry exceeds bounded classification depth",
     ))
+}
+
+fn ancestor_holds_guardian_socket(
+    fd_dir: &Path,
+    guardian_sockets: &std::collections::HashSet<String>,
+    mut read_link: impl FnMut(&Path) -> io::Result<PathBuf>,
+) -> io::Result<bool> {
+    // FD entries can vanish after enumeration. Report the exact proc operation
+    // and fail closed; a missing link is not proof of standalone ownership.
+    for fd in std::fs::read_dir(fd_dir)
+        .map_err(|error| operation_error(&format!("open {}", fd_dir.display()), error))?
+    {
+        let fd =
+            fd.map_err(|error| operation_error(&format!("enumerate {}", fd_dir.display()), error))?;
+        let path = fd.path();
+        let target = read_link(&path)
+            .map_err(|error| operation_error(&format!("readlink {}", path.display()), error))?;
+        if target
+            .to_string_lossy()
+            .strip_prefix("socket:[")
+            .and_then(|value| value.strip_suffix(']'))
+            .is_some_and(|inode| guardian_sockets.contains(inode))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn submit(
@@ -2496,6 +2541,39 @@ mod tests {
                 "{invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn disappearing_ancestor_fd_is_attributed_and_denies_standalone() {
+        let fd_dir = Path::new("/proc/self/fd");
+        let error = classify_standalone(
+            || Ok(false),
+            || {
+                ancestor_holds_guardian_socket(fd_dir, &std::collections::HashSet::new(), |_path| {
+                    Err(io::Error::from_raw_os_error(libc::ENOENT))
+                })
+            },
+        )
+        .unwrap_err();
+        let detail = error.to_string();
+        assert!(
+            detail.contains("standalone selection: ancestor classification"),
+            "{detail}"
+        );
+        assert!(detail.contains("readlink /proc/self/fd/"), "{detail}");
+        assert!(detail.contains("No such file or directory"), "{detail}");
+
+        let ring_error = classify_standalone(
+            || Err(io::Error::from_raw_os_error(libc::ENOENT)),
+            || panic!("ancestor scan must not override a failed ring query"),
+        )
+        .unwrap_err();
+        assert!(
+            ring_error
+                .to_string()
+                .contains("session keyring classification")
+        );
+        assert!(classify_standalone(|| Ok(false), || Ok(false)).is_ok());
     }
 
     #[test]

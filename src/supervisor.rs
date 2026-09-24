@@ -83,7 +83,10 @@ pub(crate) fn fork_registered_supervisor(
         )
     } < 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::other(format!(
+            "create standalone registration socketpair: {}",
+            io::Error::last_os_error()
+        )));
     }
     match unsafe { libc::fork() } {
         -1 => {
@@ -92,7 +95,9 @@ pub(crate) fn fork_registered_supervisor(
                 libc::close(sockets[0]);
                 libc::close(sockets[1]);
             }
-            Err(err)
+            Err(io::Error::other(format!(
+                "fork standalone registration worker: {err}"
+            )))
         }
         0 => unsafe {
             libc::close(sockets[0]);
@@ -111,7 +116,12 @@ fn receive_registration_result(
 ) -> io::Result<StartupOutcome> {
     let mut result = unsafe { File::from_raw_fd(socket) };
     let mut outcome = [0];
-    result.read_exact(&mut outcome)?;
+    result.read_exact(&mut outcome).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("read supervisor registration outcome: {error}"),
+        )
+    })?;
     if outcome[0] == 1 {
         return Ok(StartupOutcome::Running);
     }
@@ -121,7 +131,12 @@ fn receive_registration_result(
         return Ok(StartupOutcome::RegistrationOutcomeUnknown);
     }
     let mut detail = String::new();
-    result.read_to_string(&mut detail)?;
+    result.read_to_string(&mut detail).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("read supervisor registration detail: {error}"),
+        )
+    })?;
     let mut status = 0;
     let _ = unsafe { libc::waitpid(child_pid, &mut status, 0) };
     Err(io::Error::other(detail))
@@ -137,9 +152,9 @@ unsafe fn register_and_start_supervisor(
         CompletionScope::Root => "root",
     };
     if let Err(err) = registration.prepare_continuation(&config.paths, &config.meta, scope) {
-        let _ =
-            record_pre_admission_registration_error(&config.paths, &config.meta, &err.to_string());
-        send_registration_result(result_fd, 0, err.to_string().as_bytes());
+        let detail = format!("prepare completion continuation: {err}");
+        let _ = record_pre_admission_registration_error(&config.paths, &config.meta, &detail);
+        send_registration_result(result_fd, 0, detail.as_bytes());
         unsafe {
             libc::close(result_fd);
             libc::_exit(EX_SOFTWARE)

@@ -1259,7 +1259,12 @@ pub(crate) fn register(
     registration: DeliveryRegistration,
 ) -> Result<(), RegistrationError> {
     let request = register_request(meta, paths, registration.helper, registration.authority)
-        .map_err(RegistrationError::NotStarted)?;
+        .map_err(|error| {
+            RegistrationError::NotStarted(io::Error::new(
+                error.kind(),
+                format!("build completion registration request: {error}"),
+            ))
+        })?;
     if crate::continuation::enabled(paths) {
         let response = run_structured_helper(&request, None).map_err(registration_error)?;
         return crate::continuation::confirm_launch(paths, &response)
@@ -2154,8 +2159,18 @@ fn wait_delivery_helper(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(DeliveryHelperCommandError::NotStarted)?;
-    child.wait().map_err(DeliveryHelperCommandError::Admitted)
+        .map_err(|error| {
+            DeliveryHelperCommandError::NotStarted(io::Error::new(
+                error.kind(),
+                format!("spawn delivery helper for {}: {error}", request.operation),
+            ))
+        })?;
+    child.wait().map_err(|error| {
+        DeliveryHelperCommandError::Admitted(io::Error::new(
+            error.kind(),
+            format!("wait delivery helper for {}: {error}", request.operation),
+        ))
+    })
 }
 
 // Full per-attempt replies survive ambiguous execution and integration failure.
@@ -2200,8 +2215,18 @@ fn run_structured_helper(
             .stdout(stdout)
             .stderr(stderr)
             .spawn()
-            .map_err(DeliveryHelperCommandError::NotStarted)?;
-        let status = child.wait().map_err(DeliveryHelperCommandError::Admitted)?;
+            .map_err(|error| {
+                DeliveryHelperCommandError::NotStarted(io::Error::new(
+                    error.kind(),
+                    format!("spawn structured helper for {}: {error}", request.operation),
+                ))
+            })?;
+        let status = child.wait().map_err(|error| {
+            DeliveryHelperCommandError::Admitted(io::Error::new(
+                error.kind(),
+                format!("wait structured helper for {}: {error}", request.operation),
+            ))
+        })?;
         File::open(&stdout_path)
             .and_then(|f| f.sync_all())
             .map_err(DeliveryHelperCommandError::Admitted)?;
@@ -2249,10 +2274,18 @@ fn wait_required_delivery_helper(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(DeliveryHelperCommandError::NotStarted)?;
-    child
-        .wait_with_output()
-        .map_err(DeliveryHelperCommandError::Admitted)
+        .map_err(|error| {
+            DeliveryHelperCommandError::NotStarted(io::Error::new(
+                error.kind(),
+                format!("spawn delivery helper for {}: {error}", request.operation),
+            ))
+        })?;
+    child.wait_with_output().map_err(|error| {
+        DeliveryHelperCommandError::Admitted(io::Error::new(
+            error.kind(),
+            format!("wait delivery helper for {}: {error}", request.operation),
+        ))
+    })
 }
 
 fn require_helper_success(output: std::process::Output) -> Result<(), DeliveryHelperCommandError> {

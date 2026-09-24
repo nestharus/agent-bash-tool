@@ -293,8 +293,13 @@ fn run_command(
     let cancel_owner = resolve_cancel_owner(&caller_chain, cancel_on_owner_exit, owner_pid)?;
     let cwd = current_directory().map_err(current_directory_error)?;
     let mode = run_mode(&ready_sentinel);
-    let registration_candidate = delivery::prepare_registration(binary_config)
-        .map_err(completion_event_registration_error)?;
+    let registration_candidate =
+        delivery::prepare_registration(binary_config).map_err(|error| {
+            completion_event_registration_error(registration_stage_error(
+                "prepare delivery helper",
+                error,
+            ))
+        })?;
     let owner = owner_context(&caller_chain, &registration_candidate)?;
     require_legacy_source_route(&owner)?;
     // Owner routing precedes even local handle allocation and stale-state
@@ -308,7 +313,9 @@ fn run_command(
         Ok(registration) => registration,
         Err(err) => {
             let _ = fs::remove_dir_all(&paths.state_dir);
-            return Err(completion_event_registration_error(err));
+            return Err(completion_event_registration_error(
+                registration_stage_error("bind delivery helper to handle", err),
+            ));
         }
     };
     let meta = Meta::new(
@@ -338,7 +345,12 @@ fn run_command(
         completion_scope,
         ready_sentinel.clone(),
     );
-    let paired = root_work::selected(&paths, &meta).map_err(completion_event_registration_error)?;
+    let paired = root_work::selected(&paths, &meta).map_err(|error| {
+        completion_event_registration_error(registration_stage_error(
+            "select paired or standalone route",
+            error,
+        ))
+    })?;
     let startup_outcome = match if paired {
         root_work::submit(
             &paths,
@@ -357,7 +369,16 @@ fn run_command(
             // The channel can also disappear AFTER durable runner admission;
             // that outcome stays retained and EOF grants neither deletion nor
             // registration/workload replay.
-            return Err(completion_event_registration_error(err));
+            return Err(completion_event_registration_error(
+                registration_stage_error(
+                    if paired {
+                        "submit paired original work"
+                    } else {
+                        "start standalone supervisor registration"
+                    },
+                    err,
+                ),
+            ));
         }
     };
 
@@ -729,6 +750,10 @@ fn completion_event_registration_error(err: io::Error) -> AppError {
         EX_IOERR,
         format!("agent-bash: failed to register completion event: {err}"),
     )
+}
+
+fn registration_stage_error(stage: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{stage}: {error}"))
 }
 
 fn supervisor_config(
