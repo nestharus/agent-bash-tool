@@ -75,7 +75,8 @@ pub(crate) fn internal_main() -> Option<i32> {
         // Arguments are fixture routing data only. The broker never trusts
         // their contents without its challenged peer and consumed work K.
         let args: Vec<_> = std::env::args().collect();
-        let (socket, request_id, marker) = if args.len() == 5 {
+        let no_cancel = args.len() == 6 && args[5] == "no-cancel";
+        let (socket, request_id, marker) = if args.len() == 5 || no_cancel {
             std::thread::sleep(std::time::Duration::from_millis(250));
             (
                 Path::new(&args[2]).to_path_buf(),
@@ -193,10 +194,21 @@ pub(crate) fn internal_main() -> Option<i32> {
         {
             return Err("broker child K replayed after lost reply".into());
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let grant = loop {
             let state = request_frame(&socket, b'9', &request, true)?;
+            if let Some(rest) = state.strip_prefix("fresh-bash-physical-drained ") {
+                let id = rest
+                    .split_ascii_whitespace()
+                    .next()
+                    .ok_or("physical Q id absent")?;
+                uuid_bytes(id)?;
+                break id.to_owned();
+            }
             if let Some(rest) = state.strip_prefix("fresh-bash-physical-exited ") {
+                if no_cancel {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
                 let id = rest
                     .split_ascii_whitespace()
                     .next()
@@ -204,16 +216,16 @@ pub(crate) fn internal_main() -> Option<i32> {
                 uuid_bytes(id)?;
                 break id.to_owned();
             }
-            if !state.starts_with("fresh-bash-physical-pending ")
-                || std::time::Instant::now() >= deadline
-            {
+            if !state.starts_with("fresh-bash-physical-pending ") {
                 return Err(format!(
                     "broker child did not reach separate provider exit: {state}"
                 ));
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        request_frame(&socket, b'!', &request, true)?;
+        if !no_cancel {
+            request_frame(&socket, b'!', &request, true)?;
+        }
         let physical = loop {
             let state = request_frame(&socket, b'9', &request, true)?;
             if let Some(rest) = state.strip_prefix("fresh-bash-physical-drained ") {
@@ -224,7 +236,7 @@ pub(crate) fn internal_main() -> Option<i32> {
                     || fields[1] != "0"
                     || fields[2] != expected_stdout.len().to_string()
                     || fields[3] != "0"
-                    || fields[4] != "true"
+                    || fields[4] != if no_cancel { "false" } else { "true" }
                     || fields[5] != format!("{:x}", Sha256::digest(expected_stdout))
                     || fields[6] != format!("{:x}", Sha256::digest([]))
                 {
@@ -234,7 +246,6 @@ pub(crate) fn internal_main() -> Option<i32> {
             }
             if !(state.starts_with("fresh-bash-physical-exited ")
                 || state.starts_with("fresh-bash-physical-pending "))
-                || std::time::Instant::now() >= deadline
             {
                 return Err(format!("broker child physical Q absent: {state}"));
             }
@@ -245,6 +256,36 @@ pub(crate) fn internal_main() -> Option<i32> {
             .is_ok_and(|reply| reply.starts_with("fresh-bash-physical-"))
         {
             return Err("unrelated child key observed broker physical Q".into());
+        }
+        // `%` is the private W transition. Drop its response and read the
+        // same captured event back. No Bash O field is submitted as source
+        // authority; the broker binds its own K/output/Q to C/D and parent K.
+        request_frame(&socket, b'%', &request, false)?;
+        let accepted = request_frame(&socket, b'%', &request, true)?;
+        let source: serde_json::Value = serde_json::from_str(
+            accepted
+                .strip_prefix("fresh-bash-source-accepted ")
+                .ok_or("fresh source W not accepted")?
+                .trim_end(),
+        )
+        .map_err(|e| e.to_string())?;
+        if source["request_id"] != child.request_id
+            || source["source_id"] != child.handle
+            || source["attempt_id"] != child.invocation_uuid
+            || source["physical_grant_id"] != grant
+            || source["parent_work_grant_id"] != child.parent_work_grant_id
+            || source["parent_work_id"] != child.parent_work_id
+            || source["completion_policy"] != "tree"
+            || source["selected_kind"]
+                != if no_cancel {
+                    "tree_drained"
+                } else {
+                    "cancelled"
+                }
+            || source["tree_drained"] != true
+            || source["output_closed"] != true
+        {
+            return Err("fresh source W exact readback mismatch".into());
         }
         let status = std::fs::read_to_string("/proc/self/status").map_err(|e| e.to_string())?;
         let status_value = |field: &str| -> Result<u32, String> {
@@ -261,6 +302,7 @@ pub(crate) fn internal_main() -> Option<i32> {
                 "bash_reported_result": result,
                 "result_provenance": "bash-self-report-only",
                 "broker_physical_q": physical,
+                "fresh_source_w": source,
                 "stdout": String::from_utf8_lossy(&output.stdout),
                 "stderr": String::from_utf8_lossy(&output.stderr),
                 "parent_pid_before_c": parent_pid_before_c,
