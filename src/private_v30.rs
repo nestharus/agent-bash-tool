@@ -38,6 +38,8 @@ struct Child {
     root_handoff_id: String,
     root_id: String,
     parent_invocation_uuid: String,
+    parent_work_grant_id: String,
+    parent_work_id: String,
     actor: Actor,
     registration_authority: String,
     session: Session,
@@ -70,11 +72,36 @@ pub(crate) fn internal_main() -> Option<i32> {
         if !private_user_namespace() {
             return Err("private Bash child probe requires user namespace".into());
         }
-        let control = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
-            .map_err(|_| "private broker socket absent")?;
-        let socket = Path::new(&control).with_file_name("v30.sock");
-        let request_id = std::env::var("AGE319_PRIVATE_BASH_REQUEST_KEY").unwrap_or(random_uuid()?);
+        // Arguments are fixture routing data only. The broker never trusts
+        // their contents without its challenged peer and consumed work K.
+        let args: Vec<_> = std::env::args().collect();
+        let (socket, request_id, marker) = if args.len() == 5 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            (
+                Path::new(&args[2]).to_path_buf(),
+                args[3].clone(),
+                args[4].clone(),
+            )
+        } else {
+            let control = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+                .map_err(|_| "private broker socket absent")?;
+            (
+                Path::new(&control).with_file_name("v30.sock"),
+                std::env::var("AGE319_PRIVATE_BASH_REQUEST_KEY").unwrap_or(random_uuid()?),
+                std::env::var("AGE319_PRIVATE_BASH_EFFECT_MARKER")
+                    .map_err(|_| "private effect marker absent")?,
+            )
+        };
         let request = uuid_bytes(&request_id)?;
+        let status_before_c =
+            std::fs::read_to_string("/proc/self/status").map_err(|error| error.to_string())?;
+        let parent_pid_before_c: u32 = status_before_c
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .ok_or("Bash parent PID absent before C")?
+            .trim()
+            .parse()
+            .map_err(|error: std::num::ParseIntError| error.to_string())?;
         let first = request_frame(&socket, b'C', &request, false)?;
         let admitted = if first.is_empty() {
             // Simulate a lost C reply. Only the same process/key may recover
@@ -97,11 +124,11 @@ pub(crate) fn internal_main() -> Option<i32> {
             || !child.handle.starts_with("ab30_")
             || child.invocation_uuid == child.parent_invocation_uuid
             || child.d_key == child.session.session_id
+            || child.parent_work_grant_id.is_empty()
+            || child.parent_work_id.is_empty()
         {
             return Err("Bash child durable readback mismatch".into());
         }
-        let marker = std::env::var("AGE319_PRIVATE_BASH_EFFECT_MARKER")
-            .map_err(|_| "private effect marker absent")?;
         if Path::new(&marker).exists() {
             return Err("private effect marker exists before grant".into());
         }
@@ -236,6 +263,7 @@ pub(crate) fn internal_main() -> Option<i32> {
                 "broker_physical_q": physical,
                 "stdout": String::from_utf8_lossy(&output.stdout),
                 "stderr": String::from_utf8_lossy(&output.stderr),
+                "parent_pid_before_c": parent_pid_before_c,
                 "no_new_privs": status_value("NoNewPrivs:")?,
                 "seccomp": status_value("Seccomp:")?,
             })
