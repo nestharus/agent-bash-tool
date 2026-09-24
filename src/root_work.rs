@@ -521,7 +521,103 @@ fn valid_paired_ring_uuid(uuid: &str) -> bool {
         && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
 }
 
+const ANCESTOR_FD_OBSERVATION_ATTEMPTS: usize = 3;
+
+struct AncestorIncarnation {
+    pid: libc::pid_t,
+    starttime: u64,
+    parent: libc::pid_t,
+}
+
+enum AncestorObservation {
+    Paired,
+    Independent,
+    VanishedFd {
+        error: io::Error,
+        observer_parent: libc::pid_t,
+        incarnations: Vec<AncestorIncarnation>,
+    },
+}
+
 fn has_paired_custodian_ancestor() -> io::Result<bool> {
+    retry_ancestor_observation(|expected_parent| {
+        observe_paired_custodian_ancestor(expected_parent, |path| std::fs::read_link(path))
+    })
+}
+
+fn retry_ancestor_observation(
+    mut observe: impl FnMut(Option<libc::pid_t>) -> io::Result<AncestorObservation>,
+) -> io::Result<bool> {
+    let mut observer_parent = None;
+    let mut incarnations: Vec<AncestorIncarnation> = Vec::new();
+    for attempt in 0..ANCESTOR_FD_OBSERVATION_ATTEMPTS {
+        if let Some(parent) = observer_parent {
+            if state::observer_parent_pid()
+                .map_err(|error| operation_error("read observer parent PID", error))?
+                != parent
+                || incarnations.iter().any(|identity| {
+                    state::process_starttime_ticks(identity.pid) != Some(identity.starttime)
+                        || state::process_parent_pid(identity.pid) != Some(identity.parent)
+                })
+            {
+                return Err(io::Error::other(
+                    "ancestor identity changed during paired classification retry",
+                ));
+            }
+        }
+        match observe(observer_parent)? {
+            AncestorObservation::Paired => return Ok(true),
+            AncestorObservation::Independent => {
+                if incarnations.iter().any(|identity| {
+                    state::process_starttime_ticks(identity.pid) != Some(identity.starttime)
+                        || state::process_parent_pid(identity.pid) != Some(identity.parent)
+                }) {
+                    return Err(io::Error::other(
+                        "ancestor identity changed during paired classification retry",
+                    ));
+                }
+                return Ok(false);
+            }
+            AncestorObservation::VanishedFd {
+                error,
+                observer_parent: observed_parent,
+                incarnations: observed,
+            } => {
+                if observer_parent.is_some_and(|parent| parent != observed_parent)
+                    || observed.iter().any(|identity| {
+                        incarnations.iter().any(|previous| {
+                            previous.pid == identity.pid
+                                && (previous.starttime != identity.starttime
+                                    || previous.parent != identity.parent)
+                        })
+                    })
+                {
+                    return Err(io::Error::other(
+                        "ancestor identity changed during paired classification retry",
+                    ));
+                }
+                if attempt + 1 == ANCESTOR_FD_OBSERVATION_ATTEMPTS {
+                    return Err(error);
+                }
+                observer_parent = Some(observed_parent);
+                for identity in observed {
+                    if !incarnations
+                        .iter()
+                        .any(|previous| previous.pid == identity.pid)
+                    {
+                        incarnations.push(identity);
+                    }
+                }
+            }
+        }
+    }
+    unreachable!("bounded ancestor observation always returns")
+}
+
+fn observe_paired_custodian_ancestor(
+    expected_parent: Option<libc::pid_t>,
+    mut read_link: impl FnMut(&Path) -> io::Result<PathBuf>,
+) -> io::Result<AncestorObservation> {
     let own_image = std::fs::metadata("/proc/self/exe")
         .map_err(|error| operation_error("stat /proc/self/exe", error))?;
     // The guardian is the kernel subreaper for an accepted worker. A child
@@ -547,9 +643,16 @@ fn has_paired_custodian_ancestor() -> io::Result<bool> {
             .collect();
     let mut pid = state::observer_parent_pid()
         .map_err(|error| operation_error("read observer parent PID", error))?;
+    if expected_parent.is_some_and(|expected| expected != pid) {
+        return Err(io::Error::other(
+            "attached parent changed during paired classification retry",
+        ));
+    }
+    let observer_parent = pid;
+    let mut incarnations = Vec::new();
     for _ in 0..256 {
         if pid <= 1 {
-            return Ok(false);
+            return Ok(AncestorObservation::Independent);
         }
         let before = state::process_starttime_ticks(pid).ok_or_else(|| {
             io::Error::other(format!(
@@ -568,7 +671,14 @@ fn has_paired_custodian_ancestor() -> io::Result<bool> {
         {
             // The paired worker is a same-UID ancestor. An older, different
             // UID process cannot be that worker in this one-user topology.
-            return Ok(false);
+            if state::process_starttime_ticks(pid) != Some(before)
+                || state::process_parent_pid(pid) != Some(parent)
+            {
+                return Err(io::Error::other(
+                    "ancestor identity changed during paired classification",
+                ));
+            }
+            return Ok(AncestorObservation::Independent);
         }
         let mut command = Vec::new();
         File::open(format!("/proc/{pid}/cmdline"))
@@ -583,8 +693,10 @@ fn has_paired_custodian_ancestor() -> io::Result<bool> {
             let image = std::fs::metadata(format!("/proc/{pid}/exe"))
                 .map_err(|error| operation_error(&format!("stat /proc/{pid}/exe"), error))?;
             if image.dev() == own_image.dev() && image.ino() == own_image.ino() {
-                if state::process_starttime_ticks(pid) == Some(before) {
-                    return Ok(true);
+                if state::process_starttime_ticks(pid) == Some(before)
+                    && state::process_parent_pid(pid) == Some(parent)
+                {
+                    return Ok(AncestorObservation::Paired);
                 }
                 return Err(io::Error::other(
                     "paired ancestor identity changed during classification",
@@ -594,20 +706,31 @@ fn has_paired_custodian_ancestor() -> io::Result<bool> {
         // A bound owner.sock inode held by this exact ancestor identifies the
         // live root guardian, not a client connection or a process name.
         let fd_dir = format!("/proc/{pid}/fd");
-        if ancestor_holds_guardian_socket(Path::new(&fd_dir), &guardian_sockets, |path| {
-            std::fs::read_link(path)
-        })? {
-            if state::process_starttime_ticks(pid) == Some(before) {
-                return Ok(true);
-            }
-            return Err(io::Error::other(
-                "paired guardian identity changed during classification",
-            ));
-        }
-        if state::process_starttime_ticks(pid) != Some(before) || parent == pid {
+        let fd_observation =
+            ancestor_holds_guardian_socket(Path::new(&fd_dir), &guardian_sockets, &mut read_link)?;
+        if state::process_starttime_ticks(pid) != Some(before)
+            || state::process_parent_pid(pid) != Some(parent)
+            || parent == pid
+        {
             return Err(io::Error::other(
                 "ancestor identity changed during paired classification",
             ));
+        }
+        incarnations.push(AncestorIncarnation {
+            pid,
+            starttime: before,
+            parent,
+        });
+        match fd_observation {
+            GuardianFdObservation::Present => return Ok(AncestorObservation::Paired),
+            GuardianFdObservation::Vanished(error) => {
+                return Ok(AncestorObservation::VanishedFd {
+                    error,
+                    observer_parent,
+                    incarnations,
+                });
+            }
+            GuardianFdObservation::Absent => {}
         }
         pid = parent;
     }
@@ -620,27 +743,53 @@ fn ancestor_holds_guardian_socket(
     fd_dir: &Path,
     guardian_sockets: &std::collections::HashSet<String>,
     mut read_link: impl FnMut(&Path) -> io::Result<PathBuf>,
-) -> io::Result<bool> {
-    // FD entries can vanish after enumeration. Report the exact proc operation
-    // and fail closed; a missing link is not proof of standalone ownership.
-    for fd in std::fs::read_dir(fd_dir)
+) -> io::Result<GuardianFdObservation> {
+    // A vanished link makes a negative scan indeterminate. Positive socket
+    // evidence remains valid even when another FD closes during enumeration.
+    let mut vanished = None;
+    let mut fds = std::fs::read_dir(fd_dir)
         .map_err(|error| operation_error(&format!("open {}", fd_dir.display()), error))?
-    {
-        let fd =
-            fd.map_err(|error| operation_error(&format!("enumerate {}", fd_dir.display()), error))?;
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(|error| operation_error(&format!("enumerate {}", fd_dir.display()), error))?;
+    // Complete enumeration before readlink, including the FD that may close.
+    // Stable order also makes the injected enumeration/readlink seam repeatable.
+    fds.sort_by_key(|entry| entry.file_name());
+    for fd in fds {
         let path = fd.path();
-        let target = read_link(&path)
-            .map_err(|error| operation_error(&format!("readlink {}", path.display()), error))?;
+        let target = match read_link(&path) {
+            Ok(target) => target,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                vanished.get_or_insert_with(|| {
+                    operation_error(&format!("readlink {}", path.display()), error)
+                });
+                continue;
+            }
+            Err(error) => {
+                return Err(operation_error(
+                    &format!("readlink {}", path.display()),
+                    error,
+                ));
+            }
+        };
         if target
             .to_string_lossy()
             .strip_prefix("socket:[")
             .and_then(|value| value.strip_suffix(']'))
             .is_some_and(|inode| guardian_sockets.contains(inode))
         {
-            return Ok(true);
+            return Ok(GuardianFdObservation::Present);
         }
     }
-    Ok(false)
+    Ok(match vanished {
+        Some(error) => GuardianFdObservation::Vanished(error),
+        None => GuardianFdObservation::Absent,
+    })
+}
+
+enum GuardianFdObservation {
+    Present,
+    Absent,
+    Vanished(io::Error),
 }
 
 pub(crate) fn submit(
@@ -2546,15 +2695,23 @@ mod tests {
     #[test]
     fn disappearing_ancestor_fd_is_attributed_and_denies_standalone() {
         let fd_dir = Path::new("/proc/self/fd");
+        let mut attempts = 0;
         let error = classify_standalone(
             || Ok(false),
             || {
-                ancestor_holds_guardian_socket(fd_dir, &std::collections::HashSet::new(), |_path| {
-                    Err(io::Error::from_raw_os_error(libc::ENOENT))
+                retry_ancestor_observation(|expected_parent| {
+                    attempts += 1;
+                    test_ancestor_fd_observation(
+                        expected_parent,
+                        fd_dir,
+                        &std::collections::HashSet::new(),
+                        |_path| Err(io::Error::from_raw_os_error(libc::ENOENT)),
+                    )
                 })
             },
         )
         .unwrap_err();
+        assert_eq!(attempts, ANCESTOR_FD_OBSERVATION_ATTEMPTS);
         let detail = error.to_string();
         assert!(
             detail.contains("standalone selection: ancestor classification"),
@@ -2574,6 +2731,139 @@ mod tests {
                 .contains("session keyring classification")
         );
         assert!(classify_standalone(|| Ok(false), || Ok(false)).is_ok());
+    }
+
+    fn test_ancestor_fd_observation(
+        expected_parent: Option<libc::pid_t>,
+        fd_dir: &Path,
+        guardian_sockets: &std::collections::HashSet<String>,
+        read_link: impl FnMut(&Path) -> io::Result<PathBuf>,
+    ) -> io::Result<AncestorObservation> {
+        let observer_parent = state::observer_parent_pid()?;
+        assert!(expected_parent.is_none_or(|expected| expected == observer_parent));
+        let pid = unsafe { libc::getpid() };
+        let starttime = state::process_starttime_ticks(pid).unwrap();
+        let parent = state::process_parent_pid(pid).unwrap();
+        let observation = ancestor_holds_guardian_socket(fd_dir, guardian_sockets, read_link)?;
+        assert_eq!(state::process_starttime_ticks(pid), Some(starttime));
+        assert_eq!(state::process_parent_pid(pid), Some(parent));
+        Ok(match observation {
+            GuardianFdObservation::Present => AncestorObservation::Paired,
+            GuardianFdObservation::Absent => AncestorObservation::Independent,
+            GuardianFdObservation::Vanished(error) => AncestorObservation::VanishedFd {
+                error,
+                observer_parent,
+                incarnations: vec![AncestorIncarnation {
+                    pid,
+                    starttime,
+                    parent,
+                }],
+            },
+        })
+    }
+
+    #[test]
+    fn one_vanished_incidental_fd_restarts_complete_negative_observation() {
+        let fd_dir = tempfile::tempdir().unwrap();
+        let vanished_path = fd_dir.path().join("0");
+        std::os::unix::fs::symlink("/dev/null", &vanished_path).unwrap();
+        let mut attempts = 0;
+        let mut injected = false;
+        classify_standalone(
+            || Ok(false),
+            || {
+                retry_ancestor_observation(|expected_parent| {
+                    attempts += 1;
+                    test_ancestor_fd_observation(
+                        expected_parent,
+                        fd_dir.path(),
+                        &std::collections::HashSet::new(),
+                        |path| {
+                            if path == vanished_path && !injected {
+                                injected = true;
+                                Err(io::Error::from_raw_os_error(libc::ENOENT))
+                            } else {
+                                std::fs::read_link(path)
+                            }
+                        },
+                    )
+                })
+            },
+        )
+        .unwrap();
+        assert!(injected, "incidental FD was not enumerated");
+        assert_eq!(attempts, 2, "negative must follow a complete clean pass");
+    }
+
+    #[test]
+    fn vanished_incidental_fd_cannot_hide_genuine_guardian_socket() {
+        let fd_dir = tempfile::tempdir().unwrap();
+        let vanished_path = fd_dir.path().join("0");
+        std::os::unix::fs::symlink("/dev/null", &vanished_path).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(temp.path().join("owner.sock")).unwrap();
+        let socket_path = PathBuf::from(format!("/proc/self/fd/{}", listener.as_raw_fd()));
+        let socket_target = std::fs::read_link(&socket_path).unwrap();
+        std::os::unix::fs::symlink(&socket_target, fd_dir.path().join("1")).unwrap();
+        let inode = socket_target
+            .to_string_lossy()
+            .strip_prefix("socket:[")
+            .and_then(|value| value.strip_suffix(']'))
+            .unwrap()
+            .to_string();
+        let mut attempts = 0;
+        let mut injected = false;
+        let error = classify_standalone(
+            || Ok(false),
+            || {
+                retry_ancestor_observation(|expected_parent| {
+                    attempts += 1;
+                    let sockets = std::collections::HashSet::from([inode.clone()]);
+                    test_ancestor_fd_observation(expected_parent, fd_dir.path(), &sockets, |path| {
+                        if path == vanished_path && !injected {
+                            injected = true;
+                            Err(io::Error::from_raw_os_error(libc::ENOENT))
+                        } else {
+                            std::fs::read_link(path)
+                        }
+                    })
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(injected, "incidental FD was not enumerated");
+        assert!(attempts <= ANCESTOR_FD_OBSERVATION_ATTEMPTS);
+        assert!(
+            error
+                .to_string()
+                .contains("paired worker or guardian ancestor is live"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn persistent_vanished_fd_never_admits_standalone_work() {
+        let mut work_effect = false;
+        let result = classify_standalone(
+            || Ok(false),
+            || {
+                retry_ancestor_observation(|expected_parent| {
+                    test_ancestor_fd_observation(
+                        expected_parent,
+                        Path::new("/proc/self/fd"),
+                        &std::collections::HashSet::new(),
+                        |_path| Err(io::Error::from_raw_os_error(libc::ENOENT)),
+                    )
+                })
+            },
+        );
+        if result.is_ok() {
+            work_effect = true;
+        }
+        assert!(!work_effect);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("standalone selection: ancestor classification"));
+        assert!(error.contains("readlink /proc/self/fd/"));
     }
 
     #[test]
