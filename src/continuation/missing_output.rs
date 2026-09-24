@@ -122,7 +122,7 @@ fn loss(selection: &Value, entries: &[(String, fs::Metadata)]) -> io::Result<Opt
     ) else {
         return Ok(None);
     };
-    if inode == 0 || length > MAX_OUTPUT || selection["link_count"] != 2 {
+    if inode == 0 || selection["link_count"] != 2 {
         return Ok(None);
     }
     let selected = json!({"device": device, "inode": inode, "byte_len": length});
@@ -217,6 +217,34 @@ mod tests {
             !paths.state_dir.join(SNAPSHOT).exists(),
             "observation alone is not publication"
         );
+    }
+
+    #[test]
+    fn loss_of_selection_above_legacy_ceiling_remains_explicit_debt() {
+        let (_temp, paths, common) = super::super::tests::source();
+        let length = 1024 * 1024 * 1024 + 1;
+        File::create(&paths.log).unwrap().set_len(length).unwrap();
+        select_output(&paths).unwrap();
+        let mut observer = identity().unwrap();
+        observer.starttime_ticks += 1;
+        let mut outcome = common;
+        outcome["observer"] = json!(observer);
+        outcome["completion_revision"] = json!(1);
+        save(
+            &paths,
+            "source-observation-v2.json",
+            &json!({"outcome": outcome}),
+        )
+        .unwrap();
+        rollover(&paths);
+        fs::remove_file(paths.state_dir.join(SELECTED_LOG)).unwrap();
+
+        assert!(output_unavailable(&paths).unwrap());
+        let proof = observe(&paths).unwrap().unwrap();
+        assert_eq!(proof["reason"], "selected_storage_lost");
+        assert_eq!(proof["selection"]["byte_len"], length);
+        assert!(!paths.state_dir.join(OUTPUT).exists());
+        assert!(!paths.state_dir.join(SNAPSHOT).exists());
     }
 
     #[test]

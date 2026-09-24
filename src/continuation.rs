@@ -23,7 +23,6 @@ const CONFIRMATION: &str = "registration-confirmation-v2.json";
 const LOCAL: &str = "continuation-v2.json";
 pub(crate) const RETENTION_RELEASE: &str = "source-retention-release-v1.json";
 const MAX_SOURCE: u64 = 1024 * 1024;
-const MAX_OUTPUT: u64 = 1024 * MAX_SOURCE;
 const OUTPUT: &str = "completion-output-v2.bin";
 const SELECTION: &str = "output-selection-v2.json";
 const SELECTED_LOG: &str = "selected-log-v2.bin";
@@ -56,10 +55,8 @@ fn pin_output(paths: &StatePaths) -> io::Result<Value> {
     // Never adopt an orphaned pin whose original boundary was not committed.
     fs::hard_link(&paths.log, &destination)?;
     let metadata = fs::symlink_metadata(&destination)?;
-    if !metadata.is_file() || metadata.len() > MAX_OUTPUT {
-        return Err(error(
-            "selected log is not a supported bounded regular file",
-        ));
+    if !metadata.is_file() {
+        return Err(error("selected log is not a regular file"));
     }
     File::open(&paths.state_dir)?.sync_all()?;
     Ok(
@@ -86,7 +83,7 @@ pub(crate) fn output_unavailable(paths: &StatePaths) -> io::Result<bool> {
         return Ok(true);
     };
     match fs::symlink_metadata(paths.state_dir.join(SELECTED_LOG)) {
-        Ok(meta) => Ok(!meta.is_file() || meta.len() < length || length > MAX_OUTPUT),
+        Ok(meta) => Ok(!meta.is_file() || meta.len() < length),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(err) => Err(err),
     }
@@ -667,10 +664,8 @@ impl OutputHasher {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(paths.state_dir.join(OUTPUT))?;
         let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() > MAX_OUTPUT {
-            return Err(error(
-                "output artifact is not a supported bounded regular file",
-            ));
+        if !metadata.is_file() {
+            return Err(error("output artifact is not a regular file"));
         }
         Ok(Self {
             file,
@@ -690,10 +685,13 @@ impl OutputHasher {
             if length == 0 {
                 return self.finish().map(Some);
             }
-            self.count += length as u64;
+            self.count = self
+                .count
+                .checked_add(length as u64)
+                .ok_or_else(|| error("output artifact length overflow"))?;
             quantum += length;
-            if self.count > MAX_OUTPUT {
-                return Err(error("output artifact grew beyond bound"));
+            if self.count > self.expected_len {
+                return Err(error("output artifact grew while hashing"));
             }
             self.hash.update(&buffer[..length]);
         }
@@ -1681,15 +1679,17 @@ mod tests {
     }
 
     #[test]
-    fn supported_one_gib_output_publication_uses_bounded_memory() {
+    fn output_above_legacy_one_gib_ceiling_publishes_without_truncation() {
         if crate::test_support::private_case() {
             return;
         }
         let (_temp, paths, common) = source();
         fence(&paths, &common, "launched");
+        const LEGACY_OUTPUT_CEILING: u64 = 1024 * 1024 * 1024;
+        let selected_len = LEGACY_OUTPUT_CEILING + 1;
         File::create(&paths.log)
             .unwrap()
-            .set_len(MAX_OUTPUT)
+            .set_len(selected_len)
             .unwrap();
         let mut meta = Meta::new(
             paths.handle.clone(),
@@ -1730,14 +1730,22 @@ mod tests {
                 break;
             }
         }
-        assert!(steps >= 1024, "large hash did not yield between quanta");
+        assert!(steps > 1024, "large hash did not yield between quanta");
         let data = read(&paths.state_dir.join(SNAPSHOT), MAX_SOURCE).unwrap();
         let snapshot: Value = serde_json::from_slice(&data).unwrap();
-        assert_eq!(snapshot["output"]["byte_len"], MAX_OUTPUT);
-        // Independently computed with Python hashlib over 1024 x 1MiB zero chunks.
+        assert_eq!(
+            value(&paths.state_dir.join(SELECTION)).unwrap()["byte_len"],
+            selected_len
+        );
+        assert_eq!(
+            fs::metadata(paths.state_dir.join(OUTPUT)).unwrap().len(),
+            selected_len
+        );
+        assert_eq!(snapshot["output"]["byte_len"], selected_len);
+        // Independently computed with Python hashlib over 1024 x 1MiB zero chunks and one zero byte.
         assert_eq!(
             snapshot["output"]["sha256"],
-            "49bc20df15e412a64472421e13fe86ff1c5165e18b2afccf160d4dc19fe68a14"
+            "6d9bfe50425f2dfe4e2ac07efee1f0bc9d567348ad4aed62704ffe6f5884e9a8"
         );
         assert!(data.len() < 4096);
         let status = fs::read_to_string("/proc/self/status").unwrap();
@@ -1752,7 +1760,7 @@ mod tests {
         );
         println!(
             "publisher-unit only: raw={} snapshot={} elapsed_ms={} hash_steps={} max_step_ms={} {peak}",
-            MAX_OUTPUT,
+            selected_len,
             data.len(),
             start.elapsed().as_millis(),
             steps,
@@ -1761,7 +1769,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_descriptor_rejects_symlinks_directories_and_unsupported_size() {
+    fn artifact_descriptor_rejects_symlinks_directories_and_length_change() {
         let (_temp, paths, _) = source();
         let output = paths.state_dir.join(OUTPUT);
         fs::create_dir(&output).unwrap();
@@ -1770,11 +1778,19 @@ mod tests {
         std::os::unix::fs::symlink(&paths.log, &output).unwrap();
         assert!(output_descriptor(&paths).is_err());
         fs::remove_file(&output).unwrap();
-        File::create(&output)
+        fs::write(&output, b"original").unwrap();
+        let mut hasher = OutputHasher::new(&paths).unwrap();
+        fs::write(&output, b"short").unwrap();
+        assert!(hasher.advance().is_err(), "short read must not publish");
+        fs::write(&output, b"original").unwrap();
+        let mut hasher = OutputHasher::new(&paths).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&output)
             .unwrap()
-            .set_len(MAX_OUTPUT + 1)
+            .write_all(b"later")
             .unwrap();
-        assert!(output_descriptor(&paths).is_err());
+        assert!(hasher.advance().is_err(), "growth must not publish");
     }
 
     #[test]

@@ -22,7 +22,6 @@ pub(super) fn lock(paths: &StatePaths) -> io::Result<File> {
 fn selected_file(paths: &StatePaths, selection: &Value) -> io::Result<File> {
     let length = selection["byte_len"]
         .as_u64()
-        .filter(|n| *n <= MAX_OUTPUT)
         .ok_or_else(|| error("original output selection missing"))?;
     let directory = fs::metadata(&paths.state_dir)?;
     if selection["directory"]["device"] != directory.dev()

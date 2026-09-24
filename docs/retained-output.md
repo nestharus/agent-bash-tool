@@ -113,7 +113,7 @@ not a copy per read/acceptance. No aggregate capacity or universal reliability c
 
 ### Completion continuation: original-event selection
 
-The v2 source selects the bounded log in the original live terminal-event turn:
+The v2 source selects the log in the original live terminal-event turn:
 `selected-log-v2.bin` pins its inode and `output-selection-v2.json` records the
 exclusive byte boundary. Later appends are outside that selection. Rollover
 replaces the live log inode, so delayed body capture (including a successor after
