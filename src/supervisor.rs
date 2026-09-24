@@ -2903,6 +2903,11 @@ impl EventLoop {
             && self.tree_empty
             && self.output_closed()
         {
+            // Terminal metadata is a process diagnosis, not an output-selection
+            // receipt. Exercise the interval before source custody is retained.
+            if self.capture_error.is_some() {
+                pause_after_capture_error_metadata(&self.paths)?;
+            }
             self.pending_source =
                 crate::continuation::enabled(&self.paths).then(|| PendingSource {
                     progress: crate::continuation::Publication::default(),
@@ -2919,6 +2924,30 @@ impl EventLoop {
         self.integrate_terminal_publication(result);
         Ok(())
     }
+}
+
+#[cfg(feature = "source-fault-tests")]
+fn pause_after_capture_error_metadata(paths: &StatePaths) -> io::Result<()> {
+    if std::env::var("AGENT_BASH_SOURCE_FAULT").as_deref() != Ok("capture-error-before-selection") {
+        return Ok(());
+    }
+    let mut identity = serde_json::to_vec(&state::observer_self_identity()?)?;
+    identity.push(b'\n');
+    state::atomic_write(
+        &paths
+            .state_dir
+            .join("fault-capture-error-before-selection.reached.json"),
+        &identity,
+    )?;
+    if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "source-fault-tests"))]
+fn pause_after_capture_error_metadata(_paths: &StatePaths) -> io::Result<()> {
+    Ok(())
 }
 
 struct AvailableRead {

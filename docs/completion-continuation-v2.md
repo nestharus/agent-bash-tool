@@ -127,6 +127,10 @@ Build the actual source binary with `cargo build --locked --features source-faul
 Default builds contain no active hooks. Set `AGENT_BASH_SOURCE_FAULT` in the original
 Bash launch environment to one of:
 
+- `capture-error-before-selection`: after a real capture write failure, stops the
+  supervisor after durable terminal `ERROR` metadata but before the missing
+  output selection. The fixture checks pending recovery and resumes the exact
+  supervisor with `SIGCONT`; terminal metadata alone is not source custody.
 - `after-terminal-metadata`: yields after the first terminal publication and
   original event/selection retention, before body capture. The original loop keeps servicing I/O and
   cancellation. Root can accept a real cancellation here before source publication.
@@ -140,6 +144,7 @@ Bash launch environment to one of:
 Each reached source point writes `fault-<name>.reached.json` in its registered
 handle directory, containing its actual PID/starttime/boot identity. It retries
 without advancing until `fault-<name>.release` exists in that same directory.
+The capture-error stop point instead resumes on `SIGCONT`.
 No timeout, fabricated source certificate, registration acceptance or native
 runner proof is supplied by a marker. These hooks are inherited only by explicit
 fixture builds. Root must use private namespaces and actual paired candidates.

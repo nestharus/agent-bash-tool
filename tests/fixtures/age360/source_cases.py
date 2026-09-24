@@ -283,6 +283,7 @@ def suite(root):
                OULIPOLY_COMPLETION_ENDPOINT=str(endpoint))
     try:
         if CASE == 'capture-file-limit':
+            env['AGENT_BASH_SOURCE_FAULT'] = 'capture-error-before-selection'
             script = root/'file-limit-writer.py'
             release = root/'write-more'
             script.write_text("import os,time\nwhile not os.path.exists(%r): time.sleep(.01)\nfor _ in range(32): os.write(1,b'x'*8192)\ntime.sleep(60)\n" % str(release))
@@ -295,15 +296,30 @@ def suite(root):
             supervisor_pid = read(path/'meta.json')['supervisor_pid']
             resource.prlimit(supervisor_pid, resource.RLIMIT_FSIZE, (65536,65536))
             release.touch()
-            wait(lambda: (path/'output-capture-error.txt').exists())
-            wait(lambda: read(path/'meta.json')['state'] == 'ERROR')
-            assert 'output capture failed' in read(path/'meta.json')['error']
-            # ERROR metadata can be published before the original source
-            # selection. Observe the committed selection, not the first
-            # terminal metadata write.
-            wait(lambda: read(path/'output-selection-v2.json') is not None)
-            selection = read(path/'output-selection-v2.json')
+            reached = wait(lambda: read(path/'fault-capture-error-before-selection.reached.json'))
+            try:
+                assert reached == identity(supervisor_pid), reached
+                meta = read(path/'meta.json')
+                assert meta['state'] == 'ERROR' and meta['rc'] == 70, meta
+                assert 'output capture failed' in meta['error'], meta
+                assert (path/'output-capture-error.txt').exists()
+                assert (path/'log').stat().st_size == 65536
+                assert read(path/'output-selection-v2.json') is None
+                assert read(path/'source-observation-v2.json') is None
+                assert not (path/'selected-log-v2.bin').exists()
+                assert not (path/'completion-output-v2.bin').exists()
+                assert not (path/'fixture-acceptance.json').exists()
+                pending = reconcile(path, env)
+                assert pending.returncode == 0, pending.stderr
+                assert json.loads(pending.stdout)['status'] == 'pending', pending.stdout
+            finally:
+                os.kill(supervisor_pid, signal.SIGCONT)
+            selection = wait(lambda: read(path/'output-selection-v2.json'))
             assert selection['missing'] == 'output capture incomplete or unverified', selection
+            observation = wait(lambda: read(path/'source-observation-v2.json'))
+            assert selection['observation'] == observation, selection
+            assert observation['outcome']['kind'] == 'ceased_status_unknown', observation
+            assert observation['outcome']['observer'] == reached, observation
             assert not (path/'selected-log-v2.bin').exists()
             assert not (path/'completion-output-v2.bin').exists()
             assert not (path/'fixture-acceptance.json').exists()
@@ -311,8 +327,15 @@ def suite(root):
             result = reconcile(path, env)
             assert result.returncode == 0, result.stderr
             assert json.loads(result.stdout)['status'] == 'source_output_missing', result.stdout
+            snapshot = read(path/'completion-snapshot-v2.json')
+            assert snapshot['status'] == 'original_output_unavailable', snapshot
+            assert snapshot['output']['reason'] == 'original_selection_not_retained', snapshot
+            assert read(path/'source-outcome-v2.json') == observation['outcome']
+            assert not (path/'completion-output-v2.bin').exists()
+            assert not (path/'fixture-acceptance.json').exists()
             print(json.dumps(dict(case=CASE, capture_error=True,
-                selected_success=False, notification_debt=True)), flush=True)
+                terminal_before_selection=True, selected_success=False,
+                notification_debt=True)), flush=True)
             return
         if CASE in ['selection-before-header', 'capture-open', 'capture-complete', 'capture-partial', 'capture-occupied-partial', 'capture-occupied-complete']:
             return capture_schedule(root, env)
