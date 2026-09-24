@@ -229,3 +229,13 @@ adopting guardian at the selected-open, partial-copy or fsynced/receipted-copy
 boundary. Deterministic source tests remove the original observer and selected
 pathname, exercise actual guardian drain, and check recovery while capture is
 owned and after resume/death. The tests do not claim native recipient receipt.
+# Small-output representation for new publications
+
+New completion snapshots describe `completion-output-v2.bin` as a raw-byte
+artifact at every size, including empty and invalid UTF-8 output. The selected
+inode and exclusive byte boundary are unchanged. The descriptor uses
+`encoding:"raw"`; Runner accepts older `encoding:"utf8-lossy"` artifact
+descriptors as raw files too. Older inline strings remain a lossy legacy form.
+Runner's manual recovery CLI verifies the accepted selected artifact after
+Bash-local state disappears. This does not change the bounded latest local
+`snapshot` / `accept-output` receipt contract.

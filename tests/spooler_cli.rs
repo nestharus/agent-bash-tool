@@ -46,6 +46,35 @@ fn run_cmd(temp: &tempfile::TempDir, args: &[&str]) -> (Output, Duration) {
 }
 
 #[test]
+fn v30_handle_never_uses_local_v29_metadata_as_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    for handle in ["ab30_0123456789abcdef0123456789abcdef", "ab30_malformed"] {
+        let forged = temp.path().join("agent-bash").join(handle);
+        fs::create_dir_all(&forged).unwrap();
+        fs::write(forged.join("meta.json"), b"{}").unwrap();
+        for args in [
+            vec!["snapshot", handle],
+            vec!["status", "--observe-only", handle],
+            vec!["cancel", handle],
+        ] {
+            let (output, _) = run_cmd(&temp, &args);
+            assert_eq!(output.status.code(), Some(69), "{args:?}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("v30 broker handle route unavailable"),
+                "{args:?}: {output:?}"
+            );
+        }
+    }
+    let (listed, _) = run_cmd(&temp, &["list", "--all", "--json"]);
+    assert_command_success(&listed);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&listed.stdout).unwrap(),
+        json!([])
+    );
+}
+
+#[test]
 fn paired_context_halves_fail_closed_and_terminalize_preaccept() {
     for (present, absent, expected) in [
         (

@@ -309,7 +309,7 @@ def suite(root):
             snapshot_bytes = (path/'completion-snapshot-v2.json').read_bytes()
             snapshot = json.loads(snapshot_bytes)
             expected_descriptor = dict(representation='retained-output-v1',relative='completion-output-v2.bin',
-                sha256=hashlib.sha256(frozen).hexdigest(),byte_len=len(frozen),encoding='utf8-lossy')
+                sha256=hashlib.sha256(frozen).hexdigest(),byte_len=len(frozen),encoding='raw')
             assert snapshot['output'] == expected_descriptor, snapshot
             assert len(snapshot_bytes) < 4096
             assert read(path/'source-outcome-v2.json')['kind'] == 'ready'
@@ -482,7 +482,10 @@ def suite(root):
                 assert local['enqueue']=='accepted'
                 assert 'acknowledged' not in local, 'byte acquisition must not invent event ACK'
             if CASE in ['publication-error', 'publication-io-error']:
-                assert read(path/'completion-snapshot-v2.json')['output'] == 'READY\n'
+                selected = read(path/'completion-snapshot-v2.json')['output']
+                assert selected['encoding'] == 'raw'
+                assert selected['sha256'] == hashlib.sha256(b'READY\n').hexdigest()
+                assert (path/'completion-output-v2.bin').read_bytes() == b'READY\n'
                 reply = reconcile(path, env)
                 assert reply.returncode == 0, reply.stderr
                 recovered = json.loads(reply.stdout)

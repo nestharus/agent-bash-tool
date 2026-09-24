@@ -43,6 +43,13 @@ tagged forms; nested registration names the exact active parent work id inherite
 through `OULIPOLY_ROOT_WORK_ID` and supplies its private
 `OULIPOLY_ROOT_PARENT_CAPABILITY_V1`.
 
+Existing `ab_` handles continue to resolve through their local v29 spool for
+manual status, output receipt, detach, and cancellation. The reserved
+`ab30_` handle prefix is held closed before any local metadata
+read. A future v30 route must resolve it through exact broker readback; a
+user-owned handle directory cannot authorize that route. This source does not
+mint v30 handles or claim a broker-backed v30 manual command yet.
+
 The runner validates the capability, protocol, process ancestry and descriptors,
 then exclusively creates `root-work-accepted-v1.json`. A lost response is
 `acceptance_outcome_unknown`; it is never resubmitted. A duplicate can report

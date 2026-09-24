@@ -26,6 +26,7 @@ use crate::state::{CallerChainEntry, DeliveryMode, ListSummary, Meta, RunOutput,
 const EX_USAGE: i32 = 64;
 const EX_DATAERR: i32 = 65;
 const EX_NOINPUT: i32 = 66;
+const EX_UNAVAILABLE: i32 = 69;
 const EX_SOFTWARE: i32 = 70;
 const EX_CANTCREAT: i32 = 73;
 const EX_IOERR: i32 = 74;
@@ -1156,6 +1157,7 @@ fn reconcile_list_meta(paths: &StatePaths, meta: Meta) -> Option<Meta> {
 
 fn entry_is_state_dir(entry: &std::fs::DirEntry) -> bool {
     entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false)
+        && !is_v30_handle(&entry.file_name().to_string_lossy())
 }
 
 fn paths_for_entry(root: &Path, entry: &std::fs::DirEntry) -> StatePaths {
@@ -1313,10 +1315,24 @@ fn format_optional_rc(rc: Option<i32>) -> String {
 }
 
 fn paths_for_existing_handle(handle: &str) -> Result<StatePaths, AppError> {
+    // A new-lane handle must be resolved by the root broker before Bash opens
+    // local metadata. Local files can describe old v29 work, but cannot grant
+    // authority over a fresh v30 source or recipient. The broker-backed route
+    // remains closed until its exact readback/control protocol is integrated.
+    if is_v30_handle(handle) {
+        return Err(AppError::new(
+            EX_UNAVAILABLE,
+            format!("agent-bash: v30 broker handle route unavailable: {handle}"),
+        ));
+    }
     let root = load_state_root().map_err(state_root_unavailable)?;
     let paths = state_paths(root, handle.to_string());
     validate_existing_handle(handle, &paths)?;
     Ok(paths)
+}
+
+fn is_v30_handle(handle: &str) -> bool {
+    handle.starts_with("ab30_")
 }
 
 fn validate_existing_handle(handle: &str, paths: &StatePaths) -> Result<(), AppError> {
