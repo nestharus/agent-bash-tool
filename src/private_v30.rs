@@ -187,15 +187,15 @@ pub(crate) fn internal_main() -> Option<i32> {
         // The fixed private physical K belongs to the broker. Drop its
         // response deliberately; only observation of the same consumed K may
         // recover it. The earlier O record is still just Bash's own report.
-        request_frame(&socket, b'8', &request, false)?;
-        if request_frame(&socket, b'8', &request, true)
+        request_frame(&socket, b'%', &request, false)?;
+        if request_frame(&socket, b'%', &request, true)
             .is_ok_and(|reply| reply.starts_with("fresh-bash-physical-k "))
         {
             return Err("broker child K replayed after lost reply".into());
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let grant = loop {
-            let state = request_frame(&socket, b'9', &request, true)?;
+            let state = request_frame(&socket, b'&', &request, true)?;
             if let Some(rest) = state.strip_prefix("fresh-bash-physical-exited ") {
                 let id = rest
                     .split_ascii_whitespace()
@@ -215,7 +215,7 @@ pub(crate) fn internal_main() -> Option<i32> {
         };
         request_frame(&socket, b'!', &request, true)?;
         let physical = loop {
-            let state = request_frame(&socket, b'9', &request, true)?;
+            let state = request_frame(&socket, b'&', &request, true)?;
             if let Some(rest) = state.strip_prefix("fresh-bash-physical-drained ") {
                 let fields: Vec<_> = rest.split_ascii_whitespace().collect();
                 let expected_stdout = b"broker-child-output\n";
@@ -241,7 +241,7 @@ pub(crate) fn internal_main() -> Option<i32> {
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
         let unrelated = uuid_bytes(&random_uuid()?)?;
-        if request_frame(&socket, b'9', &unrelated, true)
+        if request_frame(&socket, b'&', &unrelated, true)
             .is_ok_and(|reply| reply.starts_with("fresh-bash-physical-"))
         {
             return Err("unrelated child key observed broker physical Q".into());
