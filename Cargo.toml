@@ -14,6 +14,8 @@ path = "src/main.rs"
 [features]
 # Explicit fixture build only; default executable contains no source fault hooks.
 source-fault-tests = []
+# Inert staged image; this guard wins even when the private probe is selected.
+age319-closed-fresh = []
 # Isolated source fixture only. The normal binary has no fresh work entry.
 private-v30-admission = []
 

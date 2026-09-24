@@ -180,6 +180,10 @@ impl AppError {
 }
 
 fn main() {
+    if cfg!(feature = "age319-closed-fresh") {
+        eprintln!("agent-bash: AGE-319 fresh entry closed; no broker source route is installed");
+        std::process::exit(EX_UNAVAILABLE);
+    }
     #[cfg(feature = "private-v30-admission")]
     if let Some(code) = private_v30::internal_main() {
         std::process::exit(code);

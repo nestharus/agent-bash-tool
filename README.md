@@ -1,5 +1,12 @@
 # agent-bash-tool
 
+For the AGE-319 inert side-by-side staging artifact, build the proposed fresh
+image with `cargo build --features age319-closed-fresh`. This feature makes
+every executable entry, including the private v30 child probe if selected,
+exit 69 before State, handle, helper, or workload code. It is a closed image
+only; it does not implement a production v30 broker registration or selector.
+The ordinary build and historical pinned v29 images keep their existing behavior.
+
 General-purpose detached bash spooler for AI agents.
 
 Agents call `agent-bash` instead of raw bash. Every command runs **detached**, regardless of
@@ -161,6 +168,30 @@ to `AGENT_BASH_AGENT_RUNNER_BIN`/`PATH`. A present but invalid file is an error 
 When the configured runner has its own adjacent `config.toml`, its `data_dir` and `config_home` are
 bound into the sealed delivery-helper environment. This preserves the runner's authoritative roots
 when `agent-bash` executes its immutable snapshot from a Linux memfd.
+
+### AGE-319 shared front-door candidate
+
+The paired Runner repository has an uninstalled `oulipoly-shared-front-door`
+candidate. An installer must adopt the exact public `agent-bash` and Runner
+aliases used by an adapter, alongside the GUI alias, before publishing its
+single fresh-closed selector. The OpenCode tool currently defaults to
+`~/.local/bin/agent-bash` and `~/.local/bin/agents`; `AGENT_BASH_BIN` and
+`AGENT_BASH_AGENT_RUNNER_BIN` can override them. Those overrides and cached or
+direct old binaries do not automatically enter the managed front door.
+
+The original Bash image, adjacent `agent-bash.toml`, absolute old Runner
+helper, State root, and retained helper snapshots remain part of the historical
+v29 island. They must not be rewritten for this candidate. Before activation,
+an alias not yet adopted can still launch old work. After activation, the
+front door refuses new Bash runs and unknown handles; it can route only an
+exact known old handle to old Bash for settlement. The staged fresh Bash copy
+is non-executable, and the optional `age319-closed-fresh` build still refuses
+at entry, including when `private-v30-admission` is selected. The latter
+feature only admits a fixed shell probe under the disposable paired Runner
+fixture; it does not open the production `run` route. No positive fresh Bash
+registration or recipient route is installed by this source. Ordinary `run`
+still refuses a resolved v30 owner before creating an old handle, and
+`ab30_` controls refuse before reading local v29 metadata.
 
 ## License
 
