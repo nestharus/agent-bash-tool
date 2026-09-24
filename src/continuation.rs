@@ -28,20 +28,27 @@ const SELECTION: &str = "output-selection-v2.json";
 const SELECTED_LOG: &str = "selected-log-v2.bin";
 
 /// Select once, in the original event turn, before any retry can collect output.
-/// The logger replaces (never truncates) an inode pinned by this hard link.
+/// The append-only logger preserves the selected inode and exclusive prefix.
 /// A failed selection is explicit missing evidence, not permission to resample.
 #[cfg(test)]
 fn select_output(paths: &StatePaths) -> io::Result<()> {
-    select_event_output(paths, None)
+    select_event_output(paths, None, true)
 }
-fn select_event_output(paths: &StatePaths, observation: Option<&Value>) -> io::Result<()> {
+fn select_event_output(
+    paths: &StatePaths,
+    observation: Option<&Value>,
+    output_trusted: bool,
+) -> io::Result<()> {
     if !enabled(paths) || paths.state_dir.join(SELECTION).try_exists()? {
         return Ok(());
     }
     let directory = fs::metadata(&paths.state_dir)?;
-    let mut selection = match pin_output(paths) {
-        Ok(selection) => selection,
-        Err(err) => json!({"missing": err.to_string()}),
+    let mut selection = match output_trusted {
+        true => match pin_output(paths) {
+            Ok(selection) => selection,
+            Err(err) => json!({"missing": err.to_string()}),
+        },
+        false => json!({"missing": "output capture incomplete or unverified"}),
     };
     if let Some(observation) = observation {
         selection["observation"] = observation.clone();
@@ -457,6 +464,9 @@ pub(crate) struct Observation<'a> {
     pub(crate) tree_drained: bool,
     pub(crate) output_closed: bool,
     pub(crate) ready_sentinel: Option<&'a str>,
+    /// True only when the original live observer captured every byte through
+    /// this event and synced the log. A successor cannot infer this from EOF.
+    pub(crate) output_trusted: bool,
 }
 /// Incremental publication work belongs to the surviving live observer, not a
 /// new workload or helper tree. Each quantum yields back to cancellation/I/O.
@@ -627,7 +637,7 @@ pub(crate) fn select_observed_event(
             "completed"
         });
         let staged = json!({"outcome": outcome, "snapshot": snapshot});
-        select_event_output(paths, Some(&staged))?;
+        select_event_output(paths, Some(&staged), observation.output_trusted)?;
     }
     Ok(())
 }
@@ -1238,6 +1248,7 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
                 tree_drained: true,
                 output_closed: true,
                 ready_sentinel: None,
+                output_trusted: true,
             },
         )?;
         state::write_rc_atomic(&paths, 70)?;
@@ -1476,6 +1487,7 @@ mod tests {
                 tree_drained: true,
                 output_closed: true,
                 ready_sentinel: None,
+                output_trusted: true,
             },
         )
         .unwrap();
@@ -1621,6 +1633,7 @@ mod tests {
                 tree_drained: true,
                 output_closed: true,
                 ready_sentinel: None,
+                output_trusted: true,
             },
         );
         assert!(result.unwrap_err().to_string().contains("cannot relabel"));
@@ -1720,6 +1733,7 @@ mod tests {
                     tree_drained: true,
                     output_closed: true,
                     ready_sentinel: None,
+                    output_trusted: true,
                 },
                 &mut progress,
             )
@@ -1819,6 +1833,7 @@ mod tests {
                     tree_drained,
                     output_closed,
                     ready_sentinel: None,
+                    output_trusted: true,
                 },
             );
             assert!(
@@ -2069,6 +2084,19 @@ mod tests {
         select_output(&paths).unwrap();
         freeze_output(&paths).unwrap();
         assert_eq!(fs::read(paths.state_dir.join(OUTPUT)).unwrap(), b"original");
+    }
+
+    #[test]
+    fn unverified_successor_does_not_select_partial_log() {
+        let (_temp, paths, _) = source();
+        fs::write(&paths.log, b"possibly partial").unwrap();
+        select_event_output(&paths, None, false).unwrap();
+        let selection = value(&paths.state_dir.join(SELECTION)).unwrap();
+        assert_eq!(
+            selection["missing"],
+            "output capture incomplete or unverified"
+        );
+        assert!(!paths.state_dir.join(SELECTED_LOG).exists());
     }
 
     #[test]

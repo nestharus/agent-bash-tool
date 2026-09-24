@@ -81,11 +81,11 @@ Bash places no positive size ceiling on selected raw output: a regular file's
 `u64` length and actual storage/I/O are the limits. A short copy, growth while
 hashing, or filesystem failure remains pending/error evidence, never a truncated
 success. Registration, selection, snapshot and outcome JSON keep their finite
-read/serialization bounds. The supervisor's separate `BoundedLog` still defaults
-to retaining the latest 16 MiB and clamps its configured limit at 1 GiB, so a
-normal workload can lose earlier output before this selection. The paired Runner
-also has a 1 GiB completion artifact validator ceiling. Both remaining limits
-must be corrected before end-to-end unrestricted output can be claimed.
+read/serialization bounds. The supervisor now appends every captured chunk to
+one per-handle file without a producer-side cap. An unverified successor cannot
+turn a possibly partial log into a successful source. The paired Runner still
+has a 1 GiB completion artifact validator ceiling, so end-to-end unrestricted
+output remains unproved.
 
 Runner owns validation and retention of its content-addressed body copy and the
 notification's explicit attachment path/hash/length/encoding. There is no additional

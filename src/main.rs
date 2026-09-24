@@ -803,12 +803,7 @@ fn status_command(
 
     emit_status_header(&meta, rc_from_file)?;
     emit_output_separator();
-    let output = read_log_for_status(&paths.log, full, tail_bytes)
-        .map_err(|err| status_log_read_error(&handle, err))?;
-    io::stdout()
-        .write_all(&output)
-        .map_err(status_write_error)?;
-    Ok(())
+    write_log_for_status(&paths.log, &handle, full, tail_bytes)
 }
 
 fn reconcile_status_meta(
@@ -1003,12 +998,40 @@ fn workload_state(running: bool) -> &'static str {
     if running { "running" } else { "exited" }
 }
 
-fn read_log_for_status(path: &Path, full: bool, tail_bytes: u64) -> io::Result<Vec<u8>> {
-    let Some(mut file) = open_status_log(path)? else {
-        return Ok(Vec::new());
+fn write_log_for_status(
+    path: &Path,
+    handle: &str,
+    full: bool,
+    tail_bytes: u64,
+) -> Result<(), AppError> {
+    let Some(mut file) = open_status_log(path).map_err(|err| status_log_read_error(handle, err))?
+    else {
+        return Ok(());
     };
-    seek_status_log(&mut file, full, tail_bytes)?;
-    read_open_status_log(file)
+    let len = file
+        .metadata()
+        .map_err(|err| status_log_read_error(handle, err))?
+        .len();
+    let start = if full {
+        0
+    } else {
+        len.saturating_sub(tail_bytes)
+    };
+    file.seek(SeekFrom::Start(start))
+        .map_err(|err| status_log_read_error(handle, err))?;
+    let mut input = file.take(len - start);
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = input
+            .read(&mut chunk)
+            .map_err(|err| status_log_read_error(handle, err))?;
+        if count == 0 {
+            return Ok(());
+        }
+        io::stdout()
+            .write_all(&chunk[..count])
+            .map_err(status_write_error)?;
+    }
 }
 
 fn open_status_log(path: &Path) -> io::Result<Option<std::fs::File>> {
@@ -1017,23 +1040,6 @@ fn open_status_log(path: &Path) -> io::Result<Option<std::fs::File>> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
     }
-}
-
-fn seek_status_log(file: &mut std::fs::File, full: bool, tail_bytes: u64) -> io::Result<()> {
-    if full {
-        return Ok(());
-    }
-    let len = file.metadata()?.len();
-    if len > tail_bytes {
-        file.seek(SeekFrom::Start(len - tail_bytes))?;
-    }
-    Ok(())
-}
-
-fn read_open_status_log(mut file: std::fs::File) -> io::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    file.read_to_end(&mut output)?;
-    Ok(output)
 }
 
 fn list_command(caller: ControlRouteCaller, all: bool, json: bool) -> Result<(), AppError> {

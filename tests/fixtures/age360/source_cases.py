@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import resource
 import signal
 import socket
 import subprocess
@@ -25,6 +26,12 @@ def identity(pid):
     return dict(pid=pid, starttime_ticks=f.stat(pid)[1], boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip())
 def read(path):
     return f.read_json(path)
+def replace_log_for_loss_fixture(path):
+    # Normal capture is append-only. Model an external pathname replacement to
+    # exercise pin/loss recovery independently of producer policy.
+    replacement = path/'external-replacement'
+    replacement.write_bytes(b'external replacement after selected event\n')
+    os.replace(replacement, path/'log')
 def run(env, *args):
     return subprocess.run([BIN, *args], env=env, capture_output=True, timeout=20)
 def wait(fn):
@@ -91,10 +98,11 @@ def publication_second(root, env):
     (root/'write-more').touch()
     wait(lambda: (root/'writer-done').exists())
     wait(lambda: b'AFTER-ROLLOVER' in (path/'log').read_bytes())
+    if CASE != 'recovery-lock': replace_log_for_loss_fixture(path)
     assert identity(reached['pid']) == reached, 'original observer must service output'
     if CASE != 'recovery-lock':
         assert b'READY' not in (path/'log').read_bytes(), 'must actually evict original selection'
-        assert (path/'log').stat().st_size <= 65536
+        assert (path/'log').stat().st_size < 65536
     if CASE in ['header-only-loss', 'pre-capture-owner-loss', 'transient-read-loss']:
         os.kill(reached['pid'], signal.SIGKILL)
     result = run(env, 'cancel', item['handle'])
@@ -180,6 +188,7 @@ def capture_schedule(root, env):
         assert not (path/'source-observation-v2.json').exists()
     (root/'write-more').touch()
     wait(lambda: (root/'writer-done').exists())
+    replace_log_for_loss_fixture(path)
     wait(lambda: b'READY' not in (path/'log').read_bytes())
     os.kill(observer['pid'], signal.SIGKILL)
     result = run(env, 'cancel', item['handle'])
@@ -195,7 +204,7 @@ def capture_schedule(root, env):
         wait(lambda: Path(f"/proc/{capturer['pid']}/stat").read_text().split(') ')[1][0] == 'T')
         if not occupied:
             (path/'selected-log-v2.bin').unlink()
-        # Original observer gone and live log rolled. Original loss schedules
+        # Original observer gone and log pathname externally replaced. Original loss schedules
         # remove the pin; occupied-slot progress schedules retain that source.
         # A stopped cooperating guardian still excludes loss inventory.
         result = reconcile(path, env)
@@ -273,13 +282,42 @@ def suite(root):
                OULIPOLY_PARENT_INVOCATION=json.dumps(dict(id='55555555-5555-4555-8555-555555555555')),
                OULIPOLY_COMPLETION_ENDPOINT=str(endpoint))
     try:
+        if CASE == 'capture-file-limit':
+            script = root/'file-limit-writer.py'
+            release = root/'write-more'
+            script.write_text("import os,time\nwhile not os.path.exists(%r): time.sleep(.01)\nfor _ in range(32): os.write(1,b'x'*8192)\ntime.sleep(60)\n" % str(release))
+            launch = subprocess.run(['/bin/bash','-c',"trap '' XFSZ; exec \"$@\"",'bash',
+                BIN,'run','--','/usr/bin/python3',str(script)], env=env,
+                capture_output=True, timeout=20)
+            assert launch.returncode == 0, launch.stderr
+            item = json.loads(launch.stdout); path = Path(item['state_dir'])
+            wait(lambda: read(path/'source-launch-v2.json')['phase'] == 'launched')
+            supervisor_pid = read(path/'meta.json')['supervisor_pid']
+            resource.prlimit(supervisor_pid, resource.RLIMIT_FSIZE, (65536,65536))
+            release.touch()
+            wait(lambda: (path/'output-capture-error.txt').exists())
+            wait(lambda: read(path/'meta.json')['state'] == 'ERROR')
+            assert 'output capture failed' in read(path/'meta.json')['error']
+            selection = read(path/'output-selection-v2.json')
+            assert selection['missing'] == 'output capture incomplete or unverified', selection
+            assert not (path/'selected-log-v2.bin').exists()
+            assert not (path/'completion-output-v2.bin').exists()
+            assert not (path/'fixture-acceptance.json').exists()
+            wait(lambda: not (path/'physical-custody').exists())
+            result = reconcile(path, env)
+            assert result.returncode == 0, result.stderr
+            assert json.loads(result.stdout)['status'] == 'source_output_missing', result.stdout
+            print(json.dumps(dict(case=CASE, capture_error=True,
+                selected_success=False, notification_debt=True)), flush=True)
+            return
         if CASE in ['selection-before-header', 'capture-open', 'capture-complete', 'capture-partial', 'capture-occupied-partial', 'capture-occupied-complete']:
             return capture_schedule(root, env)
         if CASE in ['recovery-lock', 'header-only-loss', 'pre-capture-rollover', 'pre-capture-owner-loss', 'transient-read-loss']:
             publication_second(root, env)
             return
         if CASE in ['large-escaped', 'large-raw', 'large-hash']:
-            env['AGENT_BASH_LOG_MAX_BYTES'] = str(32*1024*1024)
+            # Legacy producer cap must have no effect on authoritative bytes.
+            env['AGENT_BASH_LOG_MAX_BYTES'] = '65536'
             blocks = 512 if CASE in ['large-escaped', 'large-hash'] else 2560
             if CASE == 'large-hash': env['AGENT_BASH_SOURCE_FAULT'] = 'during-output-hash'
             byte = b'\0' if CASE == 'large-escaped' else b'\xff'
@@ -306,6 +344,10 @@ def suite(root):
             wait(lambda: read(path/'fixture-acceptance.json'))
             frozen = (path/'completion-output-v2.bin').read_bytes()
             assert frozen == byte*(blocks*8192) + b'READY\n'
+            if CASE == 'large-raw':
+                assert len(frozen) > 16*1024*1024
+                assert (path/'log').read_bytes().startswith(frozen)
+                assert read(path/'output-selection-v2.json')['byte_len'] == len(frozen)
             snapshot_bytes = (path/'completion-snapshot-v2.json').read_bytes()
             snapshot = json.loads(snapshot_bytes)
             expected_descriptor = dict(representation='retained-output-v1',relative='completion-output-v2.bin',
@@ -452,11 +494,29 @@ def suite(root):
                 wait(lambda: side_effect.exists())
                 meta = read(path/'meta.json')
                 original = identity(meta['supervisor_pid'])
+                guardian_pid = f.stat(original['pid'])[0]
                 os.kill(original['pid'], signal.SIGKILL)
                 time.sleep(.15)
                 assert not (path/'source-outcome-v2.json').exists(), 'rc70 is not cessation'
                 result = run(env,'cancel',item['handle']); assert result.returncode == 0, result.stderr
                 assert json.loads(result.stdout)['requested'], result.stdout
+                wait(lambda: not (path/'physical-custody').exists())
+                wait(lambda: not Path(f'/proc/{guardian_pid}').exists() or
+                     Path(f'/proc/{guardian_pid}/stat').read_text().split(') ')[1][0] == 'Z')
+                try: os.waitpid(guardian_pid, 0)
+                except ChildProcessError: pass
+                recovered = reconcile(path, env)
+                assert recovered.returncode == 0, recovered.stderr
+                assert json.loads(recovered.stdout)['status'] == 'source_output_missing', recovered.stdout
+                snapshot = read(path/'completion-snapshot-v2.json')
+                outcome = read(path/'source-outcome-v2.json')
+                assert outcome['kind'] == 'cancelled' and outcome['original_tree_drained'], outcome
+                assert snapshot['status'] == 'original_output_unavailable', snapshot
+                assert snapshot['output']['reason'] == 'original_selection_not_retained', snapshot
+                assert not (path/'fixture-acceptance.json').exists()
+                print(json.dumps(dict(case=CASE, output_unverified_after_observer_loss=True,
+                    cancelled_after_drain=True, source_accepted=False)), flush=True)
+                return
             acceptance = wait(lambda: read(path/'fixture-acceptance.json'))
             local = wait(lambda: (v if (v:=read(path/'continuation-v2.json')) and v['enqueue']=='accepted' else None))
             outcome = read(path/'source-outcome-v2.json')

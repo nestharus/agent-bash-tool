@@ -125,9 +125,15 @@ cannot abandon an accepted registration because the startup child continues even
 has no receiver. A later daemon fork failure is published through the normal terminal-error and
 completion-delivery path rather than leaving a registered handle in an unowned `RUNNING` state.
 
-Captured output is bounded by `AGENT_BASH_LOG_MAX_BYTES` (16 MiB by default, clamped between
-64 KiB and 1 GiB). When the limit is crossed, the log records a truncation marker and retains the
-newest output rather than allowing an unbounded state-directory file.
+Captured output is appended to one per-handle regular file without a producer-side byte cap.
+The former `AGENT_BASH_LOG_MAX_BYTES` setting has no effect on authoritative raw output.
+Pipe reads use fixed 8 KiB chunks and return to the event loop between reads. Status tail
+length is a display choice only. A write or sync failure makes output completeness unknown;
+the observer cancels on a write failure and never selects its partial log as successful source.
+An abnormal observer successor cannot certify an unselected prefix from log length alone.
+The log and any selected hard link/body copy remain in the handle directory until the existing
+state reaper can remove that directory. Disk capacity must be planned for the entire live run
+and retained source period; no size based deletion can preserve exact output.
 
 The intermediate daemon process remains as a guardian for the exact supervisor child. After a clean
 supervisor exit, the guardian drains adopted descendants before exiting. After an abnormal exit,

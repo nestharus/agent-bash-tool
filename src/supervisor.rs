@@ -1,10 +1,9 @@
-use std::os::unix::fs::OpenOptionsExt;
 mod descendant_signal;
 
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
@@ -21,11 +20,8 @@ const CANCEL_POLL: Duration = Duration::from_millis(100);
 const OWNER_POLL: Duration = Duration::from_millis(250);
 const SUPERVISOR_METADATA_WAIT: Duration = Duration::from_secs(5);
 const SUPERVISOR_RECOVERY_POLL: Duration = Duration::from_millis(100);
-const LOG_MAX_BYTES_ENV: &str = "AGENT_BASH_LOG_MAX_BYTES";
-const DEFAULT_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
-const MIN_LOG_MAX_BYTES: u64 = 64 * 1024;
-const MAX_LOG_MAX_BYTES: u64 = 1024 * 1024 * 1024;
-const LOG_TRUNCATED_MARKER: &[u8] = b"\n[agent-bash log truncated; retaining newest output]\n";
+// The per-handle log is authoritative raw output. Display reads may request a
+// tail, but no producer-side byte limit or rollover can discard this source.
 
 #[derive(Clone)]
 pub(crate) struct SupervisorConfig {
@@ -620,6 +616,7 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
                             tree_drained: true,
                             output_closed: true,
                             ready_sentinel: None,
+                            output_trusted: false,
                         },
                     )?;
                     state::write_rc_atomic(paths, meta.rc.unwrap_or(EX_SOFTWARE))?;
@@ -896,6 +893,8 @@ fn complete_without_launch(
                         tree_drained: true,
                         output_closed: true,
                         ready_sentinel: None,
+                        // No workload was released; the synced empty log is exact.
+                        output_trusted: true,
                     },
                 )
             })();
@@ -1154,115 +1153,29 @@ fn supervisor_meta(mut meta: Meta) -> Meta {
     meta
 }
 
-fn open_supervisor_log(paths: &StatePaths) -> io::Result<BoundedLog> {
-    BoundedLog::new(
-        state::open_log_append(paths)?,
-        paths.log.clone(),
-        log_max_bytes(),
-    )
+fn open_supervisor_log(paths: &StatePaths) -> io::Result<AppendLog> {
+    AppendLog::new(state::open_log_append(paths)?)
 }
 
-fn log_max_bytes() -> u64 {
-    std::env::var(LOG_MAX_BYTES_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_LOG_MAX_BYTES)
-        .clamp(MIN_LOG_MAX_BYTES, MAX_LOG_MAX_BYTES)
-}
-
-struct BoundedLog {
+struct AppendLog {
     file: File,
-    path: std::path::PathBuf,
-    max_bytes: u64,
-    len: u64,
 }
 
-impl BoundedLog {
-    fn new(file: File, path: std::path::PathBuf, max_bytes: u64) -> io::Result<Self> {
-        let len = file.metadata()?.len();
-        let mut log = Self {
-            file,
-            path,
-            max_bytes: max_bytes.max(1),
-            len,
-        };
-        if len > log.max_bytes {
-            log.reset_with_tail(&[])?;
+impl AppendLog {
+    fn new(file: File) -> io::Result<Self> {
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("output log is not a regular file"));
         }
-        Ok(log)
+        Ok(Self { file })
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        if self
-            .len
-            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-            > self.max_bytes
-        {
-            return self.reset_with_tail(bytes);
-        }
-        self.file.write_all(bytes)?;
-        self.len = self
-            .len
-            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        Ok(())
-    }
-
-    fn reset_with_tail(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let marker = retained_suffix(LOG_TRUNCATED_MARKER, self.max_bytes);
-        let payload_budget = self
-            .max_bytes
-            .saturating_sub(u64::try_from(marker.len()).unwrap_or(self.max_bytes));
-        let new_tail = retained_suffix(bytes, payload_budget);
-        let old_budget =
-            payload_budget.saturating_sub(u64::try_from(new_tail.len()).unwrap_or(payload_budget));
-        let old_tail = self.read_tail(old_budget)?;
-
-        // Rollover replaces the live pathname; a selected event's pinned inode
-        // retains its prefix, even before its bounded body copy succeeds.
-        let temp = self.path.with_extension(format!(
-            "rollover-{}",
-            state::generate_handle().map_err(io::Error::other)?
-        ));
-        let mut replacement = std::fs::OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .append(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .mode(0o600)
-            .open(&temp)?;
-        replacement.write_all(marker)?;
-        replacement.write_all(&old_tail)?;
-        replacement.write_all(new_tail)?;
-        replacement.sync_all()?;
-        std::fs::rename(&temp, &self.path)?;
-        self.file = replacement;
-        self.len =
-            u64::try_from(marker.len() + old_tail.len() + new_tail.len()).unwrap_or(self.max_bytes);
-        Ok(())
-    }
-
-    fn read_tail(&mut self, max_bytes: u64) -> io::Result<Vec<u8>> {
-        let keep = self.len.min(max_bytes);
-        if keep == 0 {
-            return Ok(Vec::new());
-        }
-        self.file
-            .seek(SeekFrom::End(-i64::try_from(keep).unwrap_or(i64::MAX)))?;
-        let mut tail = vec![0; usize::try_from(keep).unwrap_or(usize::MAX)];
-        self.file.read_exact(&mut tail)?;
-        Ok(tail)
+        self.file.write_all(bytes)
     }
 
     fn sync_all(&self) -> io::Result<()> {
         self.file.sync_all()
     }
-}
-
-fn retained_suffix(bytes: &[u8], max_bytes: u64) -> &[u8] {
-    let keep = usize::try_from(max_bytes)
-        .unwrap_or(usize::MAX)
-        .min(bytes.len());
-    &bytes[bytes.len().saturating_sub(keep)..]
 }
 
 fn open_log_failed_message(err: io::Error) -> String {
@@ -1327,7 +1240,7 @@ struct EventLoopSeed {
     image_owner: crate::image::Owner,
     paths: StatePaths,
     meta: Meta,
-    log: BoundedLog,
+    log: AppendLog,
     sigchld: Sigchld,
     cgroup: Option<ActiveCgroup>,
     spawn: WorkloadSpawn,
@@ -1370,6 +1283,7 @@ fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
         root_settlement_granted: seed.root_control_fd.is_none(),
         root_terminal_sent: false,
         deferred_ready_at: None,
+        capture_error: None,
     }
 }
 
@@ -1942,7 +1856,7 @@ struct EventLoop {
     image_owner: crate::image::Owner,
     paths: StatePaths,
     meta: Meta,
-    log: BoundedLog,
+    log: AppendLog,
     sigchld: Sigchld,
     cgroup: Option<ActiveCgroup>,
     root_pid: libc::pid_t,
@@ -1969,6 +1883,7 @@ struct EventLoop {
     root_settlement_granted: bool,
     root_terminal_sent: bool,
     deferred_ready_at: Option<u64>,
+    capture_error: Option<String>,
 }
 
 // Original finalized event stays separate from mutable status/cancellation.
@@ -2021,6 +1936,7 @@ pub(crate) enum CancellationCause {
     ExplicitRequest,
     CausalParent,
     RootAuthorityLost,
+    OutputCaptureFailure,
 }
 
 impl CancellationCause {
@@ -2030,6 +1946,7 @@ impl CancellationCause {
                 // Transport loss is a fallback only; it must never relabel a
                 // cancellation cause already accepted by the root authority.
                 CancellationCause::RootAuthorityLost => 0,
+                CancellationCause::OutputCaptureFailure => 3,
                 CancellationCause::OwnerExit => 1,
                 CancellationCause::CausalParent => 2,
                 CancellationCause::ExplicitRequest => 4,
@@ -2056,6 +1973,7 @@ impl CancellationCause {
             "owner-exit" => Some(Self::OwnerExit),
             "causal-parent-cancelled" => Some(Self::CausalParent),
             "root-authority-lost" => Some(Self::RootAuthorityLost),
+            "output-capture-failed" => Some(Self::OutputCaptureFailure),
             _ => None,
         }
     }
@@ -2066,6 +1984,7 @@ impl CancellationCause {
             Self::OwnerExit => "owner-exit",
             Self::CausalParent => "causal-parent-cancelled",
             Self::RootAuthorityLost => "root-authority-lost",
+            Self::OutputCaptureFailure => "output-capture-failed",
         }
     }
 }
@@ -2282,7 +2201,11 @@ impl EventLoop {
     fn recover_image_service(&mut self) {
         if let Err(error) = self.image_owner.recover() {
             let message = format!("image custodian recovery spawn failed (will retry): {error}\n");
-            let _ = self.log.write_all(message.as_bytes());
+            if self.capture_error.is_none()
+                && let Err(err) = self.log.write_all(message.as_bytes())
+            {
+                self.record_capture_failure(err);
+            }
         }
     }
 
@@ -2410,7 +2333,13 @@ impl EventLoop {
     }
 
     fn handle_stdout_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.log.write_all(bytes)?;
+        if self.capture_error.is_some() {
+            return Ok(());
+        }
+        if let Err(err) = self.log.write_all(bytes) {
+            self.record_capture_failure(err);
+            return Ok(());
+        }
         if self.stdout_reaches_sentinel(bytes) {
             self.record_ready_sentinel()?;
         }
@@ -2444,9 +2373,26 @@ impl EventLoop {
 
     fn write_stderr_chunks(&mut self, chunks: &[Vec<u8>]) -> io::Result<()> {
         for bytes in chunks {
-            self.log.write_all(bytes)?;
+            if self.capture_error.is_none()
+                && let Err(err) = self.log.write_all(bytes)
+            {
+                self.record_capture_failure(err);
+            }
         }
         Ok(())
+    }
+
+    fn record_capture_failure(&mut self, err: io::Error) {
+        let detail = format!("output capture failed: {err}; raw output incomplete and unconfirmed");
+        self.capture_error = Some(detail.clone());
+        // The diagnostic is best effort on the same filesystem. The in-memory
+        // veto and guardian's unverified-selection policy remain authoritative
+        // when ENOSPC prevents this file from being written.
+        let _ = state::atomic_write(
+            &self.paths.state_dir.join("output-capture-error.txt"),
+            format!("{detail}\n").as_bytes(),
+        );
+        self.request_cancellation(CancellationCause::OutputCaptureFailure);
     }
 
     fn close_stderr_if_closed(&mut self, fd: RawFd, closed: bool) {
@@ -2624,11 +2570,16 @@ impl EventLoop {
         }
         match decision {
             FinishDecision::None => Ok(()),
-            FinishDecision::SpawnError(message) => self.record_supervisor_error_in_loop(message),
+            FinishDecision::SpawnError(message) => {
+                self.record_supervisor_error_in_loop(self.capture_error.clone().unwrap_or(message))
+            }
             FinishDecision::Exit {
                 root_status,
                 reason,
-            } => self.record_exit_completion(root_status, reason),
+            } => match self.capture_error.clone() {
+                Some(message) => self.record_supervisor_error_in_loop(message),
+                None => self.record_exit_completion(root_status, reason),
+            },
         }
     }
 
@@ -2669,6 +2620,7 @@ impl EventLoop {
                 } else {
                     None
                 },
+                output_trusted: self.capture_error.is_none(),
             },
         )
     }
@@ -2699,6 +2651,7 @@ impl EventLoop {
                     } else {
                         None
                     },
+                    output_trusted: self.capture_error.is_none(),
                 },
             )?;
             crate::continuation::fault_barrier(&self.paths, "after-terminal-metadata")?;
@@ -2715,6 +2668,7 @@ impl EventLoop {
                     } else {
                         None
                     },
+                    output_trusted: self.capture_error.is_none(),
                 },
                 &mut pending.progress,
             )
@@ -2979,14 +2933,13 @@ enum FdRead {
 }
 
 fn read_available(fd: RawFd) -> io::Result<AvailableRead> {
-    let mut chunks = Vec::new();
     let mut buf = [0_u8; 8192];
-    loop {
-        match read_fd_chunk(fd, &mut buf)? {
-            FdRead::Bytes(bytes) => chunks.push(bytes),
-            FdRead::Closed => return Ok(available_read(chunks, true)),
-            FdRead::Pending => return Ok(available_read(chunks, false)),
-        }
+    // A producer can keep its pipe readable indefinitely. Return to the event
+    // loop after one fixed-size read so output and cancellation stay bounded.
+    match read_fd_chunk(fd, &mut buf)? {
+        FdRead::Bytes(bytes) => Ok(available_read(vec![bytes], false)),
+        FdRead::Closed => Ok(available_read(Vec::new(), true)),
+        FdRead::Pending => Ok(available_read(Vec::new(), false)),
     }
 }
 
@@ -3173,7 +3126,7 @@ fn record_supervisor_error(
     paths: &StatePaths,
     meta: &mut Meta,
     message: String,
-    log: Option<&mut BoundedLog>,
+    log: Option<&mut AppendLog>,
 ) -> io::Result<()> {
     publish_terminal_with_delivery_disposition(
         paths,
@@ -3185,7 +3138,7 @@ fn record_supervisor_error(
     Ok(())
 }
 
-fn sync_optional_log(log: Option<&mut BoundedLog>) -> io::Result<()> {
+fn sync_optional_log(log: Option<&mut AppendLog>) -> io::Result<()> {
     let Some(log) = log else {
         return Ok(());
     };
@@ -3317,7 +3270,7 @@ enum TerminalPublishResult {
 fn publish_terminal_with_delivery_disposition(
     paths: &StatePaths,
     meta: &mut Meta,
-    log: Option<&mut BoundedLog>,
+    log: Option<&mut AppendLog>,
     proposal: TerminalProposal,
     delivery_disposition: CompletionDeliveryDisposition,
 ) -> io::Result<TerminalPublishResult> {
@@ -4212,7 +4165,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn bounded_log_discards_old_output_and_retains_newest_bytes() {
+    fn append_log_preserves_every_chunk_and_reopened_prefix() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("log");
         let file = std::fs::OpenOptions::new()
@@ -4221,24 +4174,28 @@ for line in sys.stdin:
             .read(true)
             .open(&path)
             .expect("create log");
-        let mut log = BoundedLog::new(file, path.clone(), 128).expect("bounded log");
+        let mut log = AppendLog::new(file).expect("append log");
 
         log.write_all(&[b'a'; 100]).expect("write old output");
         log.write_all(&[b'b'; 100]).expect("write new output");
         log.sync_all().expect("sync log");
 
-        let retained = std::fs::read(path).expect("read retained log");
-        assert_eq!(retained.len(), 128);
-        assert!(retained.starts_with(LOG_TRUNCATED_MARKER));
-        assert!(
-            retained[LOG_TRUNCATED_MARKER.len()..]
-                .iter()
-                .all(|byte| *byte == b'b')
-        );
+        let retained = std::fs::read(&path).expect("read retained log");
+        assert_eq!(retained, [vec![b'a'; 100], vec![b'b'; 100]].concat());
+        let mut reopened = AppendLog::new(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .read(true)
+                .open(&path)
+                .unwrap(),
+        )
+        .unwrap();
+        reopened.write_all(b"later").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 205);
     }
 
     #[test]
-    fn bounded_log_caps_a_single_oversized_chunk() {
+    fn append_log_preserves_a_chunk_above_legacy_limit() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("log");
         let file = std::fs::OpenOptions::new()
@@ -4247,18 +4204,12 @@ for line in sys.stdin:
             .read(true)
             .open(&path)
             .expect("create log");
-        let mut log = BoundedLog::new(file, path.clone(), 96).expect("bounded log");
+        let mut log = AppendLog::new(file).expect("append log");
 
         log.write_all(&[b'x'; 4096]).expect("write large output");
 
         let retained = std::fs::read(path).expect("read retained log");
-        assert_eq!(retained.len(), 96);
-        assert!(retained.starts_with(LOG_TRUNCATED_MARKER));
-        assert!(
-            retained[LOG_TRUNCATED_MARKER.len()..]
-                .iter()
-                .all(|byte| *byte == b'x')
-        );
+        assert_eq!(retained, vec![b'x'; 4096]);
     }
 
     fn exercise_root_grant(command: u8) -> RootExecutionGrant {

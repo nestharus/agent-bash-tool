@@ -10,6 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
 use std::sync::{OnceLock, mpsc};
@@ -2675,7 +2676,7 @@ fn exit_mode_completion_rc_and_captured_output() {
 }
 
 #[test]
-fn captured_log_is_bounded_and_retains_newest_output() {
+fn captured_log_preserves_output_despite_legacy_limit_variable() {
     if test_support::private_case() {
         return;
     }
@@ -2696,12 +2697,79 @@ fn captured_log_is_bounded_and_retains_newest_output() {
     let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
 
     let log = fs::read(json["log"].as_str().expect("log path")).expect("read log");
-    assert!(log.len() <= 65_536, "retained {} bytes", log.len());
-    assert!(
-        log.windows(b"[agent-bash log truncated".len())
-            .any(|window| window == b"[agent-bash log truncated")
-    );
+    assert_eq!(log.len(), 200_012, "captured {} bytes", log.len());
+    assert!(log[..200_000].iter().all(|byte| *byte == b'x'));
     assert!(log.ends_with(b"tail-marker\n"));
+    let full = agent_bash(&temp)
+        .args(["status", "--full", handle])
+        .output()
+        .expect("full status");
+    assert_command_success(&full);
+    assert!(full.stdout.ends_with(&log));
+    let tail = agent_bash(&temp)
+        .args(["status", "--tail-bytes", "32", handle])
+        .output()
+        .expect("tail status");
+    assert_command_success(&tail);
+    assert!(tail.stdout.ends_with(&log[log.len() - 32..]));
+}
+
+#[test]
+fn capture_file_limit_reports_unknown_and_cancels_workload() {
+    if test_support::private_case() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = agent_bash(&temp).get_program().to_owned();
+    let mut command = StdCommand::new(binary);
+    command
+        .env("XDG_STATE_HOME", temp.path())
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
+        .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+        .env_remove("OULIPOLY_PARENT_INVOCATION")
+        .env_remove("OULIPOLY_DATA_DIR")
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            "head -c 200000 /dev/zero | tr '\\0' x; sleep 60",
+        ]);
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 64 * 1024,
+                rlim_max: 64 * 1024,
+            };
+            if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR
+                || libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let run = command.output().expect("run limited capture");
+    let json = parse_run_output(&run);
+    let handle = json["handle"].as_str().expect("handle");
+    let _status = wait_for_status_prefix(&temp, handle, &format!("ERROR rc=70 handle={handle}"));
+    let meta = read_meta(&meta_path(&json));
+    assert_eq!(meta["completion_reason"], "supervisor-error");
+    assert!(
+        meta["error"]
+            .as_str()
+            .unwrap()
+            .contains("output capture failed")
+    );
+    assert!(
+        fs::read_to_string(
+            Path::new(json["state_dir"].as_str().unwrap()).join("output-capture-error.txt")
+        )
+        .unwrap()
+        .contains("raw output incomplete and unconfirmed")
+    );
 }
 
 #[test]
