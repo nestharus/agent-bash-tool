@@ -271,58 +271,101 @@ pub(crate) fn internal_main() -> Option<i32> {
         Ok(())
     })();
     Some(match result {
-        Ok(()) => 0,
+        Ok(()) => {
+            write_terminal_witness(0);
+            0
+        }
         Err(error) => {
             eprintln!("AGE319_PRIVATE_BASH_CHILD={error}");
+            write_terminal_witness(70);
             70
         }
     })
 }
 
-fn request_frame(socket: &Path, opcode: u8, payload: &[u8], read: bool) -> Result<String, String> {
-    let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-        .map_err(|e| e.to_string())?;
-    let mut challenge = [0u8; 16];
-    stream
-        .read_exact(&mut challenge)
-        .map_err(|e| e.to_string())?;
-    let mut frame = Vec::with_capacity(17 + payload.len());
-    frame.push(opcode);
-    frame.extend_from_slice(&challenge);
-    frame.extend_from_slice(payload);
-    stream.write_all(&frame).map_err(|e| e.to_string())?;
-    if !read {
-        let mut first = [0u8; 1];
-        stream.read_exact(&mut first).map_err(|e| e.to_string())?;
-        if first != [b'f'] {
-            let mut rest = Vec::new();
-            stream
-                .take(8192)
-                .read_to_end(&mut rest)
-                .map_err(|e| e.to_string())?;
-            let mut response = first.to_vec();
-            response.extend_from_slice(&rest);
-            return Err(format!(
-                "private lost-reply request refused: {}",
-                String::from_utf8_lossy(&response).trim_end()
-            ));
+fn write_terminal_witness(code: i32) {
+    if let Some(marker) = std::env::args().nth(4) {
+        if let Some(parent) = Path::new(&marker).parent() {
+            let _ = std::fs::write(parent.join("bash-causal-terminal-status"), code.to_string());
         }
-        return Ok(String::new());
     }
+}
+
+fn request_frame(socket: &Path, opcode: u8, payload: &[u8], read: bool) -> Result<String, String> {
+    let mut stage = "connect";
     let mut bytes = Vec::new();
-    stream
-        .take(8193)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > 8192 || !bytes.ends_with(b"\n") {
-        return Err("incomplete broker reply".into());
-    }
-    if bytes.starts_with(b"error ") {
-        return Err(String::from_utf8_lossy(&bytes).trim_end().to_owned());
-    }
-    String::from_utf8(bytes).map_err(|e| e.to_string())
+    let result = (|| {
+        let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
+        stage = "timeout";
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .map_err(|e| e.to_string())?;
+        let mut challenge = [0u8; 16];
+        stage = "challenge";
+        stream
+            .read_exact(&mut challenge)
+            .map_err(|e| e.to_string())?;
+        let mut frame = Vec::with_capacity(17 + payload.len());
+        frame.push(opcode);
+        frame.extend_from_slice(&challenge);
+        frame.extend_from_slice(payload);
+        stage = "send";
+        stream.write_all(&frame).map_err(|e| e.to_string())?;
+        stage = "reply";
+        if !read {
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).map_err(|e| e.to_string())?;
+            bytes.push(first[0]);
+            if first != [b'f'] {
+                stream
+                    .take(8192)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| e.to_string())?;
+                return Err(format!(
+                    "private lost-reply request refused: {}",
+                    String::from_utf8_lossy(&bytes).trim_end()
+                ));
+            }
+            return Ok(String::new());
+        }
+        stream
+            .take(8193)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        stage = "frame_validate";
+        if bytes.len() > 8192 || !bytes.ends_with(b"\n") {
+            return Err("incomplete broker reply".into());
+        }
+        if bytes.starts_with(b"error ") {
+            stage = "broker_error";
+            return Err(String::from_utf8_lossy(&bytes).trim_end().to_owned());
+        }
+        stage = "decode";
+        String::from_utf8(bytes.clone()).map_err(|e| e.to_string())
+    })();
+    let prefix = if bytes.starts_with(b"error ") {
+        "broker-error"
+    } else if bytes.starts_with(b"fresh-bash-child ") {
+        "fresh-bash-child"
+    } else if bytes.starts_with(b"fresh-bash-work ") {
+        "fresh-bash-work"
+    } else if bytes.starts_with(b"fresh-bash-result ") {
+        "fresh-bash-result"
+    } else if bytes.starts_with(b"fresh-bash-physical-") {
+        "fresh-bash-physical"
+    } else if !read && bytes == b"f" {
+        "success-first-byte"
+    } else {
+        "other-or-empty"
+    };
+    eprintln!(
+        "AGE319_BASH_FRAME opcode={} stage={stage} reply_bytes={} newline={} prefix={prefix} outcome={}",
+        opcode as char,
+        bytes.len(),
+        bytes.ends_with(b"\n"),
+        if result.is_ok() { "accepted" } else { "error" }
+    );
+    result.map_err(|error| format!("opcode={} stage={stage}: {error}", opcode as char))
 }
 
 fn random_uuid() -> Result<String, String> {
@@ -365,4 +408,54 @@ fn uuid_bytes(value: &str) -> Result<[u8; 16], String> {
         return Err("nil UUID".into());
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn short_transport_reply_is_not_broker_json_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("broker.sock");
+        let server = UnixListener::bind(&socket).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut peer, _) = server.accept().unwrap();
+            peer.write_all(&[0u8; 16]).unwrap();
+            let mut frame = [0u8; 33];
+            peer.read_exact(&mut frame).unwrap();
+            peer.write_all(b"fresh-bash-child {\"partial").unwrap();
+        });
+        let error = request_frame(&socket, b'C', &[1u8; 16], true).unwrap_err();
+        assert!(error.contains("opcode=C stage=frame_validate: incomplete broker reply"));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn lost_first_c_reply_uses_same_key_for_c_and_c_readback() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("broker.sock");
+        let server = UnixListener::bind(&socket).unwrap();
+        let key = [7u8; 16];
+        let worker = std::thread::spawn(move || {
+            for expected in [b'C', b'C', b'c'] {
+                let (mut peer, _) = server.accept().unwrap();
+                peer.write_all(&[0u8; 16]).unwrap();
+                let mut frame = [0u8; 33];
+                peer.read_exact(&mut frame).unwrap();
+                assert_eq!(frame[0], expected);
+                assert_eq!(&frame[17..], &key);
+                peer.write_all(b"fresh-bash-child {}\n").unwrap_or(());
+            }
+        });
+        assert!(
+            request_frame(&socket, b'C', &key, false)
+                .unwrap()
+                .is_empty()
+        );
+        let retry = request_frame(&socket, b'C', &key, true).unwrap();
+        assert_eq!(request_frame(&socket, b'c', &key, true).unwrap(), retry);
+        worker.join().unwrap();
+    }
 }
