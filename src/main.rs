@@ -290,6 +290,7 @@ fn run_command(
     let registration_candidate = delivery::prepare_registration(binary_config)
         .map_err(completion_event_registration_error)?;
     let owner = owner_context(&caller_chain, &registration_candidate)?;
+    require_legacy_source_route(&owner)?;
     create_run_state(&paths)?;
     let registration = match registration_candidate.bind_to_handle(&paths) {
         Ok(registration) => registration,
@@ -649,6 +650,23 @@ fn owner_context(
         session_id: Some(session_id),
         invocation_uuid: Some(invocation_uuid),
     })
+}
+
+/// A fresh session can only register through the versioned broker route.
+/// Until that route returns an exact committed registration receipt, the
+/// old helper and supervisor must never turn it into an `ab_` workload.
+fn require_legacy_source_route(owner: &OwnerContext) -> Result<(), AppError> {
+    if owner
+        .session_id
+        .as_deref()
+        .is_some_and(|session| session.starts_with("v30:"))
+    {
+        return Err(AppError::new(
+            EX_UNAVAILABLE,
+            "agent-bash: fresh owner requires committed v30 source registration",
+        ));
+    }
+    Ok(())
 }
 
 fn owner_attestation_error() -> AppError {
@@ -1350,4 +1368,31 @@ fn validate_existing_handle(handle: &str, paths: &StatePaths) -> Result<(), AppE
 
 fn unknown_handle_error(handle: &str) -> AppError {
     AppError::new(EX_NOINPUT, format!("agent-bash: unknown handle: {handle}"))
+}
+
+#[cfg(test)]
+mod fresh_route_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_session_cannot_enter_old_source_launch() {
+        let old = OwnerContext {
+            session_id: Some("old-session".into()),
+            invocation_uuid: Some("old-invocation".into()),
+        };
+        assert!(require_legacy_source_route(&old).is_ok());
+        for session in [
+            "v30:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222",
+            "v30:malformed",
+        ] {
+            let fresh = OwnerContext {
+                session_id: Some(session.into()),
+                invocation_uuid: Some("fresh-invocation".into()),
+            };
+            assert_eq!(
+                require_legacy_source_route(&fresh).unwrap_err().code,
+                EX_UNAVAILABLE
+            );
+        }
+    }
 }

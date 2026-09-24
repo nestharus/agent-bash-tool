@@ -298,6 +298,10 @@ def suite(root):
             wait(lambda: (path/'output-capture-error.txt').exists())
             wait(lambda: read(path/'meta.json')['state'] == 'ERROR')
             assert 'output capture failed' in read(path/'meta.json')['error']
+            # ERROR metadata can be published before the original source
+            # selection. Observe the committed selection, not the first
+            # terminal metadata write.
+            wait(lambda: read(path/'output-selection-v2.json') is not None)
             selection = read(path/'output-selection-v2.json')
             assert selection['missing'] == 'output capture incomplete or unverified', selection
             assert not (path/'selected-log-v2.bin').exists()
