@@ -7,6 +7,8 @@ mod delivery;
 mod delivery_role;
 mod guard;
 mod image;
+#[cfg(feature = "private-v30-admission")]
+mod private_v30;
 mod retained_output;
 mod root_work;
 mod state;
@@ -178,6 +180,10 @@ impl AppError {
 }
 
 fn main() {
+    #[cfg(feature = "private-v30-admission")]
+    if let Some(code) = private_v30::internal_main() {
+        std::process::exit(code);
+    }
     if let Some(code) = image::internal_main() {
         std::process::exit(code);
     }

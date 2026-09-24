@@ -1,0 +1,260 @@
+//! Private user-namespace exercise of the real Bash binary and v30 child
+//! registration. Deliberately absent from ordinary builds and the `run` path.
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::process::Command;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Session {
+    lane_id: String,
+    source_generation: String,
+    session_id: String,
+    request_id: String,
+    allocation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Actor {
+    host_pid: i32,
+    boot_id: String,
+    starttime_ticks: u64,
+    pidns_dev: u64,
+    pidns_ino: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Child {
+    request_id: String,
+    d_key: String,
+    invocation_uuid: String,
+    handle: String,
+    root_handoff_id: String,
+    root_id: String,
+    parent_invocation_uuid: String,
+    actor: Actor,
+    registration_authority: String,
+    session: Session,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ResultReceipt {
+    request_id: String,
+    grant_id: String,
+    exit_code: i32,
+    stdout_sha256: String,
+    stdout_len: u64,
+    stderr_sha256: String,
+    stderr_len: u64,
+}
+
+fn private_user_namespace() -> bool {
+    (unsafe { libc::geteuid() }) == 0
+        && std::fs::read_to_string("/proc/self/uid_map")
+            .ok()
+            .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+}
+
+pub(crate) fn internal_main() -> Option<i32> {
+    if std::env::args().nth(1).as_deref() != Some("__age319-private-admit-child-v1") {
+        return None;
+    }
+    let result = (|| -> Result<(), String> {
+        if !private_user_namespace() {
+            return Err("private Bash child probe requires user namespace".into());
+        }
+        let control = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+            .map_err(|_| "private broker socket absent")?;
+        let socket = Path::new(&control).with_file_name("v30.sock");
+        let request_id = std::env::var("AGE319_PRIVATE_BASH_REQUEST_KEY").unwrap_or(random_uuid()?);
+        let request = uuid_bytes(&request_id)?;
+        let first = request_frame(&socket, b'C', &request, false)?;
+        let admitted = if first.is_empty() {
+            // Simulate a lost C reply. Only the same process/key may recover
+            // the exact durable row; this never authorizes work by itself.
+            request_frame(&socket, b'C', &request, true)?
+        } else {
+            first
+        };
+        let child: Child = serde_json::from_str(
+            admitted
+                .strip_prefix("fresh-bash-child ")
+                .ok_or("Bash child registration refused")?
+                .trim_end(),
+        )
+        .map_err(|e| e.to_string())?;
+        let read = request_frame(&socket, b'c', &request, true)?;
+        if read != admitted
+            || child.request_id != request_id
+            || child.session.request_id != child.d_key
+            || !child.handle.starts_with("ab30_")
+            || child.invocation_uuid == child.parent_invocation_uuid
+            || child.d_key == child.session.session_id
+        {
+            return Err("Bash child durable readback mismatch".into());
+        }
+        let marker = std::env::var("AGE319_PRIVATE_BASH_EFFECT_MARKER")
+            .map_err(|_| "private effect marker absent")?;
+        if Path::new(&marker).exists() {
+            return Err("private effect marker exists before grant".into());
+        }
+        let grant = request_frame(&socket, b'E', &request, true)?;
+        let grant_id = grant
+            .strip_prefix("fresh-bash-work ")
+            .ok_or("private Bash work not admitted")?
+            .trim_end()
+            .to_owned();
+        uuid_bytes(&grant_id)?;
+        if Path::new(&marker).exists() {
+            return Err("private effect happened before grant reply".into());
+        }
+        // One direct child and no Bash supervisor. Production `run` remains
+        // closed; this fixed command is a private positive effect witness.
+        let output = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf 'v30-child-output\\n'; printf 'ran\\n' > \"$1\"",
+                "sh",
+                &marker,
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        let result = ResultReceipt {
+            request_id,
+            grant_id,
+            exit_code: output.status.code().ok_or("private work signal exit")?,
+            stdout_sha256: format!("{:x}", Sha256::digest(&output.stdout)),
+            stdout_len: output.stdout.len() as u64,
+            stderr_sha256: format!("{:x}", Sha256::digest(&output.stderr)),
+            stderr_len: output.stderr.len() as u64,
+        };
+        let result_bytes = serde_json::to_vec(&result).map_err(|e| e.to_string())?;
+        // Result receipt retry is idempotent. It never repeats the command.
+        request_frame(&socket, b'O', &result_bytes, false)?;
+        let reported = request_frame(&socket, b'O', &result_bytes, true)?;
+        let readback: ResultReceipt = serde_json::from_str(
+            reported
+                .strip_prefix("fresh-bash-result ")
+                .ok_or("private Bash result not committed")?
+                .trim_end(),
+        )
+        .map_err(|e| e.to_string())?;
+        if readback != result {
+            return Err("private Bash result readback mismatch".into());
+        }
+        if request_frame(&socket, b'E', &request, true)
+            .is_ok_and(|reply| reply.starts_with("fresh-bash-work "))
+        {
+            return Err("private Bash work grant replayed".into());
+        }
+        let status = std::fs::read_to_string("/proc/self/status").map_err(|e| e.to_string())?;
+        let status_value = |field: &str| -> Result<u32, String> {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(field))
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or_else(|| format!("missing process status {field}"))
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "child": child,
+                "result": result,
+                "stdout": String::from_utf8_lossy(&output.stdout),
+                "stderr": String::from_utf8_lossy(&output.stderr),
+                "no_new_privs": status_value("NoNewPrivs:")?,
+                "seccomp": status_value("Seccomp:")?,
+            })
+        );
+        Ok(())
+    })();
+    Some(match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("AGE319_PRIVATE_BASH_CHILD={error}");
+            70
+        }
+    })
+}
+
+fn request_frame(socket: &Path, opcode: u8, payload: &[u8], read: bool) -> Result<String, String> {
+    let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    let mut challenge = [0u8; 16];
+    stream
+        .read_exact(&mut challenge)
+        .map_err(|e| e.to_string())?;
+    let mut frame = Vec::with_capacity(17 + payload.len());
+    frame.push(opcode);
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame).map_err(|e| e.to_string())?;
+    if !read {
+        let mut first = [0u8; 1];
+        stream.read_exact(&mut first).map_err(|e| e.to_string())?;
+        if first != [b'f'] {
+            return Err("private lost-reply registration was refused".into());
+        }
+        return Ok(String::new());
+    }
+    let mut bytes = Vec::new();
+    stream
+        .take(8193)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 8192 || !bytes.ends_with(b"\n") {
+        return Err("incomplete broker reply".into());
+    }
+    String::from_utf8(bytes).map_err(|e| e.to_string())
+}
+
+fn random_uuid() -> Result<String, String> {
+    let mut bytes = [0u8; 16];
+    File::open("/dev/urandom")
+        .map_err(|e| e.to_string())?
+        .read_exact(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    bytes[6] = bytes[6] & 0x0f | 0x40;
+    bytes[8] = bytes[8] & 0x3f | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
+}
+
+fn uuid_bytes(value: &str) -> Result<[u8; 16], String> {
+    let hex = value.replace('-', "");
+    if value.len() != 36
+        || hex.len() != 32
+        || value.as_bytes()[8] != b'-'
+        || value.as_bytes()[13] != b'-'
+        || value.as_bytes()[18] != b'-'
+        || value.as_bytes()[23] != b'-'
+    {
+        return Err("invalid UUID".into());
+    }
+    let mut bytes = [0u8; 16];
+    for (index, part) in hex.as_bytes().chunks_exact(2).enumerate() {
+        bytes[index] =
+            u8::from_str_radix(std::str::from_utf8(part).map_err(|e| e.to_string())?, 16)
+                .map_err(|e| e.to_string())?;
+    }
+    if bytes == [0; 16] {
+        return Err("nil UUID".into());
+    }
+    Ok(bytes)
+}
