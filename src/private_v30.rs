@@ -126,6 +126,9 @@ pub(crate) fn internal_main() -> Option<i32> {
             ])
             .output()
             .map_err(|e| e.to_string())?;
+        // This describes Bash's local observation only. O stores the report;
+        // it does not certify a broker fork, complete physical output, Q, W,
+        // recipient transport, or ACK.
         let result = ResultReceipt {
             request_id,
             grant_id,
@@ -154,6 +157,68 @@ pub(crate) fn internal_main() -> Option<i32> {
         {
             return Err("private Bash work grant replayed".into());
         }
+        // The fixed private physical K belongs to the broker. Drop its
+        // response deliberately; only observation of the same consumed K may
+        // recover it. The earlier O record is still just Bash's own report.
+        request_frame(&socket, b'8', &request, false)?;
+        if request_frame(&socket, b'8', &request, true)
+            .is_ok_and(|reply| reply.starts_with("fresh-bash-physical-k "))
+        {
+            return Err("broker child K replayed after lost reply".into());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let grant = loop {
+            let state = request_frame(&socket, b'9', &request, true)?;
+            if let Some(rest) = state.strip_prefix("fresh-bash-physical-exited ") {
+                let id = rest
+                    .split_ascii_whitespace()
+                    .next()
+                    .ok_or("physical K id absent")?;
+                uuid_bytes(id)?;
+                break id.to_owned();
+            }
+            if !state.starts_with("fresh-bash-physical-pending ")
+                || std::time::Instant::now() >= deadline
+            {
+                return Err(format!(
+                    "broker child did not reach separate provider exit: {state}"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        request_frame(&socket, b'!', &request, true)?;
+        let physical = loop {
+            let state = request_frame(&socket, b'9', &request, true)?;
+            if let Some(rest) = state.strip_prefix("fresh-bash-physical-drained ") {
+                let fields: Vec<_> = rest.split_ascii_whitespace().collect();
+                let expected_stdout = b"broker-child-output\n";
+                if fields.len() != 7
+                    || fields[0] != grant
+                    || fields[1] != "0"
+                    || fields[2] != expected_stdout.len().to_string()
+                    || fields[3] != "0"
+                    || fields[4] != "true"
+                    || fields[5] != format!("{:x}", Sha256::digest(expected_stdout))
+                    || fields[6] != format!("{:x}", Sha256::digest([]))
+                {
+                    return Err(format!("broker child physical Q mismatch: {state}"));
+                }
+                break state.trim_end().to_owned();
+            }
+            if !(state.starts_with("fresh-bash-physical-exited ")
+                || state.starts_with("fresh-bash-physical-pending "))
+                || std::time::Instant::now() >= deadline
+            {
+                return Err(format!("broker child physical Q absent: {state}"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let unrelated = uuid_bytes(&random_uuid()?)?;
+        if request_frame(&socket, b'9', &unrelated, true)
+            .is_ok_and(|reply| reply.starts_with("fresh-bash-physical-"))
+        {
+            return Err("unrelated child key observed broker physical Q".into());
+        }
         let status = std::fs::read_to_string("/proc/self/status").map_err(|e| e.to_string())?;
         let status_value = |field: &str| -> Result<u32, String> {
             status
@@ -166,7 +231,9 @@ pub(crate) fn internal_main() -> Option<i32> {
             "{}",
             serde_json::json!({
                 "child": child,
-                "result": result,
+                "bash_reported_result": result,
+                "result_provenance": "bash-self-report-only",
+                "broker_physical_q": physical,
                 "stdout": String::from_utf8_lossy(&output.stdout),
                 "stderr": String::from_utf8_lossy(&output.stderr),
                 "no_new_privs": status_value("NoNewPrivs:")?,
@@ -202,7 +269,17 @@ fn request_frame(socket: &Path, opcode: u8, payload: &[u8], read: bool) -> Resul
         let mut first = [0u8; 1];
         stream.read_exact(&mut first).map_err(|e| e.to_string())?;
         if first != [b'f'] {
-            return Err("private lost-reply registration was refused".into());
+            let mut rest = Vec::new();
+            stream
+                .take(8192)
+                .read_to_end(&mut rest)
+                .map_err(|e| e.to_string())?;
+            let mut response = first.to_vec();
+            response.extend_from_slice(&rest);
+            return Err(format!(
+                "private lost-reply request refused: {}",
+                String::from_utf8_lossy(&response).trim_end()
+            ));
         }
         return Ok(String::new());
     }
@@ -213,6 +290,9 @@ fn request_frame(socket: &Path, opcode: u8, payload: &[u8], read: bool) -> Resul
         .map_err(|e| e.to_string())?;
     if bytes.len() > 8192 || !bytes.ends_with(b"\n") {
         return Err("incomplete broker reply".into());
+    }
+    if bytes.starts_with(b"error ") {
+        return Err(String::from_utf8_lossy(&bytes).trim_end().to_owned());
     }
     String::from_utf8(bytes).map_err(|e| e.to_string())
 }
