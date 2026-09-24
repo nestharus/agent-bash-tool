@@ -278,10 +278,6 @@ fn run_command(
         })
         .map_err(state_root_unavailable)?;
     let (binary_config, state_root) = binary_config;
-    reap_state_dirs_at_startup(&state_root);
-    let handle = state::generate_handle().map_err(supervisor_bootstrap_error)?;
-    let paths = state_paths(state_root, handle.clone());
-
     let caller_chain = guard.caller_chain().map_err(|_| attached_guard_error())?;
     let observer_parent_pid = caller_chain[0].pid;
     let cancel_owner = resolve_cancel_owner(&caller_chain, cancel_on_owner_exit, owner_pid)?;
@@ -291,6 +287,12 @@ fn run_command(
         .map_err(completion_event_registration_error)?;
     let owner = owner_context(&caller_chain, &registration_candidate)?;
     require_legacy_source_route(&owner)?;
+    // Owner routing precedes even local handle allocation and stale-state
+    // maintenance. A fresh child cannot leave an ab_ handle that a later
+    // legacy observer might mistake for an admitted source.
+    reap_state_dirs_at_startup(&state_root);
+    let handle = state::generate_handle().map_err(supervisor_bootstrap_error)?;
+    let paths = state_paths(state_root, handle.clone());
     create_run_state(&paths)?;
     let registration = match registration_candidate.bind_to_handle(&paths) {
         Ok(registration) => registration,

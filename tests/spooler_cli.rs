@@ -76,6 +76,37 @@ fn v30_handle_never_uses_local_v29_metadata_as_authority() {
 }
 
 #[test]
+fn resolved_fresh_owner_refuses_before_handle_or_workload() {
+    if test_support::private_case() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let fake = owner_resolving_fake_agents(&temp);
+    let workload_marker = temp.path().join("workload-started");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+        .env(
+            "AGENT_BASH_FAKE_RESOLVED_SESSION",
+            "v30:22222222-2222-4222-8222-222222222222:33333333-3333-4333-8333-333333333333",
+        )
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"source":"opencode","id":"11111111-1111-4111-8111-111111111111"}"#,
+        )
+        .args(["run", "--", "/usr/bin/touch"])
+        .arg(&workload_marker)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(69), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("fresh owner requires committed v30 source registration")
+    );
+    assert!(!workload_marker.exists());
+    assert!(!temp.path().join("agent-bash").exists());
+}
+
+#[test]
 fn paired_context_halves_fail_closed_and_terminalize_preaccept() {
     for (present, absent, expected) in [
         (
