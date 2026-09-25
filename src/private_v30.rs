@@ -1,14 +1,28 @@
 //! Private user-namespace exercise of the real Bash binary and v30 child
-//! registration. The ordinary `run` entry may register its listener here,
-//! but cannot launch work until a broker-owned command/handle route exists.
+//! registration and closed ordinary command route.
 use crate::state::DeliveryMode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OrdinaryCommand {
+    version: u32,
+    original_cli_argv: Vec<String>,
+    argv: Vec<String>,
+    resolved_program: std::path::PathBuf,
+    cwd: std::path::PathBuf,
+    environment: Vec<(String, String)>,
+    completion_scope: String,
+    ready_sentinel: Option<String>,
+    cancel_on_owner_exit: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -103,11 +117,17 @@ fn private_user_namespace() -> bool {
 
 /// Called only for a resolved v30 owner in the private feature build. The
 /// broker authenticates the connected process and consumed parent work; an
-/// ambient owner marker or local handle never authorizes C. Returning this
-/// receipt does not grant a command K, source W, or recipient F.
+/// ambient owner marker or local handle never authorizes C. An ordinary
+/// command is admitted only through the broker-selected private X/^ route;
+/// async returns a consumed-K receipt while Q/W/F settle independently.
 pub(crate) fn register_ordinary_run(
     mode: DeliveryMode,
-) -> Result<Option<(String, String)>, String> {
+    argv: &[String],
+    cwd: &Path,
+    completion_scope: crate::supervisor::CompletionScope,
+    ready_sentinel: Option<&str>,
+    cancel_on_owner_exit: bool,
+) -> Result<Option<serde_json::Value>, String> {
     if !private_user_namespace() {
         return Ok(None);
     }
@@ -115,14 +135,253 @@ pub(crate) fn register_ordinary_run(
         return Ok(None);
     };
     let socket = Path::new(&control).with_file_name("v30.sock");
-    let request_id = random_uuid()?;
+    let request_id = match std::env::var("AGE319_PRIVATE_ORDINARY_COPIED_REQUEST_ID_V1") {
+        Ok(copied) => copied,
+        Err(_) => random_uuid()?,
+    };
     let request = uuid_bytes(&request_id)?;
     let policy = ListenerPolicy::from_delivery(mode);
-    let child =
-        register_child(&socket, &request_id, &request, policy, true, false).map_err(|error| {
-            format!("fresh C outcome refused or unknown; request_id={request_id}: {error}")
-        })?;
-    Ok(Some((request_id, child.handle)))
+    if completion_scope != crate::supervisor::CompletionScope::Tree
+        || ready_sentinel.is_some()
+        || cancel_on_owner_exit
+    {
+        return Err("ordinary fresh root/ready/owner-cancel mode unavailable before K".into());
+    }
+    // The pinned Bash image is the source at the original parsed CLI entry.
+    // Legacy exec_workload removes both keys before execvp. This private
+    // source runs before legacy helper preparation, so scrub them explicitly.
+    let original_cli_argv = std::env::args_os()
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|_| "non-UTF-8 original Bash CLI argv unavailable".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let environment = workload_environment()?;
+    let mut command = OrdinaryCommand {
+        version: 1,
+        original_cli_argv,
+        argv: argv.to_vec(),
+        resolved_program: resolve_execvp_program(&argv[0], cwd)?,
+        cwd: cwd.to_path_buf(),
+        environment,
+        completion_scope: "tree".into(),
+        ready_sentinel: None,
+        cancel_on_owner_exit: false,
+    };
+    if std::env::var_os("AGE319_PRIVATE_ORDINARY_MUTATE_ARGV_BEFORE_C_V1").is_some() {
+        command.argv.push("changed-before-c".into());
+    }
+    let child = register_child(
+        &socket,
+        &request_id,
+        &request,
+        policy,
+        true,
+        std::env::var_os("AGE319_PRIVATE_ORDINARY_DROP_C_REPLY_V1").is_some(),
+        Some(&command),
+    )
+    .map_err(|error| {
+        format!("fresh C outcome refused or unknown; request_id={request_id}: {error}")
+    })?;
+    if let Some(gate) = std::env::var_os("AGE319_PRIVATE_ORDINARY_PAUSE_AFTER_C_DIR_V1") {
+        let gate = std::path::PathBuf::from(gate);
+        std::fs::write(gate.join("ordinary-paused"), &request_id)
+            .map_err(|error| error.to_string())?;
+        while !gate.join("ordinary-release").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    if std::env::var_os("AGE319_PRIVATE_ORDINARY_MUTATE_ENV_AFTER_C_V1").is_some() {
+        unsafe { std::env::set_var("AGE319_ORDINARY_EFFECTIVE_ENV", "changed-after-c") };
+    }
+    if std::env::var_os("AGE319_PRIVATE_ORDINARY_MUTATE_CWD_AFTER_C_V1").is_some() {
+        std::env::set_current_dir("/").map_err(|error| error.to_string())?;
+    }
+    // This digest is only a veto for post-C drift in the pinned Bash image.
+    // The broker executes its original C selection; no later Bash assertion
+    // can replace argv, cwd, environment, or executable after selection.
+    let mut at_k = command.clone();
+    at_k.original_cli_argv = std::env::args_os()
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|_| "non-UTF-8 Bash CLI argv unavailable before K".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    at_k.cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    at_k.environment = workload_environment()?;
+    if std::env::var_os("AGE319_PRIVATE_ORDINARY_MUTATE_ARGV_AFTER_C_V1").is_some() {
+        at_k.argv.push("changed-after-c".into());
+    }
+    at_k.resolved_program = resolve_execvp_program(&argv[0], &at_k.cwd)?;
+    let digest = Sha256::digest(serde_json::to_vec(&at_k).map_err(|error| error.to_string())?);
+    let mut k_request = request.to_vec();
+    k_request.extend_from_slice(&digest);
+    let command_file = sealed_command_file(&command)?;
+    // `^` is the versioned ordinary one-use K. Fixed private `8` remains
+    // its own recipe route. A lost ^ reply can only be read through 9.
+    let k_result = if std::env::var_os("AGE319_PRIVATE_ORDINARY_DROP_K_REPLY_V1").is_some() {
+        request_frame_with_command(&socket, b'^', &k_request, Some(&command_file), false)
+            .and_then(|_| Err("ordinary K reply deliberately lost after durable receipt".into()))
+    } else {
+        request_frame_with_command(&socket, b'^', &k_request, Some(&command_file), true)
+    };
+    let physical = match k_result {
+        Ok(reply) => reply,
+        Err(k_error) => request_frame(&socket, b'9', &request, true)
+            .map_err(|read_error| {
+                if k_error.contains("ordinary Bash argv/cwd/environment changed after C before K")
+                    && read_error.contains("fresh Bash physical K absent")
+                {
+                    format!("ordinary Bash command drift unavailable before K; request_id={request_id} handle={}; {k_error}", child.handle)
+                } else {
+                    format!("ordinary Bash K outcome unknown; request_id={request_id} handle={}; K={k_error}; Q readback={read_error}", child.handle)
+                }
+            })?,
+    };
+    let grant_id = physical
+        .strip_prefix("fresh-bash-physical-k ")
+        .or_else(|| physical.strip_prefix("fresh-bash-physical-pending "))
+        .or_else(|| physical.strip_prefix("fresh-bash-physical-exited "))
+        .or_else(|| physical.strip_prefix("fresh-bash-physical-drained "))
+        .and_then(|rest| rest.split_ascii_whitespace().next())
+        .ok_or_else(|| format!("ordinary Bash physical K readback unknown; request_id={request_id} handle={}: {physical}", child.handle))?
+        .to_owned();
+    uuid_bytes(&grant_id)?;
+    if std::env::var_os("AGE319_PRIVATE_ORDINARY_CANCEL_AFTER_K_V1").is_some() {
+        let cancelled = request_frame(&socket, b'!', &request, true)
+            .map_err(|error| format!("ordinary Bash physical cancel unknown; request_id={request_id} grant={grant_id}: {error}"))?;
+        if !cancelled.starts_with(&format!("fresh-bash-physical-cancel {grant_id}")) {
+            return Err(format!(
+                "ordinary Bash physical cancel changed; request_id={request_id} grant={grant_id}: {cancelled}"
+            ));
+        }
+    }
+    let raw_dir = socket
+        .parent()
+        .ok_or("fresh Bash socket directory absent")?
+        .join("fresh-provider");
+    let base = serde_json::json!({
+        "schema_version": 30,
+        "request_id": request_id,
+        "handle": child.handle,
+        "delivery_mode": if mode == DeliveryMode::Sync { "sync" } else { "async" },
+        "completion_policy": "tree",
+        "physical_grant_id": grant_id,
+        "stdout_path": raw_dir.join(format!("{grant_id}.stdout")),
+        "stderr_path": raw_dir.join(format!("{grant_id}.stderr")),
+        "effects_possible": true,
+    });
+    if mode == DeliveryMode::Async {
+        let mut result = base;
+        result["dispatch_state"] = "broker-k-consumed".into();
+        return Ok(Some(result));
+    }
+    if std::env::var_os("AGE319_PRIVATE_ORDINARY_DROP_Q_REPLY_V1").is_some() {
+        request_frame(&socket, b'9', &request, false)?;
+    }
+    let physical_q = loop {
+        let state = request_frame(&socket, b'9', &request, true)
+            .map_err(|error| format!("ordinary Bash physical Q unknown; request_id={request_id} grant={grant_id}: {error}"))?;
+        if state.starts_with(&format!("fresh-bash-physical-drained {grant_id} ")) {
+            break state;
+        }
+        if state.starts_with("fresh-bash-physical-unknown ") {
+            return Err(format!(
+                "ordinary Bash physical Q unknown; request_id={request_id} grant={grant_id}: {state}"
+            ));
+        }
+        if !state.starts_with(&format!("fresh-bash-physical-pending {grant_id}"))
+            && !state.starts_with(&format!("fresh-bash-physical-exited {grant_id} "))
+        {
+            return Err(format!(
+                "ordinary Bash physical Q changed; request_id={request_id} grant={grant_id}: {state}"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let first_w = if std::env::var_os("AGE319_PRIVATE_ORDINARY_DROP_W_REPLY_V1").is_some() {
+        request_frame(&socket, b'%', &request, false)
+            .and_then(|_| Err("ordinary W reply deliberately lost after durable receipt".into()))
+    } else {
+        request_frame(&socket, b'%', &request, true)
+    };
+    let accepted = first_w.or_else(|first_error| {
+        request_frame(&socket, b'%', &request, true).map_err(|read_error| format!(
+            "ordinary Bash W unknown; request_id={request_id} grant={grant_id}; first={first_error}; readback={read_error}"
+        ))
+    })?;
+    let source: serde_json::Value = serde_json::from_str(
+        accepted.strip_prefix("fresh-bash-source-accepted ")
+            .ok_or_else(|| format!("ordinary Bash W readback unknown; request_id={request_id} grant={grant_id}: {accepted}"))?
+            .trim_end(),
+    ).map_err(|error| error.to_string())?;
+    if source["request_id"] != request_id
+        || source["source_id"] != child.handle
+        || source["physical_grant_id"] != grant_id
+        || source["parent_work_grant_id"] != child.parent_work_grant_id
+        || source["parent_work_id"] != child.parent_work_id
+        || source["tree_drained"] != true
+        || source["output_closed"] != true
+    {
+        return Err(format!(
+            "ordinary Bash W identity mismatch; request_id={request_id} grant={grant_id}"
+        ));
+    }
+    let mut result = base;
+    result["dispatch_state"] = "source-w-accepted".into();
+    result["physical_q"] = physical_q.trim_end().into();
+    result["source_w"] = source;
+    Ok(Some(result))
+}
+
+fn workload_environment() -> Result<Vec<(String, String)>, String> {
+    let mut environment = std::env::vars_os()
+        .filter(|(key, _)| {
+            key != "AGENT_BASH_AGENT_RUNNER_BIN"
+                && key != "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY"
+        })
+        .map(|(key, value)| {
+            Ok((
+                key.into_string()
+                    .map_err(|_| "non-UTF-8 Bash environment key unavailable")?,
+                value
+                    .into_string()
+                    .map_err(|_| "non-UTF-8 Bash environment value unavailable")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, &str>>()
+        .map_err(str::to_owned)?;
+    environment.sort();
+    Ok(environment)
+}
+
+fn resolve_execvp_program(first: &str, cwd: &Path) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::ffi::OsStrExt;
+    if unsafe { libc::getuid() != libc::geteuid() || libc::getgid() != libc::getegid() } {
+        return Err("ordinary Bash changed effective credentials unavailable before K".into());
+    }
+    let candidates: Vec<_> = if first.contains('/') {
+        vec![cwd.join(first)]
+    } else {
+        std::env::var_os("PATH")
+            .unwrap_or_else(|| "/bin:/usr/bin".into())
+            .to_str()
+            .ok_or("non-UTF-8 Bash PATH unavailable before K")?
+            .split(':')
+            .map(|entry| cwd.join(entry).join(first))
+            .collect()
+    };
+    for candidate in candidates {
+        let Ok(path) = std::ffi::CString::new(candidate.as_os_str().as_bytes()) else {
+            return Err("ordinary Bash command path contains NUL unavailable before K".into());
+        };
+        if candidate.metadata().is_ok_and(|meta| meta.is_file())
+            && unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0
+        {
+            return Ok(candidate);
+        }
+    }
+    Err("ordinary Bash command not executable in original PATH before K".into())
 }
 
 fn register_child(
@@ -132,16 +391,34 @@ fn register_child(
     policy: ListenerPolicy,
     explicit_policy: bool,
     drop_first_reply: bool,
+    ordinary_command: Option<&OrdinaryCommand>,
 ) -> Result<Child, String> {
     let mut registration = request.to_vec();
     if explicit_policy {
         registration.push(policy.wire_byte());
     }
+    let command_file = ordinary_command.map(sealed_command_file).transpose()?;
     let admitted = if drop_first_reply {
-        request_frame(socket, b'C', &registration, false)?;
+        request_frame_with_command(
+            socket,
+            if ordinary_command.is_some() {
+                b'X'
+            } else {
+                b'C'
+            },
+            &registration,
+            command_file.as_ref(),
+            false,
+        )?;
         request_frame(socket, b'c', request, true)?
     } else {
-        match request_frame(socket, b'C', &registration, true) {
+        let opcode = if ordinary_command.is_some() {
+            b'X'
+        } else {
+            b'C'
+        };
+        match request_frame_with_command(socket, opcode, &registration, command_file.as_ref(), true)
+        {
             Ok(reply) => reply,
             Err(first_error) => {
                 // A lost reply may follow a durable C. Read only the same
@@ -175,7 +452,56 @@ fn register_child(
     Ok(child)
 }
 
+fn sealed_command_file(command: &OrdinaryCommand) -> Result<File, String> {
+    let bytes = serde_json::to_vec(command).map_err(|error| error.to_string())?;
+    if bytes.len() > 64 * 1024 {
+        return Err(
+            "ordinary Bash command admission descriptor too large unavailable before K".into(),
+        );
+    }
+    let fd = unsafe {
+        libc::memfd_create(
+            c"ordinary-bash-command".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(&bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(file)
+}
+
 pub(crate) fn internal_main() -> Option<i32> {
+    if std::env::args().nth(1).as_deref() == Some("__age319-private-probe-sibling-read-v1") {
+        let result = (|| -> Result<(), String> {
+            if !private_user_namespace() {
+                return Err("private sibling probe requires user namespace".into());
+            }
+            let args: Vec<_> = std::env::args().collect();
+            if args.len() != 4 {
+                return Err("private sibling probe arguments invalid".into());
+            }
+            let request = uuid_bytes(&args[3])?;
+            match request_frame(Path::new(&args[2]), b'c', &request, true) {
+                Err(error) if error.contains("actor") => Ok(()),
+                outcome => Err(format!("sibling read was not actor-refused: {outcome:?}")),
+            }
+        })();
+        return Some(match result {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("AGE319_PRIVATE_SIBLING={error}");
+                70
+            }
+        });
+    }
     if std::env::args().nth(1).as_deref() != Some("__age319-private-admit-child-v1") {
         return None;
     }
@@ -234,6 +560,7 @@ pub(crate) fn internal_main() -> Option<i32> {
             policy,
             policy == ListenerPolicy::Notify,
             true,
+            None,
         )?;
         if Path::new(&marker).exists() {
             return Err("private effect marker exists before grant".into());
@@ -427,6 +754,16 @@ pub(crate) fn internal_main() -> Option<i32> {
 }
 
 fn request_frame(socket: &Path, opcode: u8, payload: &[u8], read: bool) -> Result<String, String> {
+    request_frame_with_command(socket, opcode, payload, None, read)
+}
+
+fn request_frame_with_command(
+    socket: &Path,
+    opcode: u8,
+    payload: &[u8],
+    command_file: Option<&File>,
+    read: bool,
+) -> Result<String, String> {
     let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -439,7 +776,40 @@ fn request_frame(socket: &Path, opcode: u8, payload: &[u8], read: bool) -> Resul
     frame.push(opcode);
     frame.extend_from_slice(&challenge);
     frame.extend_from_slice(payload);
-    stream.write_all(&frame).map_err(|e| e.to_string())?;
+    if let Some(command_file) = command_file {
+        #[repr(align(8))]
+        struct Aligned([u8; 64]);
+        let mut control = Aligned([0; 64]);
+        let mut iov = libc::iovec {
+            iov_base: frame.as_mut_ptr().cast(),
+            iov_len: frame.len(),
+        };
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.0.as_mut_ptr().cast();
+        message.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as _) as usize };
+        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&message) };
+        if cmsg.is_null() {
+            return Err("ordinary Bash command descriptor frame unavailable".into());
+        }
+        unsafe {
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as _) as usize;
+            *(libc::CMSG_DATA(cmsg) as *mut i32) = command_file.as_raw_fd();
+        }
+        let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL) };
+        if sent != frame.len() as isize {
+            return Err(format!(
+                "ordinary Bash C descriptor frame incomplete: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    } else {
+        stream.write_all(&frame).map_err(|e| e.to_string())?;
+    }
     if !read {
         let mut first = [0u8; 1];
         stream.read_exact(&mut first).map_err(|e| e.to_string())?;
@@ -630,6 +1000,7 @@ mod tests {
                 requested,
                 true,
                 drop_first_reply,
+                None,
             );
             assert_eq!(result.is_ok(), expected_success, "{result:?}");
             server.join().unwrap();

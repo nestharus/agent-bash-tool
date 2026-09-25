@@ -280,6 +280,33 @@ fn run_command(
 ) -> Result<(), AppError> {
     validate_ready_sentinel(ready_sentinel.as_deref())?;
     supervisor::validate_argv(&argv).map_err(workload_argv_error)?;
+    let cwd = current_directory().map_err(current_directory_error)?;
+    #[cfg(feature = "private-v30-admission")]
+    match private_v30::register_ordinary_run(
+        delivery_mode,
+        &argv,
+        &cwd,
+        completion_scope,
+        ready_sentinel.as_deref(),
+        cancel_on_owner_exit,
+    ) {
+        Ok(Some(result)) => {
+            serde_json::to_writer(io::stdout(), &result).map_err(json_write_error)?;
+            io::stdout().write_all(b"\n").map_err(json_write_error)?;
+            return Ok(());
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Err(AppError::new(
+                if error.contains("unavailable before K") {
+                    EX_UNAVAILABLE
+                } else {
+                    EX_IOERR
+                },
+                format!("agent-bash: {error}"),
+            ));
+        }
+    }
 
     let binary_config = config::load()
         .map_err(state::StateError::Configuration)
@@ -291,7 +318,6 @@ fn run_command(
     let caller_chain = guard.caller_chain().map_err(|_| attached_guard_error())?;
     let observer_parent_pid = caller_chain[0].pid;
     let cancel_owner = resolve_cancel_owner(&caller_chain, cancel_on_owner_exit, owner_pid)?;
-    let cwd = current_directory().map_err(current_directory_error)?;
     let mode = run_mode(&ready_sentinel);
     let registration_candidate =
         delivery::prepare_registration(binary_config).map_err(|error| {
@@ -303,24 +329,6 @@ fn run_command(
     let owner = owner_context(&caller_chain, &registration_candidate)?;
     if is_fresh_owner(&owner) {
         validate_guard(&guard)?;
-        #[cfg(feature = "private-v30-admission")]
-        match private_v30::register_ordinary_run(delivery_mode) {
-            Ok(Some((request_id, handle))) => {
-                return Err(AppError::new(
-                    EX_UNAVAILABLE,
-                    format!(
-                        "agent-bash: fresh C/D listener registered; request_id={request_id} handle={handle}; ordinary child command K and handle controls unavailable; no work launched"
-                    ),
-                ));
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return Err(AppError::new(
-                    EX_IOERR,
-                    format!("agent-bash: {error}; no work launched"),
-                ));
-            }
-        }
     }
     require_legacy_source_route(&owner)?;
     // Owner routing precedes even local handle allocation and stale-state
