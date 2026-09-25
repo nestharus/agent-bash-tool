@@ -4,7 +4,7 @@ use crate::state::DeliveryMode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -127,7 +127,7 @@ pub(crate) fn register_ordinary_run(
     completion_scope: crate::supervisor::CompletionScope,
     ready_sentinel: Option<&str>,
     cancel_on_owner_exit: bool,
-) -> Result<Option<serde_json::Value>, String> {
+) -> Result<Option<PrivateRunResult>, String> {
     if !private_user_namespace() {
         return Ok(None);
     }
@@ -272,9 +272,17 @@ pub(crate) fn register_ordinary_run(
         "effects_possible": true,
     });
     if mode == DeliveryMode::Async {
+        if std::env::var_os("AGE319_PRIVATE_ASYNC_PROBE_SYNC_REFUSAL_V1").is_some() {
+            let refused = request_frame(&socket, b'v', &request, true)
+                .err()
+                .ok_or("async C unexpectedly acquired direct sync result")?;
+            if !refused.contains("response-only") {
+                return Err(format!("async sync-result refusal changed: {refused}"));
+            }
+        }
         let mut result = base;
         result["dispatch_state"] = "broker-k-consumed".into();
-        return Ok(Some(result));
+        return Ok(Some(PrivateRunResult::Dispatch(result)));
     }
     if std::env::var_os("AGE319_PRIVATE_ORDINARY_DROP_Q_REPLY_V1").is_some() {
         request_frame(&socket, b'9', &request, false)?;
@@ -327,11 +335,226 @@ pub(crate) fn register_ordinary_run(
             "ordinary Bash W identity mismatch; request_id={request_id} grant={grant_id}"
         ));
     }
-    let mut result = base;
-    result["dispatch_state"] = "source-w-accepted".into();
-    result["physical_q"] = physical_q.trim_end().into();
-    result["source_w"] = source;
-    Ok(Some(result))
+    if let Some(gate) = std::env::var_os("AGE319_PRIVATE_SYNC_PAUSE_AFTER_W_DIR_V1") {
+        let gate = std::path::PathBuf::from(gate);
+        std::fs::write(gate.join("sync-paused"), &request_id).map_err(|e| e.to_string())?;
+        while !gate.join("sync-release").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let _ = (base, physical_q);
+    let begun = if std::env::var_os("AGE319_PRIVATE_SYNC_DROP_BEGIN_REPLY_V1").is_some() {
+        request_frame(&socket, b'v', &request, false)
+            .and_then(|_| Err("sync begin reply deliberately lost".into()))
+    } else {
+        request_sync_begin(&socket, &request)
+    };
+    let (reply, files) = match begun {
+        Ok(value) => value,
+        Err(_) => {
+            let readback = request_frame(&socket, b'u', &request, true).map_err(|error| {
+                format!("sync publication unknown; request_id={request_id}: {error}")
+            })?;
+            (readback, None)
+        }
+    };
+    let (first, json) = if let Some(json) = reply.strip_prefix("fresh-bash-sync-begin ") {
+        (true, json)
+    } else if let Some(json) = reply.strip_prefix("fresh-bash-sync-unknown ") {
+        (false, json)
+    } else {
+        return Err(format!(
+            "sync publication reply unknown; request_id={request_id}"
+        ));
+    };
+    let publication: serde_json::Value =
+        serde_json::from_str(json.trim_end()).map_err(|error| error.to_string())?;
+    if publication["version"] != 1
+        || publication["phase"] != "unknown"
+        || publication["child"]["request_id"] != request_id
+        || publication["child"]["d_key"] != child.d_key
+        || publication["child"]["actor"]
+            != serde_json::to_value(&child.actor).map_err(|e| e.to_string())?
+        || publication["event"] != source
+    {
+        return Err(format!(
+            "sync publication identity mismatch; request_id={request_id}"
+        ));
+    }
+    if !first {
+        if files.is_some() {
+            return Err("sync readback unexpectedly carried streams".into());
+        }
+        return Ok(Some(PrivateRunResult::Dispatch(serde_json::json!({
+            "schema_version": 31,
+            "dispatch_state": "sync-publication-unknown",
+            "publication": publication,
+        }))));
+    }
+    if std::env::var_os("AGE319_PRIVATE_SYNC_REPEAT_BEGIN_V1").is_some() {
+        let (repeat, repeat_files) = request_sync_begin(&socket, &request)?;
+        if !repeat.starts_with("fresh-bash-sync-unknown ") || repeat_files.is_some() {
+            return Err("same-key sync begin unexpectedly reissued streams".into());
+        }
+    }
+    let [mut stdout, mut stderr] =
+        files.ok_or("sync begin descriptors absent; publication unknown")?;
+    if let Some(gate) = std::env::var_os("AGE319_PRIVATE_SYNC_PAUSE_AFTER_BEGIN_DIR_V1") {
+        let gate = std::path::PathBuf::from(gate);
+        std::fs::write(gate.join("sync-begin-paused"), &request_id).map_err(|e| e.to_string())?;
+        while !gate.join("sync-begin-release").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    verify_sync_file(
+        &mut stdout,
+        publication["event"]["stdout_len"]
+            .as_u64()
+            .ok_or("stdout length absent")?,
+        publication["event"]["stdout_sha256"]
+            .as_str()
+            .ok_or("stdout hash absent")?,
+    )?;
+    verify_sync_file(
+        &mut stderr,
+        publication["event"]["stderr_len"]
+            .as_u64()
+            .ok_or("stderr length absent")?,
+        publication["event"]["stderr_sha256"]
+            .as_str()
+            .ok_or("stderr hash absent")?,
+    )?;
+    if let Some(gate) = std::env::var_os("AGE319_PRIVATE_SYNC_PAUSE_AFTER_VERIFY_DIR_V1") {
+        let gate = std::path::PathBuf::from(gate);
+        std::fs::write(gate.join("sync-verify-paused"), &request_id).map_err(|e| e.to_string())?;
+        while !gate.join("sync-verify-release").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    Ok(Some(PrivateRunResult::Sync {
+        publication,
+        stdout,
+        stderr,
+    }))
+}
+
+pub(crate) enum PrivateRunResult {
+    Dispatch(serde_json::Value),
+    Sync {
+        publication: serde_json::Value,
+        stdout: File,
+        stderr: File,
+    },
+}
+
+pub(crate) fn write_private_result(result: PrivateRunResult) -> std::io::Result<()> {
+    let mut caller = std::io::stdout().lock();
+    match result {
+        PrivateRunResult::Dispatch(value) => serde_json::to_writer(&mut caller, &value)?,
+        PrivateRunResult::Sync {
+            publication,
+            mut stdout,
+            mut stderr,
+        } => {
+            let stdout_hash = publication["event"]["stdout_sha256"]
+                .as_str()
+                .ok_or_else(|| std::io::Error::other("sync stdout digest absent"))?;
+            let stderr_hash = publication["event"]["stderr_sha256"]
+                .as_str()
+                .ok_or_else(|| std::io::Error::other("sync stderr digest absent"))?;
+            if std::env::var_os("AGE319_PRIVATE_SYNC_PARTIAL_CALLER_WRITE_V1").is_some() {
+                caller.write_all(
+                    b"{\"schema_version\":31,\"dispatch_state\":\"sync-child-result\"",
+                )?;
+                caller.flush()?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "private partial caller write",
+                ));
+            }
+            caller.write_all(
+                b"{\"schema_version\":31,\"dispatch_state\":\"sync-child-result\",\"publication\":",
+            )?;
+            serde_json::to_writer(&mut caller, &publication)?;
+            caller.write_all(b",\"stdout_encoding\":\"base64\",\"stdout_base64\":\"")?;
+            write_base64(&mut stdout, &mut caller, stdout_hash)?;
+            caller.write_all(b"\",\"stderr_encoding\":\"base64\",\"stderr_base64\":\"")?;
+            write_base64(&mut stderr, &mut caller, stderr_hash)?;
+            caller.write_all(b"\"}")?;
+        }
+    }
+    caller.write_all(b"\n")?;
+    caller.flush()
+}
+
+fn write_base64(
+    input: &mut File,
+    output: &mut impl Write,
+    expected_hash: &str,
+) -> std::io::Result<()> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut input_bytes = [0u8; 48 * 1024];
+    let mut encoded = [0u8; 64 * 1024];
+    let mut remaining = input.metadata()?.len();
+    let mut digest = Sha256::new();
+    while remaining > 0 {
+        let n = remaining.min(input_bytes.len() as u64) as usize;
+        input.read_exact(&mut input_bytes[..n])?;
+        digest.update(&input_bytes[..n]);
+        remaining -= n as u64;
+        let mut used = 0;
+        for chunk in input_bytes[..n].chunks(3) {
+            let a = chunk[0];
+            let b = *chunk.get(1).unwrap_or(&0);
+            let c = *chunk.get(2).unwrap_or(&0);
+            encoded[used] = TABLE[(a >> 2) as usize];
+            encoded[used + 1] = TABLE[(((a & 3) << 4) | (b >> 4)) as usize];
+            encoded[used + 2] = if chunk.len() > 1 {
+                TABLE[(((b & 15) << 2) | (c >> 6)) as usize]
+            } else {
+                b'='
+            };
+            encoded[used + 3] = if chunk.len() > 2 {
+                TABLE[(c & 63) as usize]
+            } else {
+                b'='
+            };
+            used += 4;
+        }
+        output.write_all(&encoded[..used])?;
+    }
+    if format!("{:x}", digest.finalize()) != expected_hash {
+        return Err(std::io::Error::other(
+            "sync stream changed during caller encoding",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_sync_file(file: &mut File, expected_len: u64, expected_hash: &str) -> Result<(), String> {
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() || meta.len() != expected_len {
+        return Err("sync stream descriptor length changed".into());
+    }
+    let mut hash = Sha256::new();
+    let mut count = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        count = count.checked_add(n as u64).ok_or("sync stream overflow")?;
+        hash.update(&buffer[..n]);
+    }
+    if count != expected_len
+        || format!("{:x}", hash.finalize()) != expected_hash
+        || file.metadata().map_err(|e| e.to_string())?.len() != expected_len
+    {
+        return Err("sync stream descriptor hash changed".into());
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn workload_environment() -> Result<Vec<(String, String)>, String> {
@@ -490,8 +713,14 @@ pub(crate) fn internal_main() -> Option<i32> {
             }
             let request = uuid_bytes(&args[3])?;
             match request_frame(Path::new(&args[2]), b'c', &request, true) {
+                Err(error) if error.contains("actor") => {}
+                outcome => return Err(format!("sibling read was not actor-refused: {outcome:?}")),
+            }
+            match request_frame(Path::new(&args[2]), b'u', &request, true) {
                 Err(error) if error.contains("actor") => Ok(()),
-                outcome => Err(format!("sibling read was not actor-refused: {outcome:?}")),
+                outcome => Err(format!(
+                    "sibling sync publication read was not actor-refused: {outcome:?}"
+                )),
             }
         })();
         return Some(match result {
@@ -767,6 +996,92 @@ fn write_terminal_witness(code: i32) {
 
 fn request_frame(socket: &Path, opcode: u8, payload: &[u8], read: bool) -> Result<String, String> {
     request_frame_with_command(socket, opcode, payload, None, read)
+}
+
+fn request_sync_begin(
+    socket: &Path,
+    request: &[u8; 16],
+) -> Result<(String, Option<[File; 2]>), String> {
+    let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    let mut challenge = [0u8; 16];
+    stream
+        .read_exact(&mut challenge)
+        .map_err(|e| e.to_string())?;
+    let mut frame = Vec::with_capacity(33);
+    frame.push(b'v');
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(request);
+    stream.write_all(&frame).map_err(|e| e.to_string())?;
+    let mut response = [0u8; 8193];
+    #[repr(align(8))]
+    struct Aligned([u8; 64]);
+    let mut control = Aligned([0; 64]);
+    let mut iov = libc::iovec {
+        iov_base: response.as_mut_ptr().cast(),
+        iov_len: response.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.0.as_mut_ptr().cast();
+    msg.msg_controllen = control.0.len();
+    let first = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+    if first <= 0 {
+        return Err(format!(
+            "sync begin descriptor reply absent: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+        return Err("sync begin descriptor reply truncated".into());
+    }
+    let mut files = Vec::new();
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    while !cmsg.is_null() {
+        let header = unsafe { &*cmsg };
+        if header.cmsg_level != libc::SOL_SOCKET || header.cmsg_type != libc::SCM_RIGHTS {
+            return Err("sync begin unexpected ancillary data".into());
+        }
+        let base = unsafe { libc::CMSG_LEN(0) } as usize;
+        let bytes = (header.cmsg_len as usize)
+            .checked_sub(base)
+            .ok_or("sync begin bad descriptor header")?;
+        if bytes % std::mem::size_of::<i32>() != 0 {
+            return Err("sync begin bad descriptor count".into());
+        }
+        for index in 0..bytes / std::mem::size_of::<i32>() {
+            let fd = unsafe { *(libc::CMSG_DATA(cmsg) as *const i32).add(index) };
+            files.push(unsafe { File::from_raw_fd(fd) });
+        }
+        cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
+    }
+    let mut bytes = response[..first as usize].to_vec();
+    if bytes.len() <= 8192 {
+        stream
+            .take((8193 - bytes.len()) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+    }
+    if bytes.len() > 8192 || !bytes.ends_with(b"\n") {
+        return Err("sync begin metadata incomplete".into());
+    }
+    if bytes.starts_with(b"error ") {
+        return Err(String::from_utf8_lossy(&bytes).trim_end().into());
+    }
+    let reply = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+    let files = match files.len() {
+        0 => None,
+        2 => Some(
+            files
+                .try_into()
+                .map_err(|_| "sync begin descriptor count changed")?,
+        ),
+        _ => return Err("sync begin descriptor count invalid".into()),
+    };
+    Ok((reply, files))
 }
 
 fn request_frame_with_command(

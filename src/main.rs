@@ -291,8 +291,7 @@ fn run_command(
         cancel_on_owner_exit,
     ) {
         Ok(Some(result)) => {
-            serde_json::to_writer(io::stdout(), &result).map_err(json_write_error)?;
-            io::stdout().write_all(b"\n").map_err(json_write_error)?;
+            private_v30::write_private_result(result).map_err(json_write_error)?;
             return Ok(());
         }
         Ok(None) => {}
