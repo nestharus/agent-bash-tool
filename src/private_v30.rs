@@ -745,12 +745,24 @@ pub(crate) fn internal_main() -> Option<i32> {
         Ok(())
     })();
     Some(match result {
-        Ok(()) => 0,
+        Ok(()) => {
+            write_terminal_witness(0);
+            0
+        }
         Err(error) => {
             eprintln!("AGE319_PRIVATE_BASH_CHILD={error}");
+            write_terminal_witness(70);
             70
         }
     })
+}
+
+fn write_terminal_witness(code: i32) {
+    if let Some(marker) = std::env::args().nth(4) {
+        if let Some(parent) = Path::new(&marker).parent() {
+            let _ = std::fs::write(parent.join("bash-causal-terminal-status"), code.to_string());
+        }
+    }
 }
 
 fn request_frame(socket: &Path, opcode: u8, payload: &[u8], read: bool) -> Result<String, String> {
