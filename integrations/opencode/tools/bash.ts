@@ -23,7 +23,7 @@ type CompletionScope = "root" | "tree"
 
 type RunDispatch = {
   handle: string
-  dispatchState: "running" | "registration-outcome-unknown" | "root-accepted" | "effects-possible-no-replay"
+  dispatchState: "running" | "registration-outcome-unknown" | "root-accepted" | "effects-possible-no-replay" | "broker-k-consumed"
   retrySafe: boolean
   effectsPossible: boolean
 }
@@ -227,6 +227,7 @@ async function runProcess(
   environment: Record<string, string> = {},
   workdir?: string,
   timeoutMs: number | null = PROCESS_TIMEOUT_MS,
+  strictStdout = false,
 ): Promise<ProcessResult> {
   const child = Bun.spawn(argv, {
     env: { ...runEnv(ownerSessionId), ...environment },
@@ -249,9 +250,19 @@ async function runProcess(
     }
   })
   try {
+    const stdoutText = strictStdout
+      ? new Response(child.stdout).arrayBuffer().then((raw) => {
+          const bytes = Buffer.from(raw)
+          try {
+            return new TextDecoder("utf-8", { fatal: true }).decode(bytes)
+          } catch {
+            throw new Error(`agent-bash run stdout was not UTF-8; raw hex: ${bytes.toString("hex")}`)
+          }
+        })
+      : new Response(child.stdout).text()
     const completed = Promise.all([
       child.exited,
-      new Response(child.stdout).text(),
+      stdoutText,
       new Response(child.stderr).text(),
     ]).then(([exitCode, stdout, stderr]) => ({ exitCode, stdout, stderr }))
     return await Promise.race([completed, stopped])
@@ -500,6 +511,13 @@ async function executeAgentBashControl(
 function parseRunDispatch(runOut: string): RunDispatch | undefined {
   try {
     const parsed = JSON.parse(runOut)
+    if (parsed?.schema_version === 30 && parsed.dispatch_state === "broker-k-consumed" &&
+        typeof parsed.handle === "string" && parsed.handle.length > 0 &&
+        parsed.delivery_mode === "async" && parsed.effects_possible === true &&
+        typeof parsed.request_id === "string" && parsed.request_id.length > 0 &&
+        typeof parsed.physical_grant_id === "string" && parsed.physical_grant_id.length > 0) {
+      return { handle: parsed.handle, dispatchState: "broker-k-consumed", retrySafe: false, effectsPossible: true }
+    }
     return typeof parsed.handle === "string" &&
       ["running", "registration-outcome-unknown", "root-accepted", "effects-possible-no-replay"].includes(parsed.dispatch_state) &&
       typeof parsed.retry_safe === "boolean" && typeof parsed.effects_possible === "boolean"
@@ -516,7 +534,150 @@ function parseRunDispatch(runOut: string): RunDispatch | undefined {
 }
 
 function dispatchErrorResponse(runOut: string): string {
-  return `agent-bash spooler error (could not dispatch): ${runOut}`
+  return `agent-bash response unresolved (could not identify dispatch or child publication; do not replay): ${runOut}`
+}
+
+function requiredObject(value: unknown, label: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`version-31 ${label} missing or invalid`)
+  }
+  return value as Record<string, unknown>
+}
+
+function requiredString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`version-31 ${label} missing or invalid`)
+  return value
+}
+
+function sameBinding(left: unknown, right: unknown, label: string): void {
+  if (requiredString(left, label) !== right) throw new Error(`version-31 ${label} binding mismatch`)
+}
+
+function decodeChildStream(encoded: unknown, encoding: unknown, length: unknown, digest: unknown, label: string): {
+  bytes: Buffer; representation: "utf8" | "hex"; output: string
+} {
+  if (encoding !== "base64" || typeof encoded !== "string" ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded) ||
+      !Number.isSafeInteger(length) || (length as number) < 0 ||
+      typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) {
+    throw new Error(`version-31 ${label} encoding, length, or digest invalid`)
+  }
+  const bytes = Buffer.from(encoded, "base64")
+  if (bytes.length !== length || bytes.toString("base64") !== encoded) {
+    throw new Error(`version-31 ${label} base64 or byte length mismatch`)
+  }
+  if (createHash("sha256").update(bytes).digest("hex") !== digest) {
+    throw new Error(`version-31 ${label} digest mismatch`)
+  }
+  const decoded = bytes.toString("utf8")
+  // NUL is valid UTF-8 but invisible in the tool UI, so show that stream as hex too.
+  const utf8 = !bytes.includes(0) && Buffer.from(decoded, "utf8").equals(bytes)
+  return { bytes, representation: utf8 ? "utf8" : "hex", output: utf8 ? decoded : bytes.toString("hex") }
+}
+
+function childOutcome(publication: Record<string, unknown>, event: Record<string, unknown>): string {
+  const wait = event.wait_status
+  if (!Number.isSafeInteger(wait) || (wait as number) < 0 || (wait as number) > 65535 ||
+      typeof event.cancelled !== "boolean") throw new Error("version-31 child wait/cancel facts invalid")
+  if (event.cancelled) {
+    if (publication.outcome !== "cancelled" || publication.exit_code !== null || publication.signal !== null ||
+        typeof event.cancel_grant_id !== "string" || event.cancel_grant_id.length === 0) {
+      throw new Error("version-31 cancelled outcome mismatch")
+    }
+    return `cancelled (source wait status ${wait})`
+  }
+  if (event.cancel_grant_id !== null) throw new Error("version-31 unexpected cancel grant")
+  if (((wait as number) & 0x7f) === 0) {
+    const exit = ((wait as number) >> 8) & 0xff
+    if (publication.outcome !== "exited" || publication.exit_code !== exit || publication.signal !== null) {
+      throw new Error("version-31 exit outcome mismatch")
+    }
+    return `exited with code ${exit} (source wait status ${wait})`
+  }
+  const signal = (wait as number) & 0x7f
+  if (signal < 1 || signal > 126 || publication.outcome !== "signaled" ||
+      publication.signal !== signal || publication.exit_code !== null) {
+    throw new Error("version-31 signal outcome mismatch")
+  }
+  return `signaled with signal ${signal} (source wait status ${wait})`
+}
+
+function parseVersion31Response(runOut: string, delivery: DeliveryMode): string | undefined {
+  let value: unknown
+  try {
+    value = JSON.parse(runOut)
+  } catch {
+    if (/"schema_version"\s*:\s*31|"dispatch_state"\s*:\s*"sync-(?:child-result|publication-unknown)/.test(runOut)) {
+      throw new Error(`version-31 response incomplete or malformed; publication unresolved; raw stdout: ${runOut}`)
+    }
+    return undefined
+  }
+  const envelope = requiredObject(value, "response")
+  if (envelope.schema_version !== 31 && envelope.dispatch_state !== "sync-child-result" &&
+      envelope.dispatch_state !== "sync-publication-unknown") return undefined
+  if (envelope.schema_version !== 31 || delivery !== "sync" ||
+      !["sync-child-result", "sync-publication-unknown"].includes(String(envelope.dispatch_state))) {
+    throw new Error("version-31 response schema, state, or delivery mismatch; publication unresolved")
+  }
+  const publication = requiredObject(envelope.publication, "publication")
+  const child = requiredObject(publication.child, "child")
+  const session = requiredObject(child.session, "child session")
+  const actor = requiredObject(child.actor, "child actor")
+  const event = requiredObject(publication.event, "source event")
+  if (publication.version !== 1 || publication.phase !== "unknown" ||
+      (child.listener_policy !== undefined && child.listener_policy !== "response_only") ||
+      event.completion_policy !== "tree" || event.tree_drained !== true || event.output_closed !== true) {
+    throw new Error("version-31 publication source or phase invalid")
+  }
+  for (const key of ["request_id", "d_key", "invocation_uuid", "handle", "root_id",
+    "parent_invocation_uuid", "parent_work_grant_id", "parent_work_id", "registration_authority"]) {
+    requiredString(child[key], `child ${key}`)
+  }
+  for (const key of ["host_pid", "starttime_ticks", "pidns_dev", "pidns_ino"]) {
+    if (!Number.isSafeInteger(actor[key]) || (actor[key] as number) < (key === "pidns_dev" || key === "pidns_ino" ? 0 : 1)) {
+      throw new Error(`version-31 child actor ${key} invalid`)
+    }
+  }
+  requiredString(actor.boot_id, "child actor boot_id")
+  for (const key of ["lane_id", "source_generation", "session_id", "allocation_id"]) {
+    requiredString(session[key], `child session ${key}`)
+  }
+  sameBinding(session.request_id, child.request_id, "session request_id")
+  for (const [eventKey, childKey] of [
+    ["request_id", "request_id"], ["source_id", "handle"], ["root_id", "root_id"],
+    ["attempt_id", "invocation_uuid"],
+    ["parent_work_grant_id", "parent_work_grant_id"], ["parent_work_id", "parent_work_id"],
+  ]) sameBinding(event[eventKey], child[childKey], `source ${eventKey}`)
+  for (const key of ["lane_id", "source_generation", "session_id"]) {
+    sameBinding(event[key], session[key], `source ${key}`)
+  }
+  for (const key of ["attempt_id", "state_admission_id", "physical_grant_id", "physical_work_id",
+    "owner_generation", "selected_kind"]) requiredString(event[key], `source ${key}`)
+  if (event.selected_kind !== (event.cancelled ? "cancelled" : "tree_drained")) {
+    throw new Error("version-31 source kind/cancellation mismatch")
+  }
+  if (typeof event.registration_digest !== "string" || !/^[0-9a-f]{64}$/.test(event.registration_digest)) {
+    throw new Error("version-31 source registration digest invalid")
+  }
+  const outcome = childOutcome(publication, event)
+  const identity = `request_id=${child.request_id} handle=${child.handle} physical_grant_id=${event.physical_grant_id}`
+  if (envelope.dispatch_state === "sync-publication-unknown") {
+    if ("stdout_base64" in envelope || "stderr_base64" in envelope ||
+        "stdout_encoding" in envelope || "stderr_encoding" in envelope) {
+      throw new Error("version-31 unknown publication unexpectedly contains output; publication unresolved")
+    }
+    return `Sync child publication unresolved (${identity}): ${outcome}. Source output exists, but this caller response may have been lost or partial. Do not replay. Consumer ACK: unconfirmed; remote ACK: unconfirmed; overall physical drain: unconfirmed.`
+  }
+  const stdout = decodeChildStream(envelope.stdout_base64, envelope.stdout_encoding,
+    event.stdout_len, event.stdout_sha256, "stdout")
+  const stderr = decodeChildStream(envelope.stderr_base64, envelope.stderr_encoding,
+    event.stderr_len, event.stderr_sha256, "stderr")
+  return `Sync child result (${identity}): ${outcome}. Source tree drained: true; output closed: true; ` +
+    `publication phase: unknown; consumer ACK: unconfirmed; remote ACK: unconfirmed; overall physical drain: unconfirmed.` +
+    `\nstdout: ${stdout.bytes.length} bytes, sha256=${event.stdout_sha256}, representation=${stdout.representation}` +
+    `\n--- stdout ---\n${stdout.output}` +
+    `\nstderr: ${stderr.bytes.length} bytes, sha256=${event.stderr_sha256}, representation=${stderr.representation}` +
+    `\n--- stderr ---\n${stderr.output}`
 }
 
 function noReplayResponse(dispatch: RunDispatch): string {
@@ -535,7 +696,8 @@ function noReplayResponse(dispatch: RunDispatch): string {
 }
 
 function acceptedDispatchDetail(dispatch: RunDispatch): string {
-  const owner = dispatch.dispatchState === "root-accepted" ? "root guardian" : "local supervisor"
+  const owner = dispatch.dispatchState === "root-accepted" ? "root guardian"
+    : dispatch.dispatchState === "broker-k-consumed" ? "private broker K" : "local supervisor"
   return `Dispatch accepted by ${owner} (handle=${dispatch.handle}); effects possible: ` +
     `${dispatch.effectsPossible ? "yes" : "no"}; retry safe: ${dispatch.retrySafe ? "yes" : "no"}.`
 }
@@ -716,12 +878,12 @@ async function dispatchCommand(
   admission: CommandAdmission,
   ownerSessionId: string,
   workdir?: string,
-): Promise<string> {
+): Promise<ProcessResult> {
   if (admission.kind === "unsupported") {
     throw new Error("explicit agent-bash run requires structured arguments without shell expansion")
   }
   if (admission.kind === "direct") {
-    return checkedProcessText(admission.argv, "agent-bash dispatch", ownerSessionId, undefined, undefined, workdir, null)
+    return runProcess(admission.argv, ownerSessionId, undefined, "agent-bash dispatch", undefined, workdir, null, true)
   }
   const command = pinAgentRunnerBinary(admission.command)
   const args = [AGENT_BASH, "run"]
@@ -739,7 +901,7 @@ async function dispatchCommand(
     )
   }
   args.push("--", "bash", "-lc", command)
-  return checkedProcessText(args, "agent-bash dispatch", ownerSessionId, undefined, undefined, workdir, null)
+  return runProcess(args, ownerSessionId, undefined, "agent-bash dispatch", undefined, workdir, null, true)
 }
 
 async function cancelResult(handle: string, ownerSessionId: string): Promise<string> {
@@ -846,14 +1008,34 @@ export default tool({
     }
     const binding = ensureLiveSessionBinding(context.sessionID)
     if (binding) await binding
-    const runOut = await dispatchCommand(admission, context.sessionID, args.workdir)
+    let run: ProcessResult
+    try {
+      run = await dispatchCommand(admission, context.sessionID, args.workdir)
+    } catch (error) {
+      throw new Error(`agent-bash run response unresolved: ${error instanceof Error ? error.message : String(error)}; do not replay.`)
+    }
+    if (run.exitCode !== 0) {
+      throw new Error(`agent-bash run exited ${run.exitCode}; child publication unresolved; do not replay.` +
+        `\nstdout: ${run.stdout}\nstderr: ${run.stderr}`)
+    }
+    const runOut = run.stdout.trim()
+    let childResponse: string | undefined
+    try {
+      childResponse = parseVersion31Response(runOut, admission.delivery)
+    } catch (error) {
+      throw new Error(`Sync child response unresolved: ${error instanceof Error ? error.message : String(error)}; do not replay.`)
+    }
+    if (childResponse !== undefined) return childResponse
     const dispatch = parseRunDispatch(runOut)
     if (!dispatch) return dispatchErrorResponse(runOut)
+    if (dispatch.dispatchState === "broker-k-consumed" && admission.delivery !== "async") {
+      throw new Error("agent-bash private async dispatch was returned to a sync call; outcome unresolved; do not replay")
+    }
     if (dispatch.dispatchState === "registration-outcome-unknown" ||
         dispatch.dispatchState === "effects-possible-no-replay") {
       return noReplayResponse(dispatch)
     }
-    const accepted = dispatch.dispatchState === "root-accepted"
+    const accepted = dispatch.dispatchState === "root-accepted" || dispatch.dispatchState === "broker-k-consumed"
       ? `${acceptedDispatchDetail(dispatch)}\n`
       : ""
     if (context.abort.aborted) return `${accepted}${await cancelResult(dispatch.handle, context.sessionID)}`

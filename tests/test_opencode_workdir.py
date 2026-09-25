@@ -3,6 +3,8 @@
 Real Bun subprocesses execute only a synthetic spooler, never the installed stack.
 The plugin shim follows tests/spooler_cli.rs; no package installation is needed.
 """
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -32,6 +34,11 @@ with open(os.environ['FAKE_LOG'], 'a') as f:
     f.write(json.dumps({'args': args, 'cwd': os.getcwd(), 'owner': os.environ.get('AGENT_BASH_OWNER_SESSION_ID'), 'custom': os.environ.get('TEST_CUSTOM')}) + '\\n')
 mode = os.environ.get('FAKE_MODE', '')
 if args[0] == 'run':
+    if os.environ.get('FAKE_RESPONSE_FILE'):
+        with open(os.environ['FAKE_RESPONSE_FILE'], 'rb') as response:
+            sys.stdout.buffer.write(response.read())
+        sys.stderr.write(os.environ.get('FAKE_RESPONSE_STDERR', ''))
+        sys.exit(int(os.environ.get('FAKE_RESPONSE_EXIT', '0')))
     if mode == 'slow-dispatch': time.sleep(0.05)
     dispatch = mode if mode in ('root-accepted', 'effects-possible-no-replay', 'registration-outcome-unknown') else 'running'
     print(json.dumps({'handle': 'ab_fixture', 'dispatch_state': dispatch,
@@ -87,8 +94,50 @@ class WorkdirTest(unittest.TestCase):
                                 text=True, capture_output=True, check=True)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
         reply = json.loads(result.stdout)
-        print(json.dumps(dict(request=args, mode=mode, reply=reply, calls=calls, stderr=result.stderr)), flush=True)
+        summary = reply if len(result.stdout) < 2000 else {'result_bytes': len(result.stdout)}
+        print(json.dumps(dict(request=args, mode=mode, reply=summary, calls=calls, stderr=result.stderr)), flush=True)
         return reply, calls
+
+    def version31(self, stdout=b'first\x00\xff', stderr=b'second\x00\xfe', outcome='exited', code=0):
+        digest = lambda data: hashlib.sha256(data).hexdigest()
+        child = dict(request_id='request-one', d_key='d-key', invocation_uuid='invocation-one',
+                     handle='ab30_child-one', root_handoff_id='handoff-one', root_id='root-one',
+                     parent_invocation_uuid='parent-one', parent_work_grant_id='parent-grant',
+                     parent_work_id='parent-work', registration_authority='authority-one',
+                     actor=dict(host_pid=123, boot_id='boot-one', starttime_ticks=100,
+                                pidns_dev=1, pidns_ino=2),
+                     session=dict(lane_id='lane-one', source_generation='generation-one',
+                                  session_id='session-one', request_id='request-one',
+                                  allocation_id='allocation-one'))
+        status = code << 8 if outcome == 'exited' else 15 if outcome == 'signaled' else 9
+        event = dict(request_id=child['request_id'], source_id=child['handle'],
+                     attempt_id='invocation-one', state_admission_id='admission-one',
+                     registration_digest=digest(b'registration'), lane_id='lane-one',
+                     source_generation='generation-one', session_id='session-one',
+                     root_id='root-one', owner_generation='owner-one',
+                     parent_work_grant_id='parent-grant', parent_work_id='parent-work',
+                     physical_grant_id='physical-grant', physical_work_id='physical-work',
+                     completion_policy='tree', selected_kind='cancelled' if outcome == 'cancelled' else 'tree_drained',
+                     wait_status=status,
+                     cancelled=outcome == 'cancelled',
+                     cancel_grant_id='cancel-grant' if outcome == 'cancelled' else None,
+                     tree_drained=True, output_closed=True,
+                     stdout_sha256=digest(stdout), stdout_len=len(stdout),
+                     stderr_sha256=digest(stderr), stderr_len=len(stderr))
+        publication = dict(version=1, child=child, event=event, phase='unknown',
+                           outcome=outcome, exit_code=code if outcome == 'exited' else None,
+                           signal=15 if outcome == 'signaled' else None)
+        return dict(schema_version=31, dispatch_state='sync-child-result', publication=publication,
+                    stdout_encoding='base64', stdout_base64=base64.b64encode(stdout).decode(),
+                    stderr_encoding='base64', stderr_base64=base64.b64encode(stderr).decode())
+
+    def execute_wire(self, wire, command='printf probe', exit_code=0, stderr=''):
+        path = self.root / 'response.json'
+        path.write_bytes(wire if isinstance(wire, bytes) else json.dumps(wire).encode())
+        return self.execute(dict(command=command), extra_env={
+            'FAKE_RESPONSE_FILE': str(path), 'FAKE_RESPONSE_EXIT': str(exit_code),
+            'FAKE_RESPONSE_STDERR': stderr,
+        })
 
     def test_direct_and_wrapped_sync_workdir_and_retained_output(self):
         for command in ('printf probe', 'agent-bash run -- printf probe'):
@@ -167,6 +216,94 @@ class WorkdirTest(unittest.TestCase):
             extra_env={'AGENT_BASH_TOOL_PROCESS_TIMEOUT_MS': '10'},
         )
         self.assertIn('Running asynchronously', reply['result'])
+        self.assertEqual([c['args'][0] for c in calls], ['run'])
+
+    def test_version31_separate_binary_streams_and_direct_run(self):
+        for command in ('printf probe', 'agent-bash run -- printf probe'):
+            with self.subTest(command=command):
+                reply, calls = self.execute_wire(self.version31(), command)
+                result = reply['result']
+                self.assertIn('stdout: 7 bytes', result)
+                self.assertIn('representation=hex\n--- stdout ---\n666972737400ff', result)
+                self.assertIn('stderr: 8 bytes', result)
+                self.assertIn('representation=hex\n--- stderr ---\n7365636f6e6400fe', result)
+                self.assertIn('exited with code 0', result)
+                self.assertIn('consumer ACK: unconfirmed; remote ACK: unconfirmed', result)
+                self.assertEqual([c['args'][0] for c in calls], ['run'])
+
+    def test_version31_large_complete_output(self):
+        data = b'A' * 200011
+        reply, calls = self.execute_wire(self.version31(stdout=data, stderr=b''))
+        result = reply['result']
+        self.assertIn('stdout: 200011 bytes', result)
+        self.assertIn('representation=utf8\n--- stdout ---\n' + data.decode() + '\nstderr:', result)
+        self.assertIn('stderr: 0 bytes', result)
+        self.assertEqual(len(calls), 1)
+
+    def test_version31_valid_utf8_with_nul_is_visible_as_hex(self):
+        reply, calls = self.execute_wire(self.version31(stdout=b'A\x00B', stderr=b'plain text'))
+        self.assertIn('representation=hex\n--- stdout ---\n410042', reply['result'])
+        self.assertIn('representation=utf8\n--- stderr ---\nplain text', reply['result'])
+        self.assertEqual(len(calls), 1)
+
+    def test_version31_source_outcomes(self):
+        for outcome, code, expected in (
+            ('exited', 27, 'exited with code 27'),
+            ('signaled', 0, 'signaled with signal 15'),
+            ('cancelled', 0, 'cancelled (source wait status 9)'),
+        ):
+            with self.subTest(outcome=outcome):
+                reply, calls = self.execute_wire(self.version31(outcome=outcome, code=code))
+                self.assertIn(expected, reply['result'])
+                self.assertEqual(len(calls), 1)
+
+    def test_version31_unknown_never_becomes_a_result(self):
+        wire = self.version31()
+        wire['dispatch_state'] = 'sync-publication-unknown'
+        for key in ('stdout_encoding', 'stdout_base64', 'stderr_encoding', 'stderr_base64'):
+            del wire[key]
+        reply, calls = self.execute_wire(wire)
+        self.assertIn('publication unresolved', reply['result'])
+        self.assertIn('Do not replay', reply['result'])
+        self.assertNotIn('--- stdout ---', reply['result'])
+        self.assertEqual(len(calls), 1)
+
+    def test_version31_bad_wire_fails_without_followup_or_retry(self):
+        variants = {}
+        missing = self.version31(); del missing['stderr_base64']; variants['missing stream'] = missing
+        invalid = self.version31(); invalid['stdout_base64'] = 'AQ==junk'; variants['bad base64'] = invalid
+        digest = self.version31(); digest['publication']['event']['stdout_sha256'] = '0' * 64; variants['bad digest'] = digest
+        length = self.version31(); length['publication']['event']['stderr_len'] += 1; variants['bad length'] = length
+        binding = self.version31(); binding['publication']['event']['source_id'] = 'other'; variants['bad binding'] = binding
+        disposition = self.version31(); disposition['publication']['exit_code'] = 1; variants['bad disposition'] = disposition
+        phase = self.version31(); phase['publication']['phase'] = 'delivered'; variants['bad phase'] = phase
+        for label, wire in variants.items():
+            with self.subTest(label=label):
+                reply, calls = self.execute_wire(wire)
+                self.assertIn('unresolved', reply['error'])
+                self.assertEqual([c['args'][0] for c in calls], ['run'])
+        partial, calls = self.execute_wire(b'{"schema_version":31,"dispatch_state":"sync-child-result"')
+        self.assertIn('incomplete or malformed', partial['error'])
+        self.assertEqual([c['args'][0] for c in calls], ['run'])
+        failed, calls = self.execute_wire(b'{"schema_version":31,', exit_code=70, stderr='write failed')
+        self.assertIn('exited 70; child publication unresolved', failed['error'])
+        self.assertIn('stdout:', failed['error'])
+        self.assertIn('stderr: write failed', failed['error'])
+        self.assertEqual([c['args'][0] for c in calls], ['run'])
+        invalid_bytes, calls = self.execute_wire(b'{"schema_version":31,\xff}')
+        self.assertIn('stdout was not UTF-8; raw hex:', invalid_bytes['error'])
+        self.assertIn('do not replay', invalid_bytes['error'])
+        self.assertEqual([c['args'][0] for c in calls], ['run'])
+
+    def test_version30_async_broker_handle(self):
+        wire = dict(schema_version=30, dispatch_state='broker-k-consumed', handle='ab30_child-one',
+                    request_id='request-one', physical_grant_id='physical-grant',
+                    delivery_mode='async', effects_possible=True)
+        path = self.root / 'response.json'
+        path.write_text(json.dumps(wire))
+        reply, calls = self.execute(dict(command='printf probe', delivery='async'),
+                                    extra_env={'FAKE_RESPONSE_FILE': str(path)})
+        self.assertIn('Running asynchronously (handle=ab30_child-one)', reply['result'])
         self.assertEqual([c['args'][0] for c in calls], ['run'])
 
 if __name__ == '__main__':
