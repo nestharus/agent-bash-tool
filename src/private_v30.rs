@@ -212,7 +212,9 @@ pub(crate) fn register_ordinary_run(
     if std::env::var_os("AGE319_PRIVATE_ORDINARY_MUTATE_ARGV_AFTER_C_V1").is_some() {
         at_k.argv.push("changed-after-c".into());
     }
-    at_k.resolved_program = resolve_execvp_program(&argv[0], &at_k.cwd)?;
+    // The C-selected pathname remains the command to execute. Re-resolving
+    // PATH here would turn a normal replacement/removal into a pre-K refusal
+    // or silently select a different PATH entry.
     let digest = Sha256::digest(serde_json::to_vec(&at_k).map_err(|error| error.to_string())?);
     let mut k_request = request.to_vec();
     k_request.extend_from_slice(&digest);
@@ -371,15 +373,22 @@ fn resolve_execvp_program(first: &str, cwd: &Path) -> Result<std::path::PathBuf,
             .map(|entry| cwd.join(entry).join(first))
             .collect()
     };
+    let mut non_executable = None;
     for candidate in candidates {
         let Ok(path) = std::ffi::CString::new(candidate.as_os_str().as_bytes()) else {
             return Err("ordinary Bash command path contains NUL unavailable before K".into());
         };
-        if candidate.metadata().is_ok_and(|meta| meta.is_file())
-            && unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0
-        {
-            return Ok(candidate);
+        if candidate.metadata().is_ok_and(|meta| meta.is_file()) {
+            if unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0 {
+                return Ok(candidate);
+            }
+            non_executable.get_or_insert(candidate);
         }
+    }
+    // A present ordinary command may be refused by the OS at exec. Keep its
+    // selected path so that refusal produces physical Q after the one-use K.
+    if let Some(candidate) = non_executable {
+        return Ok(candidate);
     }
     Err("ordinary Bash command not executable in original PATH before K".into())
 }
