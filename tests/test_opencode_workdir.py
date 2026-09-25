@@ -107,7 +107,7 @@ class WorkdirTest(unittest.TestCase):
                      actor=dict(host_pid=123, boot_id='boot-one', starttime_ticks=100,
                                 pidns_dev=1, pidns_ino=2),
                      session=dict(lane_id='lane-one', source_generation='generation-one',
-                                  session_id='session-one', request_id='request-one',
+                                  session_id='session-one', request_id='d-key',
                                   allocation_id='allocation-one'))
         status = code << 8 if outcome == 'exited' else 15 if outcome == 'signaled' else 9
         event = dict(request_id=child['request_id'], source_id=child['handle'],
@@ -305,6 +305,20 @@ class WorkdirTest(unittest.TestCase):
                                     extra_env={'FAKE_RESPONSE_FILE': str(path)})
         self.assertIn('Running asynchronously (handle=ab30_child-one)', reply['result'])
         self.assertEqual([c['args'][0] for c in calls], ['run'])
+
+    def test_private_sync_selector_only_changes_opted_in_call(self):
+        wire = self.root / 'response.json'
+        wire.write_text(json.dumps(self.version31()))
+        command = 'agent-bash run --completion-scope tree -- printf probe'
+        for selected in (False, True):
+            with self.subTest(selected=selected):
+                reply, calls = self.execute(dict(command=command), extra_env={
+                    'FAKE_RESPONSE_FILE': str(wire),
+                    **({'AGENT_BASH_PRIVATE_V31_SYNC': '1'} if selected else {}),
+                })
+                self.assertIn('Sync child result', reply['result'])
+                self.assertEqual('--cancel-on-owner-exit' in calls[0]['args'], not selected)
+                self.assertEqual([c['args'][0] for c in calls], ['run'])
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

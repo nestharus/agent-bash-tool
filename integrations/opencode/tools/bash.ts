@@ -642,7 +642,7 @@ function parseVersion31Response(runOut: string, delivery: DeliveryMode): string 
   for (const key of ["lane_id", "source_generation", "session_id", "allocation_id"]) {
     requiredString(session[key], `child session ${key}`)
   }
-  sameBinding(session.request_id, child.request_id, "session request_id")
+  sameBinding(session.request_id, child.d_key, "session request_id")
   for (const [eventKey, childKey] of [
     ["request_id", "request_id"], ["source_id", "handle"], ["root_id", "root_id"],
     ["attempt_id", "invocation_uuid"],
@@ -866,8 +866,12 @@ function parseStructuredExplicitRun(
 function admitCommand(command: string, requestedDelivery: string | undefined): CommandAdmission {
   const agentDispatch = recognizesAgentDispatchForAdmission(command)
   const delivery = selectedDelivery(agentDispatch, requestedDelivery)
-  const ownerLease = leaseToCaller(delivery)
-  const completionScope = agentDispatch ? "tree" : "root"
+  // The private v31 sync route owns an independent physical child and only
+  // admits tree completion. It has no owner-exit cancellation grant. Keep the
+  // older handle path unchanged unless the source-only selector is explicit.
+  const privateSync = process.env.AGENT_BASH_PRIVATE_V31_SYNC === "1" && delivery === "sync"
+  const ownerLease = !privateSync && leaseToCaller(delivery)
+  const completionScope = privateSync || agentDispatch ? "tree" : "root"
   const policy = { agentDispatch, delivery, ownerLease, completionScope } as const
   if (!conservativelyRecognizesExplicitRun(command)) return { ...policy, kind: "ordinary", command }
   const argv = parseStructuredExplicitRun(command, delivery, ownerLease)
