@@ -46,7 +46,7 @@ const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
 // Exact paired Runner fixture image. A later Runner image
 // requires an explicit paired update; an environment digest is not authority.
 const PRIVATE_V30_RUNNER_SHA256: &str =
-    "686bec5a01f2f790d0e2e7d79533023a5fe359973952a3034f0d60e07a91a68e";
+    "cc63cd78024204d8c199ea26911523bd4a4dd4984012f1fc0cd6197590252f28";
 
 #[derive(Debug)]
 struct ConfiguredDeliveryHelper {
@@ -132,6 +132,84 @@ impl DeliveryLockGuard {
 }
 
 impl DeliveryRegistration {
+    #[cfg(feature = "private-v30-admission")]
+    pub(crate) fn private_exact_source_decision(
+        &self,
+        paths: &StatePaths,
+        meta: &Meta,
+        accepted_intent: &Path,
+    ) -> io::Result<serde_json::Value> {
+        if self.helper.provenance.sha256 != PRIVATE_V30_RUNNER_SHA256 {
+            return Err(io::Error::other("private decision helper image changed"));
+        }
+        let session = meta
+            .owner_session_id
+            .as_deref()
+            .ok_or_else(|| io::Error::other("private decision session absent"))?;
+        let invocation = meta
+            .owner_invocation_uuid
+            .as_deref()
+            .ok_or_else(|| io::Error::other("private decision invocation absent"))?;
+        let intent: serde_json::Value = serde_json::from_slice(&fs::read(accepted_intent)?)?;
+        let authority: Vec<u8> = intent["registration_authority"]
+            .as_array()
+            .ok_or_else(|| io::Error::other("private decision H authority absent"))?
+            .iter()
+            .map(|byte| {
+                byte.as_u64()
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or_else(|| io::Error::other("private decision H authority byte invalid"))
+            })
+            .collect::<io::Result<_>>()?;
+        if authority.len() != 64
+            || !authority
+                .iter()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(io::Error::other("private decision H authority invalid"));
+        }
+        let work_id = intent["work_id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("private decision accepted work ID absent"))?;
+        if intent["meta"]["owner_session_id"] != session
+            || intent["meta"]["owner_invocation_uuid"] != invocation
+        {
+            return Err(io::Error::other(
+                "private decision H authority selection changed",
+            ));
+        }
+        let request = DeliveryHelperRequest {
+            paths,
+            operation: "private-exact-source-decision",
+            helper: HandleBoundDeliveryHelper::from_provenance(
+                meta.delivery_helper.as_ref(),
+                paths,
+            )
+            .map_err(io::Error::other)?,
+            args: vec![
+                "__age319-private-consumed-h-source-decision-v1".into(),
+                paths
+                    .state_dir
+                    .join(crate::continuation::REGISTRATION)
+                    .into_os_string(),
+                accepted_intent.as_os_str().to_os_string(),
+            ],
+            transient_environment: vec![
+                (
+                    COMPLETION_REGISTRATION_AUTHORITY_ENV.into(),
+                    OsString::from_vec(authority),
+                ),
+                (OWNER_SESSION_ID_ENV.into(), session.into()),
+                (OWNER_INVOCATION_UUID_ENV.into(), invocation.into()),
+                (OWNER_WORK_ID_ENV.into(), work_id.into()),
+            ],
+        };
+        run_structured_helper(&request, None).map_err(|error| match error {
+            DeliveryHelperCommandError::NotStarted(error)
+            | DeliveryHelperCommandError::Admitted(error) => error,
+        })
+    }
+
     #[cfg(feature = "private-v30-admission")]
     pub(crate) fn prepare_private_v30_continuation(
         &self,

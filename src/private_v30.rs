@@ -1102,6 +1102,13 @@ fn prepare_pre_k_h_source() -> Result<(), String> {
     if !crate::root_work::selected(&paths, &meta).map_err(|e| format!("pre-K route: {e}"))? {
         return Err("original work selection absent".into());
     }
+    // Rendezvous hint only. Broker reopens the named H intent and binds its
+    // inode and bytes to the consumed grant before accepting any decision.
+    std::fs::write(
+        gate.join("h-source-intent-dir"),
+        paths.state_dir.as_os_str().as_encoded_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
     match crate::root_work::submit_private_v30_source(
         &paths,
         &meta,
@@ -1231,6 +1238,45 @@ fn prepare_live_source() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     ready.sync_all().map_err(|e| e.to_string())?;
+    while !gate.join("source-decision-request").exists() && !gate.join("source-release").exists() {
+        parent_guard.validate()?;
+        if !private_parent_is_live(&parent) {
+            return Err("private v30 bound parent exited while decision held".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if gate.join("source-decision-request").exists() {
+        let h_dir =
+            std::fs::read_to_string(gate.join("h-source-intent-dir")).map_err(|e| e.to_string())?;
+        let intent = Path::new(h_dir.trim()).join("root-work-intent-v1.json");
+        let result = registration
+            .private_exact_source_decision(&paths, &meta, &intent)
+            .map_err(|e| {
+                let stderr = std::fs::read_dir(&paths.state_dir)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("continuation-private-exact-source-decision-")
+                            && entry.path().extension().is_some_and(|ext| ext == "stderr")
+                    })
+                    .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!("private exact source decision: {e}; helper stderr: {stderr}")
+            })?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(gate.join("source-decision-readback.json"))
+            .map_err(|e| e.to_string())?;
+        serde_json::to_writer(&mut file, &result).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+    }
     while !gate.join("source-release").exists() {
         parent_guard.validate()?;
         if !private_parent_is_live(&parent) {

@@ -1894,6 +1894,8 @@ pub(crate) mod owner_witness_tests {
             registration_authority: Some(vec![b'a'; 64]),
             environment: Vec::new(),
             cancel_owner: None,
+            #[cfg(feature = "private-v30-admission")]
+            __age319_private_bash_source_gate: None,
         };
         let intent_bytes = serde_json::to_vec(&intent).unwrap();
         state::atomic_write(&paths.state_dir.join(INTENT_FILE), &intent_bytes).unwrap();
@@ -2434,6 +2436,8 @@ mod tests {
             registration_authority: None,
             environment: vec![],
             cancel_owner: None,
+            #[cfg(feature = "private-v30-admission")]
+            __age319_private_bash_source_gate: None,
         };
         let saved: WorkIntent =
             serde_json::from_slice(&serde_json::to_vec(&intent).unwrap()).unwrap();
