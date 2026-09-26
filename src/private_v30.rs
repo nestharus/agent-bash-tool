@@ -711,6 +711,15 @@ fn sealed_command_file(command: &OrdinaryCommand) -> Result<File, String> {
 }
 
 pub(crate) fn internal_main() -> Option<i32> {
+    if std::env::args().nth(1).as_deref() == Some("__age319-private-pre-k-h-source-v1") {
+        return Some(match prepare_pre_k_h_source() {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("AGE319_PRIVATE_PRE_K_H={error}");
+                70
+            }
+        });
+    }
     if std::env::args().nth(1).as_deref() == Some("__age319-private-v30-source-prep-v1") {
         return Some(match prepare_live_source() {
             Ok(()) => 0,
@@ -1004,6 +1013,121 @@ pub(crate) fn internal_main() -> Option<i32> {
     })
 }
 
+/// A live Bash root descendant submits its own original-work H. The inherited
+/// grant and endpoint select the original J/D root; the guardian and Broker
+/// challenge the connected socket and this executable before accepting H.
+fn prepare_pre_k_h_source() -> Result<(), String> {
+    use crate::state::{Meta, StatePaths};
+    use crate::supervisor::StartupOutcome;
+    if !private_user_namespace() {
+        return Err("private pre-K H requires user namespace".into());
+    }
+    // J consumed its one-use kernel join descriptor before launching this
+    // source. Keep that bootstrap selector out of H's chosen environment.
+    unsafe {
+        std::env::remove_var("OULIPOLY_KERNEL_CHILD_JOIN_FD_V1");
+    }
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 5 || args[3] != "--" {
+        return Err("expected source gate and -- workload argv".into());
+    }
+    let gate = Path::new(&args[2]);
+    if !gate.is_absolute() || std::fs::canonicalize(gate).map_err(|e| e.to_string())? != gate {
+        return Err("private pre-K H gate is not canonical".into());
+    }
+    let argv = args[4..].to_vec();
+    crate::supervisor::validate_argv(&argv).map_err(|e| e.to_string())?;
+    if std::env::var_os("OULIPOLY_ROOT_AUTHORITY_V1").is_none() {
+        return Err("original root authority absent".into());
+    }
+    if std::env::var_os("OULIPOLY_COMPLETION_ENDPOINT").is_none() {
+        return Err("original guardian endpoint absent".into());
+    }
+    let root = std::env::var("OULIPOLY_KERNEL_EXPECTED_ROOT_V1")
+        .map_err(|_| "original root selector absent")?;
+    uuid_bytes(&root)?;
+    for key in [
+        "OULIPOLY_KERNEL_OWNER_ENDPOINT_V1",
+        "OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1",
+    ] {
+        if std::env::var_os(key).is_none() {
+            return Err(format!("original {key} selector absent"));
+        }
+    }
+    let session =
+        std::env::var("AGENT_BASH_OWNER_SESSION_ID").map_err(|_| "original D session absent")?;
+    let invocation = std::env::var("AGENT_BASH_OWNER_INVOCATION_UUID")
+        .map_err(|_| "original State invocation absent")?;
+    if !session.starts_with("v30:") {
+        return Err("original D session invalid".into());
+    }
+    uuid_bytes(&invocation)?;
+    let guard = crate::guard::AttachedGuard::capture();
+    let caller_chain = guard.caller_chain().map_err(|e| e.to_string())?;
+    let parent = caller_chain.first().ok_or("original J parent absent")?;
+    let cwd = std::env::current_dir().map_err(|e| format!("pre-K cwd: {e}"))?;
+    let config = crate::config::load().map_err(|e| format!("pre-K config: {e}"))?;
+    let state_root = crate::state::state_root_with_config(config.as_ref())
+        .map_err(|e| format!("pre-K state root: {e}"))?;
+    let candidate =
+        crate::delivery::prepare_registration(config).map_err(|e| format!("pre-K helper: {e}"))?;
+    candidate
+        .require_private_v30_pinned_helper()
+        .map_err(|e| format!("pre-K pin: {e}"))?;
+    guard.validate().map_err(|e| e.to_string())?;
+    let handle = crate::state::generate_handle().map_err(|e| e.to_string())?;
+    let paths = StatePaths::new(state_root, handle.clone());
+    crate::create_run_state(&paths).map_err(|e| format!("pre-K state create: {e:?}"))?;
+    let registration = candidate
+        .bind_to_handle(&paths)
+        .map_err(|e| format!("pre-K helper bind: {e}"))?;
+    let meta = Meta::new(
+        handle,
+        parent.pid,
+        unsafe { libc::getpid() },
+        argv.clone(),
+        cwd,
+        "exit",
+        DeliveryMode::Async,
+        None,
+        caller_chain,
+        None,
+    )
+    .with_owner_context(Some(session), Some(invocation))
+    .with_delivery_helper(registration.provenance());
+    crate::persist_delivery_mode(&paths, DeliveryMode::Async)
+        .map_err(|e| format!("pre-K delivery mode: {e:?}"))?;
+    crate::persist_initial_meta(&paths, &meta).map_err(|e| format!("pre-K meta: {e:?}"))?;
+    guard.validate().map_err(|e| e.to_string())?;
+    if !crate::root_work::selected(&paths, &meta).map_err(|e| format!("pre-K route: {e}"))? {
+        return Err("original work selection absent".into());
+    }
+    match crate::root_work::submit_private_v30_source(
+        &paths,
+        &meta,
+        argv,
+        registration,
+        gate.to_path_buf(),
+    )
+    .map_err(|e| format!("pre-K submit: {e}"))?
+    {
+        StartupOutcome::RootAccepted => {}
+        _ => return Err("original H acceptance uncertain; no replay".into()),
+    }
+    let mut marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(gate.join("h-source-ready"))
+        .map_err(|e| e.to_string())?;
+    writeln!(marker, "{}", paths.state_dir.display()).map_err(|e| e.to_string())?;
+    marker.sync_all().map_err(|e| e.to_string())?;
+    while !gate.join("h-source-release").exists() {
+        guard.validate().map_err(|e| e.to_string())?;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
+}
+
 /// Fixture entry for a direct Bash child of the consumed K work PID1. The
 /// gate is only a rendezvous path; the sealed helper's challenged Broker `=`
 /// readback supplies the owner and exact parent binding.
@@ -1021,6 +1145,12 @@ fn prepare_live_source() -> Result<(), String> {
     }
     let argv = args[4..].to_vec();
     crate::supervisor::validate_argv(&argv).map_err(|e| e.to_string())?;
+    // K's broker-owned launch gate is consumed before this Bash exec. It is
+    // not part of H's selected environment and must not turn a later Runner
+    // helper invocation into another root-child join attempt.
+    unsafe {
+        std::env::remove_var("OULIPOLY_KERNEL_CHILD_JOIN_FD_V1");
+    }
     let parent_guard = PrivatePidOneParent::capture()?;
     let caller_chain = parent_guard.caller_chain()?;
     let parent = caller_chain
@@ -1038,6 +1168,19 @@ fn prepare_live_source() -> Result<(), String> {
     let owner = candidate
         .private_v30_owner(&parent)
         .map_err(|e| e.to_string())?;
+    let mut challenged = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(gate.join("challenged-owner-readback.json"))
+        .map_err(|e| e.to_string())?;
+    serde_json::to_writer(
+        &mut challenged,
+        &serde_json::json!({
+            "readback": owner, "query_pid": parent.pid,
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+    challenged.sync_all().map_err(|e| e.to_string())?;
     parent_guard.validate()?;
     let handle = crate::state::generate_handle().map_err(|e| e.to_string())?;
     let paths = crate::state::StatePaths::new(state_root, handle.clone());

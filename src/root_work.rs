@@ -298,6 +298,9 @@ struct WorkIntent {
     registration_authority: Option<Vec<u8>>,
     environment: Vec<EnvironmentEntry>,
     cancel_owner: Option<ProcessIdentity>,
+    #[cfg(feature = "private-v30-admission")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    __age319_private_bash_source_gate: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -651,6 +654,46 @@ pub(crate) fn submit(
     ready_sentinel: Option<String>,
     registration: delivery::DeliveryRegistration,
 ) -> io::Result<StartupOutcome> {
+    submit_inner(
+        paths,
+        meta,
+        argv,
+        completion_scope,
+        ready_sentinel,
+        registration,
+        #[cfg(feature = "private-v30-admission")]
+        None,
+    )
+}
+
+#[cfg(feature = "private-v30-admission")]
+pub(crate) fn submit_private_v30_source(
+    paths: &StatePaths,
+    meta: &Meta,
+    argv: Vec<String>,
+    registration: delivery::DeliveryRegistration,
+    gate: PathBuf,
+) -> io::Result<StartupOutcome> {
+    submit_inner(
+        paths,
+        meta,
+        argv,
+        CompletionScope::Tree,
+        None,
+        registration,
+        Some(gate),
+    )
+}
+
+fn submit_inner(
+    paths: &StatePaths,
+    meta: &Meta,
+    argv: Vec<String>,
+    completion_scope: CompletionScope,
+    ready_sentinel: Option<String>,
+    registration: delivery::DeliveryRegistration,
+    #[cfg(feature = "private-v30-admission")] private_source_gate: Option<PathBuf>,
+) -> io::Result<StartupOutcome> {
     let endpoint = std::env::var_os(ENDPOINT_ENV)
         .ok_or_else(|| io::Error::other("root endpoint missing; original work was not dispatched"))
         .map_err(|error| preaccept_failure(paths, meta, error))?;
@@ -719,6 +762,8 @@ pub(crate) fn submit(
         registration_authority: registration.into_root_authority(),
         environment,
         cancel_owner: meta.cancel_owner.as_ref().map(ProcessIdentity::from),
+        #[cfg(feature = "private-v30-admission")]
+        __age319_private_bash_source_gate: private_source_gate.clone(),
     };
     let intent_bytes = serde_json::to_vec(&intent)
         .map_err(io::Error::other)
@@ -1390,7 +1435,7 @@ fn stat_starttime(stat: &str) -> Option<u64> {
 }
 
 fn broker_socket_path() -> PathBuf {
-    #[cfg(feature = "source-fault-tests")]
+    #[cfg(any(feature = "source-fault-tests", feature = "private-v30-admission"))]
     if unsafe { libc::geteuid() } == 0
         && std::fs::read_to_string("/proc/self/uid_map")
             .ok()
@@ -1463,6 +1508,12 @@ fn verify_source_socket_v2_at(
     let mut response = Vec::new();
     (&mut broker).take(257).read_to_end(&mut response)?;
     if response != format!("verified-source-v2 {}\n", witness.root_id).as_bytes() {
+        #[cfg(feature = "private-v30-admission")]
+        return Err(io::Error::other(format!(
+            "host source control verification refused: {}",
+            String::from_utf8_lossy(&response)
+        )));
+        #[cfg(not(feature = "private-v30-admission"))]
         return Err(io::Error::other("host source control verification refused"));
     }
     Ok(())

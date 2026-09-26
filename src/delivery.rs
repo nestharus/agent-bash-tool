@@ -43,10 +43,10 @@ const DELIVERY_HELPER_UNAVAILABLE: &str = "delivery_helper_unavailable";
 const DELIVERY_HELPER_INVALID: &str = "delivery_helper_provenance_invalid";
 const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
 #[cfg(feature = "private-v30-admission")]
-// Exact read-only Runner fixture image at 5190855e. A later Runner image
+// Exact paired Runner fixture image. A later Runner image
 // requires an explicit paired update; an environment digest is not authority.
 const PRIVATE_V30_RUNNER_SHA256: &str =
-    "f751c5ee2e9527b1a2add2bd6412404c572bc6651845bf51f16478d572dc9317";
+    "686bec5a01f2f790d0e2e7d79533023a5fe359973952a3034f0d60e07a91a68e";
 
 #[derive(Debug)]
 struct ConfiguredDeliveryHelper {
@@ -70,6 +70,15 @@ pub(crate) struct DeliveryRegistrationCandidate {
 }
 
 impl DeliveryRegistrationCandidate {
+    #[cfg(feature = "private-v30-admission")]
+    pub(crate) fn require_private_v30_pinned_helper(&self) -> io::Result<()> {
+        if self.helper.provenance.sha256 != PRIVATE_V30_RUNNER_SHA256 {
+            return Err(io::Error::other(
+                "private v30 Runner helper image is not pinned fixture image",
+            ));
+        }
+        Ok(())
+    }
     #[cfg(feature = "private-v30-admission")]
     pub(crate) fn private_v30_owner(
         &self,
@@ -1120,8 +1129,12 @@ struct PidSessionResponse {
 }
 
 #[cfg(feature = "private-v30-admission")]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct PrivateV30Owner {
+    pub(crate) root_id: String,
+    pub(crate) source_generation: String,
+    pub(crate) release_id: String,
+    pub(crate) owner: serde_json::Value,
     pub(crate) domain_id: String,
     pub(crate) owner_generation: String,
     pub(crate) session_id: String,
@@ -1166,10 +1179,20 @@ fn private_v30_owner(
         .as_str()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| io::Error::other("private v30 owner generation absent"))?;
+    let root_id = capability["root_id"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("private v30 challenged root absent"))?;
+    let source_generation = capability["source_generation"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("private v30 challenged source generation absent"))?;
+    let release_id = capability["release_id"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("private v30 challenged release absent"))?;
     if capability["protocol"] != crate::continuation::PROTOCOL
         || capability["status"] != "available"
         || owner["domain_id"] != domain_id
         || owner["endpoint"] != *endpoint
+        || root_id != root
         || crate::private_v30::uuid_bytes(root).is_err()
     {
         return Err(io::Error::other("private v30 challenged owner mismatch"));
@@ -1202,6 +1225,10 @@ fn private_v30_owner(
         .filter(|value| crate::private_v30::uuid_bytes(value).is_ok())
         .ok_or_else(|| io::Error::other("private v30 parent invocation absent"))?;
     Ok(PrivateV30Owner {
+        root_id: root_id.to_owned(),
+        source_generation: source_generation.to_owned(),
+        release_id: release_id.to_owned(),
+        owner: owner.clone(),
         domain_id: domain_id.to_owned(),
         owner_generation: owner_generation.to_owned(),
         session_id,

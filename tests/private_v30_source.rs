@@ -39,6 +39,27 @@ fn assert_refusal(output: &Output, root: &Path, reason: &str) {
 }
 
 #[test]
+fn private_pre_k_h_refuses_missing_original_root_before_handle() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new("unshare")
+        .args([
+            "-Urpfm",
+            "--mount-proc",
+            "sh",
+            "-c",
+            r#""$1" __age319-private-pre-k-h-source-v1 "$2" -- /bin/true; true"#,
+            "sh",
+            env!("CARGO_BIN_EXE_agent-bash"),
+        ])
+        .arg(root.path())
+        .env("XDG_STATE_HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path())
+        .output()
+        .unwrap();
+    assert_refusal(&output, root.path(), "original root authority absent");
+}
+
+#[test]
 fn private_source_requires_direct_work_pid1_before_handle() {
     let root = tempfile::tempdir().unwrap();
     let output = private_entry(root.path(), true, Path::new("/bin/true"));
