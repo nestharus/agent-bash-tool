@@ -14,6 +14,7 @@ fn fresh_staging_image_refuses_all_entries_before_state_or_child_effect() {
         vec!["__root-original-work-v1"],
         vec!["--internal-image-custodian-v1"],
         vec!["__age319-private-admit-child-v1"],
+        vec!["__age319-private-v30-source-prep-v1"],
     ] {
         let output = Command::new(binary)
             .args(&arguments)

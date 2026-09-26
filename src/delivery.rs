@@ -42,6 +42,11 @@ const DELIVERY_HELPER_LEGACY_UNSUPPORTED: &str = "delivery_helper_legacy_unsuppo
 const DELIVERY_HELPER_UNAVAILABLE: &str = "delivery_helper_unavailable";
 const DELIVERY_HELPER_INVALID: &str = "delivery_helper_provenance_invalid";
 const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
+#[cfg(feature = "private-v30-admission")]
+// Exact read-only Runner fixture image at 5190855e. A later Runner image
+// requires an explicit paired update; an environment digest is not authority.
+const PRIVATE_V30_RUNNER_SHA256: &str =
+    "f751c5ee2e9527b1a2add2bd6412404c572bc6651845bf51f16478d572dc9317";
 
 #[derive(Debug)]
 struct ConfiguredDeliveryHelper {
@@ -65,6 +70,22 @@ pub(crate) struct DeliveryRegistrationCandidate {
 }
 
 impl DeliveryRegistrationCandidate {
+    #[cfg(feature = "private-v30-admission")]
+    pub(crate) fn private_v30_owner(
+        &self,
+        parent: &CallerChainEntry,
+    ) -> io::Result<PrivateV30Owner> {
+        if self.helper.provenance.sha256 != PRIVATE_V30_RUNNER_SHA256 {
+            return Err(io::Error::other(
+                "private v30 Runner helper image is not pinned fixture image",
+            ));
+        }
+        private_v30_owner(
+            &self.helper.environment,
+            || self.helper.owner_lookup_command(),
+            parent,
+        )
+    }
     pub(crate) fn resolve_owner_binding(
         &self,
         caller_chain: &[CallerChainEntry],
@@ -102,6 +123,33 @@ impl DeliveryLockGuard {
 }
 
 impl DeliveryRegistration {
+    #[cfg(feature = "private-v30-admission")]
+    pub(crate) fn prepare_private_v30_continuation(
+        &self,
+        paths: &StatePaths,
+        meta: &Meta,
+        parent: &CallerChainEntry,
+        expected: &PrivateV30Owner,
+    ) -> io::Result<()> {
+        if self.helper.provenance.sha256 != PRIVATE_V30_RUNNER_SHA256 {
+            return Err(io::Error::other("private v30 handle helper image changed"));
+        }
+        let observed = private_v30_owner(
+            &self.helper.environment,
+            || self.helper.operation_command(),
+            parent,
+        )?;
+        if &observed != expected
+            || meta.owner_session_id.as_deref() != Some(&observed.session_id)
+            || meta.owner_invocation_uuid.as_deref() != Some(&observed.invocation_uuid)
+        {
+            return Err(io::Error::other(
+                "v30 owner binding changed before source preparation",
+            ));
+        }
+        crate::continuation::prepare(paths, meta, &observed.domain_id, "tree")
+    }
+
     pub(crate) fn provenance(&self) -> DeliveryHelperProvenance {
         self.helper.provenance.clone()
     }
@@ -1064,8 +1112,101 @@ pub(crate) struct DetachOutcome {
 #[derive(Debug, Deserialize)]
 struct PidSessionResponse {
     found: bool,
+    #[cfg(feature = "private-v30-admission")]
+    #[serde(default)]
+    pid: Option<u32>,
     invocation_uuid: Option<String>,
     session_id: Option<String>,
+}
+
+#[cfg(feature = "private-v30-admission")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PrivateV30Owner {
+    pub(crate) domain_id: String,
+    pub(crate) owner_generation: String,
+    pub(crate) session_id: String,
+    pub(crate) invocation_uuid: String,
+}
+
+#[cfg(feature = "private-v30-admission")]
+fn private_v30_owner(
+    environment: &BTreeMap<String, String>,
+    mut command: impl FnMut() -> Command,
+    parent: &CallerChainEntry,
+) -> io::Result<PrivateV30Owner> {
+    let required = |name: &str| {
+        environment
+            .get(name)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| io::Error::other(format!("private v30 helper selector {name} absent")))
+    };
+    let root = required("OULIPOLY_KERNEL_EXPECTED_ROOT_V1")?;
+    let endpoint = required("OULIPOLY_KERNEL_OWNER_ENDPOINT_V1")?;
+    let _broker = required("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")?;
+    if !crate::private_v30::private_parent_is_live(parent) {
+        return Err(io::Error::other(
+            "private v30 parent incarnation is not live",
+        ));
+    }
+    let output = command()
+        .args(["notify", "agent-bash-capability", "--json"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "private v30 challenged capability refused",
+        ));
+    }
+    let capability: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let owner = &capability["owner"];
+    let domain_id = capability["domain_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::other("private v30 capability domain absent"))?;
+    let owner_generation = owner["owner_generation"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::other("private v30 owner generation absent"))?;
+    if capability["protocol"] != crate::continuation::PROTOCOL
+        || capability["status"] != "available"
+        || owner["domain_id"] != domain_id
+        || owner["endpoint"] != *endpoint
+        || crate::private_v30::uuid_bytes(root).is_err()
+    {
+        return Err(io::Error::other("private v30 challenged owner mismatch"));
+    }
+    // The helper's v30 session route asks Broker `=` for this exact live K
+    // PID1. Runner has no v29 fallback when both selectors are present.
+    let output = command()
+        .args(["session", "of-pid", &parent.pid.to_string(), "--json"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "private v30 challenged parent binding refused",
+        ));
+    }
+    let binding: PidSessionResponse = serde_json::from_slice(&output.stdout)?;
+    if !binding.found
+        || binding.pid != Some(parent.pid as u32)
+        || !crate::private_v30::private_parent_is_live(parent)
+    {
+        return Err(io::Error::other(
+            "private v30 direct parent is not bound K PID1",
+        ));
+    }
+    let session_id = binding
+        .session_id
+        .filter(|value| value.starts_with("v30:"))
+        .ok_or_else(|| io::Error::other("private v30 parent session absent"))?;
+    let invocation_uuid = binding
+        .invocation_uuid
+        .filter(|value| crate::private_v30::uuid_bytes(value).is_ok())
+        .ok_or_else(|| io::Error::other("private v30 parent invocation absent"))?;
+    Ok(PrivateV30Owner {
+        domain_id: domain_id.to_owned(),
+        owner_generation: owner_generation.to_owned(),
+        session_id,
+        invocation_uuid,
+    })
 }
 
 enum OwnerLookup {

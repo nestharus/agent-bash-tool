@@ -711,6 +711,15 @@ fn sealed_command_file(command: &OrdinaryCommand) -> Result<File, String> {
 }
 
 pub(crate) fn internal_main() -> Option<i32> {
+    if std::env::args().nth(1).as_deref() == Some("__age319-private-v30-source-prep-v1") {
+        return Some(match prepare_live_source() {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("AGE319_PRIVATE_V30_SOURCE={error}");
+                70
+            }
+        });
+    }
     if std::env::args().nth(1).as_deref() == Some("__age319-private-probe-sibling-read-v1") {
         let result = (|| -> Result<(), String> {
             if !private_user_namespace() {
@@ -995,6 +1004,172 @@ pub(crate) fn internal_main() -> Option<i32> {
     })
 }
 
+/// Fixture entry for a direct Bash child of the consumed K work PID1. The
+/// gate is only a rendezvous path; the sealed helper's challenged Broker `=`
+/// readback supplies the owner and exact parent binding.
+fn prepare_live_source() -> Result<(), String> {
+    if !private_user_namespace() {
+        return Err("private v30 source requires user namespace".into());
+    }
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 5 || args[3] != "--" {
+        return Err("expected source gate and -- workload argv".into());
+    }
+    let gate = Path::new(&args[2]);
+    if !gate.is_absolute() || std::fs::canonicalize(gate).map_err(|e| e.to_string())? != gate {
+        return Err("private v30 source gate is not canonical".into());
+    }
+    let argv = args[4..].to_vec();
+    crate::supervisor::validate_argv(&argv).map_err(|e| e.to_string())?;
+    let parent_guard = PrivatePidOneParent::capture()?;
+    let caller_chain = parent_guard.caller_chain()?;
+    let parent = caller_chain
+        .first()
+        .ok_or("private v30 parent absent")?
+        .clone();
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let binary_config = crate::config::load().map_err(|e| e.to_string())?;
+    let state_root =
+        crate::state::state_root_with_config(binary_config.as_ref()).map_err(|e| e.to_string())?;
+    let candidate =
+        crate::delivery::prepare_registration(binary_config).map_err(|e| e.to_string())?;
+    // Authenticate before creating a handle. The helper's selected environment
+    // must contain both v30 selectors; Runner then cannot use its v29 fallback.
+    let owner = candidate
+        .private_v30_owner(&parent)
+        .map_err(|e| e.to_string())?;
+    parent_guard.validate()?;
+    let handle = crate::state::generate_handle().map_err(|e| e.to_string())?;
+    let paths = crate::state::StatePaths::new(state_root, handle.clone());
+    crate::create_run_state(&paths).map_err(|e| format!("{}", e.message.unwrap_or_default()))?;
+    let registration = candidate
+        .bind_to_handle(&paths)
+        .map_err(|e| e.to_string())?;
+    let meta = crate::state::Meta::new(
+        handle,
+        parent.pid,
+        unsafe { libc::getpid() },
+        argv,
+        cwd,
+        "exit",
+        DeliveryMode::Async,
+        None,
+        caller_chain,
+        None,
+    )
+    .with_owner_context(
+        Some(owner.session_id.clone()),
+        Some(owner.invocation_uuid.clone()),
+    )
+    .with_delivery_helper(registration.provenance());
+    crate::persist_delivery_mode(&paths, DeliveryMode::Async)
+        .map_err(|e| e.message.unwrap_or_default())?;
+    crate::persist_initial_meta(&paths, &meta).map_err(|e| e.message.unwrap_or_default())?;
+    parent_guard.validate()?;
+    registration
+        .prepare_private_v30_continuation(&paths, &meta, &parent, &owner)
+        .map_err(|e| e.to_string())?;
+    parent_guard.validate()?;
+    // The marker is a rendezvous hint, never source authority. The worker and
+    // immutable registration stay alive until the fixture releases this gate.
+    let marker = gate.join("source-ready");
+    let mut ready = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .map_err(|e| e.to_string())?;
+    writeln!(
+        ready,
+        "{}",
+        paths
+            .state_dir
+            .join("source-registration-v2.json")
+            .display()
+    )
+    .map_err(|e| e.to_string())?;
+    ready.sync_all().map_err(|e| e.to_string())?;
+    while !gate.join("source-release").exists() {
+        parent_guard.validate()?;
+        if !private_parent_is_live(&parent) {
+            return Err("private v30 bound parent exited while source held".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+/// Ordinary attached calls deliberately reject PID 1. A consumed K worker is
+/// different: its Bash child has namespace-local parent PID 1. This private
+/// guard binds that exact live procfs incarnation without changing the normal
+/// attached-call rule.
+struct PrivatePidOneParent {
+    self_identity: crate::state::CallerChainEntry,
+    parent: crate::state::CallerChainEntry,
+}
+
+impl PrivatePidOneParent {
+    fn capture() -> Result<Self, String> {
+        if unsafe { libc::getppid() } != 1 {
+            return Err("private v30 source must be direct child of work PID1".into());
+        }
+        let self_identity = crate::state::observer_self_identity().map_err(|e| e.to_string())?;
+        let parent_pid = crate::state::process_parent_pid(self_identity.pid)
+            .ok_or("private v30 observer parent absent")?;
+        let parent = crate::state::capture_caller_chain(parent_pid)
+            .into_iter()
+            .next()
+            .ok_or("private v30 parent incarnation absent")?;
+        let guard = Self {
+            self_identity,
+            parent,
+        };
+        guard.validate()?;
+        Ok(guard)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if unsafe { libc::getppid() } != 1
+            || crate::state::observer_self_identity().ok().as_ref() != Some(&self.self_identity)
+            || !private_parent_is_live(&self.parent)
+            || crate::state::process_parent_pid(self.self_identity.pid) != Some(self.parent.pid)
+        {
+            return Err("private v30 direct parent incarnation changed".into());
+        }
+        let status = std::fs::read_to_string(format!("/proc/{}/status", self.parent.pid))
+            .map_err(|e| e.to_string())?;
+        let local_pid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("NSpid:"))
+            .and_then(|line| line.split_ascii_whitespace().last())
+            .ok_or("private v30 parent namespace PID absent")?;
+        if local_pid != "1"
+            || std::fs::read_link("/proc/self/ns/pid").map_err(|e| e.to_string())?
+                != std::fs::read_link(format!("/proc/{}/ns/pid", self.parent.pid))
+                    .map_err(|e| e.to_string())?
+        {
+            return Err("private v30 parent is not work PID1".into());
+        }
+        Ok(())
+    }
+
+    fn caller_chain(&self) -> Result<Vec<crate::state::CallerChainEntry>, String> {
+        self.validate()?;
+        let chain = crate::state::capture_caller_chain(self.parent.pid);
+        if chain.first() != Some(&self.parent) {
+            return Err("private v30 parent chain changed".into());
+        }
+        Ok(chain)
+    }
+}
+
+pub(crate) fn private_parent_is_live(parent: &crate::state::CallerChainEntry) -> bool {
+    if parent.pid == 1 {
+        crate::state::capture_caller_chain(1).first() == Some(parent)
+    } else {
+        crate::state::process_identity_is_live(parent)
+    }
+}
+
 fn write_terminal_witness(code: i32) {
     if let Some(marker) = std::env::args().nth(4) {
         if let Some(parent) = Path::new(&marker).parent() {
@@ -1197,7 +1372,7 @@ fn random_uuid() -> Result<String, String> {
     ))
 }
 
-fn uuid_bytes(value: &str) -> Result<[u8; 16], String> {
+pub(crate) fn uuid_bytes(value: &str) -> Result<[u8; 16], String> {
     let hex = value.replace('-', "");
     if value.len() != 36
         || hex.len() != 32
