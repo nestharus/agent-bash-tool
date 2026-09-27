@@ -1164,6 +1164,23 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
     {
         return Err(error("pinned recovery identity conflict"));
     }
+    // Private paired fixture: a child of the selected recovery image outlives
+    // the direct worker and keeps stderr open. The source PID1 must adopt and
+    // reap it before a complete physical output receipt can exist.
+    #[cfg(feature = "private-v30-admission")]
+    if let Some(marker) = std::env::var_os("AGE319_PRIVATE_SOURCE_Q_MARKER_V1") {
+        std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf 'adopted\\n' > \"$1\"; sleep 3; while [ ! -e \"${1}.release\" ]; do sleep 0.05; done; printf 'adopted-stderr\\n' >&2",
+                "sh",
+            ])
+            .arg(marker)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()?;
+    }
     {
         let _lock = lock(&paths)?;
         let mut fence = value(&paths.state_dir.join(FENCE))?;
