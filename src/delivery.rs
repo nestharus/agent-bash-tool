@@ -46,7 +46,7 @@ const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
 // Exact paired Runner fixture image. A later Runner image
 // requires an explicit paired update; an environment digest is not authority.
 const PRIVATE_V30_RUNNER_SHA256: &str =
-    "4551874b468da7a91c9a43114b60db952bfae85e8bf84fa89a722ab11b290098";
+    "00e1ab7f4181b8c637e441460ecb99cae19983cbecc69179bde11b841e385d9f";
 
 #[derive(Debug)]
 struct ConfiguredDeliveryHelper {
@@ -196,6 +196,30 @@ impl DeliveryRegistration {
                 accepted_intent.as_os_str().to_os_string(),
             ]
         };
+        let mut transient_environment = vec![
+            (
+                COMPLETION_REGISTRATION_AUTHORITY_ENV.into(),
+                OsString::from_vec(authority),
+            ),
+            (OWNER_SESSION_ID_ENV.into(), session.into()),
+            (OWNER_INVOCATION_UUID_ENV.into(), invocation.into()),
+            (OWNER_WORK_ID_ENV.into(), work_id.into()),
+        ];
+        // A private fixture schedule selects the postcommit wire protocol.
+        // The Runner still requires its Broker/State challenge before W.
+        if production_cli {
+            if let Some(gate) =
+                env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1").filter(|gate| {
+                    Path::new(gate)
+                        .join("source-production-postcommit-h")
+                        .exists()
+                })
+            {
+                transient_environment.push(("AGE319_PRIVATE_POSTCOMMIT_H_V1".into(), "1".into()));
+                transient_environment
+                    .push(("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1".into(), gate));
+            }
+        }
         let request = DeliveryHelperRequest {
             paths,
             operation: "private-exact-source-decision",
@@ -205,15 +229,7 @@ impl DeliveryRegistration {
             )
             .map_err(io::Error::other)?,
             args,
-            transient_environment: vec![
-                (
-                    COMPLETION_REGISTRATION_AUTHORITY_ENV.into(),
-                    OsString::from_vec(authority),
-                ),
-                (OWNER_SESSION_ID_ENV.into(), session.into()),
-                (OWNER_INVOCATION_UUID_ENV.into(), invocation.into()),
-                (OWNER_WORK_ID_ENV.into(), work_id.into()),
-            ],
+            transient_environment,
         };
         run_structured_helper(&request, None).map_err(|error| match error {
             DeliveryHelperCommandError::NotStarted(error)
