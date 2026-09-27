@@ -181,6 +181,8 @@ struct SourceSocketWitness<'a> {
     guardian: ProcessWitness<'a>,
     source: ProcessWitness<'a>,
     scope: SourceScope<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delegated_root_h_request_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -685,6 +687,36 @@ pub(crate) fn submit_private_v30_source(
     )
 }
 
+/// The selected-K Bash child supplies original H. The bounded H milestone
+/// runs its fixed workload directly; it does not install the separate pre-K
+/// Bash source fixture behind this H.
+#[cfg(feature = "private-v30-admission")]
+pub(crate) fn submit_private_delegated_root_h(
+    paths: &StatePaths,
+    meta: &Meta,
+    argv: Vec<String>,
+    registration: delivery::DeliveryRegistration,
+) -> io::Result<StartupOutcome> {
+    submit_inner(
+        paths,
+        meta,
+        argv,
+        CompletionScope::Tree,
+        None,
+        registration,
+        None,
+    )
+}
+
+#[cfg(feature = "private-v30-admission")]
+fn delegated_h_stage(stage: &str) {
+    if std::env::var_os("AGE319_PRIVATE_DELEGATED_ROOT_H_REQUEST_ID").is_some()
+        && let Some(root) = std::env::var_os("XDG_STATE_HOME")
+    {
+        let _ = std::fs::write(Path::new(&root).join("delegated-h-client-stage"), stage);
+    }
+}
+
 fn submit_inner(
     paths: &StatePaths,
     meta: &Meta,
@@ -912,6 +944,8 @@ fn submit_inner(
         );
         preaccept_failure(paths, meta, error)
     })?;
+    #[cfg(feature = "private-v30-admission")]
+    delegated_h_stage("source-authenticated");
     if let Err(error) = send_with_fds(
         &mut socket,
         &frame,
@@ -939,6 +973,8 @@ fn submit_inner(
         );
         return Ok(StartupOutcome::RootEffectsPossibleNoReplay);
     }
+    #[cfg(feature = "private-v30-admission")]
+    delegated_h_stage("frame-sent");
     if grant.control_protocol == SOURCE_CONTROL_PROTOCOL
         && socket.shutdown(Shutdown::Write).is_err()
     {
@@ -958,6 +994,8 @@ fn submit_inner(
         );
         return Ok(StartupOutcome::RootEffectsPossibleNoReplay);
     }
+    #[cfg(feature = "private-v30-admission")]
+    delegated_h_stage("frame-half-closed");
     let response: WorkResponse = match read_response(&mut socket) {
         Ok(response) => response,
         Err(_error) => {
@@ -1357,6 +1395,11 @@ fn authenticate_control(
             let source = host_observed_source()?;
             let host_pid = i32::try_from(guardian.pid)
                 .map_err(|_| io::Error::other("invalid guardian host PID"))?;
+            let delegated_root_h_request_id = if matches!(&scope, SourceScope::Root) {
+                std::env::var("AGE319_PRIVATE_DELEGATED_ROOT_H_REQUEST_ID").ok()
+            } else {
+                None
+            };
             let witness = SourceSocketWitness {
                 root_id,
                 domain_id,
@@ -1372,6 +1415,7 @@ fn authenticate_control(
                     starttime_ticks: source.starttime_ticks,
                 },
                 scope,
+                delegated_root_h_request_id,
             };
             verify_source_socket_v2_at(&broker_socket_path(), socket, &witness, 0)
         }
@@ -2052,6 +2096,7 @@ mod tests {
                 starttime_ticks: source.starttime_ticks,
             },
             scope,
+            delegated_root_h_request_id: None,
         }
     }
 
