@@ -1370,6 +1370,22 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
+    #[cfg(feature = "private-v30-admission")]
+    if std::env::var_os("AGE319_PRIVATE_V2_WAIT_WORKER_V1").is_some() {
+        let worker: CallerChainEntry =
+            serde_json::from_value(registration["registering_caller"].clone())?;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while std::time::Instant::now() < until {
+            let gone = matches!(
+                state::process_identity_evidence(&worker),
+                state::ProcessIdentityEvidence::Gone | state::ProcessIdentityEvidence::Mismatch
+            );
+            if gone && paths.state_dir.join(SNAPSHOT).try_exists()? {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
     {
         let _lock = lock(&paths)?;
         let mut fence = value(&paths.state_dir.join(FENCE))?;
