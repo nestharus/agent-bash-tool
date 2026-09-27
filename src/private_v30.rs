@@ -916,10 +916,80 @@ pub(crate) fn internal_main() -> Option<i32> {
                 if request_frame(&socket, b'<', &request, true).is_ok() {
                     return Err("original H delegation consumed twice".into());
                 }
-                Some(consumed["delegation"].clone())
+                Some(consumed)
             }
         } else {
             None
+        };
+        let original_h_submitted = if let Some(consumed) = root_h_consumption.as_ref() {
+            let gate = Path::new(&marker)
+                .parent()
+                .ok_or("original H gate absent")?;
+            if !gate.join("original-d-j-bound").exists() {
+                return Err("original D/J State binding absent before H".into());
+            }
+            let delegation = &consumed["delegation"];
+            let original_session = delegation["root_session_id"]
+                .as_str()
+                .ok_or("original D session absent")?;
+            let original_invocation = delegation["root_invocation_uuid"]
+                .as_str()
+                .ok_or("original J invocation absent")?;
+            let original_endpoint = delegation["root_endpoint"]
+                .as_str()
+                .ok_or("original guardian endpoint absent")?;
+            let work_authority = consumed["root_work_authority"]
+                .as_str()
+                .ok_or("original work authority absent")?;
+            let registration_authority = consumed["registration_authority"]
+                .as_str()
+                .ok_or("original registration authority absent")?;
+            if socket.file_name().is_none_or(|name| name != "v30.sock") {
+                return Err("selected K fresh fixture socket changed".into());
+            }
+            let original_broker_socket = socket.with_file_name("broker.sock");
+            let runner_image = std::fs::read_to_string(gate.join("original-h-runner-image"))
+                .map_err(|e| format!("original H Runner image absent: {e}"))?;
+            if !Path::new(&runner_image).is_absolute() {
+                return Err("original H Runner image is not absolute".into());
+            }
+            unsafe {
+                std::env::set_var("OULIPOLY_ROOT_AUTHORITY_V1", work_authority);
+                std::env::set_var("OULIPOLY_COMPLETION_ENDPOINT", original_endpoint);
+                std::env::set_var("OULIPOLY_KERNEL_OWNER_ENDPOINT_V1", original_endpoint);
+                std::env::set_var("OULIPOLY_KERNEL_EXPECTED_ROOT_V1", &child.root_id);
+                std::env::set_var(
+                    "OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1",
+                    &original_broker_socket,
+                );
+                std::env::set_var("XDG_STATE_HOME", gate);
+                std::env::set_var("XDG_CONFIG_HOME", gate);
+                std::env::set_var("AGENT_BASH_AGENT_RUNNER_BIN", runner_image);
+                std::env::set_var("OULIPOLY_ORIGINAL_WORK_REQUIRED_V1", "1");
+                std::env::set_var("AGENT_BASH_OWNER_SESSION_ID", original_session);
+                std::env::set_var("AGENT_BASH_OWNER_INVOCATION_UUID", original_invocation);
+                std::env::set_var(
+                    "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
+                    registration_authority,
+                );
+                std::env::set_var(
+                    "AGE319_PRIVATE_DELEGATED_ROOT_H_REQUEST_ID",
+                    &child.request_id,
+                );
+                std::env::remove_var("OULIPOLY_ROOT_WORK_ID");
+                std::env::remove_var("OULIPOLY_ROOT_PARENT_CAPABILITY_V1");
+            }
+            submit_original_h_source(
+                gate,
+                vec!["/bin/true".into(), "selected workload".into()],
+                false,
+            )?;
+            unsafe {
+                std::env::remove_var("AGE319_PRIVATE_DELEGATED_ROOT_H_REQUEST_ID");
+            }
+            true
+        } else {
+            false
         };
         if Path::new(&marker).exists() {
             return Err("private effect marker exists before grant".into());
@@ -1090,7 +1160,8 @@ pub(crate) fn internal_main() -> Option<i32> {
             "{}",
             serde_json::json!({
                 "child": child,
-                "root_h_consumption": root_h_consumption,
+                "root_h_consumption": root_h_consumption.as_ref().map(|value| &value["delegation"]),
+                "original_h_submitted": original_h_submitted,
                 "bash_reported_result": result,
                 "result_provenance": "bash-self-report-only",
                 "broker_physical_q": physical,
@@ -1121,25 +1192,31 @@ pub(crate) fn internal_main() -> Option<i32> {
 /// grant and endpoint select the original J/D root; the guardian and Broker
 /// challenge the connected socket and this executable before accepting H.
 fn prepare_pre_k_h_source() -> Result<(), String> {
-    use crate::state::{Meta, StatePaths};
-    use crate::supervisor::StartupOutcome;
-    if !private_user_namespace() {
-        return Err("private pre-K H requires user namespace".into());
-    }
-    // J consumed its one-use kernel join descriptor before launching this
-    // source. Keep that bootstrap selector out of H's chosen environment.
-    unsafe {
-        std::env::remove_var("OULIPOLY_KERNEL_CHILD_JOIN_FD_V1");
-    }
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 5 || args[3] != "--" {
         return Err("expected source gate and -- workload argv".into());
     }
     let gate = Path::new(&args[2]);
+    submit_original_h_source(gate, args[4..].to_vec(), true)
+}
+
+fn submit_original_h_source(
+    gate: &Path,
+    argv: Vec<String>,
+    wait_for_release: bool,
+) -> Result<(), String> {
+    use crate::state::{Meta, StatePaths};
+    use crate::supervisor::StartupOutcome;
+    if !private_user_namespace() {
+        return Err("private original H requires user namespace".into());
+    }
+    // A root child or selected-K child has already consumed its join gate.
+    unsafe {
+        std::env::remove_var("OULIPOLY_KERNEL_CHILD_JOIN_FD_V1");
+    }
     if !gate.is_absolute() || std::fs::canonicalize(gate).map_err(|e| e.to_string())? != gate {
         return Err("private pre-K H gate is not canonical".into());
     }
-    let argv = args[4..].to_vec();
     crate::supervisor::validate_argv(&argv).map_err(|e| e.to_string())?;
     if std::env::var_os("OULIPOLY_ROOT_AUTHORITY_V1").is_none() {
         return Err("original root authority absent".into());
@@ -1166,8 +1243,30 @@ fn prepare_pre_k_h_source() -> Result<(), String> {
         return Err("original D session invalid".into());
     }
     uuid_bytes(&invocation)?;
-    let guard = crate::guard::AttachedGuard::capture();
-    let caller_chain = guard.caller_chain().map_err(|e| e.to_string())?;
+    let attached = wait_for_release.then(crate::guard::AttachedGuard::capture);
+    let selected = if wait_for_release {
+        None
+    } else {
+        Some(PrivateSelectedKParent::capture()?)
+    };
+    let validate = || -> Result<(), String> {
+        if let Some(guard) = &attached {
+            guard.validate().map_err(|e| e.to_string())
+        } else {
+            selected
+                .as_ref()
+                .ok_or("selected K parent absent")?
+                .validate()
+        }
+    };
+    let caller_chain = if let Some(guard) = &attached {
+        guard.caller_chain().map_err(|e| e.to_string())?
+    } else {
+        selected
+            .as_ref()
+            .ok_or("selected K parent absent")?
+            .caller_chain()?
+    };
     let parent = caller_chain.first().ok_or("original J parent absent")?;
     let cwd = std::env::current_dir().map_err(|e| format!("pre-K cwd: {e}"))?;
     let config = crate::config::load().map_err(|e| format!("pre-K config: {e}"))?;
@@ -1178,7 +1277,7 @@ fn prepare_pre_k_h_source() -> Result<(), String> {
     candidate
         .require_private_v30_pinned_helper()
         .map_err(|e| format!("pre-K pin: {e}"))?;
-    guard.validate().map_err(|e| e.to_string())?;
+    validate()?;
     let handle = crate::state::generate_handle().map_err(|e| e.to_string())?;
     let paths = StatePaths::new(state_root, handle.clone());
     crate::create_run_state(&paths).map_err(|e| format!("pre-K state create: {e:?}"))?;
@@ -1202,7 +1301,7 @@ fn prepare_pre_k_h_source() -> Result<(), String> {
     crate::persist_delivery_mode(&paths, DeliveryMode::Async)
         .map_err(|e| format!("pre-K delivery mode: {e:?}"))?;
     crate::persist_initial_meta(&paths, &meta).map_err(|e| format!("pre-K meta: {e:?}"))?;
-    guard.validate().map_err(|e| e.to_string())?;
+    validate()?;
     if !crate::root_work::selected(&paths, &meta).map_err(|e| format!("pre-K route: {e}"))? {
         return Err("original work selection absent".into());
     }
@@ -1213,15 +1312,18 @@ fn prepare_pre_k_h_source() -> Result<(), String> {
         paths.state_dir.as_os_str().as_encoded_bytes(),
     )
     .map_err(|e| e.to_string())?;
-    match crate::root_work::submit_private_v30_source(
-        &paths,
-        &meta,
-        argv,
-        registration,
-        gate.to_path_buf(),
-    )
-    .map_err(|e| format!("pre-K submit: {e}"))?
-    {
+    let submitted = if wait_for_release {
+        crate::root_work::submit_private_v30_source(
+            &paths,
+            &meta,
+            argv,
+            registration,
+            gate.to_path_buf(),
+        )
+    } else {
+        crate::root_work::submit_private_delegated_root_h(&paths, &meta, argv, registration)
+    };
+    match submitted.map_err(|e| format!("original H submit: {e}"))? {
         StartupOutcome::RootAccepted => {}
         _ => return Err("original H acceptance uncertain; no replay".into()),
     }
@@ -1232,9 +1334,11 @@ fn prepare_pre_k_h_source() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     writeln!(marker, "{}", paths.state_dir.display()).map_err(|e| e.to_string())?;
     marker.sync_all().map_err(|e| e.to_string())?;
-    while !gate.join("h-source-release").exists() {
-        guard.validate().map_err(|e| e.to_string())?;
-        std::thread::sleep(std::time::Duration::from_millis(20));
+    if wait_for_release {
+        while !gate.join("h-source-release").exists() {
+            validate()?;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
     Ok(())
 }
@@ -1424,6 +1528,51 @@ fn prepare_live_source() -> Result<(), String> {
 struct PrivatePidOneParent {
     self_identity: crate::state::CallerChainEntry,
     parent: crate::state::CallerChainEntry,
+}
+
+/// The selected provider may be the child's namespace-local parent instead
+/// of PID1. This only protects Bash's local H preparation against reparenting;
+/// the Broker separately proves the selected K, exact child actor and socket.
+struct PrivateSelectedKParent {
+    self_identity: crate::state::CallerChainEntry,
+    parent: crate::state::CallerChainEntry,
+}
+
+impl PrivateSelectedKParent {
+    fn capture() -> Result<Self, String> {
+        let self_identity = crate::state::observer_self_identity().map_err(|e| e.to_string())?;
+        let parent_pid = crate::state::process_parent_pid(self_identity.pid)
+            .ok_or("selected K child observer parent absent")?;
+        let parent = crate::state::capture_caller_chain(parent_pid)
+            .into_iter()
+            .next()
+            .ok_or("selected K parent incarnation absent")?;
+        let guard = Self {
+            self_identity,
+            parent,
+        };
+        guard.validate()?;
+        Ok(guard)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if crate::state::observer_self_identity().ok().as_ref() != Some(&self.self_identity)
+            || crate::state::process_parent_pid(self.self_identity.pid) != Some(self.parent.pid)
+            || !private_parent_is_live(&self.parent)
+        {
+            return Err("selected K child parent incarnation changed".into());
+        }
+        Ok(())
+    }
+
+    fn caller_chain(&self) -> Result<Vec<crate::state::CallerChainEntry>, String> {
+        self.validate()?;
+        let chain = crate::state::capture_caller_chain(self.parent.pid);
+        if chain.first() != Some(&self.parent) {
+            return Err("selected K child parent chain changed".into());
+        }
+        Ok(chain)
+    }
 }
 
 impl PrivatePidOneParent {
