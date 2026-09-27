@@ -46,7 +46,7 @@ const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
 // Exact paired Runner fixture image. A later Runner image
 // requires an explicit paired update; an environment digest is not authority.
 const PRIVATE_V30_RUNNER_SHA256: &str =
-    "1fff1e69caa64ba0975fc56e9e7fe9f6d156da61a5f5fa8252ca463ae5a902cc";
+    "bf3235ff932cba2afb8fa4d35d762f3537a03728a668ba28625c71f04c9b4693";
 
 #[derive(Debug)]
 struct ConfiguredDeliveryHelper {
@@ -2188,6 +2188,11 @@ fn register_request<'a>(
         }
     };
     let mut transient_environment = Vec::new();
+    let accepted_intent = crate::continuation::enabled(paths)
+        && paths
+            .state_dir
+            .join(crate::root_work::ACCEPTED_FILE)
+            .exists();
     if let Some(authority) = authority {
         let (session, invocation) = owner.ok_or_else(|| {
             io::Error::other("native registration requires a resolved completion owner binding")
@@ -2200,23 +2205,25 @@ fn register_request<'a>(
         ));
         transient_environment.push((OsString::from(OWNER_SESSION_ID_ENV), session.into()));
         transient_environment.push((OsString::from(OWNER_INVOCATION_UUID_ENV), invocation.into()));
-        if crate::continuation::enabled(paths)
-            && paths
-                .state_dir
-                .join(crate::root_work::ACCEPTED_FILE)
-                .exists()
-        {
+        if accepted_intent {
             transient_environment.push((
                 OsString::from(OWNER_WORK_ID_ENV),
                 meta.handle.clone().into(),
             ));
         }
     }
+    let mut args = register_args(meta, paths);
+    if accepted_intent {
+        args.extend([
+            OsString::from("--accepted-intent-file"),
+            path_arg(&paths.state_dir.join(crate::root_work::INTENT_FILE)),
+        ]);
+    }
     Ok(DeliveryHelperRequest {
         paths,
         operation: "register",
         helper,
-        args: register_args(meta, paths),
+        args,
         transient_environment,
     })
 }
@@ -3471,9 +3478,24 @@ mod tests {
             environment[3],
             (OWNER_WORK_ID_ENV.into(), paths.handle.clone().into())
         );
+        let request = register_request(&meta, &paths, helper, Some("a".repeat(64).into())).unwrap();
+        assert!(request.args.windows(2).any(|args| {
+            args[0] == "--accepted-intent-file"
+                && args[1]
+                    == paths
+                        .state_dir
+                        .join(crate::root_work::INTENT_FILE)
+                        .as_os_str()
+        }));
         let mut stale = meta.clone();
         stale.owner_invocation_uuid = Some("22222222-2222-4222-8222-222222222222".into());
-        assert!(completion_owner_environment(&paths, &stale, &helper).is_err());
+        let stale_helper = HandleBoundDeliveryHelper {
+            provenance: meta.delivery_helper.as_ref().unwrap().clone(),
+            environment: BTreeMap::new(),
+            executable: File::open("/bin/true").unwrap(),
+            interpreter: None,
+        };
+        assert!(completion_owner_environment(&paths, &stale, &stale_helper).is_err());
     }
 
     #[test]
