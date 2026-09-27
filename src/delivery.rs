@@ -46,7 +46,7 @@ const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
 // Exact paired Runner fixture image. A later Runner image
 // requires an explicit paired update; an environment digest is not authority.
 const PRIVATE_V30_RUNNER_SHA256: &str =
-    "465a9264a86ea41d3fc250ab3974bab42c68ef42b50ffd2396ff2ea614dbd1b3";
+    "336ed7790cc0c542a8c8c4da31dc625f57e708e5f56661243d9b30805e8aa2c5";
 
 #[derive(Debug)]
 struct ConfiguredDeliveryHelper {
@@ -138,6 +138,7 @@ impl DeliveryRegistration {
         paths: &StatePaths,
         meta: &Meta,
         accepted_intent: &Path,
+        production_cli: bool,
     ) -> io::Result<serde_json::Value> {
         if self.helper.provenance.sha256 != PRIVATE_V30_RUNNER_SHA256 {
             return Err(io::Error::other("private decision helper image changed"));
@@ -178,6 +179,23 @@ impl DeliveryRegistration {
                 "private decision H authority selection changed",
             ));
         }
+        let args = if production_cli {
+            let mut args = register_args(meta, paths);
+            args.extend([
+                OsString::from("--accepted-intent-file"),
+                accepted_intent.as_os_str().to_os_string(),
+            ]);
+            args
+        } else {
+            vec![
+                "__age319-private-consumed-h-source-decision-v1".into(),
+                paths
+                    .state_dir
+                    .join(crate::continuation::REGISTRATION)
+                    .into_os_string(),
+                accepted_intent.as_os_str().to_os_string(),
+            ]
+        };
         let request = DeliveryHelperRequest {
             paths,
             operation: "private-exact-source-decision",
@@ -186,14 +204,7 @@ impl DeliveryRegistration {
                 paths,
             )
             .map_err(io::Error::other)?,
-            args: vec![
-                "__age319-private-consumed-h-source-decision-v1".into(),
-                paths
-                    .state_dir
-                    .join(crate::continuation::REGISTRATION)
-                    .into_os_string(),
-                accepted_intent.as_os_str().to_os_string(),
-            ],
+            args,
             transient_environment: vec![
                 (
                     COMPLETION_REGISTRATION_AUTHORITY_ENV.into(),

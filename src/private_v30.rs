@@ -1250,7 +1250,12 @@ fn prepare_live_source() -> Result<(), String> {
             std::fs::read_to_string(gate.join("h-source-intent-dir")).map_err(|e| e.to_string())?;
         let intent = Path::new(h_dir.trim()).join("root-work-intent-v1.json");
         let result = registration
-            .private_exact_source_decision(&paths, &meta, &intent)
+            .private_exact_source_decision(
+                &paths,
+                &meta,
+                &intent,
+                gate.join("source-production-registration-cli").exists(),
+            )
             .map_err(|e| {
                 let stderr = std::fs::read_dir(&paths.state_dir)
                     .ok()
