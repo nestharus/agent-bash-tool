@@ -33,7 +33,7 @@ pub(crate) const ROOT_WORK_ID_ENV: &str = "OULIPOLY_ROOT_WORK_ID";
 pub(crate) const ROOT_PARENT_CAPABILITY_ENV: &str = "OULIPOLY_ROOT_PARENT_CAPABILITY_V1";
 const ENDPOINT_ENV: &str = "OULIPOLY_COMPLETION_ENDPOINT";
 const REQUIRED_ENV: &str = "OULIPOLY_ORIGINAL_WORK_REQUIRED_V1";
-const INTENT_FILE: &str = "root-work-intent-v1.json";
+pub(crate) const INTENT_FILE: &str = "root-work-intent-v1.json";
 pub(crate) const ACCEPTED_FILE: &str = "root-work-accepted-v1.json";
 
 pub(crate) struct CompletionOwnerWitness {
