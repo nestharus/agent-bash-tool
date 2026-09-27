@@ -1181,6 +1181,26 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
             .stderr(std::process::Stdio::inherit())
             .spawn()?;
     }
+    #[cfg(feature = "private-v30-admission")]
+    if std::env::var_os("AGE319_PRIVATE_V2_WAIT_SOURCE_V1").is_some() {
+        // W starts before the helper returns its H acknowledgement to the
+        // original worker. Do not hold launch.lock while that worker spends
+        // its exact fence and publishes through the supervisor. This wait
+        // schedules a read only; the normal v2 checks below decide the reply.
+        let worker: CallerChainEntry =
+            serde_json::from_value(registration["registering_caller"].clone())?;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while !paths.state_dir.join(SNAPSHOT).try_exists()? {
+            if !matches!(
+                state::process_identity_evidence(&worker),
+                state::ProcessIdentityEvidence::Live
+            ) || std::time::Instant::now() >= until
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
     {
         let _lock = lock(&paths)?;
         let mut fence = value(&paths.state_dir.join(FENCE))?;

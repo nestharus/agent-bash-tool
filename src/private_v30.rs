@@ -1199,7 +1199,7 @@ fn prepare_live_source() -> Result<(), String> {
         handle,
         parent.pid,
         unsafe { libc::getpid() },
-        argv,
+        argv.clone(),
         cwd,
         "exit",
         DeliveryMode::Async,
@@ -1281,6 +1281,27 @@ fn prepare_live_source() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         serde_json::to_writer(&mut file, &result).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
+        if gate.join("source-v2-workload").exists() {
+            parent_guard.validate()?;
+            // The exact committed helper reply spends this worker's original
+            // launch fence. The gate selects only this private fixture path.
+            crate::continuation::confirm_launch(&paths, &result)
+                .map_err(|e| format!("private v2 launch confirmation: {e}"))?;
+            let status = crate::supervisor::run_private_registered_source(
+                crate::supervisor::SupervisorConfig {
+                    paths,
+                    meta,
+                    argv,
+                    completion_scope: crate::supervisor::CompletionScope::Tree,
+                    ready_sentinel: None,
+                },
+            );
+            return if status == 0 {
+                Ok(())
+            } else {
+                Err(format!("private v2 supervisor exited with {status}"))
+            };
+        }
     }
     while !gate.join("source-release").exists() {
         parent_guard.validate()?;

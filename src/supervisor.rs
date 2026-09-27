@@ -1014,6 +1014,11 @@ fn write_control_byte(fd: RawFd, byte: u8) -> io::Result<()> {
     }
 }
 
+#[cfg(feature = "private-v30-admission")]
+pub(crate) fn run_private_registered_source(config: SupervisorConfig) -> i32 {
+    run_supervisor(config, None)
+}
+
 fn run_supervisor(config: SupervisorConfig, root_control_fd: Option<RawFd>) -> i32 {
     set_private_umask();
     let mut meta = supervisor_meta(config.meta);
