@@ -46,7 +46,7 @@ const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
 // Exact paired Runner fixture image. A later Runner image
 // requires an explicit paired update; an environment digest is not authority.
 const PRIVATE_V30_RUNNER_SHA256: &str =
-    "bf3235ff932cba2afb8fa4d35d762f3537a03728a668ba28625c71f04c9b4693";
+    "39e989612edc0d7585b75dc3a5db32cd8ee67c20653d4de2c9434db1c81efe65";
 
 #[derive(Debug)]
 struct ConfiguredDeliveryHelper {
@@ -2210,6 +2210,23 @@ fn register_request<'a>(
                 OsString::from(OWNER_WORK_ID_ENV),
                 meta.handle.clone().into(),
             ));
+        }
+    }
+    #[cfg(feature = "private-v30-admission")]
+    if accepted_intent && meta.delivery_mode == DeliveryMode::Async {
+        // The original H process receives only its frozen root-work
+        // environment. Its fixture gate is the parent of the Bash state
+        // root; ambient provider K variables do not cross that boundary.
+        if let Some(gate_path) = paths.state_dir.parent().and_then(Path::parent) {
+            if gate_path.join("selected-k-root-h").exists()
+                && gate_path.join("source-production-postcommit-h").exists()
+            {
+                transient_environment.push(("AGE319_PRIVATE_POSTCOMMIT_H_V1".into(), "1".into()));
+                transient_environment.push((
+                    "OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1".into(),
+                    gate_path.as_os_str().to_owned(),
+                ));
+            }
         }
     }
     let mut args = register_args(meta, paths);

@@ -91,6 +91,20 @@ impl ListenerPolicy {
         }
     }
 
+    fn delivery_mode(self) -> DeliveryMode {
+        match self {
+            Self::ResponseOnly => DeliveryMode::Sync,
+            Self::Notify => DeliveryMode::Async,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ResponseOnly => "response_only",
+            Self::Notify => "notify",
+        }
+    }
+
     fn is_response_only(&self) -> bool {
         *self == Self::ResponseOnly
     }
@@ -895,7 +909,7 @@ pub(crate) fn internal_main() -> Option<i32> {
                     || consumed["delegation"]["selected_k"]["grant_id"]
                         != child.parent_work_grant_id
                     || consumed["delegation"]["selected_k"]["work_id"] != child.parent_work_id
-                    || consumed["delegation"]["listener_policy"] != "response_only"
+                    || consumed["delegation"]["listener_policy"] != policy.as_str()
                     || consumed["delegation"]["root_endpoint"]
                         .as_str()
                         .is_none_or(str::is_empty)
@@ -983,6 +997,7 @@ pub(crate) fn internal_main() -> Option<i32> {
                 gate,
                 vec!["/bin/true".into(), "selected workload".into()],
                 false,
+                policy.delivery_mode(),
             )?;
             unsafe {
                 std::env::remove_var("AGE319_PRIVATE_DELEGATED_ROOT_H_REQUEST_ID");
@@ -1197,13 +1212,14 @@ fn prepare_pre_k_h_source() -> Result<(), String> {
         return Err("expected source gate and -- workload argv".into());
     }
     let gate = Path::new(&args[2]);
-    submit_original_h_source(gate, args[4..].to_vec(), true)
+    submit_original_h_source(gate, args[4..].to_vec(), true, DeliveryMode::Async)
 }
 
 fn submit_original_h_source(
     gate: &Path,
     argv: Vec<String>,
     wait_for_release: bool,
+    delivery_mode: DeliveryMode,
 ) -> Result<(), String> {
     use crate::state::{Meta, StatePaths};
     use crate::supervisor::StartupOutcome;
@@ -1272,8 +1288,26 @@ fn submit_original_h_source(
     let config = crate::config::load().map_err(|e| format!("pre-K config: {e}"))?;
     let state_root = crate::state::state_root_with_config(config.as_ref())
         .map_err(|e| format!("pre-K state root: {e}"))?;
+    // This private source schedule is captured with the H handle's pinned
+    // recovery environment. The provider K environment is not inherited by
+    // the later recovery worker.
+    if !wait_for_release && delivery_mode == DeliveryMode::Async {
+        unsafe {
+            std::env::set_var(
+                "AGE319_PRIVATE_SOURCE_Q_MARKER_V1",
+                gate.join("source-adopted-started"),
+            );
+            std::env::set_var("AGE319_PRIVATE_V2_WAIT_WORKER_V1", "1");
+        }
+    }
     let candidate =
         crate::delivery::prepare_registration(config).map_err(|e| format!("pre-K helper: {e}"))?;
+    if !wait_for_release && delivery_mode == DeliveryMode::Async {
+        unsafe {
+            std::env::remove_var("AGE319_PRIVATE_SOURCE_Q_MARKER_V1");
+            std::env::remove_var("AGE319_PRIVATE_V2_WAIT_WORKER_V1");
+        }
+    }
     candidate
         .require_private_v30_pinned_helper()
         .map_err(|e| format!("pre-K pin: {e}"))?;
@@ -1291,14 +1325,14 @@ fn submit_original_h_source(
         argv.clone(),
         cwd,
         "exit",
-        DeliveryMode::Async,
+        delivery_mode,
         None,
         caller_chain,
         None,
     )
     .with_owner_context(Some(session), Some(invocation))
     .with_delivery_helper(registration.provenance());
-    crate::persist_delivery_mode(&paths, DeliveryMode::Async)
+    crate::persist_delivery_mode(&paths, delivery_mode)
         .map_err(|e| format!("pre-K delivery mode: {e:?}"))?;
     crate::persist_initial_meta(&paths, &meta).map_err(|e| format!("pre-K meta: {e:?}"))?;
     validate()?;
