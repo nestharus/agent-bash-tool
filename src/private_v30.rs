@@ -840,6 +840,15 @@ pub(crate) fn internal_main() -> Option<i32> {
             )
         };
         let request = uuid_bytes(&request_id)?;
+        let delegated_root_h = Path::new(&marker)
+            .parent()
+            .is_some_and(|gate| gate.join("selected-k-root-h").exists());
+        let delegated_h_reply_lost = Path::new(&marker)
+            .parent()
+            .is_some_and(|gate| gate.join("selected-k-root-h-lost").exists());
+        if delegated_root_h && request_frame(&socket, b'<', &request, true).is_ok() {
+            return Err("original H authority consumed before Bash C".into());
+        }
         let status_before_c =
             std::fs::read_to_string("/proc/self/status").map_err(|error| error.to_string())?;
         let parent_pid_before_c: u32 = status_before_c
@@ -858,6 +867,60 @@ pub(crate) fn internal_main() -> Option<i32> {
             true,
             None,
         )?;
+        let root_h_consumption = if delegated_root_h {
+            let response = request_frame(&socket, b'<', &request, true);
+            if delegated_h_reply_lost {
+                if !response.is_err() || request_frame(&socket, b'<', &request, true).is_ok() {
+                    return Err("lost original H reply replayed authority".into());
+                }
+                None
+            } else {
+                let response = response?;
+                let consumed: serde_json::Value = serde_json::from_str(
+                    response
+                        .strip_prefix("root-h-consumed ")
+                        .ok_or("original H delegation not consumed")?
+                        .trim_end(),
+                )
+                .map_err(|e| e.to_string())?;
+                let root_work_authority = consumed["root_work_authority"]
+                    .as_str()
+                    .ok_or("original J work capability absent")?;
+                let root_work: serde_json::Value =
+                    serde_json::from_str(root_work_authority).map_err(|e| e.to_string())?;
+                if consumed["delegation"]["child_request_id"] != child.request_id
+                    || consumed["delegation"]["root_id"] != child.root_id
+                    || consumed["delegation"]["root_invocation_uuid"]
+                        != child.parent_invocation_uuid
+                    || consumed["delegation"]["selected_k"]["grant_id"]
+                        != child.parent_work_grant_id
+                    || consumed["delegation"]["selected_k"]["work_id"] != child.parent_work_id
+                    || consumed["delegation"]["listener_policy"] != "response_only"
+                    || consumed["delegation"]["root_endpoint"]
+                        .as_str()
+                        .is_none_or(str::is_empty)
+                    || consumed["delegation"]["root_work_authority_digest"]
+                        != format!("{:x}", Sha256::digest(root_work_authority.as_bytes()))
+                    || root_work["protocol"] != "root-authority-v1"
+                    || root_work["control_protocol"] != "source-control-v2"
+                    || root_work["root_id"] != child.root_id
+                    || root_work["capability"]
+                        .as_str()
+                        .is_none_or(|value| value.len() != 64)
+                    || consumed["registration_authority"]
+                        .as_str()
+                        .is_none_or(|value| value.len() != 64)
+                {
+                    return Err("original H delegation child/root/K readback changed".into());
+                }
+                if request_frame(&socket, b'<', &request, true).is_ok() {
+                    return Err("original H delegation consumed twice".into());
+                }
+                Some(consumed["delegation"].clone())
+            }
+        } else {
+            None
+        };
         if Path::new(&marker).exists() {
             return Err("private effect marker exists before grant".into());
         }
@@ -1027,6 +1090,7 @@ pub(crate) fn internal_main() -> Option<i32> {
             "{}",
             serde_json::json!({
                 "child": child,
+                "root_h_consumption": root_h_consumption,
                 "bash_reported_result": result,
                 "result_provenance": "bash-self-report-only",
                 "broker_physical_q": physical,
