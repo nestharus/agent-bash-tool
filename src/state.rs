@@ -3,7 +3,8 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -426,6 +427,8 @@ pub(crate) struct RunOutput {
     delivery_mode: DeliveryMode,
     ready_sentinel: Option<String>,
     dispatch_state: String,
+    retry_safe: bool,
+    effects_possible: bool,
 }
 
 impl RunOutput {
@@ -449,6 +452,11 @@ impl RunOutput {
             delivery_mode,
             ready_sentinel,
             dispatch_state: dispatch_state.to_string(),
+            retry_safe: dispatch_state == "rejected-preaccept",
+            effects_possible: matches!(
+                dispatch_state,
+                "root-accepted" | "effects-possible-no-replay" | "registration-outcome-unknown"
+            ),
         }
     }
 }
@@ -1179,10 +1187,25 @@ fn reap_entry_is_handle_dir(entry: &fs::DirEntry) -> bool {
 }
 
 fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig, boot_id: &str) -> bool {
-    // Runner may admit a late listener or still use the recovery image. Until
-    // a paired serialized source-release contract exists, retain v2 sources;
-    // TTL, boot changes and local byte receipts are not release authority.
-    if crate::continuation::enabled(paths) {
+    // A nested handle remains causal evidence for as long as its parent handle
+    // remains retained.  Missing or malformed accepted-work evidence fails
+    // closed; a later reap pass can reconsider it after the parent retires.
+    if causal_parent_retains(paths).unwrap_or(true) {
+        return false;
+    }
+    // Source release and local TTL do not discharge the private original-work
+    // result. The accepted root handle remains its causal evidence until the
+    // exact root result exists; nested handles retain their separate parent
+    // gate above.
+    if accepted_root_result_pending(paths).unwrap_or(true) {
+        return false;
+    }
+    // V2 sources become eligible only through the separate exact, durable
+    // source-release record written after runner custody acceptance.  TTL,
+    // reboot, or a local byte receipt alone are never release authority.
+    if crate::continuation::enabled(paths)
+        && !crate::continuation::retention_released(paths).unwrap_or(false)
+    {
         return false;
     }
     let Ok(meta) = read_meta(paths) else {
@@ -1211,6 +1234,79 @@ fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig, boot_id: &str
         return !meta.delivery.completion_lifecycle().needs_progress();
     }
     meta.state == "RUNNING" && meta_processes_are_gone_or_reused(&meta, boot_id)
+}
+
+#[derive(Deserialize)]
+struct ReapAcceptance {
+    registration: ReapRegistration,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ReapRegistration {
+    Root,
+    Nested { parent_work_id: String },
+}
+
+fn accepted_root_result_pending(paths: &StatePaths) -> io::Result<bool> {
+    let accepted = paths.state_dir.join(crate::root_work::ACCEPTED_FILE);
+    if !accepted.try_exists()? {
+        return Ok(false);
+    }
+    let acceptance: serde_json::Value =
+        serde_json::from_slice(&crate::continuation::read(&accepted, 1024 * 1024)?)?;
+    if acceptance["protocol"] != crate::root_work::PROTOCOL
+        || acceptance["work_id"] != paths.handle
+        || acceptance["root_id"].as_str().is_none_or(str::is_empty)
+        || acceptance["registration"]["kind"].as_str().is_none()
+    {
+        return Ok(true);
+    }
+    if acceptance["registration"]["kind"] != "root" {
+        return Ok(false);
+    }
+    let result = paths.state_dir.join("root-work-result-v1.json");
+    if !result.try_exists()? {
+        return Ok(true);
+    }
+    let result: serde_json::Value =
+        serde_json::from_slice(&crate::continuation::read(&result, 1024 * 1024)?)?;
+    Ok(result["protocol"] != crate::root_work::PROTOCOL
+        || result["work_id"] != paths.handle
+        || result["root_id"] != acceptance["root_id"]
+        || result["result_nonce"].as_str().is_none_or(str::is_empty)
+        || result["physical_tree_drained"] != true
+        || result["outcome"].as_str().is_none_or(str::is_empty))
+}
+
+fn causal_parent_retains(paths: &StatePaths) -> io::Result<bool> {
+    let accepted = paths.state_dir.join(crate::root_work::ACCEPTED_FILE);
+    if !accepted.try_exists()? {
+        return Ok(false);
+    }
+    let bytes = fs::read(accepted)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "root acceptance exceeds retention bound",
+        ));
+    }
+    let acceptance: ReapAcceptance = serde_json::from_slice(&bytes)?;
+    let ReapRegistration::Nested { parent_work_id } = acceptance.registration else {
+        return Ok(false);
+    };
+    let parent = Path::new(&parent_work_id);
+    if parent.components().count() != 1 || !parent_work_id.starts_with("ab_") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid causal parent handle",
+        ));
+    }
+    match fs::symlink_metadata(paths.root.join(parent)) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn meta_is_reap_terminal(meta: &Meta, boot_id: &str) -> bool {
@@ -1450,8 +1546,215 @@ fn atomic_temp_path(parent: &Path, file_name: &OsStr) -> PathBuf {
 
 #[derive(Debug)]
 struct ProcStat {
+    pid: libc::pid_t,
     ppid: libc::pid_t,
+    state: char,
     starttime_ticks: u64,
+}
+
+/// The mounted procfs may observe an ancestor PID namespace. `/proc/self`
+/// resolves through that mount, while getpid() is local to this process.
+pub(crate) fn observer_self_identity() -> io::Result<CallerChainEntry> {
+    let before = read_proc_self_stat_result()?;
+    let local = unsafe { libc::getpid() };
+    if before.pid <= 0
+        || before.starttime_ticks == 0
+        || local_pid_for_observer_path(Path::new("/proc/self"))? != local
+    {
+        return Err(io::Error::other("procfs self identity unavailable"));
+    }
+    let boot_id = read_boot_id();
+    if boot_id.is_empty()
+        || read_proc_self_stat_result()?.pid != before.pid
+        || read_proc_self_stat_result()?.starttime_ticks != before.starttime_ticks
+    {
+        return Err(io::Error::other("procfs self incarnation changed"));
+    }
+    Ok(caller_chain_entry_from_proc_stat(
+        before.pid, &before, &boot_id,
+    ))
+}
+
+/// Map only a live, unreaped child of the calling thread. This uses the
+/// kernel's bounded direct-child list, never a scan of the process table.
+pub(crate) fn observer_direct_child_identity(
+    local_pid: libc::pid_t,
+) -> io::Result<CallerChainEntry> {
+    if local_pid <= 0 {
+        return Err(io::Error::other("invalid local child PID"));
+    }
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, local_pid, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    if !pidfd_live(&pidfd)? {
+        return Err(io::Error::other("local child already exited"));
+    }
+    let observer = fs::metadata("/proc")?;
+    let parent = observer_self_identity()?;
+    let namespace = fs::read_link("/proc/self/ns/pid")?;
+    let children = observer_thread_children()?;
+    let mut found = None;
+    for pid in children {
+        let stat = read_proc_stat_result(pid)?;
+        let path = format!("/proc/{pid}");
+        if stat.ppid == parent.pid
+            && fs::read_link(format!("{path}/ns/pid"))? == namespace
+            && local_pid_for_observer_path(Path::new(&path))? == local_pid
+        {
+            if found.replace(stat).is_some() {
+                return Err(io::Error::other("ambiguous procfs child mapping"));
+            }
+        }
+    }
+    let child = found.ok_or_else(|| io::Error::other("direct child identity unavailable"))?;
+    let again = read_proc_stat_result(child.pid)?;
+    if child.starttime_ticks == 0
+        || child.starttime_ticks != again.starttime_ticks
+        || child.ppid != again.ppid
+        || child.ppid != parent.pid
+        || matches!(again.state, 'Z' | 'X' | 'x')
+        || !observer_thread_children()?.contains(&child.pid)
+        || fs::read_link(format!("/proc/{}/ns/pid", child.pid))? != namespace
+        || local_pid_for_observer_path(Path::new(&format!("/proc/{}", child.pid)))? != local_pid
+        || observer_self_identity()? != parent
+        || fs::metadata("/proc")?.dev() != observer.dev()
+        || fs::metadata("/proc")?.ino() != observer.ino()
+        || !pidfd_live(&pidfd)?
+    {
+        return Err(io::Error::other("direct child changed during observation"));
+    }
+    Ok(caller_chain_entry_from_proc_stat(
+        child.pid,
+        &child,
+        &parent.boot_id,
+    ))
+}
+
+/// The calling thread has exactly this live direct child, observed through
+/// the mounted procfs. The local PID is used only for the pinned pidfd and
+/// NSpid comparison; procfs child-list entries are observer PIDs.
+pub(crate) fn observer_only_direct_child_identity(
+    local_pid: libc::pid_t,
+) -> io::Result<CallerChainEntry> {
+    let before = observer_thread_children()?;
+    if before.len() != 1 {
+        return Err(io::Error::other("not the only direct child"));
+    }
+    let child = observer_direct_child_identity(local_pid)?;
+    if before[0] != child.pid || observer_thread_children()? != before {
+        return Err(io::Error::other("direct-child list changed"));
+    }
+    Ok(child)
+}
+
+fn observer_thread_children() -> io::Result<Vec<libc::pid_t>> {
+    const MAX_BYTES: u64 = 65536;
+    const MAX_CHILDREN: usize = 4096;
+    let mut data = String::new();
+    File::open("/proc/thread-self/children")?
+        .take(MAX_BYTES + 1)
+        .read_to_string(&mut data)?;
+    if data.len() as u64 > MAX_BYTES {
+        return Err(io::Error::other("direct-child list exceeds bound"));
+    }
+    parse_observer_thread_children(&data, MAX_CHILDREN)
+}
+
+fn parse_observer_thread_children(data: &str, max_children: usize) -> io::Result<Vec<libc::pid_t>> {
+    let mut children = Vec::new();
+    for word in data.split_whitespace() {
+        if children.len() == max_children {
+            return Err(io::Error::other("direct-child count exceeds bound"));
+        }
+        let pid = word.parse::<libc::pid_t>().map_err(io::Error::other)?;
+        if pid <= 0 || children.contains(&pid) {
+            return Err(io::Error::other("invalid direct-child list"));
+        }
+        children.push(pid);
+    }
+    Ok(children)
+}
+
+fn pidfd_live(fd: &OwnedFd) -> io::Result<bool> {
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut poll, 1, 0) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(rc == 0)
+    }
+}
+
+/// Resolve the attached parent through the mounted procfs observer while
+/// proving that it is also our namespace-local parent. Procfs can be mounted
+/// from an ancestor PID namespace, so getppid() is not a /proc lookup key.
+pub(crate) fn attached_parent_identity(local_ppid: libc::pid_t) -> io::Result<CallerChainEntry> {
+    if local_ppid <= 1 {
+        return Err(io::Error::other("detached local parent"));
+    }
+    let observer = fs::metadata("/proc")?;
+    let self_stat = read_proc_self_stat_result()?;
+    if self_stat.ppid <= 1
+        || local_pid_for_observer_path(Path::new("/proc/self"))? != unsafe { libc::getpid() }
+        || fs::read_link("/proc/self/ns/pid")?
+            != fs::read_link(format!("/proc/{}/ns/pid", self_stat.ppid))?
+        || local_pid_for_observer_path(Path::new(&format!("/proc/{}", self_stat.ppid)))?
+            != local_ppid
+    {
+        return Err(io::Error::other(
+            "procfs parent is not the attached local parent",
+        ));
+    }
+    let parent = read_proc_stat_result(self_stat.ppid)?;
+    let boot_id = read_boot_id();
+    if parent.starttime_ticks == 0 || boot_id.is_empty() {
+        return Err(io::Error::other("attached parent incarnation unavailable"));
+    }
+    let after = read_proc_self_stat_result()?;
+    if after.pid != self_stat.pid
+        || after.starttime_ticks != self_stat.starttime_ticks
+        || after.ppid != self_stat.ppid
+        || unsafe { libc::getppid() } != local_ppid
+        || read_proc_stat_result(parent.pid)?.starttime_ticks != parent.starttime_ticks
+        || fs::metadata("/proc")?.dev() != observer.dev()
+        || fs::metadata("/proc")?.ino() != observer.ino()
+    {
+        return Err(io::Error::other(
+            "attached parent changed during observation",
+        ));
+    }
+    Ok(caller_chain_entry_from_proc_stat(
+        parent.pid, &parent, &boot_id,
+    ))
+}
+
+pub(crate) fn observer_parent_pid() -> io::Result<libc::pid_t> {
+    Ok(attached_parent_identity(unsafe { libc::getppid() })?.pid)
+}
+
+pub(crate) fn local_pid_for_observer_pid(pid: libc::pid_t) -> Option<libc::pid_t> {
+    let path = format!("/proc/{pid}");
+    if fs::read_link("/proc/self/ns/pid").ok()? != fs::read_link(format!("{path}/ns/pid")).ok()? {
+        return None;
+    }
+    local_pid_for_observer_path(Path::new(&path)).ok()
+}
+
+fn local_pid_for_observer_path(path: &Path) -> io::Result<libc::pid_t> {
+    let status = fs::read_to_string(path.join("status"))?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))
+        .and_then(|value| value.split_whitespace().last())
+        .and_then(|value| value.parse::<libc::pid_t>().ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| io::Error::other("procfs NSpid unavailable"))
 }
 
 pub(crate) fn capture_caller_chain(start_pid: libc::pid_t) -> Vec<CallerChainEntry> {
@@ -1489,7 +1792,14 @@ fn read_proc_stat(pid: libc::pid_t) -> Option<ProcStat> {
 fn read_proc_stat_result(pid: libc::pid_t) -> io::Result<ProcStat> {
     let contents = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     parse_proc_stat(&contents)
+        .filter(|stat| stat.pid == pid)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid /proc stat"))
+}
+
+fn read_proc_self_stat_result() -> io::Result<ProcStat> {
+    let contents = fs::read_to_string("/proc/self/stat")?;
+    parse_proc_stat(&contents)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid /proc/self/stat"))
 }
 
 fn read_boot_id() -> String {
@@ -1624,11 +1934,19 @@ fn caller_chain_entry_from_proc_stat(
 
 fn parse_proc_stat(contents: &str) -> Option<ProcStat> {
     let end_comm = contents.rfind(") ")?;
+    let pid = contents
+        .split_whitespace()
+        .next()?
+        .parse::<libc::pid_t>()
+        .ok()?;
     let fields: Vec<&str> = contents[end_comm + 2..].split_whitespace().collect();
+    let state = fields.first()?.chars().next()?;
     let ppid = fields.get(1)?.parse::<libc::pid_t>().ok()?;
     let starttime_ticks = fields.get(19)?.parse::<u64>().ok()?;
     Some(ProcStat {
+        pid,
         ppid,
+        state,
         starttime_ticks,
     })
 }
@@ -1636,6 +1954,17 @@ fn parse_proc_stat(contents: &str) -> Option<ProcStat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observer_child_list_rejects_ambiguous_and_unbounded_mapping() {
+        assert_eq!(
+            parse_observer_thread_children("42 43\n", 2).unwrap(),
+            [42, 43]
+        );
+        for list in ["42 42", "42 0", "42 -1", "42 text", "42 43 44"] {
+            assert!(parse_observer_thread_children(list, 2).is_err(), "{list}");
+        }
+    }
 
     #[test]
     fn process_identity_boot_read_producer_distinguishes_unavailable_and_mismatch() {
@@ -2228,6 +2557,107 @@ mod tests {
     }
 
     #[test]
+    fn released_v2_source_is_reaped_after_terminal_retention_obligations_settle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_released_v2", "DONE", now - 20_000, true);
+        settle_reap_delivery(&paths);
+        crate::continuation::seed_exact_retention_release(&paths);
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 1);
+        assert!(!paths.state_dir.exists());
+    }
+
+    #[test]
+    fn accepted_root_survives_release_and_ttl_until_separate_process_writes_result() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_root_pending", "DONE", now - 20_000, true);
+        settle_reap_delivery(&paths);
+        crate::continuation::seed_exact_retention_release(&paths);
+        fs::write(
+            paths.state_dir.join(crate::root_work::ACCEPTED_FILE),
+            br#"{"protocol":"original-work-v1","work_id":"ab_root_pending","root_id":"root-1","registration":{"kind":"root"}}"#,
+        )
+        .unwrap();
+        let config = test_reap_config(now, 10, 10);
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 0);
+        assert!(paths.state_dir.exists());
+        fs::write(paths.state_dir.join("root-work-result-v1.json"), b"{}").unwrap();
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 0);
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("printf '%s\\n' '{\"protocol\":\"original-work-v1\",\"work_id\":\"ab_root_pending\",\"root_id\":\"root-1\",\"result_nonce\":\"nonce-1\",\"physical_tree_drained\":true,\"outcome\":\"terminal\"}' > \"$1\"")
+            .arg("sh")
+            .arg(paths.state_dir.join("root-work-result-v1.json"))
+            .status()
+            .expect("separate result writer");
+        assert!(status.success());
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 1);
+    }
+
+    #[test]
+    fn retained_parent_handle_protects_nested_child_evidence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let parent = write_reap_state(temp.path(), "ab_parent", "DONE", now - 20_000, true);
+        let child = write_reap_state(temp.path(), "ab_child", "DONE", now - 20_000, true);
+        settle_reap_delivery(&child);
+        fs::write(
+            child.state_dir.join(crate::root_work::ACCEPTED_FILE),
+            br#"{"protocol":"original-work-v1","work_id":"ab_child","root_id":"root-1","registration":{"kind":"nested","parent_work_id":"ab_parent"}}"#,
+        )
+        .unwrap();
+
+        assert!(!state_dir_reap_eligible(
+            &child,
+            test_reap_config(now, 10, 10),
+            &current_boot_id(),
+        ));
+        fs::remove_dir_all(&parent.state_dir).unwrap();
+        assert!(state_dir_reap_eligible(
+            &child,
+            test_reap_config(now, 10, 10),
+            &current_boot_id(),
+        ));
+    }
+
+    #[test]
+    fn reaper_owns_root_protocol_artifacts_with_the_handle_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let now = 100_000;
+        let paths = write_reap_state(temp.path(), "ab_root_artifacts", "DONE", now - 20_000, true);
+        settle_reap_delivery(&paths);
+        for artifact in [
+            "root-work-intent-v1.json",
+            "root-work-cancel-v1.json",
+            "root-work-result-v1.json",
+            "root-work-diagnostic-v1.jsonl",
+            "root-work-diagnostic-v1.jsonl.1",
+            "root-work-diagnostic-v1.lock",
+        ] {
+            fs::write(paths.state_dir.join(artifact), b"retained evidence").unwrap();
+        }
+        fs::write(
+            paths.state_dir.join("root-work-accepted-v1.json"),
+            br#"{"protocol":"original-work-v1","work_id":"ab_root_artifacts","root_id":"root-1","registration":{"kind":"root"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            paths.state_dir.join("root-work-result-v1.json"),
+            br#"{"protocol":"original-work-v1","work_id":"ab_root_artifacts","root_id":"root-1","result_nonce":"nonce-1","physical_tree_drained":true,"outcome":"terminal"}"#,
+        )
+        .unwrap();
+
+        let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
+
+        assert_eq!(stats.reaped, 1);
+        assert!(!paths.state_dir.exists());
+    }
+
+    #[test]
     fn reaper_keeps_pending_undelivered_state_at_ttl() {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
@@ -2504,6 +2934,7 @@ mod tests {
         let stat =
             parse_proc_stat("42 (name with ) paren) S 7 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12345 0")
                 .expect("stat");
+        assert_eq!(stat.pid, 42);
         assert_eq!(stat.ppid, 7);
         assert_eq!(stat.starttime_ticks, 12345);
     }

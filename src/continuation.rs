@@ -21,27 +21,34 @@ pub(crate) const SNAPSHOT: &str = "completion-snapshot-v2.json";
 const FENCE: &str = "source-launch-v2.json";
 const CONFIRMATION: &str = "registration-confirmation-v2.json";
 const LOCAL: &str = "continuation-v2.json";
+pub(crate) const RETENTION_RELEASE: &str = "source-retention-release-v1.json";
 const MAX_SOURCE: u64 = 1024 * 1024;
-const MAX_OUTPUT: u64 = 1024 * MAX_SOURCE;
 const OUTPUT: &str = "completion-output-v2.bin";
 const SELECTION: &str = "output-selection-v2.json";
 const SELECTED_LOG: &str = "selected-log-v2.bin";
 
 /// Select once, in the original event turn, before any retry can collect output.
-/// The logger replaces (never truncates) an inode pinned by this hard link.
+/// The append-only logger preserves the selected inode and exclusive prefix.
 /// A failed selection is explicit missing evidence, not permission to resample.
 #[cfg(test)]
 fn select_output(paths: &StatePaths) -> io::Result<()> {
-    select_event_output(paths, None)
+    select_event_output(paths, None, true)
 }
-fn select_event_output(paths: &StatePaths, observation: Option<&Value>) -> io::Result<()> {
+fn select_event_output(
+    paths: &StatePaths,
+    observation: Option<&Value>,
+    output_trusted: bool,
+) -> io::Result<()> {
     if !enabled(paths) || paths.state_dir.join(SELECTION).try_exists()? {
         return Ok(());
     }
     let directory = fs::metadata(&paths.state_dir)?;
-    let mut selection = match pin_output(paths) {
-        Ok(selection) => selection,
-        Err(err) => json!({"missing": err.to_string()}),
+    let mut selection = match output_trusted {
+        true => match pin_output(paths) {
+            Ok(selection) => selection,
+            Err(err) => json!({"missing": err.to_string()}),
+        },
+        false => json!({"missing": "output capture incomplete or unverified"}),
     };
     if let Some(observation) = observation {
         selection["observation"] = observation.clone();
@@ -55,10 +62,8 @@ fn pin_output(paths: &StatePaths) -> io::Result<Value> {
     // Never adopt an orphaned pin whose original boundary was not committed.
     fs::hard_link(&paths.log, &destination)?;
     let metadata = fs::symlink_metadata(&destination)?;
-    if !metadata.is_file() || metadata.len() > MAX_OUTPUT {
-        return Err(error(
-            "selected log is not a supported bounded regular file",
-        ));
+    if !metadata.is_file() {
+        return Err(error("selected log is not a regular file"));
     }
     File::open(&paths.state_dir)?.sync_all()?;
     Ok(
@@ -85,7 +90,7 @@ pub(crate) fn output_unavailable(paths: &StatePaths) -> io::Result<bool> {
         return Ok(true);
     };
     match fs::symlink_metadata(paths.state_dir.join(SELECTED_LOG)) {
-        Ok(meta) => Ok(!meta.is_file() || meta.len() < length || length > MAX_OUTPUT),
+        Ok(meta) => Ok(!meta.is_file() || meta.len() < length),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(err) => Err(err),
     }
@@ -101,6 +106,49 @@ pub(crate) fn notification_owned(paths: &StatePaths) -> io::Result<bool> {
         local["registration"].as_str(),
         Some("confirmed" | "completion_only_confirmed")
     ))
+}
+
+/// A later helper may reuse the original owner witness only after the exact
+/// source registration was committed. Neither an intent nor a launch fence is
+/// a substitute for this receipt.
+pub(crate) fn confirmed_owner_binding(
+    paths: &StatePaths,
+    session: &str,
+    invocation: &str,
+    helper_sha256: &str,
+) -> io::Result<()> {
+    let (registration, common) = binding(paths)?;
+    if registration["owner_session_id"] != session
+        || registration["owner_invocation_uuid"] != invocation
+        || registration["helper"]["sha256"] != helper_sha256
+    {
+        return Err(error("registration owner or helper binding conflict"));
+    }
+    let receipt = paths.state_dir.join("registration-receipt-v2.json");
+    let confirmation = paths.state_dir.join(CONFIRMATION);
+    let (reply, recovered) = match value(&receipt) {
+        Ok(reply) => (reply, false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => (value(&confirmation)?, true),
+        Err(err) => return Err(err),
+    };
+    exact(&common, &reply)?;
+    if reply["registration_committed"] != true {
+        return Err(error("registration receipt does not prove commitment"));
+    }
+    if recovered {
+        if reply["status"] != "exact_committed" || reply["authority"] != "completion_only" {
+            return Err(error("registration confirmation has wrong authority"));
+        }
+    } else if !matches!(
+        reply["status"].as_str(),
+        Some("registered" | "already_registered")
+    ) || reply["continuation_owner_domain"] != common["domain_id"]
+        || reply["listener_revision"] != registration["listener_revision"]
+        || reply["listeners"] != registration["listeners"]
+    {
+        return Err(error("registration receipt does not match original source"));
+    }
+    Ok(())
 }
 
 pub(crate) fn record_missing_output(paths: &StatePaths) -> io::Result<()> {
@@ -196,18 +244,8 @@ fn named_lock(paths: &StatePaths, name: &str) -> io::Result<File> {
         }
     }
 }
-fn identity(pid: i32) -> io::Result<CallerChainEntry> {
-    let boot_id = state::current_boot_id();
-    let starttime_ticks =
-        state::process_starttime_ticks(pid).ok_or_else(|| error("process identity unavailable"))?;
-    if boot_id.is_empty() {
-        return Err(error("boot identity unavailable"));
-    }
-    Ok(CallerChainEntry {
-        pid,
-        boot_id,
-        starttime_ticks,
-    })
+fn identity() -> io::Result<CallerChainEntry> {
+    state::observer_self_identity()
 }
 fn uuid() -> io::Result<String> {
     Ok(fs::read_to_string("/proc/sys/kernel/random/uuid")?
@@ -320,7 +358,7 @@ pub(crate) fn prepare(
     io::copy(&mut source, &mut recovery)?;
     recovery.sync_all()?;
     let recovery_hash = digest(&read(&recovery_path, 512 * MAX_SOURCE)?);
-    let worker = identity(unsafe { libc::getpid() })?;
+    let worker = identity()?;
     let registration = json!({
         "protocol": PROTOCOL, "domain_id": domain, "source_id": uuid()?, "registration_id": uuid()?,
         "handle": paths.handle, "handle_dir": paths.state_dir, "spool_root": paths.state_dir.parent(),
@@ -365,7 +403,7 @@ pub(crate) fn confirm_launch(paths: &StatePaths, reply: &Value) -> io::Result<()
     let mut fence = value(&paths.state_dir.join(FENCE))?;
     exact(&common, &fence)?;
     let worker: CallerChainEntry = serde_json::from_value(fence["registration_worker"].clone())?;
-    if worker != identity(unsafe { libc::getpid() })? || fence["phase"] != "unreleased" {
+    if worker != identity()? || fence["phase"] != "unreleased" {
         return Err(error("original launch authority is not spendable"));
     }
     immutable(paths, "registration-receipt-v2.json", &bytes(reply)?)?;
@@ -396,14 +434,14 @@ pub(crate) fn abandon(paths: &StatePaths) -> io::Result<()> {
     let mut fence = value(&paths.state_dir.join(FENCE))?;
     exact(&common, &fence)?;
     let worker: CallerChainEntry = serde_json::from_value(fence["registration_worker"].clone())?;
-    if worker == identity(unsafe { libc::getpid() })? && fence["phase"] == "unreleased" {
+    if worker == identity()? && fence["phase"] == "unreleased" {
         transition(paths, &mut fence, "revoked_never_launched")?;
     }
     Ok(())
 }
-pub(crate) fn launched(paths: &StatePaths, pid: i32) -> io::Result<()> {
+pub(crate) fn launched(paths: &StatePaths, pid: i32) -> io::Result<Option<CallerChainEntry>> {
     if !enabled(paths) {
-        return Ok(());
+        return Ok(None);
     }
     let _lock = lock(paths)?;
     let (_, common) = binding(paths)?;
@@ -412,8 +450,10 @@ pub(crate) fn launched(paths: &StatePaths, pid: i32) -> io::Result<()> {
     if fence["phase"] != "may_launch" {
         return Err(error("launch fence conflict"));
     }
-    fence["workload_identity"] = json!(identity(pid)?);
-    transition(paths, &mut fence, "launched")
+    let identity = state::observer_direct_child_identity(pid)?;
+    fence["workload_identity"] = json!(identity);
+    transition(paths, &mut fence, "launched")?;
+    Ok(Some(identity))
 }
 
 /// Evidence supplied only by the original live loop or actual adopting guardian.
@@ -424,6 +464,9 @@ pub(crate) struct Observation<'a> {
     pub(crate) tree_drained: bool,
     pub(crate) output_closed: bool,
     pub(crate) ready_sentinel: Option<&'a str>,
+    /// True only when the original live observer captured every byte through
+    /// this event and synced the log. A successor cannot infer this from EOF.
+    pub(crate) output_trusted: bool,
 }
 /// Incremental publication work belongs to the surviving live observer, not a
 /// new workload or helper tree. Each quantum yields back to cancellation/I/O.
@@ -574,7 +617,7 @@ pub(crate) fn select_observed_event(
         outcome["root_wait_status"] = json!(observation.root_wait_status);
         outcome["original_tree_drained"] = json!(observation.tree_drained);
         outcome["output_closed"] = json!(observation.output_closed);
-        outcome["observer"] = json!(identity(unsafe { libc::getpid() })?);
+        outcome["observer"] = json!(identity()?);
         outcome["ready_sentinel"] = json!(observation.ready_sentinel);
         outcome["cancellation_id"] = if observation.kind == "cancelled" {
             json!(cancellation_identity(paths, meta)?)
@@ -594,7 +637,7 @@ pub(crate) fn select_observed_event(
             "completed"
         });
         let staged = json!({"outcome": outcome, "snapshot": snapshot});
-        select_event_output(paths, Some(&staged))?;
+        select_event_output(paths, Some(&staged), observation.output_trusted)?;
     }
     Ok(())
 }
@@ -631,10 +674,8 @@ impl OutputHasher {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(paths.state_dir.join(OUTPUT))?;
         let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() > MAX_OUTPUT {
-            return Err(error(
-                "output artifact is not a supported bounded regular file",
-            ));
+        if !metadata.is_file() {
+            return Err(error("output artifact is not a regular file"));
         }
         Ok(Self {
             file,
@@ -654,10 +695,13 @@ impl OutputHasher {
             if length == 0 {
                 return self.finish().map(Some);
             }
-            self.count += length as u64;
+            self.count = self
+                .count
+                .checked_add(length as u64)
+                .ok_or_else(|| error("output artifact length overflow"))?;
             quantum += length;
-            if self.count > MAX_OUTPUT {
-                return Err(error("output artifact grew beyond bound"));
+            if self.count > self.expected_len {
+                return Err(error("output artifact grew while hashing"));
             }
             self.hash.update(&buffer[..length]);
         }
@@ -733,7 +777,7 @@ fn recovery_hash_barrier(paths: &StatePaths) -> io::Result<()> {
         immutable(
             paths,
             "fault-recovery-lock.reached.json",
-            &bytes(&json!(identity(unsafe { libc::getpid() })?))?,
+            &bytes(&json!(identity()?))?,
         )?;
         unsafe {
             libc::raise(libc::SIGSTOP);
@@ -754,17 +798,13 @@ pub(crate) fn fault_barrier(paths: &StatePaths, name: &str) -> io::Result<()> {
     let guardian_capture = configured.starts_with("guardian-capture-")
         && name == "before-output-capture"
         && value(&paths.state_dir.join("source-observation-v2.json"))?["outcome"]["observer"]
-            == json!(identity(unsafe { libc::getpid() })?);
+            == json!(identity()?);
     if configured != name && !guardian_capture {
         return Ok(());
     }
     let reached = format!("fault-{name}.reached.json");
     if !paths.state_dir.join(&reached).try_exists()? {
-        immutable(
-            paths,
-            &reached,
-            &bytes(&json!(identity(unsafe { libc::getpid() })?))?,
-        )?;
+        immutable(paths, &reached, &bytes(&json!(identity()?))?)?;
     }
     if paths
         .state_dir
@@ -797,6 +837,54 @@ fn cancellation_identity(paths: &StatePaths, meta: &Meta) -> io::Result<String> 
         // Do not fabricate an explicit user cancellation marker for this cause.
         receipt["basis"] = json!("registered_owner_lease");
         receipt["owner_identity"] = json!(meta.cancel_owner);
+    } else if matches!(
+        meta.completion_reason.as_deref(),
+        Some("causal-parent-cancelled" | "root-authority-lost")
+    ) {
+        let intent = read(
+            &paths.state_dir.join("root-work-intent-v1.json"),
+            MAX_SOURCE,
+        )?;
+        let accepted = read(
+            &paths.state_dir.join(crate::root_work::ACCEPTED_FILE),
+            MAX_SOURCE,
+        )?;
+        let intent_value: Value = serde_json::from_slice(&intent)?;
+        let accepted_value: Value = serde_json::from_slice(&accepted)?;
+        if intent_value["protocol"] != crate::root_work::PROTOCOL
+            || accepted_value["protocol"] != crate::root_work::PROTOCOL
+            || intent_value["work_id"] != paths.handle
+            || accepted_value["work_id"] != paths.handle
+            || intent_value["root_id"] != accepted_value["root_id"]
+            || accepted_value["request_sha256"] != digest(&intent)
+        {
+            return Err(error("paired cancellation acceptance identity conflict"));
+        }
+        receipt["accepted_work_sha256"] = json!(digest(&accepted));
+        receipt["root_id"] = accepted_value["root_id"].clone();
+        if meta.completion_reason.as_deref() == Some("causal-parent-cancelled") {
+            let causal = read(
+                &paths.state_dir.join("root-work-cancel-v1.json"),
+                MAX_SOURCE,
+            )?;
+            let causal_value: Value = serde_json::from_slice(&causal)?;
+            if causal_value["protocol"] != crate::root_work::PROTOCOL
+                || causal_value["work_id"] != paths.handle
+                || causal_value["root_id"] != accepted_value["root_id"]
+                || causal_value["cause"] != "causal_parent_cancelled"
+                || !causal_value["requester"].is_null()
+            {
+                return Err(error("causal cancellation receipt identity conflict"));
+            }
+            receipt["basis"] = json!("root_causal_receipt");
+            receipt["root_cancel_sha256"] = json!(digest(&causal));
+        } else {
+            // A dead guardian cannot create a later root-side receipt. The
+            // paired worker's original, immutable source observation is the
+            // witness that its control authority was lost or sent F.
+            receipt["basis"] = json!("paired_worker_root_loss_observation");
+            receipt["guardian_identity"] = intent_value["guardian_identity"].clone();
+        }
     } else {
         return Err(error("missing accepted cancellation basis"));
     }
@@ -889,7 +977,90 @@ pub(crate) fn accept(paths: &StatePaths, reply: &Value) -> io::Result<()> {
         local[key] = reply[key].clone();
     }
     local["enqueue"] = json!("accepted");
-    save(paths, LOCAL, &local)
+    save(paths, LOCAL, &local)?;
+
+    // This separate artifact is the serialized source-release boundary.  It
+    // deliberately does not change any completion-continuation-v2 schema: the
+    // source remains retained until an exact durable acceptance receipt has
+    // been validated and its local state has been fsynced.
+    let mut release = common;
+    release["release_protocol"] = json!("source-retention-release-v1");
+    for key in [
+        "snapshot_sha256",
+        "outcome_sha256",
+        "payload_sha256",
+        "payload_byte_len",
+    ] {
+        release[key] = local[key].clone();
+    }
+    immutable(paths, RETENTION_RELEASE, &bytes(&release)?)
+}
+
+/// True only after the runner has durably accepted the exact v2 source
+/// snapshot and the source has serialized that receipt into a distinct release
+/// record.  Invalid or incomplete evidence fails closed and remains retained.
+pub(crate) fn retention_released(paths: &StatePaths) -> io::Result<bool> {
+    let (_, common) = binding(paths)?;
+    let local = value(&paths.state_dir.join(LOCAL))?;
+    exact(&common, &local)?;
+    if local["enqueue"] != "accepted" {
+        return Ok(false);
+    }
+    let release = value(&paths.state_dir.join(RETENTION_RELEASE))?;
+    exact(&common, &release)?;
+    if release["release_protocol"] != "source-retention-release-v1" {
+        return Ok(false);
+    }
+    for key in [
+        "snapshot_sha256",
+        "outcome_sha256",
+        "payload_sha256",
+        "payload_byte_len",
+    ] {
+        if release[key] != local[key] {
+            return Ok(false);
+        }
+    }
+    Ok(release["snapshot_sha256"]
+        == digest(&read(&paths.state_dir.join(SNAPSHOT), 16 * MAX_SOURCE)?)
+        && release["outcome_sha256"] == digest(&read(&paths.state_dir.join(OUTCOME), MAX_SOURCE)?))
+}
+
+#[cfg(test)]
+pub(crate) fn seed_exact_retention_release(paths: &StatePaths) {
+    let registration = json!({
+        "protocol": PROTOCOL,
+        "domain_id": "test-domain",
+        "source_id": "test-source",
+        "handle": paths.handle,
+        "registration_id": "test-registration",
+        "handle_dir": paths.state_dir,
+        "spool_root": paths.root,
+        "meta_relative": "meta.json",
+        "log_relative": "log",
+        "rc_relative": "rc",
+        "registration_relative": REGISTRATION,
+        "outcome_relative": OUTCOME,
+        "snapshot_relative": SNAPSHOT,
+        "source_evidence_protocol": PROTOCOL,
+        "listener_revision": 1,
+    });
+    immutable(paths, REGISTRATION, &bytes(&registration).unwrap()).unwrap();
+    let common = binding(paths).unwrap().1;
+    let mut local = common.clone();
+    local["registration"] = json!("confirmed");
+    local["enqueue"] = json!("waiting_evidence");
+    save(paths, LOCAL, &local).unwrap();
+    immutable(paths, OUTCOME, b"test-outcome").unwrap();
+    immutable(paths, SNAPSHOT, b"test-snapshot").unwrap();
+    let mut reply = common;
+    reply["status"] = json!("accepted");
+    reply["snapshot_sha256"] = json!(digest(b"test-snapshot"));
+    reply["outcome_sha256"] = json!(digest(b"test-outcome"));
+    reply["payload_sha256"] = json!(digest(b"test-payload"));
+    reply["payload_byte_len"] = json!(12);
+    reply["listener_revision"] = json!(1);
+    accept(paths, &reply).unwrap();
 }
 /// Readback proves a prior explicit original-listener request, not ACK, source
 /// acceptance, or local Async. Runner owns request admission and idempotency.
@@ -993,6 +1164,43 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
     {
         return Err(error("pinned recovery identity conflict"));
     }
+    // Private paired fixture: a child of the selected recovery image outlives
+    // the direct worker and keeps stderr open. The source PID1 must adopt and
+    // reap it before a complete physical output receipt can exist.
+    #[cfg(feature = "private-v30-admission")]
+    if let Some(marker) = std::env::var_os("AGE319_PRIVATE_SOURCE_Q_MARKER_V1") {
+        std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf 'adopted\\n' > \"$1\"; sleep 3; while [ ! -e \"${1}.release\" ]; do sleep 0.05; done; printf 'adopted-stderr\\n' >&2",
+                "sh",
+            ])
+            .arg(marker)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()?;
+    }
+    #[cfg(feature = "private-v30-admission")]
+    if std::env::var_os("AGE319_PRIVATE_V2_WAIT_SOURCE_V1").is_some() {
+        // W starts before the helper returns its H acknowledgement to the
+        // original worker. Do not hold launch.lock while that worker spends
+        // its exact fence and publishes through the supervisor. This wait
+        // schedules a read only; the normal v2 checks below decide the reply.
+        let worker: CallerChainEntry =
+            serde_json::from_value(registration["registering_caller"].clone())?;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while !paths.state_dir.join(SNAPSHOT).try_exists()? {
+            if !matches!(
+                state::process_identity_evidence(&worker),
+                state::ProcessIdentityEvidence::Live
+            ) || std::time::Instant::now() >= until
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
     {
         let _lock = lock(&paths)?;
         let mut fence = value(&paths.state_dir.join(FENCE))?;
@@ -1077,6 +1285,7 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
                 tree_drained: true,
                 output_closed: true,
                 ready_sentinel: None,
+                output_trusted: true,
             },
         )?;
         state::write_rc_atomic(&paths, 70)?;
@@ -1115,6 +1324,7 @@ pub(crate) fn reconcile(registration_file: &Path, confirmation_file: &Path) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     fn fixture() -> Value {
         serde_json::from_str(include_str!("../tests/fixtures/age360/paired-wire.json")).unwrap()
     }
@@ -1128,6 +1338,223 @@ mod tests {
         immutable(&paths, REGISTRATION, &bytes(&registration).unwrap()).unwrap();
         let common = binding(&paths).unwrap().1;
         (temp, paths, common)
+    }
+    #[test]
+    fn launch_fence_requires_exact_live_direct_child_in_observer_domain() {
+        const STAGE: &str = "AGE319_LAUNCH_OBSERVER_CHILD";
+        if std::env::var_os(STAGE).is_none() {
+            launch_observer_case(false);
+            let output = Command::new("timeout")
+                .args([
+                    "--kill-after=5s", "30s", "unshare", "--user", "--map-current-user",
+                    "--pid", "--fork", "--",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "continuation::tests::launch_fence_requires_exact_live_direct_child_in_observer_domain",
+                ])
+                .env(STAGE, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        launch_observer_case(true);
+    }
+
+    fn launch_observer_case(cross_domain: bool) {
+        let worker = identity().unwrap();
+        assert_eq!(worker.pid != unsafe { libc::getpid() }, cross_domain);
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(fs::canonicalize(temp.path()).unwrap(), "ab_observer".into());
+        fs::create_dir(&paths.state_dir).unwrap();
+        let meta = registration_meta(&paths, "exit", state::DeliveryMode::Async);
+        prepare(
+            &paths,
+            &meta,
+            "11111111-1111-4111-8111-111111111111",
+            "tree",
+        )
+        .unwrap();
+        let registration = value(&paths.state_dir.join(REGISTRATION)).unwrap();
+        assert_eq!(registration["registering_caller"], json!(worker));
+        let common = binding(&paths).unwrap().1;
+        let recorded: CallerChainEntry = serde_json::from_value(
+            value(&paths.state_dir.join(FENCE)).unwrap()["registration_worker"].clone(),
+        )
+        .unwrap();
+        assert_eq!(recorded, worker);
+        let mut stale_fence = value(&paths.state_dir.join(FENCE)).unwrap();
+        stale_fence["registration_worker"]["starttime_ticks"] = json!(worker.starttime_ticks + 1);
+        save(&paths, FENCE, &stale_fence).unwrap();
+        assert!(confirm_launch(&paths, &registration_reply(&paths, &common)).is_err());
+        assert_eq!(
+            value(&paths.state_dir.join(FENCE)).unwrap()["phase"],
+            "unreleased"
+        );
+        stale_fence["registration_worker"] = json!(worker);
+        save(&paths, FENCE, &stale_fence).unwrap();
+        confirm_launch(&paths, &registration_reply(&paths, &common)).unwrap();
+        assert_eq!(
+            value(&paths.state_dir.join(FENCE)).unwrap()["phase"],
+            "may_launch"
+        );
+
+        let (pid_sender, pid_receiver) = std::sync::mpsc::channel();
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let sibling = std::thread::spawn(move || {
+            let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+            pid_sender.send(child.id() as i32).unwrap();
+            done_receiver.recv().unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
+        });
+        let sibling_pid = pid_receiver.recv().unwrap();
+        assert!(launched(&paths, unsafe { libc::getpid() }).is_err());
+        assert!(launched(&paths, sibling_pid).is_err());
+        assert!(value(&paths.state_dir.join(FENCE)).unwrap()["workload_identity"].is_null());
+
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let local_child = child.id() as i32;
+        launched(&paths, local_child).unwrap();
+        let launch = value(&paths.state_dir.join(FENCE)).unwrap();
+        assert_eq!(launch["phase"], "launched");
+        let observed: CallerChainEntry =
+            serde_json::from_value(launch["workload_identity"].clone()).unwrap();
+        assert_eq!(observed.pid != local_child, cross_domain);
+        assert_eq!(observed.boot_id, worker.boot_id);
+        assert_eq!(
+            state::process_starttime_ticks(observed.pid),
+            Some(observed.starttime_ticks)
+        );
+        assert_eq!(
+            state::local_pid_for_observer_pid(observed.pid),
+            Some(local_child)
+        );
+        assert_eq!(state::process_parent_pid(observed.pid), Some(worker.pid));
+        let mut reused = observed.clone();
+        reused.starttime_ticks += 1;
+        assert!(matches!(
+            state::process_identity_evidence(&reused),
+            state::ProcessIdentityEvidence::Mismatch
+        ));
+
+        child.kill().unwrap();
+        // An exited, unreaped child still has a procfs entry; it cannot become
+        // positive launch identity after its pidfd reports death.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    local_child as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            },
+            0
+        );
+        let (_dead_temp, dead_paths, dead_common) = source();
+        fence(&dead_paths, &dead_common, "may_launch");
+        assert!(launched(&dead_paths, local_child).is_err());
+        assert!(value(&dead_paths.state_dir.join(FENCE)).unwrap()["workload_identity"].is_null());
+        child.wait().unwrap();
+        let (_stale_temp, stale_paths, stale_common) = source();
+        fence(&stale_paths, &stale_common, "may_launch");
+        assert!(launched(&stale_paths, local_child).is_err());
+        assert!(value(&stale_paths.state_dir.join(FENCE)).unwrap()["workload_identity"].is_null());
+        done_sender.send(()).unwrap();
+        sibling.join().unwrap();
+    }
+    #[test]
+    fn paired_causal_and_root_loss_cancellation_have_distinct_exact_bases() {
+        let (_temp, paths, common) = source();
+        let mut meta = registration_meta(&paths, "exit", state::DeliveryMode::Sync);
+        meta.completion_reason = Some("causal-parent-cancelled".into());
+        let intent = json!({
+            "protocol": crate::root_work::PROTOCOL,
+            "work_id": paths.handle,
+            "root_id": "root-fixture",
+            "guardian_identity": {"pid": 123, "boot_id": "boot", "starttime_ticks": 456}
+        });
+        let intent_bytes = bytes(&intent).unwrap();
+        fs::write(
+            paths.state_dir.join("root-work-intent-v1.json"),
+            &intent_bytes,
+        )
+        .unwrap();
+        let accepted = json!({
+            "protocol": crate::root_work::PROTOCOL,
+            "work_id": paths.handle,
+            "root_id": "root-fixture",
+            "request_sha256": digest(&intent_bytes)
+        });
+        fs::write(
+            paths.state_dir.join(crate::root_work::ACCEPTED_FILE),
+            bytes(&accepted).unwrap(),
+        )
+        .unwrap();
+        assert!(cancellation_identity(&paths, &meta).is_err());
+        let mut causal = json!({
+            "protocol": crate::root_work::PROTOCOL,
+            "work_id": paths.handle,
+            "root_id": "root-fixture",
+            "cause": "causal_parent_cancelled",
+            "requester": null
+        });
+        fs::write(
+            paths.state_dir.join("root-work-cancel-v1.json"),
+            bytes(&causal).unwrap(),
+        )
+        .unwrap();
+        let causal_id = cancellation_identity(&paths, &meta).unwrap();
+        let causal_source: Value =
+            value(&paths.state_dir.join("source-cancellation-v2.json")).unwrap();
+        assert_eq!(causal_source["basis"], "root_causal_receipt");
+        assert_eq!(causal_id, digest(&bytes(&causal_source).unwrap()));
+        fence(&paths, &common, "may_launch");
+        fs::write(&paths.log, b"").unwrap();
+        retain_event(
+            &paths,
+            &meta,
+            Observation {
+                kind: "cancelled",
+                root_wait_status: None,
+                tree_drained: true,
+                output_closed: true,
+                ready_sentinel: None,
+                output_trusted: true,
+            },
+        )
+        .unwrap();
+        let selected = value(&paths.state_dir.join("source-observation-v2.json")).unwrap();
+        assert_eq!(selected["outcome"]["kind"], "cancelled");
+        assert_eq!(selected["outcome"]["cancellation_id"], causal_id);
+        causal["root_id"] = json!("other-root");
+        fs::write(
+            paths.state_dir.join("root-work-cancel-v1.json"),
+            bytes(&causal).unwrap(),
+        )
+        .unwrap();
+        assert!(cancellation_identity(&paths, &meta).is_err());
+
+        let (_other_temp, other_paths, _) = source();
+        fs::write(
+            other_paths.state_dir.join("root-work-intent-v1.json"),
+            &intent_bytes,
+        )
+        .unwrap();
+        fs::write(
+            other_paths.state_dir.join(crate::root_work::ACCEPTED_FILE),
+            bytes(&accepted).unwrap(),
+        )
+        .unwrap();
+        meta.completion_reason = Some("root-authority-lost".into());
+        let root_loss_id = cancellation_identity(&other_paths, &meta).unwrap();
+        let root_loss = value(&other_paths.state_dir.join("source-cancellation-v2.json")).unwrap();
+        assert_eq!(root_loss["basis"], "paired_worker_root_loss_observation");
+        assert_eq!(root_loss_id, digest(&bytes(&root_loss).unwrap()));
     }
     #[test]
     fn small_binary_selection_keeps_raw_descriptor() {
@@ -1243,6 +1670,7 @@ mod tests {
                 tree_drained: true,
                 output_closed: true,
                 ready_sentinel: None,
+                output_trusted: true,
             },
         );
         assert!(result.unwrap_err().to_string().contains("cannot relabel"));
@@ -1301,15 +1729,17 @@ mod tests {
     }
 
     #[test]
-    fn supported_one_gib_output_publication_uses_bounded_memory() {
+    fn output_above_legacy_one_gib_ceiling_publishes_without_truncation() {
         if crate::test_support::private_case() {
             return;
         }
         let (_temp, paths, common) = source();
         fence(&paths, &common, "launched");
+        const LEGACY_OUTPUT_CEILING: u64 = 1024 * 1024 * 1024;
+        let selected_len = LEGACY_OUTPUT_CEILING + 1;
         File::create(&paths.log)
             .unwrap()
-            .set_len(MAX_OUTPUT)
+            .set_len(selected_len)
             .unwrap();
         let mut meta = Meta::new(
             paths.handle.clone(),
@@ -1340,6 +1770,7 @@ mod tests {
                     tree_drained: true,
                     output_closed: true,
                     ready_sentinel: None,
+                    output_trusted: true,
                 },
                 &mut progress,
             )
@@ -1350,14 +1781,22 @@ mod tests {
                 break;
             }
         }
-        assert!(steps >= 1024, "large hash did not yield between quanta");
+        assert!(steps > 1024, "large hash did not yield between quanta");
         let data = read(&paths.state_dir.join(SNAPSHOT), MAX_SOURCE).unwrap();
         let snapshot: Value = serde_json::from_slice(&data).unwrap();
-        assert_eq!(snapshot["output"]["byte_len"], MAX_OUTPUT);
-        // Independently computed with Python hashlib over 1024 x 1MiB zero chunks.
+        assert_eq!(
+            value(&paths.state_dir.join(SELECTION)).unwrap()["byte_len"],
+            selected_len
+        );
+        assert_eq!(
+            fs::metadata(paths.state_dir.join(OUTPUT)).unwrap().len(),
+            selected_len
+        );
+        assert_eq!(snapshot["output"]["byte_len"], selected_len);
+        // Independently computed with Python hashlib over 1024 x 1MiB zero chunks and one zero byte.
         assert_eq!(
             snapshot["output"]["sha256"],
-            "49bc20df15e412a64472421e13fe86ff1c5165e18b2afccf160d4dc19fe68a14"
+            "6d9bfe50425f2dfe4e2ac07efee1f0bc9d567348ad4aed62704ffe6f5884e9a8"
         );
         assert!(data.len() < 4096);
         let status = fs::read_to_string("/proc/self/status").unwrap();
@@ -1372,7 +1811,7 @@ mod tests {
         );
         println!(
             "publisher-unit only: raw={} snapshot={} elapsed_ms={} hash_steps={} max_step_ms={} {peak}",
-            MAX_OUTPUT,
+            selected_len,
             data.len(),
             start.elapsed().as_millis(),
             steps,
@@ -1381,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_descriptor_rejects_symlinks_directories_and_unsupported_size() {
+    fn artifact_descriptor_rejects_symlinks_directories_and_length_change() {
         let (_temp, paths, _) = source();
         let output = paths.state_dir.join(OUTPUT);
         fs::create_dir(&output).unwrap();
@@ -1390,11 +1829,19 @@ mod tests {
         std::os::unix::fs::symlink(&paths.log, &output).unwrap();
         assert!(output_descriptor(&paths).is_err());
         fs::remove_file(&output).unwrap();
-        File::create(&output)
+        fs::write(&output, b"original").unwrap();
+        let mut hasher = OutputHasher::new(&paths).unwrap();
+        fs::write(&output, b"short").unwrap();
+        assert!(hasher.advance().is_err(), "short read must not publish");
+        fs::write(&output, b"original").unwrap();
+        let mut hasher = OutputHasher::new(&paths).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&output)
             .unwrap()
-            .set_len(MAX_OUTPUT + 1)
+            .write_all(b"later")
             .unwrap();
-        assert!(output_descriptor(&paths).is_err());
+        assert!(hasher.advance().is_err(), "growth must not publish");
     }
 
     #[test]
@@ -1423,6 +1870,7 @@ mod tests {
                     tree_drained,
                     output_closed,
                     ready_sentinel: None,
+                    output_trusted: true,
                 },
             );
             assert!(
@@ -1523,7 +1971,7 @@ mod tests {
         let mut fence = common.clone();
         fence["phase"] = json!(phase);
         fence["revision"] = json!(0);
-        fence["registration_worker"] = json!(identity(unsafe { libc::getpid() }).unwrap());
+        fence["registration_worker"] = json!(identity().unwrap());
         save(paths, FENCE, &fence).unwrap();
         let mut local = common.clone();
         local["registration"] = json!("intent");
@@ -1591,6 +2039,8 @@ mod tests {
         reply["payload_byte_len"] = json!(7);
         reply["listener_revision"] = json!(1);
         accept(&paths, &reply).unwrap();
+        assert!(retention_released(&paths).unwrap());
+        assert!(paths.state_dir.join(RETENTION_RELEASE).exists());
         reply["status"] = json!("already_accepted");
         accept(&paths, &reply).unwrap();
         reply["payload_sha256"] = json!(digest(b"changed"));
@@ -1671,6 +2121,19 @@ mod tests {
         select_output(&paths).unwrap();
         freeze_output(&paths).unwrap();
         assert_eq!(fs::read(paths.state_dir.join(OUTPUT)).unwrap(), b"original");
+    }
+
+    #[test]
+    fn unverified_successor_does_not_select_partial_log() {
+        let (_temp, paths, _) = source();
+        fs::write(&paths.log, b"possibly partial").unwrap();
+        select_event_output(&paths, None, false).unwrap();
+        let selection = value(&paths.state_dir.join(SELECTION)).unwrap();
+        assert_eq!(
+            selection["missing"],
+            "output capture incomplete or unverified"
+        );
+        assert!(!paths.state_dir.join(SELECTED_LOG).exists());
     }
 
     #[test]

@@ -89,8 +89,14 @@ fn large_escaped_output_publishes_full_artifact_and_keeps_live_observer() {
 }
 
 #[test]
-fn configured_large_invalid_utf8_output_publishes_exact_full_raw_artifact() {
+fn real_child_above_default_log_limit_publishes_exact_raw_artifact() {
     case("large-raw");
+}
+
+#[test]
+#[cfg(feature = "source-fault-tests")]
+fn real_capture_write_failure_never_publishes_partial_source() {
+    case("capture-file-limit");
 }
 
 #[test]
@@ -111,7 +117,7 @@ fn header_only_owner_loss_records_actual_guardian_drain_not_delivery() {
 }
 #[test]
 #[cfg(feature = "source-fault-tests")]
-fn pre_capture_retry_keeps_original_selection_across_rollover() {
+fn pre_capture_retry_keeps_original_selection_across_external_replacement() {
     case("pre-capture-rollover");
 }
 #[test]

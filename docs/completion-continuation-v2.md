@@ -75,10 +75,17 @@ runner's `age360_completion_continuation` paired target and final delivery.
 
 Revision 4 adds a complete-body artifact alongside the bounded JSON event. Bash
 freezes `completion-output-v2.bin` as unchanged raw bytes, then streams SHA256 with
-a 64 KiB buffer in 1 MiB quanta, yielding to the original loop between quanta. Bodies above 64 KiB use the canonical `retained-output-v1`
-descriptor; smaller bodies keep the existing inline UTF-8-lossy string. The cutoff
-bounds even worst-case inline escaping independently of the 1 GiB configured log
-ceiling. Registration bytes and snapshot/outcome JSON limits are unchanged.
+a 64 KiB buffer in 1 MiB quanta, yielding to the original loop between quanta.
+New snapshots use the canonical `retained-output-v1` descriptor at every size.
+Bash places no positive size ceiling on selected raw output: a regular file's
+`u64` length and actual storage/I/O are the limits. A short copy, growth while
+hashing, or filesystem failure remains pending/error evidence, never a truncated
+success. Registration, selection, snapshot and outcome JSON keep their finite
+read/serialization bounds. The supervisor now appends every captured chunk to
+one per-handle file without a producer-side cap. An unverified successor cannot
+turn a possibly partial log into a successful source. The paired Runner still
+has a 1 GiB completion artifact validator ceiling, so end-to-end unrestricted
+output remains unproved.
 
 Runner owns validation and retention of its content-addressed body copy and the
 notification's explicit attachment path/hash/length/encoding. There is no additional
@@ -103,7 +110,7 @@ at most once per second (a retry interval, never a workload deadline). The last
 error remains in `source-publication-error.txt`, including after later success.
 
 Private `source-observation-v2.json` retains original evidence and snapshot headers;
-`completion-output-v2.bin` freezes the entire selected bounded log using a streaming
+`completion-output-v2.bin` freezes the entire selected log using a streaming
 copy before JSON publication. These are not an alternative public wire or event
 ACK. Recovery can finish this staged original observation rather than invent a
 new cessation result. Once frozen, later ready output cannot replace its bytes.
@@ -120,6 +127,10 @@ Build the actual source binary with `cargo build --locked --features source-faul
 Default builds contain no active hooks. Set `AGENT_BASH_SOURCE_FAULT` in the original
 Bash launch environment to one of:
 
+- `capture-error-before-selection`: after a real capture write failure, stops the
+  supervisor after durable terminal `ERROR` metadata but before the missing
+  output selection. The fixture checks pending recovery and resumes the exact
+  supervisor with `SIGCONT`; terminal metadata alone is not source custody.
 - `after-terminal-metadata`: yields after the first terminal publication and
   original event/selection retention, before body capture. The original loop keeps servicing I/O and
   cancellation. Root can accept a real cancellation here before source publication.
@@ -133,6 +144,7 @@ Bash launch environment to one of:
 Each reached source point writes `fault-<name>.reached.json` in its registered
 handle directory, containing its actual PID/starttime/boot identity. It retries
 without advancing until `fault-<name>.release` exists in that same directory.
+The capture-error stop point instead resumes on `SIGCONT`.
 No timeout, fabricated source certificate, registration acceptance or native
 runner proof is supplied by a marker. These hooks are inherited only by explicit
 fixture builds. Root must use private namespaces and actual paired candidates.

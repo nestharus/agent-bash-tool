@@ -7,7 +7,10 @@ mod delivery;
 mod delivery_role;
 mod guard;
 mod image;
+#[cfg(feature = "private-v30-admission")]
+mod private_v30;
 mod retained_output;
+mod root_work;
 mod state;
 mod supervisor;
 #[cfg(test)]
@@ -25,6 +28,7 @@ use crate::state::{CallerChainEntry, DeliveryMode, ListSummary, Meta, RunOutput,
 const EX_USAGE: i32 = 64;
 const EX_DATAERR: i32 = 65;
 const EX_NOINPUT: i32 = 66;
+const EX_UNAVAILABLE: i32 = 69;
 const EX_SOFTWARE: i32 = 70;
 const EX_CANTCREAT: i32 = 73;
 const EX_IOERR: i32 = 74;
@@ -176,7 +180,18 @@ impl AppError {
 }
 
 fn main() {
+    if cfg!(feature = "age319-closed-fresh") {
+        eprintln!("agent-bash: AGE-319 fresh entry closed; no broker source route is installed");
+        std::process::exit(EX_UNAVAILABLE);
+    }
+    #[cfg(feature = "private-v30-admission")]
+    if let Some(code) = private_v30::internal_main() {
+        std::process::exit(code);
+    }
     if let Some(code) = image::internal_main() {
+        std::process::exit(code);
+    }
+    if let Some(code) = root_work::internal_main() {
         std::process::exit(code);
     }
     let guard = AttachedGuard::capture();
@@ -220,13 +235,13 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
             owner_pid,
             argv,
         ),
-        Command::Detach { handle } => detach_command(handle, control_route_caller(&guard)),
-        Command::Cancel { handle } => cancel_command(handle, control_route_caller(&guard)),
+        Command::Detach { handle } => detach_command(handle, control_route_caller(&guard)?),
+        Command::Cancel { handle } => cancel_command(handle, control_route_caller(&guard)?),
         Command::AcceptOutput { handle, snapshot } => {
-            accept_output_command(handle, snapshot, control_route_caller(&guard))
+            accept_output_command(handle, snapshot, control_route_caller(&guard)?)
         }
         Command::Snapshot { handle, bytes } => snapshot_command(handle, bytes),
-        Command::Mode { handle } => mode_command(handle, control_route_caller(&guard)),
+        Command::Mode { handle } => mode_command(handle, control_route_caller(&guard)?),
         Command::Status {
             tail_bytes,
             full,
@@ -237,19 +252,21 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
             tail_bytes.unwrap_or(65_536),
             full,
             observe_only,
-            control_route_caller(&guard),
+            control_route_caller(&guard)?,
         ),
-        Command::List { all, json } => list_command(control_route_caller(&guard), all, json),
+        Command::List { all, json } => list_command(control_route_caller(&guard)?, all, json),
     }
 }
 
 fn validate_guard(guard: &AttachedGuard) -> Result<(), AppError> {
-    guard.validate().map_err(|_| {
-        AppError::new(
-            EX_USAGE,
-            "agent-bash: must be called as an attached subprocess",
-        )
-    })
+    guard.validate().map_err(|_| attached_guard_error())
+}
+
+fn attached_guard_error() -> AppError {
+    AppError::new(
+        EX_USAGE,
+        "agent-bash: must be called as an attached subprocess",
+    )
 }
 
 fn run_command(
@@ -263,6 +280,32 @@ fn run_command(
 ) -> Result<(), AppError> {
     validate_ready_sentinel(ready_sentinel.as_deref())?;
     supervisor::validate_argv(&argv).map_err(workload_argv_error)?;
+    let cwd = current_directory().map_err(current_directory_error)?;
+    #[cfg(feature = "private-v30-admission")]
+    match private_v30::register_ordinary_run(
+        delivery_mode,
+        &argv,
+        &cwd,
+        completion_scope,
+        ready_sentinel.as_deref(),
+        cancel_on_owner_exit,
+    ) {
+        Ok(Some(result)) => {
+            private_v30::write_private_result(result).map_err(json_write_error)?;
+            return Ok(());
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Err(AppError::new(
+                if error.contains("unavailable before K") {
+                    EX_UNAVAILABLE
+                } else {
+                    EX_IOERR
+                },
+                format!("agent-bash: {error}"),
+            ));
+        }
+    }
 
     let binary_config = config::load()
         .map_err(state::StateError::Configuration)
@@ -271,28 +314,41 @@ fn run_command(
         })
         .map_err(state_root_unavailable)?;
     let (binary_config, state_root) = binary_config;
+    let caller_chain = guard.caller_chain().map_err(|_| attached_guard_error())?;
+    let observer_parent_pid = caller_chain[0].pid;
+    let cancel_owner = resolve_cancel_owner(&caller_chain, cancel_on_owner_exit, owner_pid)?;
+    let mode = run_mode(&ready_sentinel);
+    let registration_candidate =
+        delivery::prepare_registration(binary_config).map_err(|error| {
+            completion_event_registration_error(registration_stage_error(
+                "prepare delivery helper",
+                error,
+            ))
+        })?;
+    let owner = owner_context(&caller_chain, &registration_candidate)?;
+    if is_fresh_owner(&owner) {
+        validate_guard(&guard)?;
+    }
+    require_legacy_source_route(&owner)?;
+    // Owner routing precedes even local handle allocation and stale-state
+    // maintenance. A fresh child cannot leave an ab_ handle that a later
+    // legacy observer might mistake for an admitted source.
     reap_state_dirs_at_startup(&state_root);
     let handle = state::generate_handle().map_err(supervisor_bootstrap_error)?;
     let paths = state_paths(state_root, handle.clone());
-
-    let caller_chain = state::capture_caller_chain(guard.startup_ppid());
-    let cancel_owner = resolve_cancel_owner(&caller_chain, cancel_on_owner_exit, owner_pid)?;
-    let cwd = current_directory().map_err(current_directory_error)?;
-    let mode = run_mode(&ready_sentinel);
-    let registration_candidate = delivery::prepare_registration(binary_config)
-        .map_err(completion_event_registration_error)?;
-    let owner = owner_context(&caller_chain, &registration_candidate)?;
     create_run_state(&paths)?;
     let registration = match registration_candidate.bind_to_handle(&paths) {
         Ok(registration) => registration,
         Err(err) => {
             let _ = fs::remove_dir_all(&paths.state_dir);
-            return Err(completion_event_registration_error(err));
+            return Err(completion_event_registration_error(
+                registration_stage_error("bind delivery helper to handle", err),
+            ));
         }
     };
     let meta = Meta::new(
         handle,
-        guard.startup_ppid(),
+        observer_parent_pid,
         unsafe { libc::getpid() },
         argv.clone(),
         cwd,
@@ -317,13 +373,40 @@ fn run_command(
         completion_scope,
         ready_sentinel.clone(),
     );
-    let startup_outcome = match supervisor::fork_registered_supervisor(config, registration) {
+    let paired = root_work::selected(&paths, &meta).map_err(|error| {
+        completion_event_registration_error(registration_stage_error(
+            "select paired or standalone route",
+            error,
+        ))
+    })?;
+    let startup_outcome = match if paired {
+        root_work::submit(
+            &paths,
+            &meta,
+            config.argv.clone(),
+            config.completion_scope,
+            config.ready_sentinel.clone(),
+            registration,
+        )
+    } else {
+        supervisor::fork_registered_supervisor(config, registration)
+    } {
         Ok(outcome) => outcome,
         Err(err) => {
-            // The channel can disappear AFTER durable runner admission. Keep
-            // exact source, launch fence and pinned recovery image; EOF grants
-            // neither deletion nor registration/workload replay.
-            return Err(completion_event_registration_error(err));
+            // The paired submit path terminalizes failures proven pre-accept.
+            // The channel can also disappear AFTER durable runner admission;
+            // that outcome stays retained and EOF grants neither deletion nor
+            // registration/workload replay.
+            return Err(completion_event_registration_error(
+                registration_stage_error(
+                    if paired {
+                        "submit paired original work"
+                    } else {
+                        "start standalone supervisor registration"
+                    },
+                    err,
+                ),
+            ));
         }
     };
 
@@ -355,7 +438,10 @@ fn resolve_cancel_owner(
     })?;
     caller_chain
         .iter()
-        .find(|entry| entry.pid == owner_pid)
+        .find(|entry| {
+            state::process_identity_is_live(entry)
+                && state::local_pid_for_observer_pid(entry.pid) == Some(owner_pid)
+        })
         .cloned()
         .map(Some)
         .ok_or_else(|| {
@@ -369,6 +455,27 @@ fn resolve_cancel_owner(
 fn cancel_command(handle: String, caller: ControlRouteCaller) -> Result<(), AppError> {
     let paths = paths_for_existing_handle(&handle)?;
     require_control_eligibility(&paths, &handle, &caller)?;
+    if root_work::is_root_owned(&paths) {
+        let response = root_work::cancel(&paths)
+            .map_err(|err| cancel_request_error(&handle, err))?
+            .ok_or_else(|| {
+                cancel_request_error(
+                    &handle,
+                    io::Error::other("root-owned work lost its acceptance receipt"),
+                )
+            })?;
+        serde_json::to_writer(
+            io::stdout(),
+            &serde_json::json!({
+                "handle": handle,
+                "requested": response.status == "cancellation_accepted",
+                "root_status": response.status,
+                "root_detail": response.detail,
+            }),
+        )
+        .map_err(json_write_error)?;
+        return io::stdout().write_all(b"\n").map_err(json_write_error);
+    }
     let outcome =
         supervisor::request_cancel(&paths).map_err(|err| cancel_request_error(&handle, err))?;
     serde_json::to_writer(
@@ -424,9 +531,11 @@ fn accept_output_command(
     snapshot: String,
     caller: ControlRouteCaller,
 ) -> Result<(), AppError> {
+    // Resolve the handle version before even interpreting local receipt data.
+    // A v30 source has no v29 output slot to acknowledge.
+    let paths = paths_for_existing_handle(&handle)?;
     let identity: retained_output::Identity =
         serde_json::from_str(&snapshot).map_err(output_error)?;
-    let paths = paths_for_existing_handle(&handle)?;
     let _lock = state::lock_output(&paths).map_err(output_error)?;
     require_control_eligibility(&paths, &handle, &caller)?;
     let meta = terminal_output_meta(&paths, &handle)?;
@@ -606,6 +715,26 @@ fn owner_context(
     })
 }
 
+/// A fresh session can only register through the versioned broker route.
+/// Until that route returns an exact committed registration receipt, the
+/// old helper and supervisor must never turn it into an `ab_` workload.
+fn require_legacy_source_route(owner: &OwnerContext) -> Result<(), AppError> {
+    if is_fresh_owner(owner) {
+        return Err(AppError::new(
+            EX_UNAVAILABLE,
+            "agent-bash: fresh owner requires committed v30 source registration",
+        ));
+    }
+    Ok(())
+}
+
+fn is_fresh_owner(owner: &OwnerContext) -> bool {
+    owner
+        .session_id
+        .as_deref()
+        .is_some_and(|session| session.starts_with("v30:"))
+}
+
 fn owner_attestation_error() -> AppError {
     AppError::new(
         EX_IOERR,
@@ -654,6 +783,10 @@ fn completion_event_registration_error(err: io::Error) -> AppError {
         EX_IOERR,
         format!("agent-bash: failed to register completion event: {err}"),
     )
+}
+
+fn registration_stage_error(stage: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{stage}: {error}"))
 }
 
 fn supervisor_config(
@@ -758,12 +891,7 @@ fn status_command(
 
     emit_status_header(&meta, rc_from_file)?;
     emit_output_separator();
-    let output = read_log_for_status(&paths.log, full, tail_bytes)
-        .map_err(|err| status_log_read_error(&handle, err))?;
-    io::stdout()
-        .write_all(&output)
-        .map_err(status_write_error)?;
-    Ok(())
+    write_log_for_status(&paths.log, &handle, full, tail_bytes)
 }
 
 fn reconcile_status_meta(
@@ -958,12 +1086,40 @@ fn workload_state(running: bool) -> &'static str {
     if running { "running" } else { "exited" }
 }
 
-fn read_log_for_status(path: &Path, full: bool, tail_bytes: u64) -> io::Result<Vec<u8>> {
-    let Some(mut file) = open_status_log(path)? else {
-        return Ok(Vec::new());
+fn write_log_for_status(
+    path: &Path,
+    handle: &str,
+    full: bool,
+    tail_bytes: u64,
+) -> Result<(), AppError> {
+    let Some(mut file) = open_status_log(path).map_err(|err| status_log_read_error(handle, err))?
+    else {
+        return Ok(());
     };
-    seek_status_log(&mut file, full, tail_bytes)?;
-    read_open_status_log(file)
+    let len = file
+        .metadata()
+        .map_err(|err| status_log_read_error(handle, err))?
+        .len();
+    let start = if full {
+        0
+    } else {
+        len.saturating_sub(tail_bytes)
+    };
+    file.seek(SeekFrom::Start(start))
+        .map_err(|err| status_log_read_error(handle, err))?;
+    let mut input = file.take(len - start);
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = input
+            .read(&mut chunk)
+            .map_err(|err| status_log_read_error(handle, err))?;
+        if count == 0 {
+            return Ok(());
+        }
+        io::stdout()
+            .write_all(&chunk[..count])
+            .map_err(status_write_error)?;
+    }
 }
 
 fn open_status_log(path: &Path) -> io::Result<Option<std::fs::File>> {
@@ -972,23 +1128,6 @@ fn open_status_log(path: &Path) -> io::Result<Option<std::fs::File>> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
     }
-}
-
-fn seek_status_log(file: &mut std::fs::File, full: bool, tail_bytes: u64) -> io::Result<()> {
-    if full {
-        return Ok(());
-    }
-    let len = file.metadata()?.len();
-    if len > tail_bytes {
-        file.seek(SeekFrom::Start(len - tail_bytes))?;
-    }
-    Ok(())
-}
-
-fn read_open_status_log(mut file: std::fs::File) -> io::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    file.read_to_end(&mut output)?;
-    Ok(output)
 }
 
 fn list_command(caller: ControlRouteCaller, all: bool, json: bool) -> Result<(), AppError> {
@@ -1112,6 +1251,7 @@ fn reconcile_list_meta(paths: &StatePaths, meta: Meta) -> Option<Meta> {
 
 fn entry_is_state_dir(entry: &std::fs::DirEntry) -> bool {
     entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false)
+        && !is_v30_handle(&entry.file_name().to_string_lossy())
 }
 
 fn paths_for_entry(root: &Path, entry: &std::fs::DirEntry) -> StatePaths {
@@ -1174,10 +1314,10 @@ fn caller_chain_matches_handle(meta: &Meta, caller_chain: &[state::CallerChainEn
     })
 }
 
-fn control_route_caller(guard: &AttachedGuard) -> ControlRouteCaller {
-    ControlRouteCaller {
-        caller_chain: state::capture_caller_chain(guard.startup_ppid()),
-    }
+fn control_route_caller(guard: &AttachedGuard) -> Result<ControlRouteCaller, AppError> {
+    Ok(ControlRouteCaller {
+        caller_chain: guard.caller_chain().map_err(|_| attached_guard_error())?,
+    })
 }
 
 fn caller_is_control_eligible(
@@ -1269,10 +1409,24 @@ fn format_optional_rc(rc: Option<i32>) -> String {
 }
 
 fn paths_for_existing_handle(handle: &str) -> Result<StatePaths, AppError> {
+    // A new-lane handle must be resolved by the root broker before Bash opens
+    // local metadata. Local files can describe old v29 work, but cannot grant
+    // authority over a fresh v30 source or recipient. The broker-backed route
+    // remains closed until its exact readback/control protocol is integrated.
+    if is_v30_handle(handle) {
+        return Err(AppError::new(
+            EX_UNAVAILABLE,
+            format!("agent-bash: v30 broker handle route unavailable: {handle}"),
+        ));
+    }
     let root = load_state_root().map_err(state_root_unavailable)?;
     let paths = state_paths(root, handle.to_string());
     validate_existing_handle(handle, &paths)?;
     Ok(paths)
+}
+
+fn is_v30_handle(handle: &str) -> bool {
+    handle.starts_with("ab30_")
 }
 
 fn validate_existing_handle(handle: &str, paths: &StatePaths) -> Result<(), AppError> {
@@ -1284,4 +1438,31 @@ fn validate_existing_handle(handle: &str, paths: &StatePaths) -> Result<(), AppE
 
 fn unknown_handle_error(handle: &str) -> AppError {
     AppError::new(EX_NOINPUT, format!("agent-bash: unknown handle: {handle}"))
+}
+
+#[cfg(test)]
+mod fresh_route_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_session_cannot_enter_old_source_launch() {
+        let old = OwnerContext {
+            session_id: Some("old-session".into()),
+            invocation_uuid: Some("old-invocation".into()),
+        };
+        assert!(require_legacy_source_route(&old).is_ok());
+        for session in [
+            "v30:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222",
+            "v30:malformed",
+        ] {
+            let fresh = OwnerContext {
+                session_id: Some(session.into()),
+                invocation_uuid: Some("fresh-invocation".into()),
+            };
+            assert_eq!(
+                require_legacy_source_route(&fresh).unwrap_err().code,
+                EX_UNAVAILABLE
+            );
+        }
+    }
 }

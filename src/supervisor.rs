@@ -1,10 +1,9 @@
-use std::os::unix::fs::OpenOptionsExt;
 mod descendant_signal;
 
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
@@ -21,11 +20,8 @@ const CANCEL_POLL: Duration = Duration::from_millis(100);
 const OWNER_POLL: Duration = Duration::from_millis(250);
 const SUPERVISOR_METADATA_WAIT: Duration = Duration::from_secs(5);
 const SUPERVISOR_RECOVERY_POLL: Duration = Duration::from_millis(100);
-const LOG_MAX_BYTES_ENV: &str = "AGENT_BASH_LOG_MAX_BYTES";
-const DEFAULT_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
-const MIN_LOG_MAX_BYTES: u64 = 64 * 1024;
-const MAX_LOG_MAX_BYTES: u64 = 1024 * 1024 * 1024;
-const LOG_TRUNCATED_MARKER: &[u8] = b"\n[agent-bash log truncated; retaining newest output]\n";
+// The per-handle log is authoritative raw output. Display reads may request a
+// tail, but no producer-side byte limit or rollover can discard this source.
 
 #[derive(Clone)]
 pub(crate) struct SupervisorConfig {
@@ -40,6 +36,8 @@ pub(crate) struct SupervisorConfig {
 pub(crate) enum StartupOutcome {
     Running,
     RegistrationOutcomeUnknown,
+    RootAccepted,
+    RootEffectsPossibleNoReplay,
 }
 
 impl StartupOutcome {
@@ -47,6 +45,8 @@ impl StartupOutcome {
         match self {
             Self::Running => "running",
             Self::RegistrationOutcomeUnknown => "registration-outcome-unknown",
+            Self::RootAccepted => "root-accepted",
+            Self::RootEffectsPossibleNoReplay => "effects-possible-no-replay",
         }
     }
 }
@@ -83,7 +83,10 @@ pub(crate) fn fork_registered_supervisor(
         )
     } < 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::other(format!(
+            "create standalone registration socketpair: {}",
+            io::Error::last_os_error()
+        )));
     }
     match unsafe { libc::fork() } {
         -1 => {
@@ -92,7 +95,9 @@ pub(crate) fn fork_registered_supervisor(
                 libc::close(sockets[0]);
                 libc::close(sockets[1]);
             }
-            Err(err)
+            Err(io::Error::other(format!(
+                "fork standalone registration worker: {err}"
+            )))
         }
         0 => unsafe {
             libc::close(sockets[0]);
@@ -111,7 +116,12 @@ fn receive_registration_result(
 ) -> io::Result<StartupOutcome> {
     let mut result = unsafe { File::from_raw_fd(socket) };
     let mut outcome = [0];
-    result.read_exact(&mut outcome)?;
+    result.read_exact(&mut outcome).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("read supervisor registration outcome: {error}"),
+        )
+    })?;
     if outcome[0] == 1 {
         return Ok(StartupOutcome::Running);
     }
@@ -121,7 +131,12 @@ fn receive_registration_result(
         return Ok(StartupOutcome::RegistrationOutcomeUnknown);
     }
     let mut detail = String::new();
-    result.read_to_string(&mut detail)?;
+    result.read_to_string(&mut detail).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("read supervisor registration detail: {error}"),
+        )
+    })?;
     let mut status = 0;
     let _ = unsafe { libc::waitpid(child_pid, &mut status, 0) };
     Err(io::Error::other(detail))
@@ -137,9 +152,9 @@ unsafe fn register_and_start_supervisor(
         CompletionScope::Root => "root",
     };
     if let Err(err) = registration.prepare_continuation(&config.paths, &config.meta, scope) {
-        let _ =
-            record_pre_admission_registration_error(&config.paths, &config.meta, &err.to_string());
-        send_registration_result(result_fd, 0, err.to_string().as_bytes());
+        let detail = format!("prepare completion continuation: {err}");
+        let _ = record_pre_admission_registration_error(&config.paths, &config.meta, &detail);
+        send_registration_result(result_fd, 0, detail.as_bytes());
         unsafe {
             libc::close(result_fd);
             libc::_exit(EX_SOFTWARE)
@@ -205,6 +220,24 @@ fn record_pre_admission_registration_error(
         apply_supervisor_error_metadata(
             &mut meta,
             format!("completion event registration failed: {detail}"),
+        );
+        state::write_rc_atomic(paths, EX_SOFTWARE)?;
+        state::write_meta_atomic(paths, &meta)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn record_root_preaccept_failure(
+    paths: &StatePaths,
+    initial_meta: &Meta,
+    detail: &str,
+) -> io::Result<()> {
+    let _lock = state::lock_completion(paths)?;
+    let mut meta = state::read_meta(paths).unwrap_or_else(|_| initial_meta.clone());
+    if !state::terminal(&meta) {
+        apply_supervisor_error_metadata(
+            &mut meta,
+            format!("root original-work failed before acceptance: {detail}"),
         );
         state::write_rc_atomic(paths, EX_SOFTWARE)?;
         state::write_meta_atomic(paths, &meta)?;
@@ -346,7 +379,22 @@ fn request_terminal_cancel(paths: &StatePaths) -> io::Result<CancelOutcome> {
 }
 
 fn capture_cancel_supervisor(identity: &state::CallerChainEntry) -> io::Result<Option<OwnedFd>> {
-    capture_cancel_supervisor_using(identity, open_pidfd, state::process_identity_evidence)
+    capture_cancel_supervisor_using(
+        identity,
+        |observer_pid| {
+            let local_pid = if let Some(pid) = state::local_pid_for_observer_pid(observer_pid) {
+                pid
+            } else if state::observer_self_identity()?.pid == current_pid() {
+                observer_pid
+            } else {
+                return Err(io::Error::other(
+                    "supervisor PID is outside the local PID domain",
+                ));
+            };
+            open_pidfd(local_pid)
+        },
+        state::process_identity_evidence,
+    )
 }
 
 fn capture_cancel_supervisor_using(
@@ -475,7 +523,7 @@ unsafe fn daemonization_child(config: SupervisorConfig) -> ! {
             unsafe { libc::_exit(EX_SOFTWARE) };
         }
         0 => {
-            let code = run_supervisor(config);
+            let code = run_supervisor(config, None);
             unsafe { libc::_exit(code) };
         }
         supervisor_pid => {
@@ -583,6 +631,7 @@ fn guard_supervisor_exit(paths: &StatePaths, supervisor_pid: libc::pid_t) -> i32
                             tree_drained: true,
                             output_closed: true,
                             ready_sentinel: None,
+                            output_trusted: false,
                         },
                     )?;
                     state::write_rc_atomic(paths, meta.rc.unwrap_or(EX_SOFTWARE))?;
@@ -706,7 +755,271 @@ fn redirect_stdio_to_devnull() {
     }
 }
 
-fn run_supervisor(config: SupervisorConfig) -> i32 {
+pub(crate) fn run_root_worker(
+    config: SupervisorConfig,
+    registration: delivery::DeliveryRegistration,
+    control_fd: RawFd,
+    child_capability: String,
+) -> i32 {
+    let scope = match config.completion_scope {
+        CompletionScope::Tree => "tree",
+        CompletionScope::Root => "root",
+    };
+    if let Err(error) = registration.prepare_continuation(&config.paths, &config.meta, scope) {
+        let _ = record_pre_admission_registration_error(
+            &config.paths,
+            &config.meta,
+            &error.to_string(),
+        );
+        let _ = root_terminal_handshake(control_fd);
+        return EX_SOFTWARE;
+    }
+    if crate::continuation::enabled(&config.paths) {
+        let mut meta = config.meta.clone();
+        meta.schema_version = 4;
+        if let Err(error) = state::write_meta_atomic(&config.paths, &meta) {
+            let _ = crate::continuation::abandon(&config.paths);
+            let _ = record_pre_admission_registration_error(
+                &config.paths,
+                &config.meta,
+                &error.to_string(),
+            );
+            let _ = root_terminal_handshake(control_fd);
+            return EX_SOFTWARE;
+        }
+    }
+    match delivery::register(&config.paths, &config.meta, registration) {
+        Ok(()) => {}
+        Err(delivery::RegistrationError::NotStarted(error)) => {
+            let _ = crate::continuation::abandon(&config.paths);
+            let _ = record_pre_admission_registration_error(
+                &config.paths,
+                &config.meta,
+                &error.to_string(),
+            );
+            let _ = root_terminal_handshake(control_fd);
+            return EX_SOFTWARE;
+        }
+        Err(delivery::RegistrationError::Admitted(error)) => {
+            let _ = crate::continuation::abandon(&config.paths);
+            let _ = record_admitted_registration_unknown(
+                &config.paths,
+                &config.meta,
+                &error.to_string(),
+            );
+            let _ = root_terminal_handshake(control_fd);
+            return EX_SOFTWARE;
+        }
+    }
+    match await_root_execution_grant(control_fd) {
+        Ok(RootExecutionGrant::Granted) => {
+            unsafe {
+                std::env::set_var(
+                    crate::root_work::ROOT_PARENT_CAPABILITY_ENV,
+                    child_capability,
+                );
+            }
+            run_supervisor(config, Some(control_fd))
+        }
+        Ok(RootExecutionGrant::Cancelled(cause)) => {
+            complete_without_launch(config, control_fd, cause)
+        }
+        Err(error) => complete_root_loss_before_launch(config, control_fd, error),
+    }
+}
+
+enum RootExecutionGrant {
+    Granted,
+    Cancelled(CancellationCause),
+}
+
+fn await_root_execution_grant(control_fd: RawFd) -> io::Result<RootExecutionGrant> {
+    write_control_byte_wait(control_fd, b'P')?;
+    loop {
+        match read_control_byte_wait(control_fd)? {
+            b'G' => return Ok(RootExecutionGrant::Granted),
+            b'C' => {
+                return Ok(RootExecutionGrant::Cancelled(
+                    CancellationCause::ExplicitRequest,
+                ));
+            }
+            b'O' => return Ok(RootExecutionGrant::Cancelled(CancellationCause::OwnerExit)),
+            b'K' => {
+                return Ok(RootExecutionGrant::Cancelled(
+                    CancellationCause::CausalParent,
+                ));
+            }
+            b'F' => {
+                return Ok(RootExecutionGrant::Cancelled(
+                    CancellationCause::RootAuthorityLost,
+                ));
+            }
+            _ => return Err(io::Error::other("invalid root execution-grant phase")),
+        }
+    }
+}
+
+fn complete_without_launch(
+    config: SupervisorConfig,
+    control_fd: RawFd,
+    cause: CancellationCause,
+) -> i32 {
+    set_private_umask();
+    let mut meta = supervisor_meta(config.meta);
+    let mut log = match open_supervisor_log(&config.paths) {
+        Ok(log) => log,
+        Err(_) => {
+            let _ = root_terminal_handshake(control_fd);
+            return EX_SOFTWARE;
+        }
+    };
+    persist_supervisor_meta_best_effort(&config.paths, &meta);
+    // Registration and its may_launch fence were already admitted before P.
+    // Keep this exact worker as the source owner until the cancelled v2
+    // observation is durable. A failed write is pending work, not a terminal
+    // root result with a permanently missing completion source.
+    let mut delay = std::time::Duration::from_millis(50);
+    loop {
+        if cause == CancellationCause::ExplicitRequest
+            && state::record_explicit_cancel_acceptance(&config.paths).is_err()
+        {
+            std::thread::sleep(delay);
+            delay = delay
+                .saturating_mul(2)
+                .min(std::time::Duration::from_secs(5));
+            continue;
+        }
+        let terminal = publish_terminal_with_delivery_disposition(
+            &config.paths,
+            &mut meta,
+            Some(&mut log),
+            TerminalProposal::Cancellation(cause),
+            CompletionDeliveryDisposition::ClaimPending,
+        );
+        if terminal.is_ok() {
+            let source = (|| {
+                let _lock = state::lock_completion(&config.paths)?;
+                crate::continuation::publish(
+                    &config.paths,
+                    &meta,
+                    crate::continuation::Observation {
+                        kind: "cancelled",
+                        root_wait_status: None,
+                        tree_drained: true,
+                        output_closed: true,
+                        ready_sentinel: None,
+                        // No workload was released; the synced empty log is exact.
+                        output_trusted: true,
+                    },
+                )
+            })();
+            if source.is_ok() {
+                let _ = delivery::reconcile_completion_delivery(&config.paths, &mut meta);
+                break;
+            }
+        }
+        std::thread::sleep(delay);
+        delay = delay
+            .saturating_mul(2)
+            .min(std::time::Duration::from_secs(5));
+    }
+    let _ = root_terminal_handshake(control_fd);
+    cancellation_terminal_status().rc
+}
+
+fn complete_root_loss_before_launch(
+    config: SupervisorConfig,
+    control_fd: RawFd,
+    error: io::Error,
+) -> i32 {
+    let _ = error;
+    complete_without_launch(config, control_fd, CancellationCause::RootAuthorityLost)
+}
+
+fn root_terminal_handshake(control_fd: RawFd) -> io::Result<()> {
+    write_control_byte_wait(control_fd, b'R')?;
+    loop {
+        if matches!(
+            read_control_byte_wait(control_fd),
+            Ok(b'S' | b'C' | b'O') | Err(_)
+        ) {
+            break;
+        }
+    }
+    write_control_byte_wait(control_fd, b'T')
+}
+
+fn write_control_byte_wait(fd: RawFd, byte: u8) -> io::Result<()> {
+    loop {
+        match write_control_byte(fd, byte) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                poll_control(fd, libc::POLLOUT)?
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn read_control_byte_wait(fd: RawFd) -> io::Result<u8> {
+    loop {
+        let mut byte = [0];
+        let count = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+        if count == 1 {
+            return Ok(byte[0]);
+        }
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "root control closed",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == io::ErrorKind::WouldBlock {
+            poll_control(fd, libc::POLLIN)?;
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+fn poll_control(fd: RawFd, events: libc::c_short) -> io::Result<()> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
+        if result > 0 {
+            return Ok(());
+        }
+        if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(io::Error::last_os_error());
+    }
+}
+
+fn write_control_byte(fd: RawFd, byte: u8) -> io::Result<()> {
+    let result = unsafe { libc::send(fd, (&byte as *const u8).cast(), 1, libc::MSG_NOSIGNAL) };
+    if result == 1 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(feature = "private-v30-admission")]
+pub(crate) fn run_private_registered_source(config: SupervisorConfig) -> i32 {
+    run_supervisor(config, None)
+}
+
+fn run_supervisor(config: SupervisorConfig, root_control_fd: Option<RawFd>) -> i32 {
     set_private_umask();
     let mut meta = supervisor_meta(config.meta);
     if crate::continuation::enabled(&config.paths) {
@@ -774,7 +1087,7 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
             return EX_SOFTWARE;
         }
     };
-    let spawn = match spawn_workload(
+    let mut spawn = match spawn_workload(
         &c_argv,
         cgroup_setup.active.as_ref().map(ActiveCgroup::procs_fd),
     ) {
@@ -791,12 +1104,26 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
     };
 
     let root_pidfd = pidfd_open(spawn.pid);
-    let owner_pidfd = owner_pidfd(&meta);
-    apply_spawn_metadata(&mut meta, &spawn, root_pidfd);
-    // Failure to bind a post-fork identity remains may_launch uncertainty; the
-    // actual original supervisor still observes/reaps this already launched root.
-    if let Err(err) = crate::continuation::launched(&config.paths, spawn.pid) {
+    // In paired mode the runner is the sole live observer for cancel-owner
+    // death. The worker receives the durable accepted cause over root control.
+    let owner_pidfd = root_control_fd
+        .is_none()
+        .then(|| owner_pidfd(&meta))
+        .flatten();
+    // Failure to bind a post-fork identity remains may_launch uncertainty. The
+    // original supervisor still waits for the gated child, which cannot exec.
+    let launch = crate::continuation::launched(&config.paths, spawn.pid);
+    let observed_workload = match &launch {
+        Ok(Some(identity)) => Some(identity.clone()),
+        Ok(None) => state::observer_direct_child_identity(spawn.pid).ok(),
+        Err(_) => None,
+    };
+    apply_spawn_metadata(&mut meta, &spawn, root_pidfd, observed_workload.as_ref());
+    if let Err(err) = &launch {
         meta.error = Some(format!("launch identity publication failed: {err}"));
+    }
+    if let Err(err) = release_workload(&mut spawn, launch.is_ok()) {
+        meta.error = Some(format!("workload start gate failed: {err}"));
     }
     persist_supervisor_meta_best_effort(&config.paths, &meta);
 
@@ -825,6 +1152,7 @@ fn run_supervisor(config: SupervisorConfig) -> i32 {
         completion_scope: config.completion_scope,
         sentinel,
         image_owner,
+        root_control_fd,
     });
     event_loop_exit_code(event_loop(loop_state))
 }
@@ -836,124 +1164,38 @@ fn set_private_umask() {
 }
 
 fn supervisor_meta(mut meta: Meta) -> Meta {
-    let pid = current_pid();
-    meta.supervisor_pid = Some(pid);
-    meta.supervisor_pid_starttime_ticks = state::process_starttime_ticks(pid);
-    let boot_id = state::current_boot_id();
-    meta.process_boot_id = (!boot_id.is_empty()).then_some(boot_id);
+    let identity = state::observer_self_identity().ok();
+    meta.supervisor_pid = identity.as_ref().map(|identity| identity.pid);
+    meta.supervisor_pid_starttime_ticks =
+        identity.as_ref().map(|identity| identity.starttime_ticks);
+    meta.process_boot_id = identity.map(|identity| identity.boot_id);
     meta.touch();
     meta
 }
 
-fn open_supervisor_log(paths: &StatePaths) -> io::Result<BoundedLog> {
-    BoundedLog::new(
-        state::open_log_append(paths)?,
-        paths.log.clone(),
-        log_max_bytes(),
-    )
+fn open_supervisor_log(paths: &StatePaths) -> io::Result<AppendLog> {
+    AppendLog::new(state::open_log_append(paths)?)
 }
 
-fn log_max_bytes() -> u64 {
-    std::env::var(LOG_MAX_BYTES_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_LOG_MAX_BYTES)
-        .clamp(MIN_LOG_MAX_BYTES, MAX_LOG_MAX_BYTES)
-}
-
-struct BoundedLog {
+struct AppendLog {
     file: File,
-    path: std::path::PathBuf,
-    max_bytes: u64,
-    len: u64,
 }
 
-impl BoundedLog {
-    fn new(file: File, path: std::path::PathBuf, max_bytes: u64) -> io::Result<Self> {
-        let len = file.metadata()?.len();
-        let mut log = Self {
-            file,
-            path,
-            max_bytes: max_bytes.max(1),
-            len,
-        };
-        if len > log.max_bytes {
-            log.reset_with_tail(&[])?;
+impl AppendLog {
+    fn new(file: File) -> io::Result<Self> {
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("output log is not a regular file"));
         }
-        Ok(log)
+        Ok(Self { file })
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        if self
-            .len
-            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-            > self.max_bytes
-        {
-            return self.reset_with_tail(bytes);
-        }
-        self.file.write_all(bytes)?;
-        self.len = self
-            .len
-            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        Ok(())
-    }
-
-    fn reset_with_tail(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let marker = retained_suffix(LOG_TRUNCATED_MARKER, self.max_bytes);
-        let payload_budget = self
-            .max_bytes
-            .saturating_sub(u64::try_from(marker.len()).unwrap_or(self.max_bytes));
-        let new_tail = retained_suffix(bytes, payload_budget);
-        let old_budget =
-            payload_budget.saturating_sub(u64::try_from(new_tail.len()).unwrap_or(payload_budget));
-        let old_tail = self.read_tail(old_budget)?;
-
-        // Rollover replaces the live pathname; a selected event's pinned inode
-        // retains its prefix, even before its bounded body copy succeeds.
-        let temp = self.path.with_extension(format!(
-            "rollover-{}",
-            state::generate_handle().map_err(io::Error::other)?
-        ));
-        let mut replacement = std::fs::OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .append(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .mode(0o600)
-            .open(&temp)?;
-        replacement.write_all(marker)?;
-        replacement.write_all(&old_tail)?;
-        replacement.write_all(new_tail)?;
-        replacement.sync_all()?;
-        std::fs::rename(&temp, &self.path)?;
-        self.file = replacement;
-        self.len =
-            u64::try_from(marker.len() + old_tail.len() + new_tail.len()).unwrap_or(self.max_bytes);
-        Ok(())
-    }
-
-    fn read_tail(&mut self, max_bytes: u64) -> io::Result<Vec<u8>> {
-        let keep = self.len.min(max_bytes);
-        if keep == 0 {
-            return Ok(Vec::new());
-        }
-        self.file
-            .seek(SeekFrom::End(-i64::try_from(keep).unwrap_or(i64::MAX)))?;
-        let mut tail = vec![0; usize::try_from(keep).unwrap_or(usize::MAX)];
-        self.file.read_exact(&mut tail)?;
-        Ok(tail)
+        self.file.write_all(bytes)
     }
 
     fn sync_all(&self) -> io::Result<()> {
         self.file.sync_all()
     }
-}
-
-fn retained_suffix(bytes: &[u8], max_bytes: u64) -> &[u8] {
-    let keep = usize::try_from(max_bytes)
-        .unwrap_or(usize::MAX)
-        .min(bytes.len());
-    &bytes[bytes.len().saturating_sub(keep)..]
 }
 
 fn open_log_failed_message(err: io::Error) -> String {
@@ -985,9 +1227,14 @@ fn persist_supervisor_meta_best_effort(paths: &StatePaths, meta: &Meta) {
     let _ = state::write_meta_atomic(paths, meta);
 }
 
-fn apply_spawn_metadata(meta: &mut Meta, spawn: &WorkloadSpawn, root_pidfd: Option<RawFd>) {
-    meta.workload_pid = Some(spawn.pid);
-    meta.workload_pid_starttime_ticks = state::process_starttime_ticks(spawn.pid);
+fn apply_spawn_metadata(
+    meta: &mut Meta,
+    spawn: &WorkloadSpawn,
+    root_pidfd: Option<RawFd>,
+    observed_workload: Option<&state::CallerChainEntry>,
+) {
+    meta.workload_pid = observed_workload.map(|identity| identity.pid);
+    meta.workload_pid_starttime_ticks = observed_workload.map(|identity| identity.starttime_ticks);
     meta.workload_pgid = Some(spawn.pid);
     meta.workload_pidfd = root_pidfd.is_some();
     meta.touch();
@@ -1013,7 +1260,7 @@ struct EventLoopSeed {
     image_owner: crate::image::Owner,
     paths: StatePaths,
     meta: Meta,
-    log: BoundedLog,
+    log: AppendLog,
     sigchld: Sigchld,
     cgroup: Option<ActiveCgroup>,
     spawn: WorkloadSpawn,
@@ -1021,6 +1268,7 @@ struct EventLoopSeed {
     owner_pidfd: Option<RawFd>,
     completion_scope: CompletionScope,
     sentinel: Option<SentinelMatcher>,
+    root_control_fd: Option<RawFd>,
 }
 
 fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
@@ -1050,6 +1298,12 @@ fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
         sentinel: seed.sentinel,
         spawn_error: None,
         cancellation: None,
+        root_control_fd: seed.root_control_fd,
+        root_local_ready_sent: false,
+        root_settlement_granted: seed.root_control_fd.is_none(),
+        root_terminal_sent: false,
+        deferred_ready_at: None,
+        capture_error: None,
     }
 }
 
@@ -1058,7 +1312,10 @@ fn owner_pidfd(meta: &Meta) -> Option<RawFd> {
     if !state::process_identity_is_live(owner) {
         return None;
     }
-    let fd = pidfd_open(owner.pid)?;
+    // The attached owner is in our PID namespace; its durable identity uses
+    // the procfs observer PID, while pidfd_open uses a local PID here.
+    let local_pid = state::local_pid_for_observer_pid(owner.pid)?;
+    let fd = pidfd_open(local_pid)?;
     if state::process_identity_is_live(owner) {
         Some(fd)
     } else {
@@ -1110,6 +1367,7 @@ fn validated_arg_to_cstring(arg: &str) -> CString {
 
 struct WorkloadSpawn {
     pid: libc::pid_t,
+    launch_gate_fd: RawFd,
     stdout_fd: RawFd,
     stderr_fd: RawFd,
     exec_err_fd: RawFd,
@@ -1117,16 +1375,31 @@ struct WorkloadSpawn {
 
 fn spawn_workload(c_argv: &[CString], cgroup_procs_fd: Option<RawFd>) -> io::Result<WorkloadSpawn> {
     let mut stdout_pipe = make_pipe()?;
-    let mut stderr_pipe = make_pipe()?;
-    let mut exec_err_pipe = make_pipe()?;
+    let mut stderr_pipe = make_pipe().inspect_err(|_| close_pipe(stdout_pipe))?;
+    let mut exec_err_pipe = make_pipe().inspect_err(|_| {
+        close_pipe(stdout_pipe);
+        close_pipe(stderr_pipe);
+    })?;
+    let launch_gate = make_start_gate().inspect_err(|_| {
+        close_pipe(stdout_pipe);
+        close_pipe(stderr_pipe);
+        close_pipe(exec_err_pipe);
+    })?;
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        close_pipe(stdout_pipe);
+        close_pipe(stderr_pipe);
+        close_pipe(exec_err_pipe);
+        close_pipe(launch_gate);
+        return Err(err);
     }
     if pid == 0 {
+        close_fd(launch_gate.write);
         unsafe {
             workload_child(
                 c_argv,
+                launch_gate.read,
                 &mut stdout_pipe,
                 &mut stderr_pipe,
                 &mut exec_err_pipe,
@@ -1134,14 +1407,24 @@ fn spawn_workload(c_argv: &[CString], cgroup_procs_fd: Option<RawFd>) -> io::Res
             )
         };
     }
+    close_fd(launch_gate.read);
     close_fd(stdout_pipe.write);
     close_fd(stderr_pipe.write);
     close_fd(exec_err_pipe.write);
-    set_nonblocking(stdout_pipe.read)?;
-    set_nonblocking(stderr_pipe.read)?;
-    set_nonblocking(exec_err_pipe.read)?;
+    if let Err(err) = set_nonblocking(stdout_pipe.read)
+        .and_then(|_| set_nonblocking(stderr_pipe.read))
+        .and_then(|_| set_nonblocking(exec_err_pipe.read))
+    {
+        close_fd(launch_gate.write);
+        close_fd(stdout_pipe.read);
+        close_fd(stderr_pipe.read);
+        close_fd(exec_err_pipe.read);
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        return Err(err);
+    }
     Ok(workload_spawn(
         pid,
+        launch_gate.write,
         stdout_pipe.read,
         stderr_pipe.read,
         exec_err_pipe.read,
@@ -1150,12 +1433,14 @@ fn spawn_workload(c_argv: &[CString], cgroup_procs_fd: Option<RawFd>) -> io::Res
 
 fn workload_spawn(
     pid: libc::pid_t,
+    launch_gate_fd: RawFd,
     stdout_fd: RawFd,
     stderr_fd: RawFd,
     exec_err_fd: RawFd,
 ) -> WorkloadSpawn {
     WorkloadSpawn {
         pid,
+        launch_gate_fd,
         stdout_fd,
         stderr_fd,
         exec_err_fd,
@@ -1164,12 +1449,14 @@ fn workload_spawn(
 
 unsafe fn workload_child(
     c_argv: &[CString],
+    launch_gate_fd: RawFd,
     stdout_pipe: &mut Pipe,
     stderr_pipe: &mut Pipe,
     exec_err_pipe: &mut Pipe,
     cgroup_procs_fd: Option<RawFd>,
 ) -> ! {
     unblock_supervisor_signals();
+    wait_for_workload_release(launch_gate_fd);
     set_workload_process_group();
     enroll_workload_in_cgroup(cgroup_procs_fd, exec_err_pipe.write);
     redirect_workload_output(stdout_pipe, stderr_pipe, exec_err_pipe);
@@ -1178,6 +1465,46 @@ unsafe fn workload_child(
     let pointers = argv_pointers(c_argv);
     exec_workload(&pointers);
     write_errno_and_exit(exec_err_pipe.write, 127);
+}
+
+fn wait_for_workload_release(fd: RawFd) {
+    let mut byte = 0u8;
+    loop {
+        let rc = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        close_fd(fd);
+        if rc != 1 || byte != 1 {
+            unsafe { libc::_exit(126) };
+        }
+        return;
+    }
+}
+
+fn release_workload(spawn: &mut WorkloadSpawn, launch_published: bool) -> io::Result<()> {
+    let fd = std::mem::replace(&mut spawn.launch_gate_fd, -1);
+    let result = if launch_published {
+        let byte = 1u8;
+        loop {
+            let rc = unsafe { libc::send(fd, (&byte as *const u8).cast(), 1, libc::MSG_NOSIGNAL) };
+            if rc == 1 {
+                break Ok(());
+            }
+            let err = if rc == 0 {
+                io::Error::from(io::ErrorKind::WriteZero)
+            } else {
+                io::Error::last_os_error()
+            };
+            if err.kind() != io::ErrorKind::Interrupted {
+                break Err(err);
+            }
+        }
+    } else {
+        Ok(())
+    };
+    close_fd(fd);
+    result
 }
 
 fn set_workload_process_group() {
@@ -1333,9 +1660,34 @@ struct Pipe {
     write: RawFd,
 }
 
+fn close_pipe(pipe: Pipe) {
+    close_fd(pipe.read);
+    close_fd(pipe.write);
+}
+
 fn make_pipe() -> io::Result<Pipe> {
     let mut fds = [0; 2];
     let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(Pipe {
+            read: fds[0],
+            write: fds[1],
+        })
+    }
+}
+
+fn make_start_gate() -> io::Result<Pipe> {
+    let mut fds = [0; 2];
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
     if rc < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -1524,7 +1876,7 @@ struct EventLoop {
     image_owner: crate::image::Owner,
     paths: StatePaths,
     meta: Meta,
-    log: BoundedLog,
+    log: AppendLog,
     sigchld: Sigchld,
     cgroup: Option<ActiveCgroup>,
     root_pid: libc::pid_t,
@@ -1546,6 +1898,12 @@ struct EventLoop {
     sentinel: Option<SentinelMatcher>,
     spawn_error: Option<String>,
     cancellation: Option<Cancellation>,
+    root_control_fd: Option<RawFd>,
+    root_local_ready_sent: bool,
+    root_settlement_granted: bool,
+    root_terminal_sent: bool,
+    deferred_ready_at: Option<u64>,
+    capture_error: Option<String>,
 }
 
 // Original finalized event stays separate from mutable status/cancellation.
@@ -1596,14 +1954,28 @@ impl CancellationEscalation {
 pub(crate) enum CancellationCause {
     OwnerExit,
     ExplicitRequest,
+    CausalParent,
+    RootAuthorityLost,
+    OutputCaptureFailure,
 }
 
 impl CancellationCause {
     fn with_precedence_over(self, other: Self) -> Self {
-        if matches!(self, Self::ExplicitRequest) || matches!(other, Self::ExplicitRequest) {
-            Self::ExplicitRequest
+        fn rank(cause: CancellationCause) -> u8 {
+            match cause {
+                // Transport loss is a fallback only; it must never relabel a
+                // cancellation cause already accepted by the root authority.
+                CancellationCause::RootAuthorityLost => 0,
+                CancellationCause::OutputCaptureFailure => 3,
+                CancellationCause::OwnerExit => 1,
+                CancellationCause::CausalParent => 2,
+                CancellationCause::ExplicitRequest => 4,
+            }
+        }
+        if rank(self) >= rank(other) {
+            self
         } else {
-            Self::OwnerExit
+            other
         }
     }
 
@@ -1619,6 +1991,9 @@ impl CancellationCause {
         match reason {
             "cancel-request" => Some(Self::ExplicitRequest),
             "owner-exit" => Some(Self::OwnerExit),
+            "causal-parent-cancelled" => Some(Self::CausalParent),
+            "root-authority-lost" => Some(Self::RootAuthorityLost),
+            "output-capture-failed" => Some(Self::OutputCaptureFailure),
             _ => None,
         }
     }
@@ -1627,6 +2002,9 @@ impl CancellationCause {
         match self {
             Self::ExplicitRequest => "cancel-request",
             Self::OwnerExit => "owner-exit",
+            Self::CausalParent => "causal-parent-cancelled",
+            Self::RootAuthorityLost => "root-authority-lost",
+            Self::OutputCaptureFailure => "output-capture-failed",
         }
     }
 }
@@ -1667,6 +2045,7 @@ enum PollKey {
     Pidfd,
     OwnerPidfd,
     Cgroup,
+    RootControl,
 }
 
 struct PollEntry {
@@ -1683,6 +2062,8 @@ fn event_loop(mut loop_state: EventLoop) -> io::Result<()> {
         // Recovery is single-flight under this owner, never under acquiring clients.
         // Spawn failures remain bounded by backoff; image RPCs fail truthfully meanwhile.
         loop_state.recover_image_service();
+        loop_state.retry_root_terminal();
+        loop_state.retry_deferred_ready()?;
         loop_state.maybe_finish()?;
         if loop_state.tree_empty
             && loop_state.output_closed()
@@ -1728,6 +2109,11 @@ fn poll_entries(loop_state: &EventLoop) -> Vec<PollEntry> {
     ));
     push_optional_poll_entry(&mut entries, loop_state.root_pidfd, PollKey::Pidfd);
     push_optional_poll_entry(&mut entries, cgroup_inotify_fd(loop_state), PollKey::Cgroup);
+    push_optional_poll_entry(
+        &mut entries,
+        loop_state.root_control_fd,
+        PollKey::RootControl,
+    );
     entries
 }
 
@@ -1820,6 +2206,7 @@ impl EventLoop {
                 self.handle_cgroup_event();
                 Ok(())
             }
+            PollKey::RootControl => self.read_root_control(),
         }
     }
 
@@ -1834,7 +2221,11 @@ impl EventLoop {
     fn recover_image_service(&mut self) {
         if let Err(error) = self.image_owner.recover() {
             let message = format!("image custodian recovery spawn failed (will retry): {error}\n");
-            let _ = self.log.write_all(message.as_bytes());
+            if self.capture_error.is_none()
+                && let Err(err) = self.log.write_all(message.as_bytes())
+            {
+                self.record_capture_failure(err);
+            }
         }
     }
 
@@ -1864,7 +2255,10 @@ impl EventLoop {
     }
 
     fn check_polled_owner(&mut self) {
-        if self.owner_pidfd.is_some() || self.cancellation.is_some() {
+        if self.root_control_fd.is_some()
+            || self.owner_pidfd.is_some()
+            || self.cancellation.is_some()
+        {
             return;
         }
         let Some(owner) = self.meta.cancel_owner.as_ref() else {
@@ -1959,7 +2353,13 @@ impl EventLoop {
     }
 
     fn handle_stdout_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.log.write_all(bytes)?;
+        if self.capture_error.is_some() {
+            return Ok(());
+        }
+        if let Err(err) = self.log.write_all(bytes) {
+            self.record_capture_failure(err);
+            return Ok(());
+        }
         if self.stdout_reaches_sentinel(bytes) {
             self.record_ready_sentinel()?;
         }
@@ -1993,9 +2393,26 @@ impl EventLoop {
 
     fn write_stderr_chunks(&mut self, chunks: &[Vec<u8>]) -> io::Result<()> {
         for bytes in chunks {
-            self.log.write_all(bytes)?;
+            if self.capture_error.is_none()
+                && let Err(err) = self.log.write_all(bytes)
+            {
+                self.record_capture_failure(err);
+            }
         }
         Ok(())
+    }
+
+    fn record_capture_failure(&mut self, err: io::Error) {
+        let detail = format!("output capture failed: {err}; raw output incomplete and unconfirmed");
+        self.capture_error = Some(detail.clone());
+        // The diagnostic is best effort on the same filesystem. The in-memory
+        // veto and guardian's unverified-selection policy remain authoritative
+        // when ENOSPC prevents this file from being written.
+        let _ = state::atomic_write(
+            &self.paths.state_dir.join("output-capture-error.txt"),
+            format!("{detail}\n").as_bytes(),
+        );
+        self.request_cancellation(CancellationCause::OutputCaptureFailure);
     }
 
     fn close_stderr_if_closed(&mut self, fd: RawFd, closed: bool) {
@@ -2166,13 +2583,23 @@ impl EventLoop {
     }
 
     fn maybe_finish(&mut self) -> io::Result<()> {
-        match finish_decision(self) {
+        let decision = finish_decision(self);
+        if !matches!(decision, FinishDecision::None) && !self.root_settlement_granted {
+            self.announce_root_local_ready()?;
+            return Ok(());
+        }
+        match decision {
             FinishDecision::None => Ok(()),
-            FinishDecision::SpawnError(message) => self.record_supervisor_error_in_loop(message),
+            FinishDecision::SpawnError(message) => {
+                self.record_supervisor_error_in_loop(self.capture_error.clone().unwrap_or(message))
+            }
             FinishDecision::Exit {
                 root_status,
                 reason,
-            } => self.record_exit_completion(root_status, reason),
+            } => match self.capture_error.clone() {
+                Some(message) => self.record_supervisor_error_in_loop(message),
+                None => self.record_exit_completion(root_status, reason),
+            },
         }
     }
 
@@ -2188,6 +2615,8 @@ impl EventLoop {
             && !self.root_status_pending
             && self.root_status.is_some()
             && self.completion_scope.is_complete(self.tree_empty)
+            && (self.root_control_fd.is_none() || self.tree_empty)
+            && (self.root_control_fd.is_none() || self.root_terminal_sent)
             && self.output_closed()
     }
 
@@ -2211,6 +2640,7 @@ impl EventLoop {
                 } else {
                     None
                 },
+                output_trusted: self.capture_error.is_none(),
             },
         )
     }
@@ -2241,6 +2671,7 @@ impl EventLoop {
                     } else {
                         None
                     },
+                    output_trusted: self.capture_error.is_none(),
                 },
             )?;
             crate::continuation::fault_barrier(&self.paths, "after-terminal-metadata")?;
@@ -2257,6 +2688,7 @@ impl EventLoop {
                     } else {
                         None
                     },
+                    output_trusted: self.capture_error.is_none(),
                 },
                 &mut pending.progress,
             )
@@ -2289,11 +2721,30 @@ impl EventLoop {
     }
 
     fn record_ready_sentinel(&mut self) -> io::Result<()> {
+        if !self.root_settlement_granted {
+            self.deferred_ready_at.get_or_insert_with(state::unix_ms);
+            return self.announce_root_local_ready();
+        }
+        self.publish_ready_sentinel(state::unix_ms())
+    }
+
+    fn retry_deferred_ready(&mut self) -> io::Result<()> {
+        let Some(at) = self.deferred_ready_at else {
+            return Ok(());
+        };
+        if !self.root_settlement_granted {
+            return Ok(());
+        }
+        self.deferred_ready_at = None;
+        self.publish_ready_sentinel(at)
+    }
+
+    fn publish_ready_sentinel(&mut self, at: u64) -> io::Result<()> {
         let result = publish_terminal_with_delivery_disposition(
             &self.paths,
             &mut self.meta,
             Some(&mut self.log),
-            TerminalProposal::ReadySentinel(state::unix_ms()),
+            TerminalProposal::ReadySentinel(at),
             CompletionDeliveryDisposition::LiveLoop {
                 tree_empty: self.tree_empty,
             },
@@ -2320,10 +2771,92 @@ impl EventLoop {
 
     fn integrate_terminal_publication(&mut self, result: TerminalPublishResult) {
         match result {
-            TerminalPublishResult::Published => self.completion_recorded = true,
+            TerminalPublishResult::Published => {
+                self.completion_recorded = true;
+                self.retry_root_terminal();
+            }
             TerminalPublishResult::DeferredForAcceptedCancel => {
                 self.request_cancellation(CancellationCause::ExplicitRequest);
             }
+        }
+    }
+
+    fn retry_root_terminal(&mut self) {
+        if !self.completion_recorded || self.root_terminal_sent {
+            return;
+        }
+        let Some(fd) = self.root_control_fd else {
+            return;
+        };
+        match write_control_byte(fd, b'T') {
+            Ok(()) => self.root_terminal_sent = true,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                close_fd(fd);
+                self.root_control_fd = None;
+                self.root_settlement_granted = true;
+            }
+        }
+    }
+
+    fn announce_root_local_ready(&mut self) -> io::Result<()> {
+        if self.root_local_ready_sent {
+            return Ok(());
+        }
+        let Some(fd) = self.root_control_fd else {
+            self.root_settlement_granted = true;
+            return Ok(());
+        };
+        match write_control_byte(fd, b'R') {
+            Ok(()) => self.root_local_ready_sent = true,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                close_fd(fd);
+                self.root_control_fd = None;
+                self.root_settlement_granted = true;
+                self.request_cancellation(CancellationCause::RootAuthorityLost);
+            }
+        }
+        Ok(())
+    }
+
+    fn read_root_control(&mut self) -> io::Result<()> {
+        let Some(fd) = self.root_control_fd else {
+            return Ok(());
+        };
+        let mut bytes = [0; 32];
+        loop {
+            let count = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+            if count > 0 {
+                for byte in &bytes[..count as usize] {
+                    match *byte {
+                        b'S' => self.root_settlement_granted = true,
+                        b'C' => self.request_cancellation(CancellationCause::ExplicitRequest),
+                        b'O' => self.request_cancellation(CancellationCause::OwnerExit),
+                        b'K' => self.request_cancellation(CancellationCause::CausalParent),
+                        b'F' => self.request_cancellation(CancellationCause::RootAuthorityLost),
+                        _ => return Err(io::Error::other("invalid root control phase")),
+                    }
+                }
+                continue;
+            }
+            if count == 0 {
+                // Root loss never leaves accepted work unowned: this worker is
+                // the last live custodian, cancels/drains, and publishes a
+                // failure rather than waiting on an absent authority.
+                self.root_control_fd = None;
+                self.root_settlement_granted = true;
+                self.request_cancellation(CancellationCause::RootAuthorityLost);
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(());
+            }
+            return Err(error);
         }
     }
 
@@ -2390,6 +2923,11 @@ impl EventLoop {
             && self.tree_empty
             && self.output_closed()
         {
+            // Terminal metadata is a process diagnosis, not an output-selection
+            // receipt. Exercise the interval before source custody is retained.
+            if self.capture_error.is_some() {
+                pause_after_capture_error_metadata(&self.paths)?;
+            }
             self.pending_source =
                 crate::continuation::enabled(&self.paths).then(|| PendingSource {
                     progress: crate::continuation::Publication::default(),
@@ -2408,6 +2946,30 @@ impl EventLoop {
     }
 }
 
+#[cfg(feature = "source-fault-tests")]
+fn pause_after_capture_error_metadata(paths: &StatePaths) -> io::Result<()> {
+    if std::env::var("AGENT_BASH_SOURCE_FAULT").as_deref() != Ok("capture-error-before-selection") {
+        return Ok(());
+    }
+    let mut identity = serde_json::to_vec(&state::observer_self_identity()?)?;
+    identity.push(b'\n');
+    state::atomic_write(
+        &paths
+            .state_dir
+            .join("fault-capture-error-before-selection.reached.json"),
+        &identity,
+    )?;
+    if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "source-fault-tests"))]
+fn pause_after_capture_error_metadata(_paths: &StatePaths) -> io::Result<()> {
+    Ok(())
+}
+
 struct AvailableRead {
     chunks: Vec<Vec<u8>>,
     closed: bool,
@@ -2420,14 +2982,13 @@ enum FdRead {
 }
 
 fn read_available(fd: RawFd) -> io::Result<AvailableRead> {
-    let mut chunks = Vec::new();
     let mut buf = [0_u8; 8192];
-    loop {
-        match read_fd_chunk(fd, &mut buf)? {
-            FdRead::Bytes(bytes) => chunks.push(bytes),
-            FdRead::Closed => return Ok(available_read(chunks, true)),
-            FdRead::Pending => return Ok(available_read(chunks, false)),
-        }
+    // A producer can keep its pipe readable indefinitely. Return to the event
+    // loop after one fixed-size read so output and cancellation stay bounded.
+    match read_fd_chunk(fd, &mut buf)? {
+        FdRead::Bytes(bytes) => Ok(available_read(vec![bytes], false)),
+        FdRead::Closed => Ok(available_read(Vec::new(), true)),
+        FdRead::Pending => Ok(available_read(Vec::new(), false)),
     }
 }
 
@@ -2614,7 +3175,7 @@ fn record_supervisor_error(
     paths: &StatePaths,
     meta: &mut Meta,
     message: String,
-    log: Option<&mut BoundedLog>,
+    log: Option<&mut AppendLog>,
 ) -> io::Result<()> {
     publish_terminal_with_delivery_disposition(
         paths,
@@ -2626,7 +3187,7 @@ fn record_supervisor_error(
     Ok(())
 }
 
-fn sync_optional_log(log: Option<&mut BoundedLog>) -> io::Result<()> {
+fn sync_optional_log(log: Option<&mut AppendLog>) -> io::Result<()> {
     let Some(log) = log else {
         return Ok(());
     };
@@ -2758,7 +3319,7 @@ enum TerminalPublishResult {
 fn publish_terminal_with_delivery_disposition(
     paths: &StatePaths,
     meta: &mut Meta,
-    log: Option<&mut BoundedLog>,
+    log: Option<&mut AppendLog>,
     proposal: TerminalProposal,
     delivery_disposition: CompletionDeliveryDisposition,
 ) -> io::Result<TerminalPublishResult> {
@@ -2862,8 +3423,135 @@ impl Drop for EventLoop {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixStream;
+    use std::process::Command;
 
     use super::*;
+
+    #[test]
+    fn persisted_process_identity_uses_observer_pid_and_local_wait_stays_local() {
+        const STAGE: &str = "AGE319_SUPERVISOR_OBSERVER_CHILD";
+        if std::env::var_os(STAGE).is_none() {
+            persisted_process_identity_case(false);
+            let output = Command::new("timeout")
+                .args([
+                    "--kill-after=5s", "30s", "unshare", "--user", "--map-current-user",
+                    "--pid", "--fork", "--",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "supervisor::tests::persisted_process_identity_uses_observer_pid_and_local_wait_stays_local",
+                ])
+                .env(STAGE, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        persisted_process_identity_case(true);
+    }
+
+    fn persisted_process_identity_case(cross_domain: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let meta = Meta::new(
+            "ab_observer".into(),
+            1,
+            1,
+            vec![],
+            temp.path().into(),
+            "exit",
+            state::DeliveryMode::Async,
+            None,
+            vec![],
+            None,
+        );
+        let mut meta = supervisor_meta(meta);
+        let self_identity = state::observer_self_identity().unwrap();
+        assert_eq!(meta.supervisor_pid, Some(self_identity.pid));
+        assert_eq!(
+            meta.supervisor_pid_starttime_ticks,
+            Some(self_identity.starttime_ticks)
+        );
+        assert_eq!(self_identity.pid != current_pid(), cross_domain);
+        assert!(capture_cancel_supervisor(&self_identity).unwrap().is_some());
+        meta.cancel_owner = Some(self_identity);
+        close_fd(owner_pidfd(&meta).unwrap());
+
+        let argv = argv_to_cstrings(&["/bin/sleep".into(), "30".into()]).unwrap();
+        let mut spawn = spawn_workload(&argv, None).unwrap();
+        let observed = state::observer_direct_child_identity(spawn.pid).unwrap();
+        apply_spawn_metadata(&mut meta, &spawn, None, Some(&observed));
+        assert_eq!(meta.workload_pid, Some(observed.pid));
+        assert_eq!(
+            meta.workload_pid_starttime_ticks,
+            Some(observed.starttime_ticks)
+        );
+        assert_eq!(meta.workload_pgid, Some(spawn.pid));
+        assert_eq!(observed.pid != spawn.pid, cross_domain);
+        release_workload(&mut spawn, false).unwrap();
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(spawn.pid, &mut status, 0) },
+            spawn.pid
+        );
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 126);
+        for fd in [spawn.stdout_fd, spawn.stderr_fd, spawn.exec_err_fd] {
+            close_fd(fd);
+        }
+    }
+
+    #[test]
+    fn workload_start_gate_runs_only_after_identity_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let effect = temp.path().join("effect");
+        let script = format!("printf executed > '{}'", effect.display());
+        let argv = argv_to_cstrings(&["/bin/sh".into(), "-c".into(), script]).unwrap();
+        let mut spawn = spawn_workload(&argv, None).unwrap();
+        assert!(state::observer_direct_child_identity(spawn.pid).is_ok());
+        assert!(!effect.exists());
+        release_workload(&mut spawn, true).unwrap();
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(spawn.pid, &mut status, 0) },
+            spawn.pid
+        );
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert_eq!(fs::read(&effect).unwrap(), b"executed");
+        for fd in [spawn.stdout_fd, spawn.stderr_fd, spawn.exec_err_fd] {
+            close_fd(fd);
+        }
+
+        fs::remove_file(&effect).unwrap();
+        let mut refused = spawn_workload(&argv, None).unwrap();
+        release_workload(&mut refused, false).unwrap();
+        assert_eq!(
+            unsafe { libc::waitpid(refused.pid, &mut status, 0) },
+            refused.pid
+        );
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 126);
+        assert!(!effect.exists());
+        for fd in [refused.stdout_fd, refused.stderr_fd, refused.exec_err_fd] {
+            close_fd(fd);
+        }
+
+        let mut dead = spawn_workload(&argv, None).unwrap();
+        assert_eq!(unsafe { libc::kill(dead.pid, libc::SIGKILL) }, 0);
+        assert_eq!(unsafe { libc::waitpid(dead.pid, &mut status, 0) }, dead.pid);
+        assert_eq!(
+            release_workload(&mut dead, true)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPIPE)
+        );
+        assert!(!effect.exists());
+        for fd in [dead.stdout_fd, dead.stderr_fd, dead.exec_err_fd] {
+            close_fd(fd);
+        }
+    }
 
     /// Private child with an acknowledged signal counter. No models, shared
     /// signal handlers, host PID reuse, or production fixture knobs.
@@ -3526,7 +4214,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn bounded_log_discards_old_output_and_retains_newest_bytes() {
+    fn append_log_preserves_every_chunk_and_reopened_prefix() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("log");
         let file = std::fs::OpenOptions::new()
@@ -3535,24 +4223,28 @@ for line in sys.stdin:
             .read(true)
             .open(&path)
             .expect("create log");
-        let mut log = BoundedLog::new(file, path.clone(), 128).expect("bounded log");
+        let mut log = AppendLog::new(file).expect("append log");
 
         log.write_all(&[b'a'; 100]).expect("write old output");
         log.write_all(&[b'b'; 100]).expect("write new output");
         log.sync_all().expect("sync log");
 
-        let retained = std::fs::read(path).expect("read retained log");
-        assert_eq!(retained.len(), 128);
-        assert!(retained.starts_with(LOG_TRUNCATED_MARKER));
-        assert!(
-            retained[LOG_TRUNCATED_MARKER.len()..]
-                .iter()
-                .all(|byte| *byte == b'b')
-        );
+        let retained = std::fs::read(&path).expect("read retained log");
+        assert_eq!(retained, [vec![b'a'; 100], vec![b'b'; 100]].concat());
+        let mut reopened = AppendLog::new(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .read(true)
+                .open(&path)
+                .unwrap(),
+        )
+        .unwrap();
+        reopened.write_all(b"later").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 205);
     }
 
     #[test]
-    fn bounded_log_caps_a_single_oversized_chunk() {
+    fn append_log_preserves_a_chunk_above_legacy_limit() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("log");
         let file = std::fs::OpenOptions::new()
@@ -3561,17 +4253,61 @@ for line in sys.stdin:
             .read(true)
             .open(&path)
             .expect("create log");
-        let mut log = BoundedLog::new(file, path.clone(), 96).expect("bounded log");
+        let mut log = AppendLog::new(file).expect("append log");
 
         log.write_all(&[b'x'; 4096]).expect("write large output");
 
         let retained = std::fs::read(path).expect("read retained log");
-        assert_eq!(retained.len(), 96);
-        assert!(retained.starts_with(LOG_TRUNCATED_MARKER));
-        assert!(
-            retained[LOG_TRUNCATED_MARKER.len()..]
-                .iter()
-                .all(|byte| *byte == b'x')
+        assert_eq!(retained, vec![b'x'; 4096]);
+    }
+
+    fn exercise_root_grant(command: u8) -> RootExecutionGrant {
+        let (worker, mut authority) = UnixStream::pair().expect("root control pair");
+        let thread = std::thread::spawn(move || {
+            let mut prepared = [0];
+            authority.read_exact(&mut prepared).expect("prepared phase");
+            assert_eq!(prepared, [b'P']);
+            authority.write_all(&[command]).expect("authority decision");
+        });
+        let outcome = await_root_execution_grant(worker.as_raw_fd()).expect("grant outcome");
+        thread.join().unwrap();
+        outcome
+    }
+
+    #[test]
+    fn root_worker_never_executes_before_an_explicit_grant() {
+        assert!(matches!(
+            exercise_root_grant(b'G'),
+            RootExecutionGrant::Granted
+        ));
+    }
+
+    #[test]
+    fn cancellation_before_grant_preserves_distinct_causes() {
+        assert!(matches!(
+            exercise_root_grant(b'C'),
+            RootExecutionGrant::Cancelled(CancellationCause::ExplicitRequest)
+        ));
+        assert!(matches!(
+            exercise_root_grant(b'O'),
+            RootExecutionGrant::Cancelled(CancellationCause::OwnerExit)
+        ));
+        assert!(matches!(
+            exercise_root_grant(b'K'),
+            RootExecutionGrant::Cancelled(CancellationCause::CausalParent)
+        ));
+        assert!(matches!(
+            exercise_root_grant(b'F'),
+            RootExecutionGrant::Cancelled(CancellationCause::RootAuthorityLost)
+        ));
+        assert_eq!(
+            CancellationCause::CausalParent
+                .with_precedence_over(CancellationCause::RootAuthorityLost),
+            CancellationCause::CausalParent
+        );
+        assert_eq!(
+            CancellationCause::OwnerExit.with_precedence_over(CancellationCause::RootAuthorityLost),
+            CancellationCause::OwnerExit
         );
     }
 }

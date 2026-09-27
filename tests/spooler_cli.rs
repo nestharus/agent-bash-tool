@@ -10,6 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
 use std::sync::{OnceLock, mpsc};
@@ -43,6 +44,175 @@ fn run_cmd(temp: &tempfile::TempDir, args: &[&str]) -> (Output, Duration) {
     let start = Instant::now();
     let output = agent_bash(temp).args(args).output().expect("run command");
     (output, start.elapsed())
+}
+
+#[test]
+fn v30_handle_never_uses_local_v29_metadata_as_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    for handle in ["ab30_0123456789abcdef0123456789abcdef", "ab30_malformed"] {
+        let forged = temp.path().join("agent-bash").join(handle);
+        fs::create_dir_all(&forged).unwrap();
+        fs::write(forged.join("meta.json"), b"{}").unwrap();
+        for args in [
+            vec!["snapshot", handle],
+            vec!["status", "--observe-only", handle],
+            vec!["cancel", handle],
+            vec!["detach", handle],
+            vec!["mode", handle],
+            vec!["accept-output", handle, "--snapshot", "{}"],
+        ] {
+            let (output, _) = run_cmd(&temp, &args);
+            assert_eq!(output.status.code(), Some(69), "{args:?}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("v30 broker handle route unavailable"),
+                "{args:?}: {output:?}"
+            );
+        }
+    }
+    let (listed, _) = run_cmd(&temp, &["list", "--all", "--json"]);
+    assert_command_success(&listed);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&listed.stdout).unwrap(),
+        json!([])
+    );
+}
+
+#[test]
+fn resolved_fresh_owner_refuses_before_handle_or_workload() {
+    if test_support::private_case() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let fake = owner_resolving_fake_agents(&temp);
+    let workload_marker = temp.path().join("workload-started");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", fake)
+        .env(
+            "AGENT_BASH_FAKE_RESOLVED_SESSION",
+            "v30:22222222-2222-4222-8222-222222222222:33333333-3333-4333-8333-333333333333",
+        )
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"source":"opencode","id":"11111111-1111-4111-8111-111111111111"}"#,
+        )
+        .args(["run", "--", "/usr/bin/touch"])
+        .arg(&workload_marker)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(69), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("fresh owner requires committed v30 source registration")
+    );
+    assert!(!workload_marker.exists());
+    assert!(!temp.path().join("agent-bash").exists());
+}
+
+#[test]
+fn paired_context_halves_fail_closed_and_terminalize_preaccept() {
+    for (present, absent, expected) in [
+        (
+            "OULIPOLY_COMPLETION_ENDPOINT",
+            "OULIPOLY_ROOT_AUTHORITY_V1",
+            "paired root endpoint is present but root authority is missing",
+        ),
+        (
+            "OULIPOLY_ROOT_AUTHORITY_V1",
+            "OULIPOLY_COMPLETION_ENDPOINT",
+            "paired root authority is present but endpoint is missing",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let output = agent_bash(&temp)
+            .env("OULIPOLY_ORIGINAL_WORK_REQUIRED_V1", "1")
+            .env(present, "paired-context-present")
+            .env_remove(absent)
+            .args(["run", "--delivery", "async", "--", "/bin/true"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{}",
+            command_failure_message(&output)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{stderr}");
+        let state_root = temp.path().join("agent-bash");
+        let handle = fs::read_dir(&state_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("ab_"))
+            .unwrap()
+            .path();
+        let meta: Value =
+            serde_json::from_slice(&fs::read(handle.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["state"], "ERROR", "{meta}");
+        assert_eq!(meta["completion_reason"], "supervisor-error", "{meta}");
+        assert!(handle.join("root-work-diagnostic-v1.jsonl").exists());
+    }
+}
+
+#[test]
+fn paired_session_ring_blocks_erased_context_even_after_setsid_reparent() {
+    for case in ["paired", "orphan", "invalid", "independent", "default"] {
+        let temp = tempfile::tempdir().unwrap();
+        let effect = temp.path().join("second-root-effect");
+        let output = StdCommand::new("python3")
+            .arg("-c")
+            .arg(include_str!("fixtures/age319_session_ring.py"))
+            .arg(case)
+            .arg(assert_cmd::cargo::cargo_bin("agent-bash"))
+            .env("XDG_STATE_HOME", temp.path())
+            .env("XDG_CONFIG_HOME", temp.path().join("config"))
+            .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+            .env("AGENT_BASH_TEST_EFFECT", &effect)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{case}: {}",
+            command_failure_message(&output)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let rejected = matches!(case, "paired" | "orphan" | "invalid");
+        if rejected {
+            assert_ne!(report["rc"], 0, "{case}: {report}");
+            assert!(
+                !effect.exists(),
+                "{case} started an unauthorized second root"
+            );
+            let stderr = report["stderr"].as_str().unwrap();
+            assert!(
+                stderr.contains(if case == "invalid" {
+                    "invalid paired session keyring UUID"
+                } else {
+                    "inherited paired session keyring"
+                }),
+                "{case}: {stderr}"
+            );
+            let handle = fs::read_dir(temp.path().join("agent-bash"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| entry.file_name().to_string_lossy().starts_with("ab_"))
+                .unwrap()
+                .path();
+            let meta: Value =
+                serde_json::from_slice(&fs::read(handle.join("meta.json")).unwrap()).unwrap();
+            assert_eq!(meta["state"], "ERROR", "{case}: {meta}");
+            assert!(handle.join("root-work-diagnostic-v1.jsonl").exists());
+        } else {
+            assert_eq!(report["rc"], 0, "{case}: {report}");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !effect.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                effect.exists(),
+                "{case}: independent launch did not execute"
+            );
+        }
+    }
 }
 
 fn completion_evidence(path: &Path, meta: &Value) -> Value {
@@ -2540,7 +2710,7 @@ fn exit_mode_completion_rc_and_captured_output() {
 }
 
 #[test]
-fn captured_log_is_bounded_and_retains_newest_output() {
+fn captured_log_preserves_output_despite_legacy_limit_variable() {
     if test_support::private_case() {
         return;
     }
@@ -2561,12 +2731,79 @@ fn captured_log_is_bounded_and_retains_newest_output() {
     let _ = wait_for_status_prefix(&temp, handle, &format!("DONE rc=0 handle={handle}"));
 
     let log = fs::read(json["log"].as_str().expect("log path")).expect("read log");
-    assert!(log.len() <= 65_536, "retained {} bytes", log.len());
-    assert!(
-        log.windows(b"[agent-bash log truncated".len())
-            .any(|window| window == b"[agent-bash log truncated")
-    );
+    assert_eq!(log.len(), 200_012, "captured {} bytes", log.len());
+    assert!(log[..200_000].iter().all(|byte| *byte == b'x'));
     assert!(log.ends_with(b"tail-marker\n"));
+    let full = agent_bash(&temp)
+        .args(["status", "--full", handle])
+        .output()
+        .expect("full status");
+    assert_command_success(&full);
+    assert!(full.stdout.ends_with(&log));
+    let tail = agent_bash(&temp)
+        .args(["status", "--tail-bytes", "32", handle])
+        .output()
+        .expect("tail status");
+    assert_command_success(&tail);
+    assert!(tail.stdout.ends_with(&log[log.len() - 32..]));
+}
+
+#[test]
+fn capture_file_limit_reports_unknown_and_cancels_workload() {
+    if test_support::private_case() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = agent_bash(&temp).get_program().to_owned();
+    let mut command = StdCommand::new(binary);
+    command
+        .env("XDG_STATE_HOME", temp.path())
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", "/bin/true")
+        .env_remove("AGENT_BASH_OWNER_INVOCATION_UUID")
+        .env_remove("AGENT_BASH_OWNER_SESSION_ID")
+        .env_remove("OULIPOLY_PARENT_INVOCATION")
+        .env_remove("OULIPOLY_DATA_DIR")
+        .args([
+            "run",
+            "--",
+            "bash",
+            "-lc",
+            "head -c 200000 /dev/zero | tr '\\0' x; sleep 60",
+        ]);
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 64 * 1024,
+                rlim_max: 64 * 1024,
+            };
+            if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR
+                || libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let run = command.output().expect("run limited capture");
+    let json = parse_run_output(&run);
+    let handle = json["handle"].as_str().expect("handle");
+    let _status = wait_for_status_prefix(&temp, handle, &format!("ERROR rc=70 handle={handle}"));
+    let meta = read_meta(&meta_path(&json));
+    assert_eq!(meta["completion_reason"], "supervisor-error");
+    assert!(
+        meta["error"]
+            .as_str()
+            .unwrap()
+            .contains("output capture failed")
+    );
+    assert!(
+        fs::read_to_string(
+            Path::new(json["state_dir"].as_str().unwrap()).join("output-capture-error.txt")
+        )
+        .unwrap()
+        .contains("raw output incomplete and unconfirmed")
+    );
 }
 
 #[test]
@@ -3303,7 +3540,7 @@ fn opencode_adapter_abort_signal_cancels_sync_workload() {
 
     let result = run_adapter_driver(&temp, &driver, "abort", None);
 
-    assert_adapter_result_contains(&result, "Cancellation requested");
+    assert_adapter_result_contains(&result, "Cancellation accepted");
     let handle = adapter_result_handle(&result);
     let state_dir = temp.path().join("agent-bash").join(handle);
     let meta = read_meta(&state_dir.join("meta.json"));

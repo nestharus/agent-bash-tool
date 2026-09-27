@@ -1,5 +1,12 @@
 # agent-bash-tool
 
+For the AGE-319 inert side-by-side staging artifact, build the proposed fresh
+image with `cargo build --features age319-closed-fresh`. This feature makes
+every executable entry, including the private v30 child probe if selected,
+exit 69 before State, handle, helper, or workload code. It is a closed image
+only; it does not implement a production v30 broker registration or selector.
+The ordinary build and historical pinned v29 images keep their existing behavior.
+
 General-purpose detached bash spooler for AI agents.
 
 Agents call `agent-bash` instead of raw bash. Every command runs **detached**, regardless of
@@ -8,6 +15,15 @@ completion returns synchronously in-band or asynchronously through the agent mai
 
 - **Always detached.** There is no foreground execution mode. `run` returns a handle immediately
   and the workload continues under a surviving supervisor.
+- **Paired root ownership.** When agent-runner marks a current paired tree and supplies both its
+  completion endpoint and a `root-authority-v1` grant, `run` durably submits
+  `original-work-v1` to that existing root
+  guardian. The guardian exclusively accepts and grants execution, owns cancellation and exact
+  child settlement, and directly reaps the short-lived agent-bash worker; agent-bash does not
+  create its standalone guardian/supervisor pair. A marked tree fails closed if either required
+  value is missing or invalid. A live paired-worker or adopting guardian ancestor also blocks standalone
+  selection when a wrapper strips the marker and grant; genuinely unpaired endpoint-only
+  legacy callers retain completion-continuation-v2 behavior. See [root original work](docs/root-original-work-v1.md).
 - **Explicit result delivery.** `run --delivery sync` keeps completion in-band;
   `run --delivery async` sends completion through agent-runner. The CLI defaults to `async` for
   existing callers, while the OpenCode adapter defaults ordinary shell commands to `sync` and
@@ -36,14 +52,18 @@ completion returns synchronously in-band or asynchronously through the agent mai
   spooler operation; cross-owner `status` is read-only. The guardian also adopts the workload
   tree and finishes any already-accepted explicit cancellation.
 - **Owner-scoped cancellation.** Integrations can opt into an exact PID/start-time/boot-ID lease
-  with `run --cancel-on-owner-exit --owner-pid <pid>`. `cancel <handle>`, an owner exit, or an
-  OpenCode tool abort terminates the complete adopted workload process tree, escalating to `SIGKILL` after
-  a bounded grace period. A direct cancel is accepted when its durable marker is synchronized;
-  signaling only wakes the supervisor, which also observes the marker independently. Cancellation
+  with `run --cancel-on-owner-exit --owner-pid <pid>`. A supported `cancel <handle>`, owner exit,
+  or OpenCode tool abort seeks cancellation of the adopted tree, escalating to `SIGKILL` after
+  a bounded grace period once accepted. Paired direct cancel passes the caller eligibility check
+  and submits the handle's private cancel capability to the root guardian. Its durable
+  `cancellation_accepted` receipt reports `requested=true`; `cancellation_pending_receipt` and
+  `rejected` report `requested=false` with their actual status and detail. Pending receipt has
+  not authorized a cancellation effect. Standalone direct cancel is accepted when its durable
+  local marker is synchronized; signaling only wakes the supervisor, which also observes the marker. Cancellation
   of nonterminal work captures and validates an exact supervisor pidfd, with no numeric-signal fallback; unavailable
-  capture fails before acceptance. Cancel JSON `requested` reports durable acceptance by this attempt,
-  not whether a prior accepted cancellation obligation remains pending (`false` does not mean none
-  is pending). `wake`
+  capture fails before acceptance on the standalone path. Cancel JSON `requested` reports
+  durable acceptance by this attempt, not whether a prior accepted cancellation obligation
+  remains pending (`false` does not mean none is pending). Standalone `wake`
   separately reports `not-requested`, `custody-polling`, `sent`, `supervisor-gone`, or `failed` (`wake_error` gives detail).
   Terminal work with same-boot physical custody accepts cancellation through the existing
   reapers' durable poll (`custody-polling`, no signal sent by the requester). Empty-tree
@@ -148,6 +168,30 @@ to `AGENT_BASH_AGENT_RUNNER_BIN`/`PATH`. A present but invalid file is an error 
 When the configured runner has its own adjacent `config.toml`, its `data_dir` and `config_home` are
 bound into the sealed delivery-helper environment. This preserves the runner's authoritative roots
 when `agent-bash` executes its immutable snapshot from a Linux memfd.
+
+### AGE-319 shared front-door candidate
+
+The paired Runner repository has an uninstalled `oulipoly-shared-front-door`
+candidate. An installer must adopt the exact public `agent-bash` and Runner
+aliases used by an adapter, alongside the GUI alias, before publishing its
+single fresh-closed selector. The OpenCode tool currently defaults to
+`~/.local/bin/agent-bash` and `~/.local/bin/agents`; `AGENT_BASH_BIN` and
+`AGENT_BASH_AGENT_RUNNER_BIN` can override them. Those overrides and cached or
+direct old binaries do not automatically enter the managed front door.
+
+The original Bash image, adjacent `agent-bash.toml`, absolute old Runner
+helper, State root, and retained helper snapshots remain part of the historical
+v29 island. They must not be rewritten for this candidate. Before activation,
+an alias not yet adopted can still launch old work. After activation, the
+front door refuses new Bash runs and unknown handles; it can route only an
+exact known old handle to old Bash for settlement. The staged fresh Bash copy
+is non-executable, and the optional `age319-closed-fresh` build still refuses
+at entry, including when `private-v30-admission` is selected. The latter
+feature only admits a fixed shell probe under the disposable paired Runner
+fixture; it does not open the production `run` route. No positive fresh Bash
+registration or recipient route is installed by this source. Ordinary `run`
+still refuses a resolved v30 owner before creating an old handle, and
+`ab30_` controls refuse before reading local v29 metadata.
 
 ## License
 

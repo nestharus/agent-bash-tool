@@ -536,7 +536,7 @@ os.execv(os.environ['AGE363_REAL'], [os.environ['AGE363_REAL'], *args])
         assert!(text.ends_with(bytes), "{text}");
         assert_eq!(text.matches(bytes).count(), 1);
         assert!(
-            text.contains("cancellation after acquisition: Cancellation requested"),
+            text.contains("cancellation after acquisition: Cancellation accepted"),
             "{text}"
         );
         assert!(text.contains("subprocess aborted"), "{text}");

@@ -7,7 +7,7 @@ use std::fmt;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -34,11 +34,19 @@ const DELIVERY_HELPER_SCHEMA_VERSION: u8 = 5;
 const LEGACY_INLINE_ENVIRONMENT_SCHEMA_VERSION: u8 = 4;
 const DELIVERY_HELPER_ENV_ALLOWLIST_ENV: &str = "AGENT_BASH_DELIVERY_HELPER_ENV_ALLOWLIST";
 const COMPLETION_REGISTRATION_AUTHORITY_ENV: &str = "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY";
+const OWNER_SESSION_ID_ENV: &str = "AGENT_BASH_OWNER_SESSION_ID";
+const OWNER_INVOCATION_UUID_ENV: &str = "AGENT_BASH_OWNER_INVOCATION_UUID";
+const OWNER_WORK_ID_ENV: &str = "AGENT_BASH_OWNER_WORK_ID_V1";
 const DELIVERY_HELPER_CACHE_DIR: &str = ".delivery-helpers";
 const DELIVERY_HELPER_LEGACY_UNSUPPORTED: &str = "delivery_helper_legacy_unsupported";
 const DELIVERY_HELPER_UNAVAILABLE: &str = "delivery_helper_unavailable";
 const DELIVERY_HELPER_INVALID: &str = "delivery_helper_provenance_invalid";
 const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
+#[cfg(feature = "private-v30-admission")]
+// Exact paired Runner fixture image. A later Runner image
+// requires an explicit paired update; an environment digest is not authority.
+const PRIVATE_V30_RUNNER_SHA256: &str =
+    "ec24862537d15cf4a2cd7c7918b325cc5eb9fd62fabcf4ef2ab86fd805c88fe5";
 
 #[derive(Debug)]
 struct ConfiguredDeliveryHelper {
@@ -62,6 +70,31 @@ pub(crate) struct DeliveryRegistrationCandidate {
 }
 
 impl DeliveryRegistrationCandidate {
+    #[cfg(feature = "private-v30-admission")]
+    pub(crate) fn require_private_v30_pinned_helper(&self) -> io::Result<()> {
+        if self.helper.provenance.sha256 != PRIVATE_V30_RUNNER_SHA256 {
+            return Err(io::Error::other(
+                "private v30 Runner helper image is not pinned fixture image",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(feature = "private-v30-admission")]
+    pub(crate) fn private_v30_owner(
+        &self,
+        parent: &CallerChainEntry,
+    ) -> io::Result<PrivateV30Owner> {
+        if self.helper.provenance.sha256 != PRIVATE_V30_RUNNER_SHA256 {
+            return Err(io::Error::other(
+                "private v30 Runner helper image is not pinned fixture image",
+            ));
+        }
+        private_v30_owner(
+            &self.helper.environment,
+            || self.helper.owner_lookup_command(),
+            parent,
+        )
+    }
     pub(crate) fn resolve_owner_binding(
         &self,
         caller_chain: &[CallerChainEntry],
@@ -99,8 +132,162 @@ impl DeliveryLockGuard {
 }
 
 impl DeliveryRegistration {
+    #[cfg(feature = "private-v30-admission")]
+    pub(crate) fn private_exact_source_decision(
+        &self,
+        paths: &StatePaths,
+        meta: &Meta,
+        accepted_intent: &Path,
+        production_cli: bool,
+    ) -> io::Result<serde_json::Value> {
+        if self.helper.provenance.sha256 != PRIVATE_V30_RUNNER_SHA256 {
+            return Err(io::Error::other("private decision helper image changed"));
+        }
+        let session = meta
+            .owner_session_id
+            .as_deref()
+            .ok_or_else(|| io::Error::other("private decision session absent"))?;
+        let invocation = meta
+            .owner_invocation_uuid
+            .as_deref()
+            .ok_or_else(|| io::Error::other("private decision invocation absent"))?;
+        let intent: serde_json::Value = serde_json::from_slice(&fs::read(accepted_intent)?)?;
+        let authority: Vec<u8> = intent["registration_authority"]
+            .as_array()
+            .ok_or_else(|| io::Error::other("private decision H authority absent"))?
+            .iter()
+            .map(|byte| {
+                byte.as_u64()
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or_else(|| io::Error::other("private decision H authority byte invalid"))
+            })
+            .collect::<io::Result<_>>()?;
+        if authority.len() != 64
+            || !authority
+                .iter()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(io::Error::other("private decision H authority invalid"));
+        }
+        let work_id = intent["work_id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("private decision accepted work ID absent"))?;
+        if intent["meta"]["owner_session_id"] != session
+            || intent["meta"]["owner_invocation_uuid"] != invocation
+        {
+            return Err(io::Error::other(
+                "private decision H authority selection changed",
+            ));
+        }
+        let args = if production_cli {
+            let mut args = register_args(meta, paths);
+            args.extend([
+                OsString::from("--accepted-intent-file"),
+                accepted_intent.as_os_str().to_os_string(),
+            ]);
+            args
+        } else {
+            vec![
+                "__age319-private-consumed-h-source-decision-v1".into(),
+                paths
+                    .state_dir
+                    .join(crate::continuation::REGISTRATION)
+                    .into_os_string(),
+                accepted_intent.as_os_str().to_os_string(),
+            ]
+        };
+        let mut transient_environment = vec![
+            (
+                COMPLETION_REGISTRATION_AUTHORITY_ENV.into(),
+                OsString::from_vec(authority),
+            ),
+            (OWNER_SESSION_ID_ENV.into(), session.into()),
+            (OWNER_INVOCATION_UUID_ENV.into(), invocation.into()),
+            (OWNER_WORK_ID_ENV.into(), work_id.into()),
+        ];
+        // A private fixture schedule selects the postcommit wire protocol.
+        // The Runner still requires its Broker/State challenge before W.
+        if production_cli {
+            if let Some(gate) =
+                env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1").filter(|gate| {
+                    Path::new(gate)
+                        .join("source-production-postcommit-h")
+                        .exists()
+                })
+            {
+                transient_environment.push(("AGE319_PRIVATE_POSTCOMMIT_H_V1".into(), "1".into()));
+                transient_environment
+                    .push(("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1".into(), gate));
+            }
+        }
+        let request = DeliveryHelperRequest {
+            paths,
+            operation: "private-exact-source-decision",
+            helper: HandleBoundDeliveryHelper::from_provenance(
+                meta.delivery_helper.as_ref(),
+                paths,
+            )
+            .map_err(io::Error::other)?,
+            args,
+            transient_environment,
+        };
+        run_structured_helper(&request, None).map_err(|error| match error {
+            DeliveryHelperCommandError::NotStarted(error)
+            | DeliveryHelperCommandError::Admitted(error) => error,
+        })
+    }
+
+    #[cfg(feature = "private-v30-admission")]
+    pub(crate) fn prepare_private_v30_continuation(
+        &self,
+        paths: &StatePaths,
+        meta: &Meta,
+        parent: &CallerChainEntry,
+        expected: &PrivateV30Owner,
+    ) -> io::Result<()> {
+        if self.helper.provenance.sha256 != PRIVATE_V30_RUNNER_SHA256 {
+            return Err(io::Error::other("private v30 handle helper image changed"));
+        }
+        let observed = private_v30_owner(
+            &self.helper.environment,
+            || self.helper.operation_command(),
+            parent,
+        )?;
+        if &observed != expected
+            || meta.owner_session_id.as_deref() != Some(&observed.session_id)
+            || meta.owner_invocation_uuid.as_deref() != Some(&observed.invocation_uuid)
+        {
+            return Err(io::Error::other(
+                "v30 owner binding changed before source preparation",
+            ));
+        }
+        crate::continuation::prepare(paths, meta, &observed.domain_id, "tree")
+    }
+
     pub(crate) fn provenance(&self) -> DeliveryHelperProvenance {
         self.helper.provenance.clone()
+    }
+
+    /// Moves the single-use completion registration authority into the
+    /// descriptor-pinned root request. It is never restored to the ambient
+    /// environment of the submitting process.
+    pub(crate) fn into_root_authority(self) -> Option<Vec<u8>> {
+        self.authority.map(OsString::into_vec)
+    }
+
+    /// Rebuilds the already handle-bound registration inside the root-owned
+    /// worker. The helper image and its environment are revalidated against
+    /// the immutable handle snapshot before any registration or launch.
+    pub(crate) fn from_root_request(
+        paths: &StatePaths,
+        provenance: Option<&DeliveryHelperProvenance>,
+        authority: Option<Vec<u8>>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            helper: HandleBoundDeliveryHelper::from_provenance(provenance, paths)
+                .map_err(io::Error::other)?,
+            authority: authority.map(OsString::from_vec),
+        })
     }
 }
 
@@ -882,7 +1069,11 @@ fn validate_delivery_helper_environment(
 fn delivery_helper_environment_name_is_transient(name: &str) -> bool {
     matches!(
         name,
-        COMPLETION_REGISTRATION_AUTHORITY_ENV | DELIVERY_HELPER_ENV_ALLOWLIST_ENV
+        COMPLETION_REGISTRATION_AUTHORITY_ENV
+            | OWNER_SESSION_ID_ENV
+            | OWNER_INVOCATION_UUID_ENV
+            | OWNER_WORK_ID_ENV
+            | DELIVERY_HELPER_ENV_ALLOWLIST_ENV
     )
 }
 
@@ -893,7 +1084,14 @@ fn validate_delivery_helper_environment_name(name: &str) -> Result<(), DeliveryH
             "delivery helper environment variable name {name:?} is invalid"
         )));
     }
-    if delivery_helper_environment_name_is_transient(name) {
+    // Older handle snapshots may contain owner markers. Keep them readable;
+    // fresh captures omit them and registration overrides them from Meta.
+    if matches!(
+        name,
+        COMPLETION_REGISTRATION_AUTHORITY_ENV
+            | OWNER_WORK_ID_ENV
+            | DELIVERY_HELPER_ENV_ALLOWLIST_ENV
+    ) {
         return Err(DeliveryHelperError::invalid(format!(
             "delivery helper environment variable {name} is reserved"
         )));
@@ -1028,8 +1226,119 @@ pub(crate) struct DetachOutcome {
 #[derive(Debug, Deserialize)]
 struct PidSessionResponse {
     found: bool,
+    #[cfg(feature = "private-v30-admission")]
+    #[serde(default)]
+    pid: Option<u32>,
     invocation_uuid: Option<String>,
     session_id: Option<String>,
+}
+
+#[cfg(feature = "private-v30-admission")]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct PrivateV30Owner {
+    pub(crate) root_id: String,
+    pub(crate) source_generation: String,
+    pub(crate) release_id: String,
+    pub(crate) owner: serde_json::Value,
+    pub(crate) domain_id: String,
+    pub(crate) owner_generation: String,
+    pub(crate) session_id: String,
+    pub(crate) invocation_uuid: String,
+}
+
+#[cfg(feature = "private-v30-admission")]
+fn private_v30_owner(
+    environment: &BTreeMap<String, String>,
+    mut command: impl FnMut() -> Command,
+    parent: &CallerChainEntry,
+) -> io::Result<PrivateV30Owner> {
+    let required = |name: &str| {
+        environment
+            .get(name)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| io::Error::other(format!("private v30 helper selector {name} absent")))
+    };
+    let root = required("OULIPOLY_KERNEL_EXPECTED_ROOT_V1")?;
+    let endpoint = required("OULIPOLY_KERNEL_OWNER_ENDPOINT_V1")?;
+    let _broker = required("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")?;
+    if !crate::private_v30::private_parent_is_live(parent) {
+        return Err(io::Error::other(
+            "private v30 parent incarnation is not live",
+        ));
+    }
+    let output = command()
+        .args(["notify", "agent-bash-capability", "--json"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "private v30 challenged capability refused",
+        ));
+    }
+    let capability: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let owner = &capability["owner"];
+    let domain_id = capability["domain_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::other("private v30 capability domain absent"))?;
+    let owner_generation = owner["owner_generation"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::other("private v30 owner generation absent"))?;
+    let root_id = capability["root_id"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("private v30 challenged root absent"))?;
+    let source_generation = capability["source_generation"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("private v30 challenged source generation absent"))?;
+    let release_id = capability["release_id"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("private v30 challenged release absent"))?;
+    if capability["protocol"] != crate::continuation::PROTOCOL
+        || capability["status"] != "available"
+        || owner["domain_id"] != domain_id
+        || owner["endpoint"] != *endpoint
+        || root_id != root
+        || crate::private_v30::uuid_bytes(root).is_err()
+    {
+        return Err(io::Error::other("private v30 challenged owner mismatch"));
+    }
+    // The helper's v30 session route asks Broker `=` for this exact live K
+    // PID1. Runner has no v29 fallback when both selectors are present.
+    let output = command()
+        .args(["session", "of-pid", &parent.pid.to_string(), "--json"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "private v30 challenged parent binding refused",
+        ));
+    }
+    let binding: PidSessionResponse = serde_json::from_slice(&output.stdout)?;
+    if !binding.found
+        || binding.pid != Some(parent.pid as u32)
+        || !crate::private_v30::private_parent_is_live(parent)
+    {
+        return Err(io::Error::other(
+            "private v30 direct parent is not bound K PID1",
+        ));
+    }
+    let session_id = binding
+        .session_id
+        .filter(|value| value.starts_with("v30:"))
+        .ok_or_else(|| io::Error::other("private v30 parent session absent"))?;
+    let invocation_uuid = binding
+        .invocation_uuid
+        .filter(|value| crate::private_v30::uuid_bytes(value).is_ok())
+        .ok_or_else(|| io::Error::other("private v30 parent invocation absent"))?;
+    Ok(PrivateV30Owner {
+        root_id: root_id.to_owned(),
+        source_generation: source_generation.to_owned(),
+        release_id: release_id.to_owned(),
+        owner: owner.clone(),
+        domain_id: domain_id.to_owned(),
+        owner_generation: owner_generation.to_owned(),
+        session_id,
+        invocation_uuid,
+    })
 }
 
 enum OwnerLookup {
@@ -1222,7 +1531,13 @@ pub(crate) fn register(
     meta: &Meta,
     registration: DeliveryRegistration,
 ) -> Result<(), RegistrationError> {
-    let request = register_request(meta, paths, registration.helper, registration.authority);
+    let request = register_request(meta, paths, registration.helper, registration.authority)
+        .map_err(|error| {
+            RegistrationError::NotStarted(io::Error::new(
+                error.kind(),
+                format!("build completion registration request: {error}"),
+            ))
+        })?;
     if crate::continuation::enabled(paths) {
         let response = run_structured_helper(&request, None).map_err(registration_error)?;
         return crate::continuation::confirm_launch(paths, &response)
@@ -1504,12 +1819,7 @@ fn execute_completion_transfer(
     if crate::continuation::enabled(paths) {
         return execute_continuation_transfer(paths, persisted, external);
     }
-    let request = match completion_request(
-        persisted.caller_ppid,
-        &persisted.handle,
-        paths,
-        persisted.delivery_helper.as_ref(),
-    ) {
+    let request = match completion_request(&persisted, paths) {
         Ok(request) => request,
         Err(err) => {
             persisted.delivery = completion_delivery_meta_from_helper_error(err, retry_count);
@@ -1536,13 +1846,7 @@ fn execute_continuation_transfer(
     mut meta: Meta,
     external: bool,
 ) -> io::Result<()> {
-    let request = completion_request(
-        meta.caller_ppid,
-        &meta.handle,
-        paths,
-        meta.delivery_helper.as_ref(),
-    )
-    .map_err(io::Error::other)?;
+    let request = completion_request(&meta, paths).map_err(io::Error::other)?;
     meta.delivery = provisional_completion_delivery_transfer_meta();
     state::write_meta_atomic(paths, &meta)?;
     let result = run_structured_helper(&request, external.then_some(paths))
@@ -1716,18 +2020,20 @@ fn retry_uncertain_activation(
 }
 
 fn readback_activation_committed(meta: &Meta, paths: &StatePaths) -> io::Result<bool> {
+    let helper = HandleBoundDeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)
+        .map_err(io::Error::other)?;
+    let transient_environment = completion_owner_environment(paths, meta, &helper)?;
     let request = DeliveryHelperRequest {
         paths,
         operation: "activation-readback",
-        helper: HandleBoundDeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)
-            .map_err(io::Error::other)?,
+        helper,
         args: vec![
             "notify".into(),
             "agent-bash-completion-state".into(),
             "--registration-file".into(),
             path_arg(&paths.state_dir.join(crate::continuation::REGISTRATION)),
         ],
-        transient_environment: Vec::new(),
+        transient_environment,
     };
     let reply = run_structured_helper(&request, Some(paths)).map_err(|error| match error {
         DeliveryHelperCommandError::NotStarted(error)
@@ -1866,44 +2172,118 @@ fn register_request<'a>(
     paths: &'a StatePaths,
     helper: HandleBoundDeliveryHelper,
     authority: Option<OsString>,
-) -> DeliveryHelperRequest<'a> {
-    DeliveryHelperRequest {
+) -> io::Result<DeliveryHelperRequest<'a>> {
+    let owner = match (
+        meta.owner_session_id.as_deref(),
+        meta.owner_invocation_uuid.as_deref(),
+    ) {
+        (Some(session), Some(invocation)) if !session.is_empty() && !invocation.is_empty() => {
+            Some((session, invocation))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(io::Error::other(
+                "incomplete resolved completion owner binding",
+            ));
+        }
+    };
+    let mut transient_environment = Vec::new();
+    if let Some(authority) = authority {
+        let (session, invocation) = owner.ok_or_else(|| {
+            io::Error::other("native registration requires a resolved completion owner binding")
+        })?;
+        // V checks these exact fields against the sealed H grant. Use the
+        // resolved, persisted Meta pair, never the caller's ambient markers.
+        transient_environment.push((
+            OsString::from(COMPLETION_REGISTRATION_AUTHORITY_ENV),
+            authority,
+        ));
+        transient_environment.push((OsString::from(OWNER_SESSION_ID_ENV), session.into()));
+        transient_environment.push((OsString::from(OWNER_INVOCATION_UUID_ENV), invocation.into()));
+        if crate::continuation::enabled(paths)
+            && paths
+                .state_dir
+                .join(crate::root_work::ACCEPTED_FILE)
+                .exists()
+        {
+            transient_environment.push((
+                OsString::from(OWNER_WORK_ID_ENV),
+                meta.handle.clone().into(),
+            ));
+        }
+    }
+    Ok(DeliveryHelperRequest {
         paths,
         operation: "register",
         helper,
         args: register_args(meta, paths),
-        transient_environment: authority
-            .map(|value| vec![(OsString::from(COMPLETION_REGISTRATION_AUTHORITY_ENV), value)])
-            .unwrap_or_default(),
-    }
+        transient_environment,
+    })
 }
 
 fn activate_request<'a>(
     meta: &Meta,
     paths: &'a StatePaths,
 ) -> Result<DeliveryHelperRequest<'a>, DeliveryHelperError> {
+    let helper = HandleBoundDeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)?;
+    let transient_environment = completion_owner_environment(paths, meta, &helper)
+        .map_err(|error| DeliveryHelperError::invalid(error.to_string()))?;
     Ok(DeliveryHelperRequest {
         paths,
         operation: "activate",
-        helper: HandleBoundDeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)?,
+        helper,
         args: activate_args(&meta.handle),
-        transient_environment: Vec::new(),
+        transient_environment,
     })
 }
 
 fn completion_request<'a>(
-    caller_ppid: libc::pid_t,
-    handle: &str,
+    meta: &Meta,
     paths: &'a StatePaths,
-    provenance: Option<&DeliveryHelperProvenance>,
 ) -> Result<DeliveryHelperRequest<'a>, DeliveryHelperError> {
+    let helper = HandleBoundDeliveryHelper::from_provenance(meta.delivery_helper.as_ref(), paths)?;
+    let transient_environment = completion_owner_environment(paths, meta, &helper)
+        .map_err(|error| DeliveryHelperError::invalid(error.to_string()))?;
     Ok(DeliveryHelperRequest {
         paths,
         operation: "complete",
-        helper: HandleBoundDeliveryHelper::from_provenance(provenance, paths)?,
-        args: completion_args(caller_ppid, handle, paths),
-        transient_environment: Vec::new(),
+        helper,
+        args: completion_args(meta.caller_ppid, &meta.handle, paths),
+        transient_environment,
     })
+}
+
+fn completion_owner_environment(
+    paths: &StatePaths,
+    meta: &Meta,
+    helper: &HandleBoundDeliveryHelper,
+) -> io::Result<Vec<(OsString, OsString)>> {
+    if !crate::continuation::enabled(paths) {
+        return Ok(Vec::new());
+    }
+    let Some(witness) =
+        crate::root_work::completion_owner_witness(paths, meta, &helper.provenance.sha256)?
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![
+        (
+            OsString::from(COMPLETION_REGISTRATION_AUTHORITY_ENV),
+            witness.registration_authority,
+        ),
+        (
+            OsString::from(OWNER_SESSION_ID_ENV),
+            witness.session_id.into(),
+        ),
+        (
+            OsString::from(OWNER_INVOCATION_UUID_ENV),
+            witness.invocation_uuid.into(),
+        ),
+        (
+            OsString::from(OWNER_WORK_ID_ENV),
+            paths.handle.clone().into(),
+        ),
+    ])
 }
 
 fn register_args(meta: &Meta, paths: &StatePaths) -> Vec<OsString> {
@@ -2052,8 +2432,18 @@ fn wait_delivery_helper(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(DeliveryHelperCommandError::NotStarted)?;
-    child.wait().map_err(DeliveryHelperCommandError::Admitted)
+        .map_err(|error| {
+            DeliveryHelperCommandError::NotStarted(io::Error::new(
+                error.kind(),
+                format!("spawn delivery helper for {}: {error}", request.operation),
+            ))
+        })?;
+    child.wait().map_err(|error| {
+        DeliveryHelperCommandError::Admitted(io::Error::new(
+            error.kind(),
+            format!("wait delivery helper for {}: {error}", request.operation),
+        ))
+    })
 }
 
 // Full per-attempt replies survive ambiguous execution and integration failure.
@@ -2098,8 +2488,18 @@ fn run_structured_helper(
             .stdout(stdout)
             .stderr(stderr)
             .spawn()
-            .map_err(DeliveryHelperCommandError::NotStarted)?;
-        let status = child.wait().map_err(DeliveryHelperCommandError::Admitted)?;
+            .map_err(|error| {
+                DeliveryHelperCommandError::NotStarted(io::Error::new(
+                    error.kind(),
+                    format!("spawn structured helper for {}: {error}", request.operation),
+                ))
+            })?;
+        let status = child.wait().map_err(|error| {
+            DeliveryHelperCommandError::Admitted(io::Error::new(
+                error.kind(),
+                format!("wait structured helper for {}: {error}", request.operation),
+            ))
+        })?;
         File::open(&stdout_path)
             .and_then(|f| f.sync_all())
             .map_err(DeliveryHelperCommandError::Admitted)?;
@@ -2147,10 +2547,18 @@ fn wait_required_delivery_helper(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(DeliveryHelperCommandError::NotStarted)?;
-    child
-        .wait_with_output()
-        .map_err(DeliveryHelperCommandError::Admitted)
+        .map_err(|error| {
+            DeliveryHelperCommandError::NotStarted(io::Error::new(
+                error.kind(),
+                format!("spawn delivery helper for {}: {error}", request.operation),
+            ))
+        })?;
+    child.wait_with_output().map_err(|error| {
+        DeliveryHelperCommandError::Admitted(io::Error::new(
+            error.kind(),
+            format!("wait delivery helper for {}: {error}", request.operation),
+        ))
+    })
 }
 
 fn require_helper_success(output: std::process::Output) -> Result<(), DeliveryHelperCommandError> {
@@ -2908,6 +3316,18 @@ mod tests {
                 OsString::from("one-shot-secret"),
             ),
             (
+                OsString::from(OWNER_SESSION_ID_ENV),
+                OsString::from("ambient-session"),
+            ),
+            (
+                OsString::from(OWNER_INVOCATION_UUID_ENV),
+                OsString::from("ambient-invocation"),
+            ),
+            (
+                OsString::from(OWNER_WORK_ID_ENV),
+                OsString::from("ambient-work"),
+            ),
+            (
                 OsString::from(DELIVERY_HELPER_ENV_ALLOWLIST_ENV),
                 OsString::from("WU_D_WORK_DIR"),
             ),
@@ -2919,8 +3339,141 @@ mod tests {
         assert_eq!(captured["WU_D_WORK_DIR"], "/tmp/wake-work");
         assert_eq!(captured["AGENT_BASH_AGENT_RUNNER_BIN"], "/opt/agents");
         assert!(!captured.contains_key(COMPLETION_REGISTRATION_AUTHORITY_ENV));
+        assert!(!captured.contains_key(OWNER_SESSION_ID_ENV));
+        assert!(!captured.contains_key(OWNER_INVOCATION_UUID_ENV));
+        assert!(!captured.contains_key(OWNER_WORK_ID_ENV));
         assert!(!captured.contains_key(DELIVERY_HELPER_ENV_ALLOWLIST_ENV));
         validate_delivery_helper_environment(&captured).unwrap();
+    }
+
+    #[test]
+    fn registration_requires_complete_owner_when_authority_is_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_witness".into());
+        state::create_handle_state(&paths).unwrap();
+        let helper = ConfiguredDeliveryHelper::from_resolved_path(Path::new("/bin/true"))
+            .unwrap()
+            .pin_to_handle(&paths)
+            .unwrap();
+        let provenance = helper.provenance.clone();
+        let owner = |session: Option<&str>, invocation: Option<&str>| {
+            continuity_meta(&paths)
+                .with_owner_context(session.map(str::to_string), invocation.map(str::to_string))
+        };
+        for (session, invocation) in [(None, None), (Some("ses"), None), (None, Some("uuid"))] {
+            let meta = owner(session, invocation);
+            let helper =
+                HandleBoundDeliveryHelper::from_provenance(Some(&provenance), &paths).unwrap();
+            assert!(
+                register_request(&meta, &paths, helper, Some("authority".into())).is_err(),
+                "partial native owner was accepted: {session:?}, {invocation:?}"
+            );
+            if session.is_some() || invocation.is_some() {
+                let helper =
+                    HandleBoundDeliveryHelper::from_provenance(Some(&provenance), &paths).unwrap();
+                assert!(register_request(&meta, &paths, helper, None).is_err());
+            }
+        }
+        let meta = owner(Some("ses"), Some("uuid"));
+        let request = register_request(&meta, &paths, helper, Some("authority".into())).unwrap();
+        assert_eq!(
+            request.transient_environment,
+            [
+                (
+                    COMPLETION_REGISTRATION_AUTHORITY_ENV.into(),
+                    "authority".into()
+                ),
+                (OWNER_SESSION_ID_ENV.into(), "ses".into()),
+                (OWNER_INVOCATION_UUID_ENV.into(), "uuid".into()),
+            ]
+        );
+        let helper = HandleBoundDeliveryHelper::from_provenance(Some(&provenance), &paths).unwrap();
+        let standalone = register_request(&meta, &paths, helper, None).unwrap();
+        assert!(standalone.transient_environment.is_empty());
+    }
+
+    #[test]
+    fn sealed_helper_receives_exact_witness_only_on_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().to_path_buf(), "ab_witness_exec".into());
+        state::create_handle_state(&paths).unwrap();
+        let script = temp.path().join("witness-helper");
+        fs::write(
+            &script,
+            b"#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$2\" \"${AGENT_BASH_OWNER_SESSION_ID-unset}\" \"${AGENT_BASH_OWNER_INVOCATION_UUID-unset}\" \"${OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY-unset}\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let helper = ConfiguredDeliveryHelper::from_resolved_path(&script)
+            .unwrap()
+            .pin_to_handle(&paths)
+            .unwrap();
+        let provenance = helper.provenance.clone();
+        let meta = continuity_meta(&paths)
+            .with_owner_context(
+                Some("resolved-session".into()),
+                Some("11111111-1111-4111-8111-111111111111".into()),
+            )
+            .with_delivery_helper(provenance.clone());
+        state::write_meta_atomic(&paths, &meta).unwrap();
+        let meta = state::read_meta(&paths).unwrap();
+        let registration =
+            register_request(&meta, &paths, helper, Some("registration-authority".into())).unwrap();
+        let output = registration.command().output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "agent-bash-register|resolved-session|11111111-1111-4111-8111-111111111111|registration-authority\n"
+        );
+        let standalone_helper =
+            HandleBoundDeliveryHelper::from_provenance(Some(&provenance), &paths).unwrap();
+        let standalone = register_request(&meta, &paths, standalone_helper, None).unwrap();
+        let output = standalone.command().output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "agent-bash-register|unset|unset|unset\n"
+        );
+        let completion = completion_request(&meta, &paths).unwrap();
+        let output = completion.command().output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "agent-bash-complete|unset|unset|unset\n"
+        );
+    }
+
+    #[test]
+    fn accepted_completion_injects_only_exact_transient_owner_witness() {
+        let (_temp, paths, meta, _) = crate::root_work::owner_witness_tests::fixture();
+        let helper = HandleBoundDeliveryHelper {
+            provenance: meta.delivery_helper.as_ref().unwrap().clone(),
+            environment: BTreeMap::new(),
+            executable: File::open("/bin/true").unwrap(),
+            interpreter: None,
+        };
+        let environment = completion_owner_environment(&paths, &meta, &helper).unwrap();
+        assert_eq!(environment.len(), 4);
+        assert_eq!(environment[0].0, COMPLETION_REGISTRATION_AUTHORITY_ENV);
+        assert_eq!(environment[0].1.as_bytes(), &[b'a'; 64]);
+        assert_eq!(
+            environment[1],
+            (OWNER_SESSION_ID_ENV.into(), "session-original".into())
+        );
+        assert_eq!(
+            environment[2],
+            (
+                OWNER_INVOCATION_UUID_ENV.into(),
+                "11111111-1111-4111-8111-111111111111".into()
+            )
+        );
+        assert_eq!(
+            environment[3],
+            (OWNER_WORK_ID_ENV.into(), paths.handle.clone().into())
+        );
+        let mut stale = meta.clone();
+        stale.owner_invocation_uuid = Some("22222222-2222-4222-8222-222222222222".into());
+        assert!(completion_owner_environment(&paths, &stale, &helper).is_err());
     }
 
     #[test]
@@ -3036,8 +3589,17 @@ mod tests {
             None,
         );
         provenance.schema_version = LEGACY_INLINE_ENVIRONMENT_SCHEMA_VERSION;
-        provenance.environment =
-            BTreeMap::from([("LEGACY_CONTEXT".to_string(), "preserved".to_string())]);
+        provenance.environment = BTreeMap::from([
+            ("LEGACY_CONTEXT".to_string(), "preserved".to_string()),
+            (
+                OWNER_SESSION_ID_ENV.to_string(),
+                "legacy-session".to_string(),
+            ),
+            (
+                OWNER_INVOCATION_UUID_ENV.to_string(),
+                "legacy-invocation".to_string(),
+            ),
+        ]);
 
         assert_eq!(
             load_delivery_helper_environment(&provenance, &paths).unwrap(),
