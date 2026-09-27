@@ -22,6 +22,7 @@ const FENCE: &str = "source-launch-v2.json";
 const CONFIRMATION: &str = "registration-confirmation-v2.json";
 const LOCAL: &str = "continuation-v2.json";
 pub(crate) const RETENTION_RELEASE: &str = "source-retention-release-v1.json";
+const BROKER_RETENTION_RELEASE: &str = "broker-source-retention-release-v1.json";
 const MAX_SOURCE: u64 = 1024 * 1024;
 const OUTPUT: &str = "completion-output-v2.bin";
 const SELECTION: &str = "output-selection-v2.json";
@@ -979,51 +980,219 @@ pub(crate) fn accept(paths: &StatePaths, reply: &Value) -> io::Result<()> {
     local["enqueue"] = json!("accepted");
     save(paths, LOCAL, &local)?;
 
-    // This separate artifact is the serialized source-release boundary.  It
-    // deliberately does not change any completion-continuation-v2 schema: the
-    // source remains retained until an exact durable acceptance receipt has
-    // been validated and its local state has been fsynced.
-    let mut release = common;
-    release["release_protocol"] = json!("source-retention-release-v1");
-    for key in [
-        "snapshot_sha256",
-        "outcome_sha256",
-        "payload_sha256",
-        "payload_byte_len",
-    ] {
-        release[key] = local[key].clone();
-    }
-    immutable(paths, RETENTION_RELEASE, &bytes(&release)?)
+    // A legacy acceptance reply records local enqueue progress only. Broker's
+    // separate retained release decision must reach this original handle as a
+    // root-owned receipt before the source can be released.
+    Ok(())
 }
 
-/// True only after the runner has durably accepted the exact v2 source
-/// snapshot and the source has serialized that receipt into a distinct release
-/// record.  Invalid or incomplete evidence fails closed and remains retained.
+/// Validate Broker's root-owned release and exact original source bytes, then
+/// durably record local release. A copied JSON or legacy acceptance reply has
+/// no release authority. Revalidate the root receipt on every reap pass.
 pub(crate) fn retention_released(paths: &StatePaths) -> io::Result<bool> {
-    let (_, common) = binding(paths)?;
-    let local = value(&paths.state_dir.join(LOCAL))?;
-    exact(&common, &local)?;
-    if local["enqueue"] != "accepted" {
+    let (registration, common) = binding(paths)?;
+    let source_directory = fs::symlink_metadata(&paths.state_dir)?;
+    if !source_directory.is_dir()
+        || source_directory.file_type().is_symlink()
+        || fs::canonicalize(&paths.state_dir)? != paths.state_dir
+    {
         return Ok(false);
     }
-    let release = value(&paths.state_dir.join(RETENTION_RELEASE))?;
-    exact(&common, &release)?;
-    if release["release_protocol"] != "source-retention-release-v1" {
+    let receipt_path = paths.state_dir.join(BROKER_RETENTION_RELEASE);
+    let mut receipt_file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&receipt_path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    let receipt_meta = receipt_file.metadata()?;
+    if !receipt_meta.is_file()
+        || receipt_meta.uid() != 0
+        || receipt_meta.nlink() != 1
+        || receipt_meta.mode() & 0o222 != 0
+        || receipt_meta.len() > 64 * MAX_SOURCE
+    {
+        return Ok(false);
+    }
+    let mut receipt_bytes = Vec::new();
+    receipt_file.read_to_end(&mut receipt_bytes)?;
+    if receipt_bytes.len() as u64 != receipt_meta.len() {
+        return Ok(false);
+    }
+    let receipt: Value = serde_json::from_slice(&receipt_bytes)?;
+    if receipt["protocol"] != "broker-bash-source-release-v1"
+        || receipt["registration_id"] != registration["registration_id"]
+        || receipt["registration_digest"] != common["registration_digest"]
+        || receipt["handle"] != paths.handle
+        || receipt["event_id"] != paths.handle
+        || receipt["listener_revision"] != registration["listener_revision"]
+        || receipt["notification_count"]
+            .as_u64()
+            .is_none_or(|count| count == 0)
+        || receipt["source_directory"]["device"] != source_directory.dev()
+        || receipt["source_directory"]["inode"] != source_directory.ino()
+        || receipt["source_directory"]["owner_uid"] != source_directory.uid()
+        || receipt["grant_id"].as_str().is_none()
+        || receipt["source_generation"].as_str().is_none()
+        || receipt["root_id"].as_str().is_none()
+        || receipt["owner_generation"].as_str().is_none()
+    {
+        return Ok(false);
+    }
+    let acceptance_json = receipt["acceptance_json"]
+        .as_str()
+        .ok_or_else(|| error("Broker acceptance JSON absent"))?;
+    let release_json = receipt["release_json"]
+        .as_str()
+        .ok_or_else(|| error("Broker release JSON absent"))?;
+    let acceptance: Value = serde_json::from_str(acceptance_json)?;
+    let decision: Value = serde_json::from_str(release_json)?;
+    if receipt["acceptance_sha256"] != digest(acceptance_json.as_bytes())
+        || receipt["release_sha256"] != digest(release_json.as_bytes())
+        || acceptance["protocol"] != "broker-completion-source-acceptance-v1"
+        || decision["protocol"] != "broker-source-retention-release-v1"
+        || decision["acceptance_sha256"] != receipt["acceptance_sha256"]
+        || acceptance["state_admission_id"].as_str().is_none()
+        || acceptance["registration_digest"] != common["registration_digest"]
+        || acceptance["evidence_seal"]["manifest_sha256"] != receipt["manifest_sha256"]
+        || acceptance["selected_output"] != receipt["selected_output"]
+    {
         return Ok(false);
     }
     for key in [
-        "snapshot_sha256",
-        "outcome_sha256",
-        "payload_sha256",
-        "payload_byte_len",
+        "registration_id",
+        "source_generation",
+        "root_id",
+        "owner_generation",
+        "grant_id",
     ] {
-        if release[key] != local[key] {
+        if acceptance[key] != receipt[key] || decision[key] != receipt[key] {
             return Ok(false);
         }
     }
-    Ok(release["snapshot_sha256"]
-        == digest(&read(&paths.state_dir.join(SNAPSHOT), 16 * MAX_SOURCE)?)
-        && release["outcome_sha256"] == digest(&read(&paths.state_dir.join(OUTCOME), MAX_SOURCE)?))
+    for (name, stamp) in [
+        (REGISTRATION, &receipt["registration_file"]),
+        (SNAPSHOT, &receipt["snapshot_file"]),
+        (OUTCOME, &receipt["outcome_file"]),
+    ] {
+        if !source_stamp_matches(paths, name, stamp, source_directory.uid())? {
+            return Ok(false);
+        }
+    }
+    if receipt["registration_file"]["sha256"] != common["registration_digest"]
+        || receipt["snapshot_file"]["sha256"] != acceptance["evidence_seal"]["snapshot_sha256"]
+        || receipt["outcome_file"]["sha256"] != acceptance["evidence_seal"]["outcome_sha256"]
+    {
+        return Ok(false);
+    }
+    let snapshot = value(&paths.state_dir.join(SNAPSHOT))?;
+    let outcome = value(&paths.state_dir.join(OUTCOME))?;
+    let payload_json = receipt["payload_json"]
+        .as_str()
+        .ok_or_else(|| error("Broker payload absent from release receipt"))?;
+    let payload: Value = serde_json::from_str(payload_json)?;
+    exact(&common, &snapshot)?;
+    exact(&common, &outcome)?;
+    if snapshot["status"] != "completed"
+        || snapshot["outcome_sha256"] != receipt["outcome_file"]["sha256"]
+        || snapshot["outcome_byte_len"] != receipt["outcome_file"]["byte_len"]
+        || snapshot["output"] != receipt["selected_output"]
+        || receipt["selected_output"]["representation"] != "retained-output-v1"
+        || receipt["stable_output"]["sha256"] != receipt["selected_output"]["sha256"]
+        || receipt["stable_output"]["byte_len"] != receipt["selected_output"]["byte_len"]
+        || receipt["payload_sha256"] != digest(payload_json.as_bytes())
+        || receipt["payload_byte_len"] != payload_json.len()
+        || payload["registration_id"] != registration["registration_id"]
+        || payload["registration_digest"] != common["registration_digest"]
+        || payload["event_id"] != paths.handle
+        || payload["kind"] != "agent_bash_complete"
+        || payload["schema_version"] != 2
+        || payload["snapshot"] != snapshot
+        || payload["outcome"] != outcome
+        || payload["output_artifact"] != receipt["stable_output"]
+    {
+        return Ok(false);
+    }
+    let output_relative = receipt["selected_output"]["relative"]
+        .as_str()
+        .ok_or_else(|| error("selected output name absent"))?;
+    if output_relative != OUTPUT
+        || receipt["artifact_original"]["sha256"] != receipt["selected_output"]["sha256"]
+        || receipt["artifact_original"]["byte_len"] != receipt["selected_output"]["byte_len"]
+        || !source_stamp_matches(
+            paths,
+            OUTPUT,
+            &receipt["artifact_original"],
+            source_directory.uid(),
+        )?
+    {
+        return Ok(false);
+    }
+    let receipt_now = fs::symlink_metadata(&receipt_path)?;
+    let directory_now = fs::symlink_metadata(&paths.state_dir)?;
+    if (receipt_now.dev(), receipt_now.ino(), receipt_now.len())
+        != (receipt_meta.dev(), receipt_meta.ino(), receipt_meta.len())
+        || receipt_now.uid() != 0
+        || receipt_now.mode() & 0o222 != 0
+        || (
+            directory_now.dev(),
+            directory_now.ino(),
+            directory_now.uid(),
+        ) != (
+            source_directory.dev(),
+            source_directory.ino(),
+            source_directory.uid(),
+        )
+    {
+        return Ok(false);
+    }
+    let mut local_release = common;
+    local_release["release_protocol"] = json!("source-retention-release-v1");
+    local_release["broker_receipt_sha256"] = json!(digest(&receipt_bytes));
+    local_release["acceptance_sha256"] = receipt["acceptance_sha256"].clone();
+    local_release["release_sha256"] = receipt["release_sha256"].clone();
+    immutable(paths, RETENTION_RELEASE, &bytes(&local_release)?)?;
+    Ok(value(&paths.state_dir.join(RETENTION_RELEASE))? == local_release)
+}
+
+fn source_stamp_matches(
+    paths: &StatePaths,
+    relative: &str,
+    stamp: &Value,
+    owner_uid: u32,
+) -> io::Result<bool> {
+    let path = paths.state_dir.join(relative);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&path)?;
+    let before = file.metadata()?;
+    if !before.is_file()
+        || before.uid() != owner_uid
+        || before.nlink() != 1
+        || stamp["device"] != before.dev()
+        || stamp["inode"] != before.ino()
+        || stamp["byte_len"] != before.len()
+    {
+        return Ok(false);
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let after = fs::symlink_metadata(&path)?;
+    Ok(after.is_file()
+        && !after.file_type().is_symlink()
+        && (after.dev(), after.ino(), after.len()) == (before.dev(), before.ino(), before.len())
+        && stamp["sha256"] == format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -2039,8 +2208,8 @@ mod tests {
         reply["payload_byte_len"] = json!(7);
         reply["listener_revision"] = json!(1);
         accept(&paths, &reply).unwrap();
-        assert!(retention_released(&paths).unwrap());
-        assert!(paths.state_dir.join(RETENTION_RELEASE).exists());
+        assert!(!retention_released(&paths).unwrap());
+        assert!(!paths.state_dir.join(RETENTION_RELEASE).exists());
         reply["status"] = json!("already_accepted");
         accept(&paths, &reply).unwrap();
         reply["payload_sha256"] = json!(digest(b"changed"));

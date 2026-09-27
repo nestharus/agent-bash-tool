@@ -1193,19 +1193,17 @@ fn state_dir_reap_eligible(paths: &StatePaths, config: ReapConfig, boot_id: &str
     if causal_parent_retains(paths).unwrap_or(true) {
         return false;
     }
-    // Source release and local TTL do not discharge the private original-work
-    // result. The accepted root handle remains its causal evidence until the
-    // exact root result exists; nested handles retain their separate parent
-    // gate above.
-    if accepted_root_result_pending(paths).unwrap_or(true) {
-        return false;
-    }
     // V2 sources become eligible only through the separate exact, durable
     // source-release record written after runner custody acceptance.  TTL,
     // reboot, or a local byte receipt alone are never release authority.
     if crate::continuation::enabled(paths)
         && !crate::continuation::retention_released(paths).unwrap_or(false)
     {
+        return false;
+    }
+    // Receipt delivery can be recorded while the private original-work
+    // result remains pending, but it never discharges that separate duty.
+    if accepted_root_result_pending(paths).unwrap_or(true) {
         return false;
     }
     let Ok(meta) = read_meta(paths) else {
@@ -2557,7 +2555,7 @@ mod tests {
     }
 
     #[test]
-    fn released_v2_source_is_reaped_after_terminal_retention_obligations_settle() {
+    fn local_acceptance_without_broker_receipt_cannot_reap_v2_source() {
         let temp = tempfile::tempdir().expect("tempdir");
         let now = 100_000;
         let paths = write_reap_state(temp.path(), "ab_released_v2", "DONE", now - 20_000, true);
@@ -2566,8 +2564,8 @@ mod tests {
 
         let stats = reap_state_dirs(temp.path(), test_reap_config(now, 10, 10));
 
-        assert_eq!(stats.reaped, 1);
-        assert!(!paths.state_dir.exists());
+        assert_eq!(stats.reaped, 0);
+        assert!(paths.state_dir.exists());
     }
 
     #[test]
@@ -2595,7 +2593,7 @@ mod tests {
             .status()
             .expect("separate result writer");
         assert!(status.success());
-        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 1);
+        assert_eq!(reap_state_dirs(temp.path(), config).reaped, 0);
     }
 
     #[test]
