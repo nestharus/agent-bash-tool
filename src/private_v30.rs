@@ -711,6 +711,46 @@ fn sealed_command_file(command: &OrdinaryCommand) -> Result<File, String> {
 }
 
 pub(crate) fn internal_main() -> Option<i32> {
+    if std::env::args().nth(1).as_deref() == Some("__age319-private-source-retention-check-v1") {
+        let result = (|| -> Result<bool, String> {
+            if !private_user_namespace() {
+                return Err("private retention check requires user namespace".into());
+            }
+            let args: Vec<_> = std::env::args().collect();
+            if args.len() != 3 {
+                return Err("private retention check arguments invalid".into());
+            }
+            let registration = Path::new(&args[2]);
+            if registration.file_name()
+                != Some(std::ffi::OsStr::new(crate::continuation::REGISTRATION))
+            {
+                return Err("private retention check registration name invalid".into());
+            }
+            let directory = registration
+                .parent()
+                .ok_or("private retention check source directory absent")?;
+            let root = directory
+                .parent()
+                .ok_or("private retention check spool root absent")?;
+            let handle = directory
+                .file_name()
+                .ok_or("private retention check handle absent")?
+                .to_str()
+                .ok_or("private retention check handle invalid")?;
+            let paths = crate::state::StatePaths::new(root.to_path_buf(), handle.to_owned());
+            crate::continuation::retention_released(&paths).map_err(|e| e.to_string())
+        })();
+        return Some(match result {
+            Ok(released) => {
+                println!("{}", if released { "released" } else { "retained" });
+                0
+            }
+            Err(error) => {
+                eprintln!("AGE319_PRIVATE_RETENTION={error}");
+                70
+            }
+        });
+    }
     if std::env::args().nth(1).as_deref() == Some("__age319-private-pre-k-h-source-v1") {
         return Some(match prepare_pre_k_h_source() {
             Ok(()) => 0,
