@@ -175,6 +175,27 @@ fn paired_session_ring_blocks_erased_context_even_after_setsid_reparent() {
             command_failure_message(&output)
         );
         let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let fixture_state_env = format!("XDG_STATE_HOME={}", temp.path().display());
+        let fixture_processes = fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_string_lossy().parse::<libc::pid_t>().ok())
+            .filter_map(|pid| {
+                let env = fs::read(format!("/proc/{pid}/environ")).ok()?;
+                env.split(|byte| *byte == 0)
+                    .any(|value| value == fixture_state_env.as_bytes())
+                    .then(|| {
+                        json!({
+                            "identity": proc_identity(pid).map(|(identity, _)| exact_identity(&identity)),
+                            "cwd": fs::read_link(format!("/proc/{pid}/cwd")).ok(),
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            fixture_processes.is_empty(),
+            "{case}: live fixture processes after Python teardown: {fixture_processes:?}"
+        );
         let rejected = matches!(case, "paired" | "orphan" | "invalid");
         if rejected {
             assert_ne!(report["rc"], 0, "{case}: {report}");
@@ -203,14 +224,19 @@ fn paired_session_ring_blocks_erased_context_even_after_setsid_reparent() {
             assert!(handle.join("root-work-diagnostic-v1.jsonl").exists());
         } else {
             assert_eq!(report["rc"], 0, "{case}: {report}");
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !effect.exists() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(fs::read(&effect).unwrap(), b"effect", "{case}: {report}");
+            let retired = report["retired"].as_array().unwrap();
+            assert!(!retired.is_empty(), "{case}: no guardian reap: {report}");
+            for child in retired {
+                let pid = child["pid"].as_i64().unwrap() as libc::pid_t;
+                let start_ticks = child["start_ticks"].as_u64().unwrap();
+                assert_ne!(start_ticks, 0, "{case}: {child}");
+                assert_ne!(
+                    proc_identity(pid).map(|(identity, _)| identity.starttime_ticks),
+                    Some(start_ticks),
+                    "{case}: reaped identity is still live: {child}"
+                );
             }
-            assert!(
-                effect.exists(),
-                "{case}: independent launch did not execute"
-            );
         }
     }
 }
