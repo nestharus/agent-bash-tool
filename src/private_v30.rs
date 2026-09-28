@@ -826,11 +826,12 @@ pub(crate) fn internal_main() -> Option<i32> {
         if explicit
             && args[5..]
                 .iter()
-                .any(|arg| arg != "no-cancel" && arg != "notify")
+                .any(|arg| arg != "no-cancel" && arg != "notify" && arg != "native")
         {
             return Err("invalid private Bash child option".into());
         }
         let no_cancel = explicit && args[5..].iter().any(|arg| arg == "no-cancel");
+        let native = explicit && args[5..].iter().any(|arg| arg == "native");
         let policy = if explicit && args[5..].iter().any(|arg| arg == "notify") {
             ListenerPolicy::Notify
         } else {
@@ -966,6 +967,23 @@ pub(crate) fn internal_main() -> Option<i32> {
                 .map_err(|e| format!("original H Runner image absent: {e}"))?;
             if !Path::new(&runner_image).is_absolute() {
                 return Err("original H Runner image is not absolute".into());
+            }
+            if native {
+                // Codex command/exec inherits K's entry environment. The
+                // original H helper must receive only its explicit root
+                // authority, as it does on the fixture-selected K path.
+                let data_dir = std::env::var_os("OULIPOLY_DATA_DIR")
+                    .ok_or("native Bash data directory absent")?;
+                if unsafe { libc::clearenv() } != 0 {
+                    return Err(format!(
+                        "native Bash environment reset: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                unsafe {
+                    std::env::set_var("OULIPOLY_DATA_DIR", data_dir);
+                    std::env::set_var("PATH", "/usr/bin:/bin");
+                }
             }
             unsafe {
                 std::env::set_var("OULIPOLY_ROOT_AUTHORITY_V1", work_authority);
