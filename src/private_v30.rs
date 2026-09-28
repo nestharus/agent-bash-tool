@@ -341,6 +341,11 @@ pub(crate) fn register_ordinary_run(
     ).map_err(|error| error.to_string())?;
     if source["request_id"] != request_id
         || source["source_id"] != child.handle
+        || source["attempt_id"] != child.invocation_uuid
+        || source["lane_id"] != child.session.lane_id
+        || source["source_generation"] != child.session.source_generation
+        || source["session_id"] != child.session.session_id
+        || source["root_id"] != child.root_id
         || source["physical_grant_id"] != grant_id
         || source["parent_work_grant_id"] != child.parent_work_grant_id
         || source["parent_work_id"] != child.parent_work_id
@@ -1166,6 +1171,10 @@ pub(crate) fn internal_main() -> Option<i32> {
         if source["request_id"] != child.request_id
             || source["source_id"] != child.handle
             || source["attempt_id"] != child.invocation_uuid
+            || source["lane_id"] != child.session.lane_id
+            || source["source_generation"] != child.session.source_generation
+            || source["session_id"] != child.session.session_id
+            || source["root_id"] != child.root_id
             || source["physical_grant_id"] != grant
             || source["parent_work_grant_id"] != child.parent_work_grant_id
             || source["parent_work_id"] != child.parent_work_id
