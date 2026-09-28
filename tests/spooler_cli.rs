@@ -109,6 +109,32 @@ fn resolved_fresh_owner_refuses_before_handle_or_workload() {
 }
 
 #[test]
+fn marker_only_fresh_owner_refuses_without_broker_or_handle() {
+    if test_support::private_case() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let effect = temp.path().join("marker-only-effect");
+    let output = agent_bash(&temp)
+        .env("AGENT_BASH_OWNER_SESSION_ID", "v30:ambient-only")
+        .env(
+            "AGENT_BASH_OWNER_INVOCATION_UUID",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .env(
+            "OULIPOLY_PARENT_INVOCATION",
+            r#"{"id":"11111111-1111-4111-8111-111111111111"}"#,
+        )
+        .args(["run", "--", "/usr/bin/touch"])
+        .arg(&effect)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(!effect.exists());
+    assert!(!temp.path().join("agent-bash").exists());
+}
+
+#[test]
 fn paired_context_halves_fail_closed_and_terminalize_preaccept() {
     for (present, absent, expected) in [
         (
