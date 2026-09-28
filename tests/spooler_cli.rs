@@ -102,8 +102,7 @@ fn resolved_fresh_owner_refuses_before_handle_or_workload() {
         .unwrap();
     assert_eq!(output.status.code(), Some(69), "{output:?}");
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("fresh owner requires committed v30 source registration")
+        String::from_utf8_lossy(&output.stderr).contains("fresh Broker source route unavailable")
     );
     assert!(!workload_marker.exists());
     assert!(!temp.path().join("agent-bash").exists());
