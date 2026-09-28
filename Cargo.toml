@@ -16,7 +16,7 @@ path = "src/main.rs"
 source-fault-tests = []
 # Inert staged image; this guard wins even when the private probe is selected.
 age319-closed-fresh = []
-# Isolated source fixture only. The normal binary has no fresh work entry.
+# Isolated legacy private admission fixture; ordinary v30 runs use the Broker.
 private-v30-admission = []
 
 [dependencies]

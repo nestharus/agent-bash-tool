@@ -62,6 +62,16 @@ struct Child {
     session: Session,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Parent {
+    root_id: String,
+    root_invocation_uuid: String,
+    root_session_id: String,
+    parent_work_grant_id: String,
+    parent_work_id: String,
+}
+
 pub(crate) fn private_probe_available() -> bool {
     (unsafe { libc::geteuid() }) == 0
         && std::fs::read_to_string("/proc/self/uid_map")
@@ -128,16 +138,25 @@ pub(crate) fn register_ordinary_run(
     // before Bash can select the fresh route or submit C.
     let probe = match request_frame(&socket, 0x90, &[]) {
         Ok(reply) => reply,
-        Err(error)
-            if error.contains("Bash child is outside a released root")
-                || error.contains("consumed causal parent work grant absent") =>
-        {
+        Err(error) if error == "error Bash child is outside a released root" => {
             return Ok(None);
         }
         Err(error) => return Err(format!("fresh Bash parent probe refused: {error}")),
     };
-    if !probe.starts_with("fresh-bash-parent ") {
-        return Err("fresh Bash parent probe changed".into());
+    // Parse the challenged connected peer's causal parent before C can have
+    // any effect. The Broker rechecks this parent on every later operation.
+    let parent: Parent = serde_json::from_str(
+        probe
+            .strip_prefix("fresh-bash-parent ")
+            .ok_or("fresh Bash parent probe changed")?
+            .trim_end(),
+    )
+    .map_err(|error| format!("fresh Bash parent probe invalid: {error}"))?;
+    uuid_bytes(&parent.root_id)?;
+    uuid_bytes(&parent.root_invocation_uuid)?;
+    uuid_bytes(&parent.parent_work_grant_id)?;
+    if !parent.root_session_id.starts_with("v30:") || parent.parent_work_id.is_empty() {
+        return Err("fresh Bash causal parent probe invalid".into());
     }
     let policy = ListenerPolicy::from_delivery(mode);
     if completion_scope != crate::supervisor::CompletionScope::Tree
@@ -174,16 +193,10 @@ pub(crate) fn register_ordinary_run(
         register_child(&socket, &request_id, &request, policy, &command).map_err(|error| {
             format!("fresh C outcome refused or unknown; request_id={request_id}: {error}")
         })?;
-    let parent: serde_json::Value =
-        serde_json::from_str(probe.strip_prefix("fresh-bash-parent ").unwrap().trim_end())
-            .map_err(|error| error.to_string())?;
-    if parent["root_id"] != child.root_id
-        || parent["root_invocation_uuid"] != child.parent_invocation_uuid
-        || parent["parent_work_grant_id"] != child.parent_work_grant_id
-        || parent["parent_work_id"] != child.parent_work_id
-        || parent["root_session_id"]
-            .as_str()
-            .is_none_or(|session| !session.starts_with("v30:"))
+    if parent.root_id != child.root_id
+        || parent.root_invocation_uuid != child.parent_invocation_uuid
+        || parent.parent_work_grant_id != child.parent_work_grant_id
+        || parent.parent_work_id != child.parent_work_id
     {
         return Err("fresh Bash parent changed between probe and C".into());
     }

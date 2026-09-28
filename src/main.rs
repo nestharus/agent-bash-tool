@@ -284,22 +284,20 @@ fn run_command(
     supervisor::validate_argv(&argv).map_err(workload_argv_error)?;
     let cwd = current_directory().map_err(current_directory_error)?;
     #[cfg(all(target_os = "linux", not(feature = "private-v30-admission")))]
-    if fresh_run::private_probe_available() {
-        match fresh_run::register_ordinary_run(
-            delivery_mode,
-            &argv,
-            &cwd,
-            completion_scope,
-            ready_sentinel.as_deref(),
-            cancel_on_owner_exit,
-        ) {
-            Ok(Some(result)) => {
-                fresh_run::write_result(result).map_err(json_write_error)?;
-                return Ok(());
-            }
-            Ok(None) => {}
-            Err(error) => return Err(fresh_run_error(error)),
+    match fresh_run::register_ordinary_run(
+        delivery_mode,
+        &argv,
+        &cwd,
+        completion_scope,
+        ready_sentinel.as_deref(),
+        cancel_on_owner_exit,
+    ) {
+        Ok(Some(result)) => {
+            fresh_run::write_result(result).map_err(json_write_error)?;
+            return Ok(());
         }
+        Ok(None) => {}
+        Err(error) => return Err(fresh_run_error(error)),
     }
     #[cfg(feature = "private-v30-admission")]
     match private_v30::register_ordinary_run(
