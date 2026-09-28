@@ -1168,6 +1168,7 @@ pub(crate) fn internal_main() -> Option<i32> {
                 .trim_end(),
         )
         .map_err(|e| e.to_string())?;
+        let physical_stdout = b"broker-child-output\n";
         if source["request_id"] != child.request_id
             || source["source_id"] != child.handle
             || source["attempt_id"] != child.invocation_uuid
@@ -1187,6 +1188,10 @@ pub(crate) fn internal_main() -> Option<i32> {
                 }
             || source["tree_drained"] != true
             || source["output_closed"] != true
+            || source["stdout_len"].as_u64() != Some(physical_stdout.len() as u64)
+            || source["stdout_sha256"] != format!("{:x}", Sha256::digest(physical_stdout))
+            || source["stderr_len"].as_u64() != Some(0)
+            || source["stderr_sha256"] != format!("{:x}", Sha256::digest([]))
         {
             return Err("fresh source W exact readback mismatch".into());
         }
