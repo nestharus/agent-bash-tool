@@ -46,7 +46,7 @@ const DELIVERY_HELPER_CHANGED: &str = "delivery_helper_changed";
 // Exact paired Runner fixture image. A later Runner image
 // requires an explicit paired update; an environment digest is not authority.
 const PRIVATE_V30_RUNNER_SHA256: &str =
-    "67c07940478e0760ad295a5e6000462ae364895a7735c9dbba780e435dd8933e";
+    "4a6a3697ccf685b7948639ae67868201c631215b53fe7b22c66b6b68d1652a6c";
 
 #[derive(Debug)]
 struct ConfiguredDeliveryHelper {
