@@ -680,6 +680,109 @@ function parseVersion31Response(runOut: string, delivery: DeliveryMode): string 
     `\n--- stderr ---\n${stderr.output}`
 }
 
+const ROOT_V1_ENV = "OULIPOLY_ROOT_BASH_V1"
+const ROOT_V1_SURFACE = "agent-bash-root-v1"
+const ROOT_V1_OUTCOMES = ["refused", "not-started", "ended", "ended-output-unproven", "unknown"]
+
+// Inside a new-lineage root, its own Bash ingress is the only route.
+function rootV1Context(): boolean {
+  return process.env[ROOT_V1_ENV] !== undefined
+}
+
+function rootV1Unresolved(reason: string, run: ProcessResult): Error {
+  return new Error(`root v1 result unresolved (${reason}); the command may have run; do not replay.` +
+    `\nexit: ${run.exitCode}\nstdout: ${run.stdout}\nstderr: ${run.stderr}`)
+}
+
+function rootV1Stage(stage: any): string {
+  const name = String(stage?.event)
+  if (name === "accepted") return `accepted(work=${stage.work}, durable=${stage.durable})`
+  if (name === "output-closed") return `output-closed(bytes=${stage.bytes})`
+  if (name === "end") return `end(${stage.status}, observer=${stage.observer}, output=${stage.output?.state})`
+  if (name === "output") return "output"
+  return stage?.reason === undefined ? name : `${name}(${stage.reason})`
+}
+
+// Renders only what the root's stage lines established. The command's wait
+// status is read from the result object, never from agent-bash's exit code.
+function rootV1Response(run: ProcessResult): string {
+  if (run.exitCode !== 0) throw rootV1Unresolved("agent-bash did not complete its result", run)
+  let value: any
+  try {
+    value = JSON.parse(run.stdout)
+  } catch {
+    throw rootV1Unresolved("result is not one JSON object", run)
+  }
+  const output = value?.output
+  if (value?.result_surface !== ROOT_V1_SURFACE || value.version !== 1 || value.delivery_mode !== "sync" ||
+      !ROOT_V1_OUTCOMES.includes(value.outcome) || typeof value.effects_possible !== "boolean" ||
+      typeof value.retry_safe !== "boolean" || !Array.isArray(value.stages) || !Array.isArray(value.faults) ||
+      !output || typeof output.base64 !== "string" || !Number.isSafeInteger(output.bytes) ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(output.base64)) {
+    throw rootV1Unresolved("result surface invalid", run)
+  }
+  const bytes = Buffer.from(output.base64, "base64")
+  if (bytes.length !== output.bytes || bytes.toString("base64") !== output.base64) {
+    throw rootV1Unresolved("output length or encoding mismatch", run)
+  }
+  const ended = value.outcome === "ended" || value.outcome === "ended-output-unproven"
+  if (ended !== (value.wait !== null && typeof value.wait === "object") ||
+      value.effects_possible !== !["refused", "not-started"].includes(value.outcome)) {
+    throw rootV1Unresolved("result outcome inconsistent", run)
+  }
+  const stages = `stages: ${value.stages.map(rootV1Stage).join(" -> ") || "none"}`
+  const faults = value.faults.length ? `\nfaults: ${value.faults.join("; ")}` : ""
+  const text = bytes.toString("utf8")
+  const utf8 = !bytes.includes(0) && Buffer.from(text, "utf8").equals(bytes)
+  const body = `\n--- output (stderr joined; ${bytes.length} bytes, ${utf8 ? "utf8" : "hex"}) ---\n` +
+    (utf8 ? text : bytes.toString("hex"))
+  switch (value.outcome) {
+    case "refused":
+      return `Root v1 refused by ${value.refusal?.by} (${value.refusal?.reason})` +
+        `${value.refusal?.detail ? `: ${value.refusal.detail}` : ""}. Nothing was run; ` +
+        `no other route was tried and the request was not converted.\n${stages}`
+    case "not-started":
+      return `Root v1 accepted the command, then reported a positive no-start; nothing was run.\n${stages}${faults}`
+    case "unknown":
+      return `Root v1 outcome unknown (${value.meaning}): the command may have run. Effects possible: yes; ` +
+        `retry safe: no. Do not replay; there is no root v1 cancel or status for it here.\n${stages}${faults}` +
+        (bytes.length ? `${body}\n(output above is partial and unproven)` : "")
+    default: {
+      const wait = value.wait.exit?.code !== undefined
+        ? `exited with code ${value.wait.exit.code}`
+        : `signaled with signal ${value.wait.exit?.signal}`
+      const delivery = value.outcome === "ended"
+        ? "output complete (counted, closed, matched by the end)"
+        : "output delivery unproven: the command ran and its wait is known, but the output below may be incomplete; do not replay"
+      return `Root v1 work ended: ${wait} (${value.wait.status}, observer ${value.wait.observer}); ${delivery}.` +
+        `\n${stages}${faults}${body}`
+    }
+  }
+}
+
+async function rootV1Execute(admission: CommandAdmission, ownerSessionId: string, workdir?: string): Promise<string> {
+  if (admission.agentDispatch) {
+    return "Root v1 refused child-agent dispatch: it needs asynchronous completion, which root v1 does not serve. " +
+      "Nothing was run; it was not converted to a synchronous run."
+  }
+  let args: string[]
+  if (admission.kind === "unsupported") {
+    throw new Error("explicit agent-bash run requires structured arguments without shell expansion")
+  } else if (admission.kind === "direct") {
+    args = admission.argv
+  } else {
+    args = [AGENT_BASH, "run", "--delivery", admission.delivery, "--", "bash", "-lc", admission.command]
+  }
+  let run: ProcessResult
+  try {
+    run = await runProcess(args, ownerSessionId, undefined, "agent-bash root v1 run", undefined, workdir, null, true)
+  } catch (error) {
+    throw new Error(`root v1 result unresolved: ${error instanceof Error ? error.message : String(error)}; ` +
+      "the command may have run; do not replay.")
+  }
+  return rootV1Response(run)
+}
+
 function noReplayResponse(dispatch: RunDispatch): string {
   if (dispatch.dispatchState === "registration-outcome-unknown") {
     return (
@@ -869,8 +972,9 @@ function admitCommand(command: string, requestedDelivery: string | undefined): C
   // The private v31 sync route owns an independent physical child and only
   // admits tree completion. It has no owner-exit cancellation grant. Keep the
   // older handle path unchanged unless the source-only selector is explicit.
-  const privateSync = process.env.AGENT_BASH_PRIVATE_V31_SYNC === "1" && delivery === "sync"
-  const ownerLease = !privateSync && leaseToCaller(delivery)
+  const privateSync = !rootV1Context() && process.env.AGENT_BASH_PRIVATE_V31_SYNC === "1" && delivery === "sync"
+  // Root v1 has no owner-exit lease; the root owns its work's lifetime.
+  const ownerLease = !rootV1Context() && !privateSync && leaseToCaller(delivery)
   const completionScope = privateSync || agentDispatch ? "tree" : "root"
   const policy = { agentDispatch, delivery, ownerLease, completionScope } as const
   if (!conservativelyRecognizesExplicitRun(command)) return { ...policy, kind: "ordinary", command }
@@ -980,7 +1084,8 @@ export default tool({
     "A synchronous call can be detached externally without terminating its workload. Exact " +
     "`agent-bash list [--all] [--json]` observations and bounded standalone sleeps run attached without creating a " +
     `workload handle. Leading agent-runner commands are pinned to ${AGENTS}. An optional workdir sets the supervised ` +
-    "process working directory.",
+    "process working directory. Inside a root v1 context, commands run synchronously through that root only; " +
+    "asynchronous delivery and child-agent dispatch are refused there, not converted.",
   args: {
     command: tool.schema.string().describe("the shell command to run").optional(),
     handle: tool.schema.string().describe("poll an existing asynchronous command by its handle").optional(),
@@ -1009,6 +1114,10 @@ export default tool({
     const sleepMilliseconds = standaloneSleepMilliseconds(args.command)
     if (admission.delivery === "sync" && sleepMilliseconds !== undefined) {
       return runStandaloneSleep(sleepMilliseconds)
+    }
+    if (rootV1Context()) {
+      const result = await rootV1Execute(admission, context.sessionID, args.workdir)
+      return context.abort.aborted ? `${result}\nTool abort: root v1 has no cancel; the work was not cancelled.` : result
     }
     const binding = ensureLiveSessionBinding(context.sessionID)
     if (binding) await binding

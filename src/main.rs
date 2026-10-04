@@ -12,6 +12,7 @@ mod image;
 #[cfg(feature = "private-v30-admission")]
 mod private_v30;
 mod retained_output;
+mod root_v1;
 mod root_work;
 mod state;
 mod supervisor;
@@ -67,8 +68,9 @@ enum Command {
         delivery: CliDeliveryMode,
         /// Completion boundary for exit-mode workloads. Tree waits for every adopted
         /// descendant; root completes when the launched process exits and output closes.
-        #[arg(long, value_enum, default_value_t = CliCompletionScope::Tree)]
-        completion_scope: CliCompletionScope,
+        /// Defaults to tree.
+        #[arg(long, value_enum)]
+        completion_scope: Option<CliCompletionScope>,
         /// Treat the workload as a long-lived server: report ready on this stdout
         /// marker (regex) instead of waiting for process-tree exit.
         #[arg(long)]
@@ -218,6 +220,11 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
         println!("{result}");
         return Ok(());
     }
+    // A root-v1 context is served by its own root alone, before any legacy
+    // guard, probe, Broker or spooler selection.
+    if let (Some(ingress), Command::Run { .. }) = (root_v1::selected(), &cli.command) {
+        return root_v1_run(&ingress, cli.command);
+    }
     validate_guard(&guard)?;
     match cli.command {
         Command::CompletionReconcileV2 { .. } => unreachable!(),
@@ -231,7 +238,7 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
         } => run_command(
             guard,
             delivery.into(),
-            completion_scope.into(),
+            completion_scope.unwrap_or(CliCompletionScope::Tree).into(),
             ready_sentinel,
             cancel_on_owner_exit,
             owner_pid,
@@ -258,6 +265,42 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
         ),
         Command::List { all, json } => list_command(control_route_caller(&guard)?, all, json),
     }
+}
+
+fn root_v1_run(ingress: &std::ffi::OsStr, command: Command) -> Result<(), AppError> {
+    let Command::Run {
+        delivery,
+        completion_scope,
+        ready_sentinel,
+        cancel_on_owner_exit,
+        argv,
+        ..
+    } = command
+    else {
+        unreachable!("root v1 serves run only");
+    };
+    let mut unsupported = Vec::new();
+    if completion_scope.is_some() {
+        unsupported.push("--completion-scope");
+    }
+    if ready_sentinel.is_some() {
+        unsupported.push("--ready-sentinel");
+    }
+    if cancel_on_owner_exit {
+        unsupported.push("--cancel-on-owner-exit");
+    }
+    let result = root_v1::run(
+        ingress,
+        &root_v1::Request {
+            sync: matches!(delivery, CliDeliveryMode::Sync),
+            unsupported,
+            argv: &argv,
+        },
+    );
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{result}")
+        .and_then(|()| stdout.flush())
+        .map_err(json_write_error)
 }
 
 fn validate_guard(guard: &AttachedGuard) -> Result<(), AppError> {

@@ -15,6 +15,16 @@ completion returns synchronously in-band or asynchronously through the agent mai
 
 - **Always detached.** There is no foreground execution mode. `run` returns a handle immediately
   and the workload continues under a surviving supervisor.
+- **Root v1 (new lineage).** When `OULIPOLY_ROOT_BASH_V1` is present, `run` sends the
+  command to that root's Bash ingress and nowhere else. No Broker, guardian, probe,
+  state or local execution is used, and nothing is retried. Only `--delivery sync`
+  is served; async delivery (including the CLI default) and the lease, scope and
+  sentinel options are refused before anything is sent, not converted. The result is one
+  JSON object (`result_surface: "agent-bash-root-v1"`) carrying the root's stage
+  lines, the wait status only from its work PID 1 wait, and output marked complete
+  only when count, closure and the end agree. Exit 0 means that object was written,
+  not that the command succeeded. The OpenCode adapter renders it and refuses
+  child-agent dispatch there. Root v1 has no handle, status or cancel.
 - **Paired root ownership.** When agent-runner marks a current paired tree and supplies both its
   completion endpoint and a `root-authority-v1` grant, `run` durably submits
   `original-work-v1` to that existing root
