@@ -765,6 +765,10 @@ async function rootV1Execute(admission: CommandAdmission, ownerSessionId: string
     return "Root v1 refused child-agent dispatch: it needs asynchronous completion, which root v1 does not serve. " +
       "Nothing was run; it was not converted to a synchronous run."
   }
+  if (admission.kind === "direct" && admission.delivery === "async") {
+    return "Root v1 refused by bash-adapter (async-delivery-unavailable-under-root-v1): synchronous commands only. " +
+      "Nothing was run; no other route was tried and the request was not converted."
+  }
   let args: string[]
   if (admission.kind === "unsupported") {
     throw new Error("explicit agent-bash run requires structured arguments without shell expansion")
@@ -835,6 +839,10 @@ function stripReservedSpoolerAssignmentsForShellRouting(command: string): ShellC
 // admission. The resulting admission record owns every semantic fact consumed by callers.
 function conservativelyRecognizesExplicitRun(command: string): boolean {
   const { body } = stripReservedSpoolerAssignmentsForShellRouting(command)
+  if (rootV1Context()) {
+    const words = structuredShellWords(body)
+    if (words && [AGENT_BASH, "agent-bash"].includes(words[0]) && words[1] === "run") return true
+  }
   return [`${AGENT_BASH} run`, "agent-bash run"].some((prefix) => startsWithToken(body, prefix))
 }
 
@@ -952,13 +960,18 @@ function parseStructuredExplicitRun(
   words[0] = AGENT_BASH
   const separator = words.indexOf("--")
   const optionsEnd = separator < 0 ? words.length : separator
+  // Root requests keep their explicit mode, including --delivery=async.
+  // Tool-level async is refused separately, so neither spelling wins by
+  // silently replacing the other. Legacy mode selection stays unchanged.
+  const explicitRootDelivery = rootV1Context() && words.slice(2, optionsEnd)
+    .some(word => word === "--delivery" || word.startsWith("--delivery="))
   for (let index = 2; index < optionsEnd; index += 1) {
-    if (words[index] === "--delivery") {
+    if (!rootV1Context() && words[index] === "--delivery") {
       words.splice(index, 2)
       break
     }
   }
-  const controls = ["--delivery", delivery]
+  const controls = explicitRootDelivery ? [] : ["--delivery", delivery]
   if (ownerLease) controls.unshift("--cancel-on-owner-exit", "--owner-pid", String(process.pid))
   words.splice(2, 0, ...controls)
   const workload = words.indexOf("--") + 1
@@ -1085,7 +1098,8 @@ export default tool({
     "`agent-bash list [--all] [--json]` observations and bounded standalone sleeps run attached without creating a " +
     `workload handle. Leading agent-runner commands are pinned to ${AGENTS}. An optional workdir sets the supervised ` +
     "process working directory. Inside a root v1 context, commands run synchronously through that root only; " +
-    "asynchronous delivery and child-agent dispatch are refused there, not converted.",
+    "asynchronous delivery, child-agent dispatch and legacy handle/controls are refused there, not converted; " +
+    "standalone sleeps also use that root's command result.",
   args: {
     command: tool.schema.string().describe("the shell command to run").optional(),
     handle: tool.schema.string().describe("poll an existing asynchronous command by its handle").optional(),
@@ -1093,6 +1107,15 @@ export default tool({
     workdir: tool.schema.string().describe("working directory for the supervised process").optional(),
   },
   async execute(args, context) {
+    if (rootV1Context()) {
+      const words = args.command && structuredShellWords(stripReservedSpoolerAssignmentsForShellRouting(args.command).body)
+      const control = words && [AGENT_BASH, "agent-bash"].includes(words[0]) &&
+        ["list", "cancel", "detach", "status", "snapshot", "mode", "accept-output", "completion-reconcile-v2"].includes(words[1])
+      if (args.handle || control) {
+        return "Root v1 refused legacy handle/control request: only synchronous commands are supported. " +
+          "No legacy state was accessed; no other route was tried."
+      }
+    }
     if (args.handle) {
       return observeVisibleHandle(args.handle, "tail", context.sessionID, context.abort)
     }
@@ -1112,7 +1135,7 @@ export default tool({
     if (context.abort.aborted) return "Cancellation requested before dispatch."
     const admission = admitCommand(args.command, args.delivery)
     const sleepMilliseconds = standaloneSleepMilliseconds(args.command)
-    if (admission.delivery === "sync" && sleepMilliseconds !== undefined) {
+    if (!rootV1Context() && admission.delivery === "sync" && sleepMilliseconds !== undefined) {
       return runStandaloneSleep(sleepMilliseconds)
     }
     if (rootV1Context()) {

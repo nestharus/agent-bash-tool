@@ -71,22 +71,55 @@ class Owner:
 
 @unittest.skipUnless(BUN and AGENT_BASH, 'requires BUN and AGENT_BASH_TEST_BIN')
 class RootV1Adapter(unittest.TestCase):
-    def call(self, reply, args):
+    def call(self, reply, args, forbid_binary=False):
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)
             driver = temp / 'driver.ts'
             driver.write_text(DRIVER)
+            trap = temp / 'legacy-trap'
+            trap.write_text('#!/bin/sh\nprintf contacted > "$CONTACT_MARKER"\nexit 99\n')
+            trap.chmod(0o700)
+            if forbid_binary and 'command' in args:
+                args = dict(args, command=args['command'].replace(AGENT_BASH, str(trap)))
+            binding = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            binding.bind(str(temp / 'binding.sock'))
+            binding.listen()
+            binding.setblocking(False)
             owner = Owner(temp / 'bash.sock', reply)
             try:
                 env = {'PATH': '/usr/bin:/bin', 'HOME': str(temp / 'home'),
-                       'AGENT_BASH_BIN': AGENT_BASH, 'OULIPOLY_ROOT_BASH_V1': str(temp / 'bash.sock')}
+                       'AGENT_BASH_BIN': str(trap) if forbid_binary else AGENT_BASH,
+                       'CONTACT_MARKER': str(temp / 'contacted'),
+                       'XDG_STATE_HOME': str(temp / 'state'),
+                       'TMPDIR': str(temp), 'BUN_INSTALL_CACHE_DIR': str(temp / 'bun-cache'),
+                       'OULIPOLY_ROOT_BASH_V1': str(temp / 'bash.sock'),
+                       'OULIPOLY_LIVE_SESSION_BIND_SOCKET': str(temp / 'binding.sock'),
+                       'OULIPOLY_LIVE_SESSION_BIND_TOKEN': 'public-fixture-token',
+                       'OULIPOLY_PARENT_INVOCATION': '{"id":"fixture-invocation"}'}
                 done = subprocess.run([BUN, '--no-install', str(driver), str(ADAPTER), json.dumps(args)],
                                       env=env, cwd=temp, capture_output=True, text=True, timeout=60)
                 self.assertEqual(done.returncode, 0, done.stderr)
-                self.assertFalse((temp / 'home').exists(), 'no legacy state')
-                return json.loads(done.stdout.strip().splitlines()[-1]), owner.requests
+                self.assertFalse((temp / 'state').exists(), 'no legacy state')
+                # Bun's transpiler cache can create HOME/.bun even with --no-install.
+                if (temp / 'home').exists():
+                    self.assertEqual([p.name for p in (temp / 'home').iterdir()], ['.bun'])
+                self.assertFalse((temp / 'contacted').exists(), 'no legacy binary contact')
+                with self.assertRaises(BlockingIOError, msg='no binding handshake'):
+                    connection, _ = binding.accept()
+                    connection.close()
+                result = json.loads(done.stdout.strip().splitlines()[-1])
+                requests = list(owner.requests)
             finally:
                 owner.stop()
+                binding.close()
+        evidence = os.environ.get('ROOT_V1_ADAPTER_EVIDENCE')
+        if evidence:
+            with open(evidence, 'a') as stream:
+                stream.write(json.dumps({'args': args, 'result': result, 'requests': requests,
+                                         'binary_trapped': forbid_binary, 'binding_contacts': 0,
+                                         'fixture': str(temp), 'fixture_removed': not temp.exists()}) + '\n')
+        self.assertFalse(temp.exists(), 'owned fixture removed')
+        return result, requests
 
     def test_sync_command_returns_waited_status_and_output_from_root_stages(self):
         reply, requests = self.call([ACCEPTED, STARTED, OUTPUT, CLOSED, END], {'command': 'echo hi; exit 3'})
@@ -125,6 +158,56 @@ class RootV1Adapter(unittest.TestCase):
         reply, more = self.call([ACCEPTED], {'command': 'agents run --prompt x'})
         self.assertIn('Root v1 refused child-agent dispatch', reply['result'])
         self.assertEqual(requests + more, [])
+
+    def test_direct_async_spellings_and_tool_async_never_execute_as_sync(self):
+        for command, delivery in [
+            ('agent-bash run --delivery async -- true', None),
+            ('agent-bash run --delivery=async -- true', 'sync'),
+            (f"'{AGENT_BASH}' run --delivery 'async' -- true", 'sync'),
+            ('agent-bash run --delivery sync -- true', 'async'),
+            ('agent-bash run -- true', 'async'),
+        ]:
+            with self.subTest(command=command, delivery=delivery):
+                args = {'command': command}
+                if delivery:
+                    args['delivery'] = delivery
+                reply, requests = self.call([ACCEPTED, STARTED, OUTPUT, CLOSED, END], args)
+                self.assertIn('async-delivery-unavailable-under-root-v1', reply['result'])
+                self.assertIn('not converted', reply['result'])
+                self.assertEqual(requests, [])
+
+    def test_explicit_sync_still_reaches_owner_with_workload_mode_words_untouched(self):
+        reply, requests = self.call([ACCEPTED, STARTED, OUTPUT, CLOSED, END],
+                                   {'command': 'agent-bash run --delivery=sync -- echo --delivery async'})
+        self.assertIn('exited with code 3', reply['result'])
+        self.assertEqual([r['argv'] for r in requests], [['echo', '--delivery', 'async']])
+
+    def test_root_sleep_reports_owner_outcome_instead_of_local_done(self):
+        reply, requests = self.call([ACCEPTED, STARTED, OUTPUT, CLOSED, END], {'command': 'sleep 0'})
+        self.assertIn('Root v1 work ended: exited with code 3', reply['result'])
+        self.assertNotIn('DONE rc=0', reply['result'])
+        self.assertEqual([r['argv'] for r in requests], [['bash', '-lc', 'sleep 0']])
+        refused, requests = self.call([{'event': 'refused', 'reason': 'sleep-fixture-refusal'}],
+                                     {'command': 'sleep 0'})
+        self.assertIn('sleep-fixture-refusal', refused['result'])
+        self.assertNotIn('DONE', refused['result'])
+        self.assertEqual(len(requests), 1)
+
+    def test_root_handles_and_controls_refuse_without_binary_binding_or_owner_contact(self):
+        cases = [{'handle': 'retained-fixture'}, {'handle': 'retained-fixture', 'command': 'true'}]
+        cases += [{'command': command} for command in [
+            'agent-bash list --all --json', 'agent-bash cancel retained-fixture',
+            'agent-bash status retained-fixture', 'agent-bash snapshot retained-fixture',
+            'agent-bash mode retained-fixture', 'agent-bash detach retained-fixture',
+            'agent-bash accept-output retained-fixture --snapshot fixture',
+            f"'{AGENT_BASH}' list", 'agent-bash completion-reconcile-v2 --json',
+        ]]
+        for args in cases:
+            with self.subTest(args=args):
+                reply, requests = self.call([ACCEPTED], args, forbid_binary=True)
+                self.assertIn('Root v1 refused legacy handle/control request', reply['result'])
+                self.assertIn('No legacy state was accessed', reply['result'])
+                self.assertEqual(requests, [])
 
 
 if __name__ == '__main__':

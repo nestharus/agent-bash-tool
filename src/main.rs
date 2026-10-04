@@ -209,6 +209,17 @@ fn main() {
 }
 
 fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
+    // Select the owning root before legacy control/reconciliation can read state.
+    // Guard capture and CLI parsing have already happened in main.
+    if let Some(ingress) = root_v1::selected() {
+        return match cli.command {
+            command @ Command::Run { .. } => root_v1_run(&ingress, command),
+            _ => Err(AppError::new(
+                EX_UNAVAILABLE,
+                "agent-bash: root v1 refuses legacy controls; only synchronous run is supported; no legacy state was accessed",
+            )),
+        };
+    }
     if let Command::CompletionReconcileV2 {
         registration_file,
         confirmation,
@@ -219,11 +230,6 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
             .map_err(completion_event_registration_error)?;
         println!("{result}");
         return Ok(());
-    }
-    // A root-v1 context is served by its own root alone, before any legacy
-    // guard, probe, Broker or spooler selection.
-    if let (Some(ingress), Command::Run { .. }) = (root_v1::selected(), &cli.command) {
-        return root_v1_run(&ingress, cli.command);
     }
     validate_guard(&guard)?;
     match cli.command {

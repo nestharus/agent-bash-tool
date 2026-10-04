@@ -195,6 +195,81 @@ fn async_default_and_legacy_options_are_refused_without_contacting_the_owner() {
     assert_eq!(owner.connections(), 0);
 }
 
+#[test]
+fn root_legacy_controls_refuse_before_config_state_reconciliation_or_socket_contact() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("agent-bash");
+    fs::copy(env!("CARGO_BIN_EXE_agent-bash"), &binary).unwrap();
+    fs::write(dir.path().join("agent-bash.toml"), "state_root = [").unwrap();
+    let state = dir.path().join("state");
+    fs::create_dir(&state).unwrap();
+    let retained = state.join("retained-fixture");
+    fs::write(&retained, "retained evidence must stay untouched").unwrap();
+    let root_socket = dir.path().join("bash.sock");
+    let root = UnixListener::bind(&root_socket).unwrap();
+    root.set_nonblocking(true).unwrap();
+    let broker_socket = dir.path().join("control.sock");
+    let broker = UnixListener::bind(&broker_socket).unwrap();
+    broker.set_nonblocking(true).unwrap();
+    for args in [
+        vec!["list", "--all", "--json"],
+        vec!["cancel", "retained-fixture"],
+        vec!["detach", "retained-fixture"],
+        vec!["status", "retained-fixture"],
+        vec!["snapshot", "retained-fixture"],
+        vec!["mode", "retained-fixture"],
+        vec!["accept-output", "retained-fixture", "--snapshot", "fixture"],
+        vec![
+            "completion-reconcile-v2",
+            "--registration-file",
+            "missing-registration",
+            "--confirmation",
+            "missing-confirmation",
+            "--json",
+        ],
+    ] {
+        // Empty presence also selects root, never an alternate legacy route.
+        for ingress in [root_socket.as_os_str(), std::ffi::OsStr::new("")] {
+            let output = Command::new(&binary)
+                .args(&args)
+                .current_dir(dir.path())
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &state)
+                .env("XDG_STATE_HOME", &state)
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &broker_socket)
+                .env(ROOT_ENV, ingress)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(69), "{args:?}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("root v1 refuses legacy controls")
+            );
+            assert!(output.stdout.is_empty());
+            assert_eq!(
+                fs::read_to_string(&retained).unwrap(),
+                "retained evidence must stay untouched"
+            );
+            assert_eq!(fs::read_dir(&state).unwrap().count(), 1);
+            assert!(!dir.path().join("missing-confirmation").exists());
+        }
+    }
+    assert_eq!(
+        root.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        broker.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(root);
+    drop(broker);
+    let fixture = dir.path().to_owned();
+    dir.close().unwrap();
+    assert!(!fixture.exists());
+    println!("owned fixture removed: {}", fixture.display());
+}
+
 /// With the root context present but its owner unreachable, nothing else is
 /// tried: not the private Broker probe (made available here by a user
 /// namespace and its fixture socket), not the legacy configuration or state.
