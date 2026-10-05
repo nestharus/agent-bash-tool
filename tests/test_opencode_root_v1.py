@@ -7,6 +7,7 @@ This shows the tool result built from agent-bash's root-v1 surface and that
 async and child-agent requests are refused without contacting the owner. It
 is not a witness of an actual root owner or root PID 1.
 """
+import base64
 import json
 import os
 from pathlib import Path
@@ -25,8 +26,12 @@ const tool = Object.assign(d => d, { schema: { string: () => ({ describe: () => 
 mock.module("@opencode-ai/plugin", () => ({ tool }))
 const adapter = (await import(process.argv[2])).default
 try {
-  const result = await adapter.execute(JSON.parse(process.argv[3]), {sessionID: "root-v1", abort: new AbortController().signal})
-  console.log(JSON.stringify({result}))
+  const args = JSON.parse(process.argv[3])
+  const replies = []
+  for (const item of Array.isArray(args) ? args : [args]) {
+    replies.push(await adapter.execute(item, {sessionID: "root-v1", abort: new AbortController().signal}))
+  }
+  console.log(JSON.stringify(Array.isArray(args) ? {results: replies} : {result: replies[0]}))
 } catch (error) { console.log(JSON.stringify({error: String(error)})) }
 '''
 
@@ -61,7 +66,9 @@ class Owner:
             with conn:
                 conn.settimeout(5)
                 self.requests.append(json.loads(conn.makefile('r').readline()))
-                conn.sendall(''.join(json.dumps(e) + '\n' for e in self.reply).encode())
+                events = self.reply(self.requests[-1]) if callable(self.reply) else self.reply
+                for event in events:
+                    conn.sendall((json.dumps(event) + '\n').encode())
 
     def stop(self):
         self.stopped = True
@@ -126,10 +133,61 @@ class RootV1Adapter(unittest.TestCase):
         result = reply['result']
         self.assertIn('Root v1 work ended: exited with code 3 (code:3, observer work-pid1-wait)', result)
         self.assertIn('output complete', result)
-        self.assertIn('accepted(work=4, durable=true) -> started -> output -> output-closed(bytes=7) -> end(', result)
+        self.assertIn('accepted(work=4, durable=true) -> started -> output(chunks=1, bytes=7) -> output-closed(bytes=7) -> end(', result)
         self.assertTrue(result.endswith('---\nhi\nerr\n'), result)
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0]['argv'], ['bash', '-lc', 'echo hi; exit 3'])
+
+    def test_large_command_is_partial_counted_closed_waited_and_next_call_works(self):
+        # Local stand-in relays an actual synthetic command in 16 KiB chunks;
+        # it supplies custody stages, not a real root/PID-1 witness.
+        command = "python3 -c 'import sys; sys.stdout.buffer.write(b\"x\" * 33554432)' ; exit 2"
+
+        def relay(request):
+            yield ACCEPTED
+            yield STARTED
+            process = subprocess.Popen(request['argv'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            total = 0
+            while chunk := process.stdout.read(16384):
+                total += len(chunk)
+                yield {'event': 'output', 'b64': base64.b64encode(chunk).decode()}
+            process.stdout.close()
+            status = process.wait()
+            yield dict(CLOSED, bytes=total)
+            yield dict(END, status=f'code:{status}', output={'state': 'closed', 'bytes': total})
+
+        reply, requests = self.call(relay, [{'command': command}, {'command': "printf next"}])
+        large, next_result = reply['results']
+        self.assertIn('exited with code 2', large)
+        self.assertIn('output partial; full stream counted, closed, matched by the end', large)
+        self.assertIn('showing the first 65536 of 33554432 received bytes', large)
+        self.assertIn('33488896 bytes omitted and discarded (not retained)', large)
+        self.assertIn('output-closed(bytes=33554432)', large)
+        self.assertNotIn('output complete', large)
+        self.assertTrue(large.endswith('x' * 65536))
+        self.assertLess(len(large), 66560)
+        self.assertIn('output complete', next_result)
+        self.assertTrue(next_result.endswith('---\nnext'))
+        self.assertEqual(len(requests), 2)
+
+    def test_utf8_boundary_binary_and_zero_output(self):
+        for payload, shown, mode in [
+            ('€'.encode() * 22000, 65535, 'utf8'),
+            (b'\x00\xff' * 33000, 65536, 'hex'),
+            (b'', 0, 'utf8'),
+        ]:
+            with self.subTest(mode=mode, bytes=len(payload)):
+                total = len(payload)
+                events = [ACCEPTED, STARTED,
+                          {'event': 'output', 'b64': base64.b64encode(payload).decode()},
+                          dict(CLOSED, bytes=total),
+                          dict(END, status='code:0', output={'state': 'closed', 'bytes': total})]
+                result = self.call(events, {'command': 'true'})[0]['result']
+                self.assertIn(f'{shown} bytes', result)
+                self.assertIn(f', {mode})', result)
+                body = payload[:shown].decode() if mode == 'utf8' else payload[:shown].hex()
+                self.assertTrue(result.endswith('---\n' + body))
+                self.assertLess(len(result), 132100)
 
     def test_output_fault_keeps_the_wait_but_says_delivery_is_unproven(self):
         bad = dict(CLOSED, bytes=6)

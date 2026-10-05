@@ -699,7 +699,7 @@ function rootV1Stage(stage: any): string {
   if (name === "accepted") return `accepted(work=${stage.work}, durable=${stage.durable})`
   if (name === "output-closed") return `output-closed(bytes=${stage.bytes})`
   if (name === "end") return `end(${stage.status}, observer=${stage.observer}, output=${stage.output?.state})`
-  if (name === "output") return "output"
+  if (name === "output") return `output(chunks=${stage.chunks}, bytes=${stage.bytes})`
   return stage?.reason === undefined ? name : `${name}(${stage.reason})`
 }
 
@@ -722,7 +722,12 @@ function rootV1Response(run: ProcessResult): string {
     throw rootV1Unresolved("result surface invalid", run)
   }
   const bytes = Buffer.from(output.base64, "base64")
-  if (bytes.length !== output.bytes || bytes.toString("base64") !== output.base64) {
+  const presented = output.presented_bytes ?? output.bytes
+  const omitted = output.omitted_bytes ?? 0
+  if (!Number.isSafeInteger(presented) || !Number.isSafeInteger(omitted) ||
+      presented < 0 || omitted < 0 || presented + omitted !== output.bytes ||
+      bytes.length !== presented || bytes.toString("base64") !== output.base64 ||
+      (omitted > 0 && output.remainder !== "discarded")) {
     throw rootV1Unresolved("output length or encoding mismatch", run)
   }
   const ended = value.outcome === "ended" || value.outcome === "ended-output-unproven"
@@ -734,7 +739,11 @@ function rootV1Response(run: ProcessResult): string {
   const faults = value.faults.length ? `\nfaults: ${value.faults.join("; ")}` : ""
   const text = bytes.toString("utf8")
   const utf8 = !bytes.includes(0) && Buffer.from(text, "utf8").equals(bytes)
-  const body = `\n--- output (stderr joined; ${bytes.length} bytes, ${utf8 ? "utf8" : "hex"}) ---\n` +
+  const partial = omitted > 0
+    ? `\nPartial output: showing the first ${presented} of ${output.bytes} received bytes; ` +
+      `${omitted} bytes omitted and discarded (not retained).`
+    : ""
+  const body = partial + `\n--- output (stderr joined; ${bytes.length} bytes${omitted ? " shown" : ""}, ${utf8 ? "utf8" : "hex"}) ---\n` +
     (utf8 ? text : bytes.toString("hex"))
   switch (value.outcome) {
     case "refused":
@@ -752,7 +761,9 @@ function rootV1Response(run: ProcessResult): string {
         ? `exited with code ${value.wait.exit.code}`
         : `signaled with signal ${value.wait.exit?.signal}`
       const delivery = value.outcome === "ended"
-        ? "output complete (counted, closed, matched by the end)"
+        ? omitted > 0
+          ? "output partial; full stream counted, closed, matched by the end"
+          : "output complete (counted, closed, matched by the end)"
         : "output delivery unproven: the command ran and its wait is known, but the output below may be incomplete; do not replay"
       return `Root v1 work ended: ${wait} (${value.wait.status}, observer ${value.wait.observer}); ${delivery}.` +
         `\n${stages}${faults}${body}`

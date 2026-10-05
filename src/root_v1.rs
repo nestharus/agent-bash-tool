@@ -24,6 +24,8 @@ use serde_json::{Value, json};
 pub(crate) const ROOT_BASH_ENV: &str = "OULIPOLY_ROOT_BASH_V1";
 const PROTOCOL: u64 = 1;
 pub(crate) const RESULT_SURFACE: &str = "agent-bash-root-v1";
+// Keep a useful orientation prefix, not an unbounded model-facing body.
+const OUTPUT_PREFIX_BYTES: usize = 64 * 1024;
 
 /// The root path applies when its environment names an ingress, even an
 /// empty or unusable one: a marked context never falls back.
@@ -106,6 +108,9 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
     let mut stages: Vec<Value> = Vec::new();
     let mut faults: Vec<String> = Vec::new();
     let mut output = Vec::new();
+    let mut bytes = 0u64;
+    let mut output_stage: Option<usize> = None;
+    let mut chunks = 0u64;
     let mut accepted = false;
     let mut started = false;
     let mut closed = false;
@@ -127,7 +132,13 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
         };
         let name = event["event"].as_str().unwrap_or_default().to_owned();
         if name == "output" {
-            stages.push(json!({ "event": "output", "chunk": stages.len() }));
+            // Output chunks are counted, not retained as an ever-growing
+            // stage list. Continue draining even after the prefix is full.
+            chunks += 1;
+            let index = *output_stage.get_or_insert_with(|| {
+                stages.push(json!({ "event": "output" }));
+                stages.len() - 1
+            });
             let chunk = event["b64"].as_str().and_then(unbase64);
             match chunk {
                 _ if !started => {
@@ -142,8 +153,13 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
                     faults.push("output-after-closure".to_owned());
                     output_fault = true;
                 }
-                Some(chunk) => output.extend_from_slice(&chunk),
+                Some(chunk) => {
+                    bytes += chunk.len() as u64;
+                    let keep = chunk.len().min(OUTPUT_PREFIX_BYTES - output.len());
+                    output.extend_from_slice(&chunk[..keep]);
+                }
             }
+            stages[index] = json!({ "event": "output", "chunks": chunks, "bytes": bytes });
             continue;
         }
         stages.push(event.clone());
@@ -167,7 +183,7 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
             "started" if accepted && !started => started = true,
             "output-closed" if started && !closed => {
                 closed = true;
-                if event["bytes"].as_u64() != Some(output.len() as u64) {
+                if event["bytes"].as_u64() != Some(bytes) {
                     faults.push("output-byte-count-mismatch".to_owned());
                     output_fault = true;
                 }
@@ -206,8 +222,28 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
             }
         }
     }
-    let bytes = output.len();
+    // A valid UTF-8 prefix can end inside one character. In a truncated
+    // result, omit that incomplete character as well; never replace bytes.
+    if bytes > output.len() as u64 {
+        if let Err(error) = std::str::from_utf8(&output) {
+            if error.error_len().is_none() {
+                output.truncate(error.valid_up_to());
+            }
+        }
+    }
+    let presented_bytes = output.len();
+    let omitted_bytes = bytes - presented_bytes as u64;
     let base64 = base64(&output);
+    let presentation = |delivery: &str| {
+        json!({
+            "delivery": delivery,
+            "bytes": bytes,
+            "presented_bytes": presented_bytes,
+            "omitted_bytes": omitted_bytes,
+            "remainder": if omitted_bytes > 0 { "discarded" } else { "none" },
+            "base64": base64,
+        })
+    };
     let unknown = |meaning: &str, faults: Vec<String>, delivery: &str| {
         json!({
             "result_surface": RESULT_SURFACE,
@@ -219,7 +255,7 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
             "retry_safe": false,
             "refusal": null,
             "wait": null,
-            "output": { "delivery": delivery, "bytes": bytes, "base64": base64 },
+            "output": presentation(delivery),
             "faults": faults,
             "stages": stages,
             "request_sent": sent,
@@ -251,8 +287,7 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
             if !closed {
                 faults.push("output-not-closed".to_owned());
             }
-            if end["output"]["state"] != "closed"
-                || end["output"]["bytes"].as_u64() != Some(bytes as u64)
+            if end["output"]["state"] != "closed" || end["output"]["bytes"].as_u64() != Some(bytes)
             {
                 faults.push("end-output-state-not-closed-with-count".to_owned());
             }
@@ -266,11 +301,8 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
                 "retry_safe": false,
                 "refusal": null,
                 "wait": { "status": status, "observer": observer, "exit": wait },
-                "output": {
-                    "delivery": if complete { "complete" } else { "unproven" },
-                    "bytes": bytes,
-                    "base64": base64,
-                },
+                "output": presentation(if !complete { "unproven" }
+                    else if omitted_bytes > 0 { "partial" } else { "complete" }),
                 "faults": faults,
                 "stages": stages,
             })
@@ -526,6 +558,89 @@ mod tests {
         assert_eq!(refused["outcome"], "refused");
         assert_eq!(refused["refusal"]["by"], "root-owner");
         assert_eq!(refused["effects_possible"], false);
+    }
+
+    #[test]
+    fn bounded_prefix_keeps_total_closure_wait_and_compacts_chunk_stages() {
+        let chunk = vec![b'x'; 16 * 1024];
+        let mut events = vec![accepted(), started()];
+        for _ in 0..128 {
+            events.push(json!({ "event": "output", "b64": base64(&chunk) }));
+        }
+        let total = 128 * chunk.len() as u64;
+        events.extend([closed(total), end("code:2", total)]);
+        let result = decode(transcript(&events), true);
+        assert_eq!(result["outcome"], "ended");
+        assert_eq!(result["wait"]["exit"]["code"], 2);
+        assert_eq!(result["output"]["delivery"], "partial");
+        assert_eq!(result["output"]["bytes"], total);
+        assert_eq!(result["output"]["presented_bytes"], OUTPUT_PREFIX_BYTES);
+        assert_eq!(
+            result["output"]["omitted_bytes"],
+            total - OUTPUT_PREFIX_BYTES as u64
+        );
+        assert_eq!(result["output"]["remainder"], "discarded");
+        assert_eq!(
+            unbase64(result["output"]["base64"].as_str().unwrap()).unwrap(),
+            vec![b'x'; OUTPUT_PREFIX_BYTES]
+        );
+        assert_eq!(result["stages"].as_array().unwrap().len(), 5);
+        assert_eq!(result["stages"][2]["chunks"], 128);
+        // The discarded suffix is still validated: no early-stop green.
+        events.insert(
+            events.len() - 2,
+            json!({ "event": "output", "b64": "!!!!" }),
+        );
+        let bad = decode(transcript(&events), true);
+        assert_eq!(bad["outcome"], "ended-output-unproven");
+        assert_eq!(bad["wait"]["exit"]["code"], 2);
+        assert_eq!(bad["output"]["delivery"], "unproven");
+        assert!(
+            bad["faults"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("output-invalid-or-missing-base64"))
+        );
+        events.remove(events.len() - 3);
+        let closure_index = events.len() - 2;
+        events[closure_index] = closed(total - 1);
+        let bad_count = decode(transcript(&events), true);
+        assert_eq!(bad_count["outcome"], "ended-output-unproven");
+        events.pop();
+        let lost = decode(transcript(&events), true);
+        assert_eq!(lost["outcome"], "unknown");
+        assert!(lost["wait"].is_null());
+        assert_eq!(lost["retry_safe"], false);
+    }
+
+    #[test]
+    fn prefix_boundary_is_exact_and_does_not_split_valid_utf8_or_rewrite_binary() {
+        for (payload, shown) in [
+            (vec![b'x'; OUTPUT_PREFIX_BYTES], OUTPUT_PREFIX_BYTES),
+            (vec![b'x'; OUTPUT_PREFIX_BYTES + 1], OUTPUT_PREFIX_BYTES),
+            (
+                "€".repeat(OUTPUT_PREFIX_BYTES / 3 + 1).into_bytes(),
+                OUTPUT_PREFIX_BYTES - 1,
+            ),
+            (vec![0xff; OUTPUT_PREFIX_BYTES + 1], OUTPUT_PREFIX_BYTES),
+        ] {
+            let total = payload.len() as u64;
+            let result = decode(
+                transcript(&[
+                    accepted(),
+                    started(),
+                    json!({ "event": "output", "b64": base64(&payload) }),
+                    closed(total),
+                    end("code:0", total),
+                ]),
+                true,
+            );
+            assert_eq!(result["outcome"], "ended");
+            assert_eq!(result["output"]["presented_bytes"], shown);
+            assert_eq!(result["output"]["bytes"], total);
+            let prefix = unbase64(result["output"]["base64"].as_str().unwrap()).unwrap();
+            assert_eq!(prefix, payload[..shown]);
+        }
     }
 
     #[test]
