@@ -224,12 +224,11 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
     }
     // A valid UTF-8 prefix can end inside one character. In a truncated
     // result, omit that incomplete character as well; never replace bytes.
-    if bytes > output.len() as u64 {
-        if let Err(error) = std::str::from_utf8(&output) {
-            if error.error_len().is_none() {
-                output.truncate(error.valid_up_to());
-            }
-        }
+    if bytes > output.len() as u64
+        && let Err(error) = std::str::from_utf8(&output)
+        && error.error_len().is_none()
+    {
+        output.truncate(error.valid_up_to());
     }
     let presented_bytes = output.len();
     let omitted_bytes = bytes - presented_bytes as u64;
