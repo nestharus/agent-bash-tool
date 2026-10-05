@@ -21,10 +21,23 @@ completion returns synchronously in-band or asynchronously through the agent mai
   is served; async delivery (including the CLI default) and the lease, scope and
   sentinel options are refused before anything is sent, not converted. The result is one
   JSON object (`result_surface: "agent-bash-root-v1"`) carrying the root's stage
-  lines, the wait status only from its work PID 1 wait, and output marked complete
-  only when count, closure and the end agree. Exit 0 means that object was written,
+  lines and the wait status only from its work PID 1 wait. The requester drains
+  and validates the full output stream but retains at most its first 64 KiB;
+  omitted bytes are discarded, not spilled or recoverable here. A truncated
+  UTF-8 prefix omits an incomplete final character rather than replacing bytes.
+  `output.bytes` counts all valid received bytes, `presented_bytes` counts the
+  base64 payload, and `omitted_bytes` is their difference. Delivery is `partial`
+  when count, closure and the end agree but the prefix omits bytes; `complete`
+  requires no omission. Faulted or unfinished streams remain `unproven`, with
+  only their observed byte count, and never acquire a guessed wait. Output
+  stages are aggregated with chunk and byte counts. Exit 0 means the object was written,
   not that the command succeeded. The OpenCode adapter renders it and refuses
   child-agent dispatch there. Root v1 has no handle, status or cancel.
+  **Pairing required:** Runner's Claude `renderRootV1` must understand the
+  presented/total count distinction before using this requester for large
+  output; its current length-equals-total check rejects partial results.
+  Later async delivery must retain its own bounded payload and metadata if
+  needed: this synchronous requester keeps no remainder or durable prefix.
 - **Paired root ownership.** When agent-runner marks a current paired tree and supplies both its
   completion endpoint and a `root-authority-v1` grant, `run` durably submits
   `original-work-v1` to that existing root
