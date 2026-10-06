@@ -130,6 +130,40 @@ fn sync_run_sends_one_request_and_reports_the_waited_end_and_output() {
 }
 
 #[test]
+fn async_run_sends_delivery_async_and_returns_running_after_detach() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("bash.sock");
+    let owner = Owner::start(
+        &socket,
+        vec![
+            json!({ "event": "accepted", "work": 4, "root_id": "r1", "durable": true, "delivery": "async" }),
+            json!({ "event": "started", "work": 4, "pid": 2 }),
+            json!({ "event": "detached", "work": 4, "completion": "owed-to-requesting-harness" }),
+        ],
+    );
+    let value = result(&agent_bash(
+        dir.path(),
+        &socket,
+        &["run", "--delivery", "async", "--", "sh", "-c", "exit 3"],
+    ));
+    assert_eq!(value["outcome"], "running", "{value}");
+    assert_eq!(value["delivery_mode"], "async");
+    assert!(
+        value["wait"].is_null(),
+        "no wait is invented for a running command"
+    );
+    assert_eq!(value["output"]["reference"], "rv1w:r1:4");
+    assert_eq!(
+        value["completion"]["delivery"],
+        "owed-to-requesting-harness"
+    );
+    assert_eq!(owner.connections(), 1);
+    let request = owner.requests.lock().unwrap()[0].clone();
+    assert_eq!(request["delivery"], "async");
+    assert_eq!(request["argv"], json!(["sh", "-c", "exit 3"]));
+}
+
+#[test]
 fn a_lost_reply_after_acceptance_is_unknown_and_not_retried() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("bash.sock");
@@ -147,18 +181,14 @@ fn a_lost_reply_after_acceptance_is_unknown_and_not_retried() {
 }
 
 #[test]
-fn async_default_and_legacy_options_are_refused_without_contacting_the_owner() {
+fn implicit_delivery_and_legacy_options_are_refused_without_contacting_the_owner() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("bash.sock");
     let owner = Owner::start(&socket, stages());
     for (args, reason) in [
         (
-            &["run", "--delivery", "async", "--", "true"][..],
-            "async-delivery-unavailable-under-root-v1",
-        ),
-        (
             &["run", "--", "true"][..],
-            "async-delivery-unavailable-under-root-v1",
+            "delivery-required-under-root-v1",
         ),
         (
             &[

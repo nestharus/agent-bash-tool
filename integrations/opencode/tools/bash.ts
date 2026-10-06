@@ -862,14 +862,27 @@ async function rootV1Output(args: any, ownerSessionId: string): Promise<string> 
   }
 }
 
-async function rootV1Execute(admission: CommandAdmission, ownerSessionId: string, workdir?: string): Promise<string> {
+async function rootV1Execute(
+  admission: CommandAdmission,
+  ownerSessionId: string,
+  workdir?: string,
+  requestedDelivery?: string,
+): Promise<string> {
   if (admission.agentDispatch) {
-    return "Root v1 refused child-agent dispatch: it needs asynchronous completion, which root v1 does not serve. " +
+    return "Root v1 refused child-agent dispatch: nested agent registration is not served by root v1. " +
       "Nothing was run; it was not converted to a synchronous run."
   }
-  if (admission.kind === "direct" && admission.delivery === "async") {
-    return "Root v1 refused by bash-adapter (async-delivery-unavailable-under-root-v1): synchronous commands only. " +
-      "Nothing was run; no other route was tried and the request was not converted."
+  if (admission.kind === "direct" && requestedDelivery !== undefined) {
+    // An explicit agent-bash run keeps its own --delivery; a different
+    // tool-level delivery is refused rather than silently overridden.
+    const separator = admission.argv.indexOf("--")
+    const options = admission.argv.slice(2, separator < 0 ? admission.argv.length : separator)
+    const at = options.findIndex(word => word === "--delivery" || word.startsWith("--delivery="))
+    const explicit = at < 0 ? undefined : options[at].startsWith("--delivery=") ? options[at].slice(11) : options[at + 1]
+    if (explicit !== undefined && explicit !== requestedDelivery) {
+      return `Root v1 refused by bash-adapter (delivery-conflict): the command names --delivery ${explicit} ` +
+        `but the tool call asked for ${requestedDelivery}. Nothing was run; the request was not converted.`
+    }
   }
   let args: string[]
   if (admission.kind === "unsupported") {
@@ -886,7 +899,45 @@ async function rootV1Execute(admission: CommandAdmission, ownerSessionId: string
     throw new Error(`root v1 result unresolved: ${error instanceof Error ? error.message : String(error)}; ` +
       "the command may have run; do not replay.")
   }
-  return rootV1Response(run)
+  return rootV1AsyncResult(run) ?? rootV1Response(run)
+}
+
+// A background (`delivery: "async"`) root v1 result, or undefined when the
+// result is not one (the sync renderer then validates it). `running` means
+// durably accepted and started only: no wait, exit or output is known here.
+function rootV1AsyncResult(run: ProcessResult): string | undefined {
+  if (run.exitCode !== 0) return undefined
+  let value: any
+  try {
+    value = JSON.parse(run.stdout)
+  } catch {
+    return undefined
+  }
+  if (value?.result_surface !== ROOT_V1_SURFACE || value.version !== 1 || value.delivery_mode !== "async") return undefined
+  const stages = `stages: ${Array.isArray(value.stages) ? value.stages.map(rootV1Stage).join(" -> ") || "none" : "invalid"}`
+  const faults = Array.isArray(value.faults) && value.faults.length ? `\nfaults: ${value.faults.join("; ")}` : ""
+  const reference = typeof value.output?.reference === "string" ? value.output.reference : undefined
+  switch (value.outcome) {
+    case "running":
+      if (value.wait !== null || value.effects_possible !== true || !reference) {
+        throw rootV1Unresolved("async result inconsistent", run)
+      }
+      return `Root v1 background work accepted and started (reference=${reference}); it is still running. ` +
+        "Its end (wait status, output facts and retained output identity) will arrive later in this conversation as a " +
+        "separate input; do not poll for it. Nothing about its exit or output is known yet. " +
+        `Retained bytes can be requested with {output_identity: "${reference}"} once sealed.\n${stages}`
+    case "refused":
+      return `Root v1 refused background work (${value.refusal?.reason}). Nothing was run; ` +
+        `no other route was tried and the request was not converted to synchronous.\n${stages}`
+    case "not-started":
+      return `Root v1 accepted the background command, then reported a positive no-start; nothing was run.\n${stages}${faults}`
+    case "unknown":
+      return `Root v1 background outcome unknown (${value.meaning}): the command may be running or may have run. ` +
+        `Effects possible: yes; retry safe: no. Do not replay; a completion may or may not arrive.` +
+        `${reference ? ` reference=${reference}` : ""}\n${stages}${faults}`
+    default:
+      throw rootV1Unresolved("async result outcome invalid", run)
+  }
 }
 
 function noReplayResponse(dispatch: RunDispatch): string {
@@ -1199,8 +1250,9 @@ export default tool({
     "A synchronous call can be detached externally without terminating its workload. Exact " +
     "`agent-bash list [--all] [--json]` observations and bounded standalone sleeps run attached without creating a " +
     `workload handle. Leading agent-runner commands are pinned to ${AGENTS}. An optional workdir sets the supervised ` +
-    "process working directory. Inside a root v1 context, commands run synchronously through that root only; " +
-    "asynchronous delivery, child-agent dispatch and legacy handle/controls are refused there, not converted; " +
+    "process working directory. Inside a root v1 context, commands run through that root only: synchronously by " +
+    "default, or with delivery \"async\" as background work whose end arrives later in this conversation as a " +
+    "separate input (do not poll); child-agent dispatch and legacy handle/controls are refused there, not converted; " +
     "standalone sleeps also use that root's command result. Use output_identity with output_offset/output_length to read " +
     "retained output after inline limits; accept_output records explicit exact local acceptance of that identity.",
   args: {
@@ -1223,7 +1275,7 @@ export default tool({
       const control = words && [AGENT_BASH, "agent-bash"].includes(words[0]) &&
         ["list", "cancel", "detach", "status", "snapshot", "mode", "accept-output", "completion-reconcile-v2"].includes(words[1])
       if (args.handle || control) {
-        return "Root v1 refused legacy handle/control request: only synchronous commands are supported. " +
+        return "Root v1 refused legacy handle/control request: only explicit synchronous or asynchronous runs and retained-output requests are supported. " +
           "No legacy state was accessed; no other route was tried."
       }
     }
@@ -1250,7 +1302,7 @@ export default tool({
       return runStandaloneSleep(sleepMilliseconds)
     }
     if (rootV1Context()) {
-      const result = await rootV1Execute(admission, context.sessionID, args.workdir)
+      const result = await rootV1Execute(admission, context.sessionID, args.workdir, args.delivery)
       return context.abort.aborted ? `${result}\nTool abort: root v1 has no cancel; the work was not cancelled.` : result
     }
     const binding = ensureLiveSessionBinding(context.sessionID)

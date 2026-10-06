@@ -3,9 +3,11 @@ configured owner socket standing in for the root's Bash ingress:
 
   AGENT_BASH_TEST_BIN=/abs/agent-bash BUN=/abs/bun python3 tests/test_opencode_root_v1.py
 
-This shows the tool result built from agent-bash's root-v1 surface and that
-async and child-agent requests are refused without contacting the owner. It
-is not a witness of an actual root owner or root PID 1.
+This shows the tool result built from agent-bash's root-v1 surface, that
+async requests reach the owner only as explicit background work, and that
+child-agent and conflicting-delivery requests are refused without
+contacting the owner. It is not a witness of an actual root owner or root
+PID 1.
 """
 import base64
 import json
@@ -42,6 +44,8 @@ OUTPUT = {'event': 'output', 'b64': 'aGkKZXJyCg=='}
 CLOSED = {'event': 'output-closed', 'bytes': 7}
 END = {'event': 'end', 'status': 'code:3', 'observer': 'work-pid1-wait',
        'output': {'state': 'closed', 'bytes': 7}}
+ASYNC_ACCEPTED = {'event': 'accepted', 'work': 4, 'root_id': 'r1', 'durable': True, 'delivery': 'async'}
+DETACHED = {'event': 'detached', 'work': 4, 'completion': 'owed-to-requesting-harness'}
 
 
 class Owner:
@@ -248,30 +252,45 @@ class RootV1Adapter(unittest.TestCase):
         self.assertIn('Nothing was run; no other route was tried', reply['result'])
         self.assertEqual(len(requests), 1)
 
-    def test_async_and_child_dispatch_are_refused_without_contacting_the_owner(self):
-        reply, requests = self.call([ACCEPTED], {'command': 'true', 'delivery': 'async'})
-        self.assertIn('Root v1 refused by agent-bash (async-delivery-unavailable-under-root-v1)', reply['result'])
-        self.assertIn('not converted', reply['result'])
+    def test_tool_async_is_background_work_and_child_dispatch_is_refused(self):
+        reply, requests = self.call([ASYNC_ACCEPTED, STARTED, DETACHED], {'command': 'true', 'delivery': 'async'})
+        self.assertIn('background work accepted and started (reference=rv1w:r1:4)', reply['result'])
+        self.assertIn('arrive later in this conversation', reply['result'])
+        self.assertIn('Nothing about its exit or output is known yet', reply['result'])
+        self.assertEqual([(r['argv'], r.get('delivery')) for r in requests], [(['bash', '-lc', 'true'], 'async')])
         reply, more = self.call([ACCEPTED], {'command': 'agents run --prompt x'})
         self.assertIn('Root v1 refused child-agent dispatch', reply['result'])
-        self.assertEqual(requests + more, [])
+        self.assertEqual(more, [])
 
-    def test_direct_async_spellings_and_tool_async_never_execute_as_sync(self):
-        for command, delivery in [
-            ('agent-bash run --delivery async -- true', None),
-            ('agent-bash run --delivery=async -- true', 'sync'),
-            (f"'{AGENT_BASH}' run --delivery 'async' -- true", 'sync'),
-            ('agent-bash run --delivery sync -- true', 'async'),
-            ('agent-bash run -- true', 'async'),
+    def test_async_owner_refusal_and_lost_detach_are_not_running(self):
+        refused = {'event': 'refused', 'reason': 'async-unavailable: registered child'}
+        reply, _ = self.call([refused], {'command': 'true', 'delivery': 'async'})
+        self.assertIn('Root v1 refused background work (async-unavailable: registered child)', reply['result'])
+        reply, requests = self.call([ASYNC_ACCEPTED, STARTED], {'command': 'true', 'delivery': 'async'})
+        self.assertIn('background outcome unknown (accepted-completion-delivery-unknown)', reply['result'])
+        self.assertIn('Do not replay', reply['result'])
+        self.assertEqual(len(requests), 1)
+
+    def test_direct_async_spellings_run_async_and_conflicts_are_refused(self):
+        for command, delivery, expected in [
+            ('agent-bash run --delivery async -- true', None, 'async'),
+            ('agent-bash run -- true', 'async', 'async'),
+            ('agent-bash run --delivery=async -- true', 'sync', None),
+            (f"'{AGENT_BASH}' run --delivery 'async' -- true", 'sync', None),
+            ('agent-bash run --delivery sync -- true', 'async', None),
         ]:
             with self.subTest(command=command, delivery=delivery):
                 args = {'command': command}
                 if delivery:
                     args['delivery'] = delivery
-                reply, requests = self.call([ACCEPTED, STARTED, OUTPUT, CLOSED, END], args)
-                self.assertIn('async-delivery-unavailable-under-root-v1', reply['result'])
-                self.assertIn('not converted', reply['result'])
-                self.assertEqual(requests, [])
+                reply, requests = self.call([ASYNC_ACCEPTED, STARTED, DETACHED], args)
+                if expected is None:
+                    self.assertIn('delivery-conflict', reply['result'])
+                    self.assertIn('not converted', reply['result'])
+                    self.assertEqual(requests, [])
+                else:
+                    self.assertIn('background work accepted and started', reply['result'])
+                    self.assertEqual([r.get('delivery') for r in requests], [expected])
 
     def test_explicit_sync_still_reaches_owner_with_workload_mode_words_untouched(self):
         reply, requests = self.call([ACCEPTED, STARTED, OUTPUT, CLOSED, END],
