@@ -23,7 +23,8 @@ completion returns synchronously in-band or asynchronously through the agent mai
   JSON object (`result_surface: "agent-bash-root-v1"`) carrying the root's stage
   lines and the wait status only from its work PID 1 wait. The requester drains
   and validates the full output stream but retains at most its first 64 KiB;
-  omitted bytes are discarded, not spilled or recoverable here. A truncated
+  omitted bytes are absent from this response; `output.retained` describes
+  owner retention separately (identity, state, bytes, received count and losses). A truncated
   UTF-8 prefix omits an incomplete final character rather than replacing bytes.
   `output.bytes` counts all valid received bytes, `presented_bytes` counts the
   base64 payload, and `omitted_bytes` is their difference. Delivery is `partial`
@@ -37,16 +38,42 @@ completion returns synchronously in-band or asynchronously through the agent mai
   for the receipt under OpenCode 1.18.30's default 50 KiB / 2,000-line generic
   truncator. Hex uses two rendered bytes per stream byte; a UTF-8 cut omits
   an incomplete final character. On loss, the display separately reports
-  received, producer-carried/discarded and OpenCode-presented/additionally-omitted
+  received, producer-carried/omitted and OpenCode-presented/additionally-omitted
   **stream bytes**, plus the payload's rendered UTF-8 byte count. Additional
-  presentation omissions are not retained for recovery. This is a default-limit
-  presentation budget, not a guarantee for smaller configured limits, oversized
-  diagnostics or later context compaction. Root v1 has no handle, status or cancel.
-  **Pairing required:** Runner's Claude `renderRootV1` must understand the
-  presented/total count distinction before using this requester for large
-  output; its current length-equals-total check rejects partial results.
-  Later async delivery must retain its own bounded payload and metadata if
-  needed: this synchronous requester keeps no remainder or durable prefix.
+  presentation omissions can be recovered through owner retention when a sealed
+  identity is available. This is a default-limit presentation budget, not a
+  guarantee for smaller configured limits, oversized diagnostics or later context
+  compaction. Root v1 has no legacy handle, status or cancel.
+  **Pairing required:** both the Runner owner/Claude receiver and this CLI/OpenCode
+  adapter must support native retained output. Source availability is not installation.
+  The owner retains at most 64 MiB per Bash run and 512 MiB of logical output bytes
+  per root, in private owner-written files. Bound/write/stream/sync loss is explicit;
+  `complete` is distinct from `partial` and `unsealed`. Sync-failed partial seals do
+  not prove storage/power-crash persistence. On takeover, received totals and any
+  pre-takeover gap may be unknown. Retention ends with deliberate root/store retirement.
+  A live harness reads only its originating harness's Bash works through the same
+  positively attributed ingress, never by supplying a path or claiming a root marker.
+  Native CLI operations (one bounded JSON result, no automatic retry):
+  - `agent-bash native-output 'rv1o:ROOT:WORK:BYTES:SHA256' --offset 0 --length 1024`
+    returns exact Base64 bytes and `next_offset`/`eof`; at most 256 KiB per request.
+  A `run` also exposes `output.reference` (`rv1w:ROOT:WORK`) as soon as its
+  accepted work is known. `native-output` accepts that reference to discover the
+  current seal after an unknown end/owner change; it does not infer availability,
+  recreate work or accept unnamed bytes. Only the returned `rv1o` identity can be
+  used for exact acceptance.
+  - `agent-bash native-accept 'rv1o:ROOT:WORK:BYTES:SHA256'` explicitly accepts precisely
+    those retained bytes locally. Repeats return the first durable receipt. A lost
+    reply leaves acceptance unconfirmed; it never creates a receipt from inline text.
+  Both supported Bash tools expose `output_identity`, optional `output_offset` and
+  `output_length`, and `accept_output: true` for explicit local acceptance (no range
+  arguments on accept). Use these instead of `command`/`handle`/`workdir`/`delivery`.
+  OpenCode ranges are 1..16384 bytes (default 16384); Claude ranges are 1..1024
+  (default 1024). Binary/NUL/invalid UTF-8 is losslessly shown as hex; OpenCode also
+  uses hex for newline-heavy ranges to fit its default line limit. Continue at
+  `next_offset` to retrieve the whole named retained output. Acceptance is the
+  harness's explicit statement about that identity, not evidence the model read it,
+  an input ACK, processing, remote settlement or physical drain. Wait status remains
+  the separate `run` result's true work-PID1 observation.
 - **Paired root ownership.** When agent-runner marks a current paired tree and supplies both its
   completion endpoint and a `root-authority-v1` grant, `run` durably submits
   `original-work-v1` to that existing root

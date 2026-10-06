@@ -23,7 +23,7 @@ ADAPTER = Path(__file__).resolve().parents[1] / 'integrations/opencode/tools/bas
 BUN = shutil.which(os.environ.get('BUN', 'bun'))
 AGENT_BASH = os.environ.get('AGENT_BASH_TEST_BIN')
 DRIVER = '''import { mock } from "bun:test"
-const tool = Object.assign(d => d, { schema: { string: () => ({ describe: () => ({ optional: () => ({}) }) }) } })
+const tool = Object.assign(d => d, { schema: Object.fromEntries(["string", "number", "boolean"].map(k => [k, () => ({ describe: () => ({ optional: () => ({}) }) })])) })
 mock.module("@opencode-ai/plugin", () => ({ tool }))
 const adapter = (await import(process.argv[2])).default
 try {

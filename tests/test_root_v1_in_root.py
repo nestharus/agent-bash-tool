@@ -28,7 +28,7 @@ BUN = shutil.which(os.environ.get('BUN', 'bun'))
 AGENT_BASH = os.environ.get('AGENT_BASH_TEST_BIN')
 RUNNER = Path(os.environ.get('ROOT_V1_RUNNER_BIN_DIR', '/nonexistent'))
 DRIVER = '''import { mock } from "bun:test"
-const tool = Object.assign(d => d, { schema: { string: () => ({ describe: () => ({ optional: () => ({}) }) }) } })
+const tool = Object.assign(d => d, { schema: Object.fromEntries(["string", "number", "boolean"].map(k => [k, () => ({ describe: () => ({ optional: () => ({}) }) })])) })
 mock.module("@opencode-ai/plugin", () => ({ tool }))
 const adapter = (await import(process.argv[2])).default
 let command = process.argv[3]
@@ -66,6 +66,7 @@ class InRoot(unittest.TestCase):
             wrapper.chmod(stat.S_IRWXU)
             spec = {'store': str(scratch / 'root'), 'intent': {
                 'outage_closure_cap': 3, 'delivery_attempt_cap': 10, 'cwd': '/',
+                'workload': {'isolation': 'unprivileged-userns'},
                 'harnesses': [{'id': 'a', 'argv': [str(peer), '--state', str(scratch / 'a.json'),
                                                    '--exit-after-acks', '3'],
                                'messages': [f'bash:{SYNC}', 'bash:@async true', 'bash:agents run --prompt x']}]}}
@@ -92,7 +93,8 @@ class InRoot(unittest.TestCase):
             terminal = seen[-1]
             self.assertEqual(terminal['status'], 'ended', terminal)
             self.assertEqual(terminal['bash'], {'accepted': 1, 'refused': 0, 'not_run': 0,
-                                                'ended': 1, 'end_unknown': 0, 'open': 0})
+                                                'ended': 1, 'end_unknown': 0, 'open': 0,
+                                                'output_open': 0, 'output_requests': 0})
             accepted = [e for e in seen if e.get('event') == 'bash-accepted']
             self.assertEqual(len(accepted), 1)
             self.assertEqual(accepted[0]['harness'], 'a')

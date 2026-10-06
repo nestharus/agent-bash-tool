@@ -85,6 +85,16 @@ enum Command {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
+    /// Read a named native root output range (no legacy state or path access).
+    NativeOutput {
+        identity: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long, default_value_t = 1024)]
+        length: u64,
+    },
+    /// Explicitly accept exactly the named retained bytes locally.
+    NativeAccept { identity: String },
     /// Internal completion-only source recovery; cannot launch or register work.
     CompletionReconcileV2 {
         #[arg(long)]
@@ -214,6 +224,16 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
     if let Some(ingress) = root_v1::selected() {
         return match cli.command {
             command @ Command::Run { .. } => root_v1_run(&ingress, command),
+            Command::NativeOutput {
+                identity,
+                offset,
+                length,
+            } => write_root_result(root_v1::retained(
+                &ingress, &identity, false, offset, length,
+            )),
+            Command::NativeAccept { identity } => {
+                write_root_result(root_v1::retained(&ingress, &identity, true, 0, 0))
+            }
             _ => Err(AppError::new(
                 EX_UNAVAILABLE,
                 "agent-bash: root v1 refuses legacy controls; only synchronous run is supported; no legacy state was accessed",
@@ -231,9 +251,22 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
         println!("{result}");
         return Ok(());
     }
+    if matches!(
+        cli.command,
+        Command::NativeOutput { .. } | Command::NativeAccept { .. }
+    ) {
+        return Err(AppError::new(
+            EX_UNAVAILABLE,
+            "agent-bash: native output requires a current root v1 context",
+        ));
+    }
     validate_guard(&guard)?;
     match cli.command {
         Command::CompletionReconcileV2 { .. } => unreachable!(),
+        Command::NativeOutput { .. } | Command::NativeAccept { .. } => Err(AppError::new(
+            EX_UNAVAILABLE,
+            "agent-bash: native output requires a current root v1 context",
+        )),
         Command::Run {
             delivery,
             completion_scope,
@@ -303,6 +336,10 @@ fn root_v1_run(ingress: &std::ffi::OsStr, command: Command) -> Result<(), AppErr
             argv: &argv,
         },
     );
+    write_root_result(result)
+}
+
+fn write_root_result(result: serde_json::Value) -> Result<(), AppError> {
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "{result}")
         .and_then(|()| stdout.flush())
