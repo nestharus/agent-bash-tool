@@ -835,27 +835,21 @@ enum RootExecutionGrant {
 
 fn await_root_execution_grant(control_fd: RawFd) -> io::Result<RootExecutionGrant> {
     write_control_byte_wait(control_fd, b'P')?;
-    loop {
-        match read_control_byte_wait(control_fd)? {
-            b'G' => return Ok(RootExecutionGrant::Granted),
-            b'C' => {
-                return Ok(RootExecutionGrant::Cancelled(
-                    CancellationCause::ExplicitRequest,
-                ));
-            }
-            b'O' => return Ok(RootExecutionGrant::Cancelled(CancellationCause::OwnerExit)),
-            b'K' => {
-                return Ok(RootExecutionGrant::Cancelled(
-                    CancellationCause::CausalParent,
-                ));
-            }
-            b'F' => {
-                return Ok(RootExecutionGrant::Cancelled(
-                    CancellationCause::RootAuthorityLost,
-                ));
-            }
-            _ => return Err(io::Error::other("invalid root execution-grant phase")),
-        }
+    // The I/O helpers wait indefinitely for readiness and retry interruptions.
+    // This boundary consumes exactly one authority decision; unknown phases fail.
+    match read_control_byte_wait(control_fd)? {
+        b'G' => Ok(RootExecutionGrant::Granted),
+        b'C' => Ok(RootExecutionGrant::Cancelled(
+            CancellationCause::ExplicitRequest,
+        )),
+        b'O' => Ok(RootExecutionGrant::Cancelled(CancellationCause::OwnerExit)),
+        b'K' => Ok(RootExecutionGrant::Cancelled(
+            CancellationCause::CausalParent,
+        )),
+        b'F' => Ok(RootExecutionGrant::Cancelled(
+            CancellationCause::RootAuthorityLost,
+        )),
+        _ => Err(io::Error::other("invalid root execution-grant phase")),
     }
 }
 
@@ -4275,11 +4269,80 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn root_worker_never_executes_before_an_explicit_grant() {
+    fn prepared_worker_maps_explicit_grant() {
         assert!(matches!(
             exercise_root_grant(b'G'),
             RootExecutionGrant::Granted
         ));
+    }
+
+    #[test]
+    fn prepared_worker_waits_for_nonblocking_authority_decision() {
+        // root-original-work-v1 requires indefinite waiting after P. This
+        // observes the decision boundary, not workload dispatch or publication.
+        let (worker, mut authority) = UnixStream::pair().expect("root control pair");
+        worker.set_nonblocking(true).expect("nonblocking worker");
+        authority
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            send.send(await_root_execution_grant(worker.as_raw_fd()))
+                .unwrap();
+        });
+        let mut prepared = [0];
+        authority.read_exact(&mut prepared).expect("prepared phase");
+        assert_eq!(prepared, *b"P");
+        let withheld = receive.recv_timeout(Duration::from_millis(100));
+        // Always release the waiter before assertions so even a failed control
+        // does not leave a pending thread holding its socket.
+        authority.write_all(b"G").expect("authority grant");
+        let outcome = receive.recv_timeout(Duration::from_secs(2));
+        drop(authority);
+        thread.join().unwrap();
+        assert!(matches!(
+            withheld,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(outcome, Ok(Ok(RootExecutionGrant::Granted))));
+    }
+
+    #[test]
+    fn prepared_worker_rejects_unknown_phase_and_authority_eof() {
+        for decision in [Some(b'?'), None] {
+            let (worker, mut authority) = UnixStream::pair().expect("root control pair");
+            worker.set_nonblocking(true).expect("nonblocking worker");
+            authority
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                send.send(await_root_execution_grant(worker.as_raw_fd()))
+                    .unwrap();
+            });
+            let mut prepared = [0];
+            authority.read_exact(&mut prepared).expect("prepared phase");
+            assert_eq!(prepared, *b"P");
+            if let Some(byte) = decision {
+                authority.write_all(&[byte]).expect("invalid decision");
+            } else {
+                authority.shutdown(std::net::Shutdown::Write).unwrap();
+            }
+            let outcome = receive.recv_timeout(Duration::from_secs(2));
+            drop(authority);
+            thread.join().unwrap();
+            let Ok(Err(error)) = outcome else {
+                panic!("invalid or lost authority must not grant or keep waiting");
+            };
+            assert_eq!(
+                error.kind(),
+                if decision.is_some() {
+                    io::ErrorKind::Other
+                } else {
+                    io::ErrorKind::UnexpectedEof
+                }
+            );
+        }
     }
 
     #[test]

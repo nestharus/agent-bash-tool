@@ -60,6 +60,10 @@ fn confirm_role(role: &Role, pid: i32) -> bool {
     if role.pid.load(Ordering::SeqCst) != pid {
         return false;
     }
+    // fetch_update is stable on the supported Rust 1.88/1.92 compilers;
+    // its try_update rename is not. Keep the checked SeqCst update and the
+    // previous-value contract, including refusal rather than reuse on overflow.
+    #[allow(deprecated)]
     let Ok(previous) = role
         .challenge
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {

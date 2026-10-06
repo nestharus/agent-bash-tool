@@ -37,12 +37,10 @@ pub(crate) fn private_case() -> bool {
                 while !done.load(Ordering::Relaxed) {
                     if let Ok(children) = fs::read_to_string("/proc/1/task/1/children") {
                         for word in children.split_whitespace() {
-                            if let Ok(pid) = word.parse::<libc::pid_t>() {
-                                if pid != child_pid {
-                                    unsafe {
-                                        libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG)
-                                    };
-                                }
+                            if let Ok(pid) = word.parse::<libc::pid_t>()
+                                && pid != child_pid
+                            {
+                                unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
                             }
                         }
                     }

@@ -89,17 +89,12 @@ fn broker_socket() -> Option<std::path::PathBuf> {
     installed.exists().then(|| installed.to_path_buf())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ListenerPolicy {
+    #[default]
     ResponseOnly,
     Notify,
-}
-
-impl Default for ListenerPolicy {
-    fn default() -> Self {
-        Self::ResponseOnly
-    }
 }
 
 impl ListenerPolicy {
@@ -823,7 +818,7 @@ pub(crate) fn uuid_bytes(value: &str) -> Result<[u8; 16], String> {
         return Err("invalid UUID".into());
     }
     let mut bytes = [0u8; 16];
-    for (index, part) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (index, part) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         bytes[index] =
             u8::from_str_radix(std::str::from_utf8(part).map_err(|e| e.to_string())?, 16)
                 .map_err(|e| e.to_string())?;
