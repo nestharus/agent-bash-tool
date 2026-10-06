@@ -11,6 +11,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
@@ -128,6 +129,46 @@ class RootV1Adapter(unittest.TestCase):
         self.assertFalse(temp.exists(), 'owned fixture removed')
         return result, requests
 
+    def assert_output_view(self, result, payload, carried, mode):
+        # Goal C / U40 J1-B: distinguish producer facts from the literal inline
+        # prefix. The retained OpenCode 1.18.30 boundary is 50 KiB / 2000 lines;
+        # neither the adapter's payload budget nor its chosen cut is an oracle.
+        self.assertLessEqual(len(result.encode()), 50 * 1024)
+        self.assertLessEqual(len(result.split('\n')), 2000)
+        self.assertNotIn('Full output saved', result)
+        self.assertNotIn('tool call succeeded', result)
+        header, body = result.split('---\n', 1)
+        actual = body.encode() if mode == 'utf8' else bytes.fromhex(body)
+        self.assertEqual(body, actual.decode() if mode == 'utf8' else actual.hex())
+        self.assertEqual(actual, payload[:len(actual)], 'literal stream prefix')
+        self.assertLessEqual(len(actual), carried)
+        if carried:
+            self.assertGreater(len(actual), 0, 'payload remains inline')
+        marker = re.search(r'--- output \(stderr joined; (\d+) bytes(?: shown inline)?, '
+                           + mode + r'\) $', header)
+        self.assertIsNotNone(marker)
+        self.assertEqual(int(marker[1]), len(actual), 'shown matches actual stream bytes')
+        if len(payload) > len(actual):
+            producer = re.search(r'Producer output: (\d+) received stream bytes; '
+                                 r'(\d+) stream bytes carried; (\d+) bytes omitted '
+                                 r'and discarded \(not retained\)', header)
+            presentation = re.search(r'OpenCode presentation: first (\d+) of (\d+) '
+                                     r'producer-carried stream bytes shown inline; (\d+) '
+                                     r'additional stream bytes omitted here \(not retained '
+                                     r'for recovery\); (\d+) rendered UTF-8 bytes', header)
+            self.assertIsNotNone(producer, 'producer layer and stream-byte units')
+            self.assertIsNotNone(presentation, 'presentation layer and distinct rendered units')
+            self.assertEqual(tuple(map(int, producer.groups())),
+                             (len(payload), carried, len(payload) - carried))
+            self.assertEqual(tuple(map(int, presentation.groups())),
+                             (len(actual), carried, carried - len(actual), len(body.encode())))
+            self.assertIn('output partial', header)
+            self.assertNotIn('output complete', header)
+        else:
+            self.assertEqual(actual, payload, 'complete output includes the entire payload')
+            self.assertIn('output complete', header)
+            self.assertNotIn('omitted', header)
+
     def test_sync_command_returns_waited_status_and_output_from_root_stages(self):
         reply, requests = self.call([ACCEPTED, STARTED, OUTPUT, CLOSED, END], {'command': 'echo hi; exit 3'})
         result = reply['result']
@@ -160,18 +201,17 @@ class RootV1Adapter(unittest.TestCase):
         large, next_result = reply['results']
         self.assertIn('exited with code 2', large)
         self.assertIn('output partial; full stream counted, closed, matched by the end', large)
-        self.assertIn('showing the first 65536 of 33554432 received bytes', large)
+        self.assert_output_view(large, b'x' * 33554432, 65536, 'utf8')
         self.assertIn('33488896 bytes omitted and discarded (not retained)', large)
         self.assertIn('output-closed(bytes=33554432)', large)
         self.assertNotIn('output complete', large)
-        self.assertTrue(large.endswith('x' * 65536))
-        self.assertLess(len(large), 66560)
+        self.assertIn('output(chunks=2048, bytes=33554432)', large)
         self.assertIn('output complete', next_result)
         self.assertTrue(next_result.endswith('---\nnext'))
         self.assertEqual(len(requests), 2)
 
     def test_utf8_boundary_binary_and_zero_output(self):
-        for payload, shown, mode in [
+        for payload, carried, mode in [
             ('€'.encode() * 22000, 65535, 'utf8'),
             (b'\x00\xff' * 33000, 65536, 'hex'),
             (b'', 0, 'utf8'),
@@ -183,11 +223,10 @@ class RootV1Adapter(unittest.TestCase):
                           dict(CLOSED, bytes=total),
                           dict(END, status='code:0', output={'state': 'closed', 'bytes': total})]
                 result = self.call(events, {'command': 'true'})[0]['result']
-                self.assertIn(f'{shown} bytes', result)
+                self.assert_output_view(result, payload, carried, mode)
                 self.assertIn(f', {mode})', result)
-                body = payload[:shown].decode() if mode == 'utf8' else payload[:shown].hex()
-                self.assertTrue(result.endswith('---\n' + body))
-                self.assertLess(len(result), 132100)
+                self.assertIn('exited with code 0 (code:0, observer work-pid1-wait)', result)
+                self.assertIn(f'output-closed(bytes={total})', result)
 
     def test_output_fault_keeps_the_wait_but_says_delivery_is_unproven(self):
         bad = dict(CLOSED, bytes=6)

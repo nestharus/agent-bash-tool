@@ -703,6 +703,35 @@ function rootV1Stage(stage: any): string {
   return stage?.reason === undefined ? name : `${name}(${stage.reason})`
 }
 
+// OpenCode 1.18.30 applies its generic 50 KiB / 2000-line truncator to
+// every custom-tool return. Leave room for the ordinary root receipt and
+// abort note; budget rendered bytes (hex doubles stream bytes), not JS chars.
+const ROOT_V1_PAYLOAD_RENDERED_BYTES = 48 * 1024
+const ROOT_V1_PAYLOAD_LINES = 1900
+
+function rootV1Utf8Prefix(bytes: Buffer): Buffer {
+  let prefix = bytes.subarray(0, ROOT_V1_PAYLOAD_RENDERED_BYTES)
+  // The carried stream is valid UTF-8, so only the final codepoint can be
+  // incomplete after the byte cut. Omit it, never insert replacement bytes.
+  while (!Buffer.from(prefix.toString("utf8"), "utf8").equals(prefix)) {
+    prefix = prefix.subarray(0, prefix.length - 1)
+  }
+  return prefix
+}
+
+function rootV1InlinePrefix(bytes: Buffer): { bytes: Buffer; utf8: boolean; text: string } {
+  const decoded = bytes.toString("utf8")
+  const utf8 = !bytes.includes(0) && Buffer.from(decoded, "utf8").equals(bytes)
+  if (!utf8) {
+    const prefix = bytes.subarray(0, ROOT_V1_PAYLOAD_RENDERED_BYTES / 2)
+    return { bytes: prefix, utf8, text: prefix.toString("hex") }
+  }
+  // Splitting with a limit keeps a literal prefix, including intervening LFs,
+  // but excludes the LF that would introduce a line beyond the budget.
+  const text = rootV1Utf8Prefix(bytes).toString("utf8").split("\n", ROOT_V1_PAYLOAD_LINES).join("\n")
+  return { bytes: Buffer.from(text, "utf8"), utf8, text }
+}
+
 // Renders only what the root's stage lines established. The command's wait
 // status is read from the result object, never from agent-bash's exit code.
 function rootV1Response(run: ProcessResult): string {
@@ -737,14 +766,17 @@ function rootV1Response(run: ProcessResult): string {
   }
   const stages = `stages: ${value.stages.map(rootV1Stage).join(" -> ") || "none"}`
   const faults = value.faults.length ? `\nfaults: ${value.faults.join("; ")}` : ""
-  const text = bytes.toString("utf8")
-  const utf8 = !bytes.includes(0) && Buffer.from(text, "utf8").equals(bytes)
-  const partial = omitted > 0
-    ? `\nPartial output: showing the first ${presented} of ${output.bytes} received bytes; ` +
-      `${omitted} bytes omitted and discarded (not retained).`
+  const inline = rootV1InlinePrefix(bytes)
+  const additionallyOmitted = presented - inline.bytes.length
+  const partial = omitted > 0 || additionallyOmitted > 0
+    ? `\nProducer output: ${output.bytes} received stream bytes; ${presented} stream bytes carried; ` +
+      `${omitted} bytes omitted and discarded (not retained).` +
+      `\nOpenCode presentation: first ${inline.bytes.length} of ${presented} producer-carried stream bytes shown inline; ` +
+      `${additionallyOmitted} additional stream bytes omitted here (not retained for recovery); ` +
+      `${Buffer.byteLength(inline.text)} rendered UTF-8 bytes.`
     : ""
-  const body = partial + `\n--- output (stderr joined; ${bytes.length} bytes${omitted ? " shown" : ""}, ${utf8 ? "utf8" : "hex"}) ---\n` +
-    (utf8 ? text : bytes.toString("hex"))
+  const body = partial + `\n--- output (stderr joined; ${inline.bytes.length} bytes` +
+    `${omitted || additionallyOmitted ? " shown inline" : ""}, ${inline.utf8 ? "utf8" : "hex"}) ---\n` + inline.text
   switch (value.outcome) {
     case "refused":
       return `Root v1 refused by ${value.refusal?.by} (${value.refusal?.reason})` +
@@ -761,7 +793,7 @@ function rootV1Response(run: ProcessResult): string {
         ? `exited with code ${value.wait.exit.code}`
         : `signaled with signal ${value.wait.exit?.signal}`
       const delivery = value.outcome === "ended"
-        ? omitted > 0
+        ? omitted > 0 || additionallyOmitted > 0
           ? "output partial; full stream counted, closed, matched by the end"
           : "output complete (counted, closed, matched by the end)"
         : "output delivery unproven: the command ran and its wait is known, but the output below may be incomplete; do not replay"
