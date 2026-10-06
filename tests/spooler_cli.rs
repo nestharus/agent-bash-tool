@@ -1122,7 +1122,9 @@ fn adapter_driver_source() -> &'static str {
 const optional = () => ({})
 const describe = () => ({ optional })
 const string = () => ({ describe })
-const tool = Object.assign((definition) => definition, { schema: { string } })
+const number = () => ({ describe })
+const boolean = () => ({ describe })
+const tool = Object.assign((definition) => definition, { schema: { string, number, boolean } })
 
 mock.module("@opencode-ai/plugin", () => ({ tool }))
 

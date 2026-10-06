@@ -2,7 +2,8 @@ import { mock } from "bun:test"
 import { writeFileSync } from "node:fs"
 
 const tool = Object.assign((definition: unknown) => definition, {
-  schema: { string: () => ({ describe: () => ({ optional: () => ({}) }) }) },
+  schema: Object.fromEntries(["string", "number", "boolean"].map(k =>
+    [k, () => ({ describe: () => ({ optional: () => ({}) }) })])),
 })
 mock.module("@opencode-ai/plugin", () => ({ tool }))
 
