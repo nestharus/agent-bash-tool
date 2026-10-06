@@ -6,19 +6,27 @@ on:
   pull_request:
 
 jobs:
-  build:
-    # The test-only AppArmor allowance below targets Ubuntu 24.04 / ABI 4.0.
+  lint:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: oven-sh/setup-bun@v2
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
+        if: ${{ !cancelled() }}
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  build:
+    # Independent of lint: either job's failure still fails CI.
+    # The test-only AppArmor allowance below targets Ubuntu 24.04 / ABI 4.0.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@v2
       - name: test
         shell: bash
         run: |
@@ -62,3 +70,13 @@ jobs:
             printf "parent=%s child=%s\n" "$AGENT_BASH_CI_PARENT_NET" "$(readlink /proc/self/ns/net)"
           '
           cargo test --workspace
+      - name: root-v1 adapter and presentation controls
+        if: ${{ !cancelled() }}
+        env:
+          BUN: bun
+          AGENT_BASH_TEST_BIN: ${{ github.workspace }}/target/debug/agent-bash
+        run: |
+          cargo build --bin agent-bash
+          command -v "$BUN"
+          test -x "$AGENT_BASH_TEST_BIN"
+          python3 -m unittest discover -s tests -p 'test_opencode_root_v1*.py' -v

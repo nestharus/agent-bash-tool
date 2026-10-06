@@ -1600,10 +1600,9 @@ pub(crate) fn observer_direct_child_identity(
         if stat.ppid == parent.pid
             && fs::read_link(format!("{path}/ns/pid"))? == namespace
             && local_pid_for_observer_path(Path::new(&path))? == local_pid
+            && found.replace(stat).is_some()
         {
-            if found.replace(stat).is_some() {
-                return Err(io::Error::other("ambiguous procfs child mapping"));
-            }
+            return Err(io::Error::other("ambiguous procfs child mapping"));
         }
     }
     let child = found.ok_or_else(|| io::Error::other("direct child identity unavailable"))?;

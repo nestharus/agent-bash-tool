@@ -1102,7 +1102,7 @@ pub(crate) fn cancel(paths: &StatePaths) -> io::Result<Option<WorkResponse>> {
             detail: None,
         },
     )?;
-    let mut socket = UnixStream::connect(Path::new(&endpoint)).map_err(|error| {
+    let mut socket = UnixStream::connect(Path::new(&endpoint)).inspect_err(|error| {
         let detail = error.to_string();
         let _ = append_diagnostic(
             paths,
@@ -1118,7 +1118,6 @@ pub(crate) fn cancel(paths: &StatePaths) -> io::Result<Option<WorkResponse>> {
                 detail: Some(&detail),
             },
         );
-        error
     })?;
     let parent_work_id = std::env::var(ROOT_WORK_ID_ENV).ok();
     let prewire = (|| {
@@ -1181,7 +1180,7 @@ pub(crate) fn cancel(paths: &StatePaths) -> io::Result<Option<WorkResponse>> {
         }
         read_response(&mut socket)
     })();
-    let response: WorkResponse = response_result.map_err(|error| {
+    let response: WorkResponse = response_result.inspect_err(|error| {
         let detail = error.to_string();
         let _ = append_diagnostic(
             paths,
@@ -1197,7 +1196,6 @@ pub(crate) fn cancel(paths: &StatePaths) -> io::Result<Option<WorkResponse>> {
                 detail: Some(&detail),
             },
         );
-        error
     })?;
     if response.protocol != PROTOCOL
         || response.work_id != submission.work_id
@@ -1604,7 +1602,7 @@ fn read_response<T: serde::de::DeserializeOwned>(socket: &mut UnixStream) -> io:
         }
         let mut byte = [0];
         socket.read_exact(&mut byte)?;
-        if byte == [b'\n'] {
+        if byte == *b"\n" {
             break;
         }
         bytes.push(byte[0]);
@@ -2123,7 +2121,7 @@ mod tests {
                 unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
             let size = unsafe { libc::recvmsg(broker.as_raw_fd(), &mut message, 0) };
             assert!(size > 17);
-            assert_eq!(&bytes[..17], &[&[b's'][..], &[7u8; 16]].concat());
+            assert_eq!(&bytes[..17], &[&b"s"[..], &[7u8; 16]].concat());
             let witness: serde_json::Value =
                 serde_json::from_slice(&bytes[17..size as usize]).unwrap();
             assert_eq!(witness["scope"]["kind"], expected_scope);
@@ -2148,7 +2146,7 @@ mod tests {
             let mut source_copy = unsafe { UnixStream::from_raw_fd(passed) };
             if accepted {
                 source_copy
-                    .write_all(&[&[b'@'][..], &[1u8; 16]].concat())
+                    .write_all(&[&b"@"[..], &[1u8; 16]].concat())
                     .unwrap();
                 broker.write_all(b"verified-source-v2 root\n").unwrap();
             } else {
@@ -2218,7 +2216,7 @@ mod tests {
             .unwrap();
             let mut marker = [0u8; 17];
             guardian.read_exact(&mut marker).unwrap();
-            assert_eq!(marker, [&[b'@'][..], &[1u8; 16]].concat().as_slice());
+            assert_eq!(marker, [&b"@"[..], &[1u8; 16]].concat().as_slice());
             if cancel {
                 source
                     .write_all(b"cancel\n{\"work_id\":\"work\"}\n")
@@ -2605,20 +2603,14 @@ mod tests {
         let valid = format!(
             "keyring;{uid};{uid};3f030000;{PAIRED_RING_PREFIX}12345678-1234-4abc-8abc-123456789abc"
         );
-        assert_eq!(
-            parse_session_ring_description(valid.as_bytes(), uid).unwrap(),
-            true
-        );
+        assert!(parse_session_ring_description(valid.as_bytes(), uid).unwrap());
         for ring in [
             "_ses",
             "_uid_ses.1000",
             "unrelated-work:12345678-1234-4abc-8abc-123456789abc",
         ] {
             let description = format!("keyring;{uid};{uid};3f030000;{ring}");
-            assert_eq!(
-                parse_session_ring_description(description.as_bytes(), uid).unwrap(),
-                false
-            );
+            assert!(!parse_session_ring_description(description.as_bytes(), uid).unwrap());
         }
         for invalid in [
             valid
