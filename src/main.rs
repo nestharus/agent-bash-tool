@@ -63,9 +63,11 @@ struct Cli {
 enum Command {
     /// Spool a command under a surviving detached supervisor.
     Run {
-        /// Completion delivery policy. Sync results stay in-band; async results notify the mailbox.
-        #[arg(long, value_enum, default_value_t = CliDeliveryMode::Async)]
-        delivery: CliDeliveryMode,
+        /// Completion delivery policy. Sync results stay in-band; async results notify the mailbox
+        /// (legacy default), or, under a root v1 owner, reach the requesting harness as a later
+        /// input. Root v1 requires this option explicitly.
+        #[arg(long, value_enum)]
+        delivery: Option<CliDeliveryMode>,
         /// Completion boundary for exit-mode workloads. Tree waits for every adopted
         /// descendant; root completes when the launched process exits and output closes.
         /// Defaults to tree.
@@ -236,7 +238,7 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
             }
             _ => Err(AppError::new(
                 EX_UNAVAILABLE,
-                "agent-bash: root v1 refuses legacy controls; only synchronous run is supported; no legacy state was accessed",
+                "agent-bash: root v1 refuses legacy controls; only run (explicit --delivery sync|async), native-output and native-accept are supported; no legacy state was accessed",
             )),
         };
     }
@@ -276,7 +278,7 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
             argv,
         } => run_command(
             guard,
-            delivery.into(),
+            delivery.unwrap_or(CliDeliveryMode::Async).into(),
             completion_scope.unwrap_or(CliCompletionScope::Tree).into(),
             ready_sentinel,
             cancel_on_owner_exit,
@@ -331,7 +333,11 @@ fn root_v1_run(ingress: &std::ffi::OsStr, command: Command) -> Result<(), AppErr
     let result = root_v1::run(
         ingress,
         &root_v1::Request {
-            sync: matches!(delivery, CliDeliveryMode::Sync),
+            delivery: match delivery {
+                Some(CliDeliveryMode::Sync) => root_v1::Delivery::Sync,
+                Some(CliDeliveryMode::Async) => root_v1::Delivery::Async,
+                None => root_v1::Delivery::Unspecified,
+            },
             unsupported,
             argv: &argv,
         },

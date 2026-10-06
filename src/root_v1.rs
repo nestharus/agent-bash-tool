@@ -5,9 +5,14 @@
 //! root's ingress and nowhere else: no Broker, guardian, supervisor, probe,
 //! state directory or local execution is used, and nothing is retried.
 //!
-//! Only synchronous delivery exists on this path. Asynchronous delivery
-//! (the CLI default) and the legacy lease/scope/sentinel options are refused
-//! before anything is sent; they are never converted.
+//! Delivery must be explicit on this path. `--delivery sync` reads the run
+//! to its end. `--delivery async` returns once the owner has durably
+//! accepted and started the run (`outcome` `running`); the root owner later
+//! delivers its end to the requesting harness as an ACP v2 input naming
+//! the run's retained output. That later input is not this process's
+//! result and is not a local acceptance. An omitted `--delivery` (the CLI's
+//! legacy async default) and the legacy lease/scope/sentinel options are
+//! refused before anything is sent; they are never converted.
 //!
 //! The result is one JSON object on stdout (`result_surface`
 //! `agent-bash-root-v1`). It reports what the root's stage lines showed and
@@ -33,9 +38,21 @@ pub(crate) fn selected() -> Option<std::ffi::OsString> {
     std::env::var_os(ROOT_BASH_ENV)
 }
 
+/// The completion delivery a root v1 run asked for. Only an explicit
+/// choice is honoured: the CLI's legacy async default never silently
+/// backgrounds a root v1 command.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    Sync,
+    /// The owner answers once the run has started; its end later reaches
+    /// the requesting harness as an owner input (ACP v2), not this process.
+    Async,
+    Unspecified,
+}
+
 /// What the caller asked `run` for, as far as the root path cares.
 pub(crate) struct Request<'a> {
-    pub(crate) sync: bool,
+    pub(crate) delivery: Delivery,
     /// Legacy options this path cannot honour, by flag name.
     pub(crate) unsupported: Vec<&'static str>,
     pub(crate) argv: &'a [String],
@@ -43,11 +60,11 @@ pub(crate) struct Request<'a> {
 
 /// Runs one request and returns the result object.
 pub(crate) fn run(ingress: &std::ffi::OsStr, request: &Request<'_>) -> Value {
-    if !request.sync {
+    if request.delivery == Delivery::Unspecified {
         return refused(
             "agent-bash",
-            "async-delivery-unavailable-under-root-v1",
-            "root v1 serves synchronous commands only",
+            "delivery-required-under-root-v1",
+            "root v1 needs an explicit --delivery sync or --delivery async",
         );
     }
     if let Some(flag) = request.unsupported.first() {
@@ -75,13 +92,130 @@ pub(crate) fn run(ingress: &std::ffi::OsStr, request: &Request<'_>) -> Value {
         Ok(stream) => stream,
         Err(error) => return refused("agent-bash", "owner-unreachable", &error.to_string()),
     };
-    let line = json!({ "v": PROTOCOL, "op": "run", "argv": request.argv, "cwd": cwd });
+    let background = request.delivery == Delivery::Async;
+    let mut line = json!({ "v": PROTOCOL, "op": "run", "argv": request.argv, "cwd": cwd });
+    if background {
+        line["delivery"] = json!("async");
+    }
     // The owner may refuse and close before reading; its refusal is still
     // there to read, so a failed write is not the answer.
     let sent = writeln!(stream, "{line}")
         .and_then(|()| stream.flush())
         .is_ok();
-    decode(BufReader::new(stream), sent)
+    if background {
+        decode_async(BufReader::new(stream), sent)
+    } else {
+        decode(BufReader::new(stream), sent)
+    }
+}
+
+/// Reads a background run's stage lines: `accepted` (durable), `started`,
+/// then `detached`. Its result is `running`: the command's end, wait and
+/// output are not known here; they are owed to the requesting harness as
+/// a later owner input naming `reference`. Anything else is a refusal,
+/// a proven no-start, or unknown with possible effects.
+pub(crate) fn decode_async(reader: impl BufRead, sent: bool) -> Value {
+    let mut stages: Vec<Value> = Vec::new();
+    let mut faults: Vec<String> = Vec::new();
+    let mut detached = false;
+    let mut terminal: Option<Value> = None;
+    for line in reader.lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                faults.push(format!("read-failed: {error}"));
+                break;
+            }
+        };
+        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            faults.push("protocol-violation: unparseable stage line".to_owned());
+            break;
+        };
+        let name = event["event"].as_str().unwrap_or_default().to_owned();
+        stages.push(event.clone());
+        match (name.as_str(), stages.len()) {
+            ("refused", 1) => {
+                let mut result = refused("root-owner", "", "");
+                result["delivery_mode"] = json!("async");
+                result["refusal"]["reason"] = event["reason"].clone();
+                result["refusal"]["detail"] = Value::Null;
+                result["stages"] = json!(stages);
+                return result;
+            }
+            ("accepted", 1) if event["delivery"] == "async" => {}
+            ("started", 2) => {}
+            ("detached", 3) if event["work"] == stages[0]["work"] => {
+                detached = true;
+                break;
+            }
+            ("launch-failed" | "launch-unknown", 2) => {
+                terminal = Some(event);
+                break;
+            }
+            _ => {
+                faults.push(format!("unexpected-stage: {name}"));
+                break;
+            }
+        }
+    }
+    let reference = stages.first().and_then(|accepted| {
+        let root = accepted["root_id"].as_str()?;
+        let work = accepted["work"].as_i64()?;
+        let reference = format!("rv1w:{root}:{work}");
+        parse_reference(&reference).map(|_| reference)
+    });
+    let base = |outcome: &str, meaning: &str, effects: bool| {
+        json!({
+            "result_surface": RESULT_SURFACE,
+            "version": 1,
+            "delivery_mode": "async",
+            "outcome": outcome,
+            "meaning": meaning,
+            "effects_possible": effects,
+            "retry_safe": !effects,
+            "refusal": null,
+            "wait": null,
+            "output": { "delivery": "none", "bytes": 0, "base64": "", "reference": reference },
+            "faults": faults,
+            "stages": stages,
+            "request_sent": sent,
+        })
+    };
+    if detached && faults.is_empty() {
+        let mut result = base(
+            "running",
+            "accepted-and-started; end, wait and output owed to the requesting harness as a later input",
+            true,
+        );
+        result["completion"] = json!({
+            "delivery": "owed-to-requesting-harness",
+            "work": stages[0]["work"],
+            "root_id": stages[0]["root_id"],
+        });
+        return result;
+    }
+    match terminal {
+        Some(end) if end["event"] == "launch-failed" && end["not_started"] == true => {
+            base("not-started", "launch-refused-before-start", false)
+        }
+        Some(_) => base("unknown", "possible-effect-unknown", true),
+        None if stages.first().is_some_and(|s| s["event"] == "accepted") => {
+            let mut faults = faults.clone();
+            if !detached {
+                faults.push("no-detached-stage".to_owned());
+            }
+            let mut result = base("unknown", "accepted-completion-delivery-unknown", true);
+            result["faults"] = json!(faults);
+            result
+        }
+        None => {
+            let mut result = base("unknown", "possible-effect-unknown", true);
+            if faults.is_empty() {
+                result["faults"] = json!(["no-final-stage"]);
+            }
+            result
+        }
+    }
 }
 
 fn refused(by: &str, reason: &str, detail: &str) -> Value {
@@ -889,7 +1023,7 @@ mod tests {
         let result = run(
             ingress,
             &Request {
-                sync: false,
+                delivery: Delivery::Unspecified,
                 unsupported: vec![],
                 argv: &argv,
             },
@@ -897,12 +1031,12 @@ mod tests {
         assert_eq!(result["outcome"], "refused");
         assert_eq!(
             result["refusal"]["reason"],
-            "async-delivery-unavailable-under-root-v1"
+            "delivery-required-under-root-v1"
         );
         let result = run(
             ingress,
             &Request {
-                sync: true,
+                delivery: Delivery::Sync,
                 unsupported: vec!["--cancel-on-owner-exit"],
                 argv: &argv,
             },
@@ -911,15 +1045,75 @@ mod tests {
             result["refusal"]["reason"],
             "option-unavailable-under-root-v1"
         );
-        let result = run(
-            ingress,
-            &Request {
-                sync: true,
-                unsupported: vec![],
-                argv: &argv,
-            },
+        for delivery in [Delivery::Sync, Delivery::Async] {
+            let result = run(
+                ingress,
+                &Request {
+                    delivery,
+                    unsupported: vec![],
+                    argv: &argv,
+                },
+            );
+            assert_eq!(result["refusal"]["reason"], "owner-unreachable");
+        }
+    }
+
+    #[test]
+    fn async_run_is_running_only_after_durable_accept_start_and_detach() {
+        let accepted = json!({ "event": "accepted", "root_id": "fixture", "work": 7, "durable": true, "delivery": "async" });
+        let detached =
+            json!({ "event": "detached", "work": 7, "completion": "owed-to-requesting-harness" });
+        let result = decode_async(
+            transcript(&[accepted.clone(), started(), detached.clone()]),
+            true,
         );
-        assert_eq!(result["refusal"]["reason"], "owner-unreachable");
+        assert_eq!(result["outcome"], "running");
+        assert_eq!(result["delivery_mode"], "async");
+        assert_eq!(result["wait"], Value::Null);
+        assert_eq!(result["effects_possible"], true);
+        assert_eq!(result["output"]["reference"], "rv1w:fixture:7");
+        assert_eq!(result["completion"]["work"], 7);
+        // No detach: accepted work whose completion delivery is unknown.
+        let lost = decode_async(transcript(&[accepted.clone(), started()]), true);
+        assert_eq!(lost["outcome"], "unknown");
+        assert_eq!(lost["meaning"], "accepted-completion-delivery-unknown");
+        // A sync-shaped acceptance is never read as a background run.
+        let sync_shaped = decode_async(
+            transcript(&[accepted_sync(), started(), detached.clone()]),
+            true,
+        );
+        assert_eq!(sync_shaped["outcome"], "unknown");
+        // Detach naming other work is not this run's detach.
+        let other = json!({ "event": "detached", "work": 8 });
+        assert_eq!(
+            decode_async(transcript(&[accepted.clone(), started(), other]), true)["outcome"],
+            "unknown"
+        );
+        let not_started = decode_async(
+            transcript(&[
+                accepted.clone(),
+                json!({ "event": "launch-failed", "not_started": true }),
+            ]),
+            true,
+        );
+        assert_eq!(not_started["outcome"], "not-started");
+        assert_eq!(not_started["effects_possible"], false);
+        let refused = decode_async(
+            transcript(&[
+                json!({ "event": "refused", "reason": "async-unavailable: registered child" }),
+            ]),
+            true,
+        );
+        assert_eq!(refused["outcome"], "refused");
+        assert_eq!(
+            refused["refusal"]["reason"],
+            "async-unavailable: registered child"
+        );
+        assert_eq!(refused["delivery_mode"], "async");
+    }
+
+    fn accepted_sync() -> Value {
+        accepted()
     }
 
     #[test]
