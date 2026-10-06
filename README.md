@@ -32,7 +32,16 @@ completion returns synchronously in-band or asynchronously through the agent mai
   only their observed byte count, and never acquire a guessed wait. Output
   stages are aggregated with chunk and byte counts. Exit 0 means the object was written,
   not that the command succeeded. The OpenCode adapter renders it and refuses
-  child-agent dispatch there. Root v1 has no handle, status or cancel.
+  child-agent dispatch there. Its root-v1 display additionally bounds the inline
+  payload to 48 KiB of rendered UTF-8 text and 1,900 split lines, leaving room
+  for the receipt under OpenCode 1.18.30's default 50 KiB / 2,000-line generic
+  truncator. Hex uses two rendered bytes per stream byte; a UTF-8 cut omits
+  an incomplete final character. On loss, the display separately reports
+  received, producer-carried/discarded and OpenCode-presented/additionally-omitted
+  **stream bytes**, plus the payload's rendered UTF-8 byte count. Additional
+  presentation omissions are not retained for recovery. This is a default-limit
+  presentation budget, not a guarantee for smaller configured limits, oversized
+  diagnostics or later context compaction. Root v1 has no handle, status or cancel.
   **Pairing required:** Runner's Claude `renderRootV1` must understand the
   presented/total count distinction before using this requester for large
   output; its current length-equals-total check rejects partial results.
