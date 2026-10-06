@@ -756,7 +756,7 @@ function rootV1Response(run: ProcessResult): string {
   if (!Number.isSafeInteger(presented) || !Number.isSafeInteger(omitted) ||
       presented < 0 || omitted < 0 || presented + omitted !== output.bytes ||
       bytes.length !== presented || bytes.toString("base64") !== output.base64 ||
-      (omitted > 0 && output.remainder !== "discarded")) {
+      (omitted > 0 && !["discarded", "retained-by-owner", "partial-owner-retention"].includes(output.remainder))) {
     throw rootV1Unresolved("output length or encoding mismatch", run)
   }
   const ended = value.outcome === "ended" || value.outcome === "ended-output-unproven"
@@ -768,14 +768,15 @@ function rootV1Response(run: ProcessResult): string {
   const faults = value.faults.length ? `\nfaults: ${value.faults.join("; ")}` : ""
   const inline = rootV1InlinePrefix(bytes)
   const additionallyOmitted = presented - inline.bytes.length
+  const retention = rootV1Retention(output.retained, output.reference)
   const partial = omitted > 0 || additionallyOmitted > 0
     ? `\nProducer output: ${output.bytes} received stream bytes; ${presented} stream bytes carried; ` +
-      `${omitted} bytes omitted and discarded (not retained).` +
+      (retention ? `${omitted} bytes omitted from this producer response.` : `${omitted} bytes omitted and discarded (not retained).`) +
       `\nOpenCode presentation: first ${inline.bytes.length} of ${presented} producer-carried stream bytes shown inline; ` +
-      `${additionallyOmitted} additional stream bytes omitted here (not retained for recovery); ` +
+      `${additionallyOmitted} additional stream bytes omitted here (${retention ? "see owner retention below" : "not retained for recovery"}); ` +
       `${Buffer.byteLength(inline.text)} rendered UTF-8 bytes.`
     : ""
-  const body = partial + `\n--- output (stderr joined; ${inline.bytes.length} bytes` +
+  const body = partial + retention + `\n--- output (stderr joined; ${inline.bytes.length} bytes` +
     `${omitted || additionallyOmitted ? " shown inline" : ""}, ${inline.utf8 ? "utf8" : "hex"}) ---\n` + inline.text
   switch (value.outcome) {
     case "refused":
@@ -787,7 +788,7 @@ function rootV1Response(run: ProcessResult): string {
     case "unknown":
       return `Root v1 outcome unknown (${value.meaning}): the command may have run. Effects possible: yes; ` +
         `retry safe: no. Do not replay; there is no root v1 cancel or status for it here.\n${stages}${faults}` +
-        (bytes.length ? `${body}\n(output above is partial and unproven)` : "")
+        (bytes.length ? `${body}\n(output above is partial and unproven)` : retention)
     default: {
       const wait = value.wait.exit?.code !== undefined
         ? `exited with code ${value.wait.exit.code}`
@@ -800,6 +801,64 @@ function rootV1Response(run: ProcessResult): string {
       return `Root v1 work ended: ${wait} (${value.wait.status}, observer ${value.wait.observer}); ${delivery}.` +
         `\n${stages}${faults}${body}`
     }
+  }
+}
+
+function rootV1Retention(record: any, reference?: string): string {
+  if (!record) return reference ? `\nOwner output reference=${reference}; seal not observed. ` +
+    `Use {output_identity: "${reference}"} to request retained bytes from the current owner; availability/loss may remain unknown.` : ""
+  if (!["complete", "partial"].includes(record.state) || typeof record.identity !== "string") {
+    return `\nOwner retention: ${record.state ?? "unknown"}; no recoverable identity. ${JSON.stringify(record.losses ?? record.reason ?? "")}`
+  }
+  return `\nOwner retention: ${record.state}, ${record.bytes} bytes; received=${record.received ?? "unknown"}; ` +
+    `losses=${JSON.stringify(record.losses)}. identity=${record.identity}` +
+    `\nRead with {output_identity: "${record.identity}", output_offset: 0, output_length: 16384}; ` +
+    `continue at next_offset. Explicit local acceptance: {output_identity: "${record.identity}", accept_output: true}. ` +
+    "Acceptance names retained bytes only; no input ACK, processing, remote settlement or drain. Retention ends with root/store retirement."
+}
+
+function rootV1OutputResponse(run: ProcessResult): string {
+  if (run.exitCode !== 0) throw new Error("native output request unresolved; local acceptance unconfirmed")
+  const value = JSON.parse(run.stdout)
+  if (value.result_surface !== "agent-bash-root-v1-output" || value.version !== 1) throw new Error("invalid native output result")
+  if (value.outcome === "refused" || value.outcome === "unknown") {
+    return `Root v1 output ${value.outcome}: ${value.reason}. Local acceptance unconfirmed; no command replay.`
+  }
+  const reply = value.reply
+  if (value.outcome === "accepted") {
+    return `Root v1 exact local acceptance: ${reply.retained.identity}; durable=${reply.durable}; repeat=${reply.repeat}. ` +
+      `receipt=${JSON.stringify(reply.receipt)}. Not an input ACK, processing, remote settlement or drain.`
+  }
+  if (value.outcome !== "read") throw new Error("invalid native output outcome")
+  const bytes = Buffer.from(reply.b64, "base64")
+  const text = bytes.toString("utf8")
+  const utf8 = !bytes.includes(0) && Buffer.from(text, "utf8").equals(bytes) && text.split("\n").length < 1900
+  return `Root v1 retained range: identity=${reply.retained.identity}; state=${reply.retained.state}; ` +
+    `offset=${reply.offset}; length=${bytes.length}; next_offset=${reply.next_offset}; eof=${reply.eof}; ` +
+    `received=${reply.retained.received ?? "unknown"}; losses=${JSON.stringify(reply.retained.losses)}. ` +
+    "No local acceptance was recorded by this read." +
+    `\n--- retained bytes (${utf8 ? "utf8" : "hex"}; ${bytes.length} bytes) ---\n${utf8 ? text : bytes.toString("hex")}`
+}
+
+async function rootV1Output(args: any, ownerSessionId: string): Promise<string> {
+  if (!rootV1Context()) return "Native output requires a current root v1 context."
+  if (args.command !== undefined || args.handle !== undefined || args.delivery !== undefined || args.workdir !== undefined ||
+      typeof args.output_identity !== "string" || (args.accept_output !== undefined && typeof args.accept_output !== "boolean")) {
+    return "Native output request conflicts with command/handle/delivery/workdir or has an invalid identity. Nothing sent."
+  }
+  const offset = args.output_offset ?? 0
+  const length = args.output_length ?? 16384
+  if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 1 || length > 16384 ||
+      (args.accept_output && (args.output_offset !== undefined || args.output_length !== undefined))) {
+    return "Native output range invalid (1..16384 bytes); acceptance takes only the exact output_identity. Nothing sent."
+  }
+  const argv = args.accept_output ? [AGENT_BASH, "native-accept", args.output_identity]
+    : [AGENT_BASH, "native-output", args.output_identity, "--offset", String(offset), "--length", String(length)]
+  try {
+    const result = await runProcess(argv, ownerSessionId, undefined, "agent-bash native output", undefined, undefined, null, true)
+    return rootV1OutputResponse(result)
+  } catch {
+    return "Native output result unresolved; local acceptance unconfirmed. No command replay."
   }
 }
 
@@ -1142,14 +1201,23 @@ export default tool({
     `workload handle. Leading agent-runner commands are pinned to ${AGENTS}. An optional workdir sets the supervised ` +
     "process working directory. Inside a root v1 context, commands run synchronously through that root only; " +
     "asynchronous delivery, child-agent dispatch and legacy handle/controls are refused there, not converted; " +
-    "standalone sleeps also use that root's command result.",
+    "standalone sleeps also use that root's command result. Use output_identity with output_offset/output_length to read " +
+    "retained output after inline limits; accept_output records explicit exact local acceptance of that identity.",
   args: {
+    output_identity: tool.schema.string().describe("native retained identity (rv1o:...) or pre-seal work reference (rv1w:...) returned by Bash").optional(),
+    output_offset: tool.schema.number().describe("native byte offset (default 0)").optional(),
+    output_length: tool.schema.number().describe("native range byte count, 1..16384 (default 16384)").optional(),
+    accept_output: tool.schema.boolean().describe("explicitly accept precisely output_identity locally; no ACK/processing/drain").optional(),
     command: tool.schema.string().describe("the shell command to run").optional(),
     handle: tool.schema.string().describe("poll an existing asynchronous command by its handle").optional(),
     delivery: tool.schema.string().describe('completion delivery: "sync" or "async"').optional(),
     workdir: tool.schema.string().describe("working directory for the supervised process").optional(),
   },
   async execute(args, context) {
+    if (args.output_identity !== undefined || args.output_offset !== undefined || args.output_length !== undefined || args.accept_output !== undefined) {
+      if (context.abort.aborted) return "Cancellation requested before native output request."
+      return rootV1Output(args, context.sessionID)
+    }
     if (rootV1Context()) {
       const words = args.command && structuredShellWords(stripReservedSpoolerAssignmentsForShellRouting(args.command).body)
       const control = words && [AGENT_BASH, "agent-bash"].includes(words[0]) &&

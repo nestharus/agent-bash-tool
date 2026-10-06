@@ -111,6 +111,8 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
     let mut bytes = 0u64;
     let mut output_stage: Option<usize> = None;
     let mut chunks = 0u64;
+    let mut stream_hash = sha2::Sha256::new();
+    use sha2::Digest;
     let mut accepted = false;
     let mut started = false;
     let mut closed = false;
@@ -154,6 +156,7 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
                     output_fault = true;
                 }
                 Some(chunk) => {
+                    stream_hash.update(&chunk);
                     bytes += chunk.len() as u64;
                     let keep = chunk.len().min(OUTPUT_PREFIX_BYTES - output.len());
                     output.extend_from_slice(&chunk[..keep]);
@@ -230,6 +233,31 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
     {
         output.truncate(error.valid_up_to());
     }
+    let mut retained = terminal
+        .as_ref()
+        .map(|end| end["retained"].clone())
+        .unwrap_or(Value::Null);
+    if !retained.is_null() && retained["state"] != "unsealed" {
+        let valid = valid_record(&retained)
+            && stages.first().is_some_and(|s| {
+                s["work"] == retained["work"] && s["root_id"] == retained["root_id"]
+            });
+        let complete_matches = retained["state"] != "complete"
+            || (retained["received"].as_u64() == Some(bytes)
+                && retained["bytes"].as_u64() == Some(bytes)
+                && retained["sha256"] == format!("{:x}", stream_hash.finalize()));
+        if !valid || !complete_matches {
+            faults.push("retained-identity-or-stream-mismatch".into());
+            retained =
+                json!({ "state": "unknown", "reason": "retained-identity-or-stream-mismatch" });
+        }
+    }
+    let reference = stages.first().and_then(|accepted| {
+        let root = accepted["root_id"].as_str()?;
+        let work = accepted["work"].as_i64()?;
+        let reference = format!("rv1w:{root}:{work}");
+        parse_reference(&reference).map(|_| reference)
+    });
     let presented_bytes = output.len();
     let omitted_bytes = bytes - presented_bytes as u64;
     let base64 = base64(&output);
@@ -239,7 +267,11 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
             "bytes": bytes,
             "presented_bytes": presented_bytes,
             "omitted_bytes": omitted_bytes,
-            "remainder": if omitted_bytes > 0 { "discarded" } else { "none" },
+            "remainder": if omitted_bytes > 0 {
+                if retained["state"] == "complete" { "retained-by-owner" } else if retained["state"] == "partial" { "partial-owner-retention" } else { "discarded" }
+            } else { "none" },
+            "retained": retained,
+            "reference": reference,
             "base64": base64,
         })
     };
@@ -330,6 +362,158 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
     }
 }
 
+/// Parse the opaque identity without turning it into a path or authority.
+fn parse_identity(identity: &str) -> Option<(String, i64, u64, String)> {
+    let parts: Vec<_> = identity.split(':').collect();
+    if parts.len() != 5
+        || parts[0] != "rv1o"
+        || parts[1].is_empty()
+        || parts[1].len() > 64
+        || !parts[1]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        || parts[4].len() != 64
+        || !parts[4]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let work = parts[2].parse::<i64>().ok()?;
+    let bytes = parts[3].parse::<u64>().ok()?;
+    if work <= 0 || bytes > 64 * 1024 * 1024 {
+        return None;
+    }
+    let parsed = (parts[1].to_owned(), work, bytes, parts[4].to_owned());
+    (format!("rv1o:{}:{}:{}:{}", parsed.0, parsed.1, parsed.2, parsed.3) == identity)
+        .then_some(parsed)
+}
+
+fn parse_reference(reference: &str) -> Option<(String, i64)> {
+    let parts: Vec<_> = reference.split(':').collect();
+    if parts.len() != 3 || parts[0] != "rv1w" {
+        return None;
+    }
+    let exact = format!("rv1o:{}:{}:0:{}", parts[1], parts[2], "0".repeat(64));
+    let (root, work, _, _) = parse_identity(&exact)?;
+    Some((root, work))
+}
+
+fn valid_record(record: &Value) -> bool {
+    let Some((root, work, bytes, hash)) = record["identity"].as_str().and_then(parse_identity)
+    else {
+        return false;
+    };
+    record["root_id"] == root
+        && record["work"] == work
+        && record["bytes"] == bytes
+        && record["sha256"] == hash
+        && matches!(record["state"].as_str(), Some("complete" | "partial"))
+        && record["losses"].is_array()
+}
+
+/// Explicit read or local acceptance through the same attributed ingress.
+/// A missing reply to accept is unknown, never a fabricated receipt or retry.
+pub(crate) fn retained(
+    ingress: &std::ffi::OsStr,
+    identity: &str,
+    accept: bool,
+    offset: u64,
+    length: u64,
+) -> Value {
+    let surface = "agent-bash-root-v1-output";
+    let refuse = |reason: &str| json!({ "result_surface": surface, "version": 1, "outcome": "refused", "reason": reason });
+    let exact = parse_identity(identity);
+    let target = exact
+        .as_ref()
+        .map(|(root, work, _, _)| (root.clone(), *work))
+        .or_else(|| (!accept).then(|| parse_reference(identity)).flatten());
+    let Some((root, work)) = target else {
+        return refuse("bad-identity");
+    };
+    if !accept
+        && (length == 0
+            || length > 256 * 1024
+            || offset > exact.as_ref().map_or(64 * 1024 * 1024, |i| i.2))
+    {
+        return refuse("bad-range");
+    }
+    let mut stream = match UnixStream::connect(ingress) {
+        Ok(stream) => stream,
+        Err(_) => return refuse("owner-unreachable"),
+    };
+    let mut request = json!({ "v": 1, "op": if accept { "accept" } else { "output" },
+        "root_id": root, "work": work, "offset": offset, "length": length });
+    if let Some((_, _, bytes, hash)) = &exact {
+        request["bytes"] = json!(bytes);
+        request["sha256"] = json!(hash);
+    }
+    let sent = writeln!(stream, "{request}")
+        .and_then(|()| stream.flush())
+        .is_ok();
+    let mut line = Vec::new();
+    let reader = BufReader::new(stream);
+    use std::io::Read;
+    let read = reader.take(400_000).read_until(b'\n', &mut line);
+    let unknown = || {
+        json!({ "result_surface": surface, "version": 1, "outcome": "unknown",
+        "reason": "reply-missing-or-invalid", "request_sent": sent, "acceptance": "unconfirmed" })
+    };
+    if read.is_err() || !line.ends_with(b"\n") {
+        return unknown();
+    }
+    let Ok(reply) = serde_json::from_slice::<Value>(&line) else {
+        return unknown();
+    };
+    if reply["event"] == "refused" {
+        return refuse(reply["reason"].as_str().unwrap_or("owner-refused"));
+    }
+    if !valid_record(&reply["retained"])
+        || reply["retained"]["root_id"] != root
+        || reply["retained"]["work"] != work
+        || (exact.is_some() && reply["retained"]["identity"] != identity)
+    {
+        return unknown();
+    }
+    let bytes = reply["retained"]["bytes"]
+        .as_u64()
+        .expect("validated record");
+    let hash = reply["retained"]["sha256"]
+        .as_str()
+        .expect("validated record");
+    if accept {
+        if reply["event"] != "output-accepted"
+            || reply["durable"] != true
+            || !reply["repeat"].is_boolean()
+            || reply["receipt"]["root_id"] != root
+            || reply["receipt"]["work"] != work
+            || reply["receipt"]["bytes"] != bytes
+            || reply["receipt"]["sha256"] != hash
+        {
+            return unknown();
+        }
+    } else {
+        let Some(data) = reply["b64"].as_str().and_then(unbase64) else {
+            return unknown();
+        };
+        if offset > bytes {
+            return unknown();
+        }
+        let take = length.min(bytes - offset);
+        if reply["event"] != "output-range"
+            || reply["offset"] != offset
+            || reply["length"] != take
+            || data.len() as u64 != take
+            || reply["next_offset"] != offset + take
+            || reply["eof"] != (offset + take == bytes)
+        {
+            return unknown();
+        }
+    }
+    json!({ "result_surface": surface, "version": 1,
+        "outcome": if accept { "accepted" } else { "read" }, "reply": reply })
+}
+
 /// `code:N` or `signal:N` as written by the root's work PID 1 wait.
 fn wait_status(status: &str) -> Option<Value> {
     if let Some(code) = status.strip_prefix("code:") {
@@ -401,7 +585,7 @@ mod tests {
     }
 
     fn accepted() -> Value {
-        json!({ "event": "accepted", "work": 7, "durable": true })
+        json!({ "event": "accepted", "root_id": "fixture", "work": 7, "durable": true })
     }
     fn started() -> Value {
         json!({ "event": "started", "work": 7 })
@@ -640,6 +824,60 @@ mod tests {
             let prefix = unbase64(result["output"]["base64"].as_str().unwrap()).unwrap();
             assert_eq!(prefix, payload[..shown]);
         }
+    }
+
+    #[test]
+    fn retained_identity_is_joined_to_work_and_actual_full_stream_without_replacing_wait() {
+        use sha2::Digest;
+        let payload = vec![b'x'; 100_000];
+        let hash = format!("{:x}", sha2::Sha256::digest(&payload));
+        let record = json!({ "state": "complete", "root_id": "fixture", "work": 7,
+            "bytes": payload.len(), "sha256": hash, "received": payload.len(), "losses": [],
+            "identity": format!("rv1o:fixture:7:100000:{hash}") });
+        let mut final_stage = end("code:7", 100000);
+        final_stage["retained"] = record.clone();
+        let make = |end| {
+            transcript(&[
+                accepted(),
+                started(),
+                json!({ "event": "output", "b64": base64(&payload) }),
+                closed(100000),
+                end,
+            ])
+        };
+        let full = decode(make(final_stage.clone()), true);
+        assert_eq!(full["outcome"], "ended");
+        assert_eq!(full["wait"]["status"], "code:7");
+        assert_eq!(full["output"]["remainder"], "retained-by-owner");
+        assert_eq!(full["output"]["retained"], record);
+        final_stage["retained"]["sha256"] = json!("0".repeat(64));
+        final_stage["retained"]["identity"] =
+            json!(format!("rv1o:fixture:7:100000:{}", "0".repeat(64)));
+        let mismatch = decode(make(final_stage), true);
+        assert_eq!(mismatch["wait"]["status"], "code:7");
+        assert_eq!(mismatch["outcome"], "ended-output-unproven");
+        assert!(mismatch["output"]["retained"]["identity"].is_null());
+        assert_eq!(mismatch["output"]["retained"]["state"], "unknown");
+    }
+
+    #[test]
+    fn accepted_work_reference_survives_an_unknown_end_without_inventing_wait_or_seal() {
+        let result = decode(
+            transcript(&[
+                json!({ "event": "accepted", "root_id": "fixture", "work": 7, "durable": true }),
+                started(),
+            ]),
+            true,
+        );
+        assert_eq!(result["outcome"], "unknown");
+        assert!(result["wait"].is_null());
+        assert_eq!(result["output"]["reference"], "rv1w:fixture:7");
+        assert!(result["output"]["retained"].is_null());
+        assert_eq!(
+            parse_reference("rv1w:fixture:7"),
+            Some(("fixture".into(), 7))
+        );
+        assert!(parse_reference("rv1w:fixture:07").is_none());
     }
 
     #[test]

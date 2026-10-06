@@ -323,3 +323,115 @@ fn unreachable_root_owner_is_refused_with_no_broker_probe_or_legacy_state() {
     assert_eq!(broker.connections(), 0, "no Broker probe");
     assert_eq!(fs::read_dir(&state).unwrap().count(), 0, "no legacy state");
 }
+
+/// Missing or corrupted replies cannot become exact local acceptance.
+/// This configured socket fixture checks the actual CLI decoder, not owner
+/// identity admission (covered separately by in-root controls).
+#[test]
+fn native_output_cli_checks_identity_ranges_and_unknown_acceptance_without_retry() {
+    let data = b"hi\n";
+    use sha2::Digest;
+    let hash = format!("{:x}", sha2::Sha256::digest(data));
+    let identity = format!("rv1o:fixture:4:3:{hash}");
+    let record = json!({ "root_id": "fixture", "work": 4, "bytes": 3, "sha256": hash,
+        "identity": identity, "state": "complete", "received": 3, "losses": [] });
+    let good = json!({ "event": "output-range", "retained": record, "offset": 0,
+        "length": 3, "next_offset": 3, "eof": true, "b64": "aGkK" });
+    for (reply, expected) in [
+        (vec![good.clone()], "read"),
+        (
+            vec![{
+                let mut v = good.clone();
+                v["retained"]["work"] = json!(5);
+                v
+            }],
+            "unknown",
+        ),
+        (
+            vec![{
+                let mut v = good.clone();
+                v["b64"] = json!("aGl=");
+                v
+            }],
+            "unknown",
+        ),
+        (
+            vec![{
+                let mut v = good.clone();
+                v["next_offset"] = json!(4);
+                v
+            }],
+            "unknown",
+        ),
+        (
+            vec![{
+                let mut v = good.clone();
+                v["eof"] = json!(false);
+                v
+            }],
+            "unknown",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("bash.sock");
+        let owner = Owner::start(&socket, reply);
+        let value = result(&agent_bash(
+            dir.path(),
+            &socket,
+            &["native-output", &identity, "--length", "3"],
+        ));
+        assert_eq!(value["outcome"], expected, "{value}");
+        assert_eq!(owner.connections(), 1);
+        assert_eq!(
+            owner.requests.lock().unwrap()[0],
+            json!({ "v": 1, "op": "output", "root_id": "fixture", "work": 4,
+            "bytes": 3, "sha256": hash, "offset": 0, "length": 3 })
+        );
+        assert!(!dir.path().join("home").exists());
+    }
+    let discover_dir = tempfile::tempdir().unwrap();
+    let discover_socket = discover_dir.path().join("bash.sock");
+    let discover_owner = Owner::start(&discover_socket, vec![good]);
+    let acquired = result(&agent_bash(
+        discover_dir.path(),
+        &discover_socket,
+        &["native-output", "rv1w:fixture:4", "--length", "3"],
+    ));
+    assert_eq!(acquired["outcome"], "read");
+    assert_eq!(acquired["reply"]["retained"]["identity"], identity);
+    assert_eq!(discover_owner.connections(), 1);
+    assert!(
+        discover_owner.requests.lock().unwrap()[0]
+            .get("bytes")
+            .is_none()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("bash.sock");
+    let owner = Owner::start(&socket, vec![]);
+    let lost = result(&agent_bash(
+        dir.path(),
+        &socket,
+        &["native-accept", &identity],
+    ));
+    assert_eq!(lost["outcome"], "unknown");
+    assert_eq!(lost["acceptance"], "unconfirmed");
+    assert_eq!(
+        owner.connections(),
+        1,
+        "acceptance is never retried automatically"
+    );
+    for args in [
+        vec!["native-output", "bad"],
+        vec!["native-accept", "rv1w:fixture:4"],
+        vec!["native-output", &identity, "--length", "262145"],
+        vec!["native-output", &identity, "--offset", "4"],
+    ] {
+        let refused = result(&agent_bash(dir.path(), &socket, &args));
+        assert_eq!(refused["outcome"], "refused");
+    }
+    assert_eq!(
+        owner.connections(),
+        1,
+        "invalid requests never contact owner"
+    );
+}
