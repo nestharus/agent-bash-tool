@@ -7,7 +7,7 @@
 //!
 //! Delivery must be explicit on this path. `--delivery sync` reads the run
 //! to its end. `--delivery async` returns once the owner has durably
-//! accepted and started the run (`outcome` `running`); the root owner later
+//! accepted and created the work child (`outcome` `running` unless exec failed); the root owner later
 //! delivers its end to the requesting harness as an ACP v2 input naming
 //! the run's retained output. That later input is not this process's
 //! result and is not a local acceptance. An omitted `--delivery` (the CLI's
@@ -118,6 +118,7 @@ pub(crate) fn decode_async(reader: impl BufRead, sent: bool) -> Value {
     let mut stages: Vec<Value> = Vec::new();
     let mut faults: Vec<String> = Vec::new();
     let mut detached = false;
+    let mut exec_error: Option<String> = None;
     let mut terminal: Option<Value> = None;
     for line in reader.lines() {
         let line = match line {
@@ -143,8 +144,18 @@ pub(crate) fn decode_async(reader: impl BufRead, sent: bool) -> Value {
                 return result;
             }
             ("accepted", 1) if event["delivery"] == "async" => {}
-            ("started", 2) => {}
-            ("detached", 3) if event["work"] == stages[0]["work"] => {
+            ("started", 2) => match started_exec_error(&event, &stages[0]) {
+                Ok(error) => exec_error = error,
+                Err(fault) => {
+                    faults.push(fault.into());
+                    break;
+                }
+            },
+            ("detached", 3)
+                if event["work"] == stages[0]["work"]
+                    && (exec_error.is_none()
+                        || event["completion"] == "owed-to-requesting-harness") =>
+            {
                 detached = true;
                 break;
             }
@@ -179,12 +190,21 @@ pub(crate) fn decode_async(reader: impl BufRead, sent: bool) -> Value {
             "faults": faults,
             "stages": stages,
             "request_sent": sent,
+            "exec_error": exec_error,
         })
     };
     if detached && faults.is_empty() {
         let mut result = base(
-            "running",
-            "accepted-and-started; end, wait and output owed to the requesting harness as a later input",
+            if exec_error.is_some() {
+                "unknown"
+            } else {
+                "running"
+            },
+            if exec_error.is_some() {
+                "requested-program-exec-failed; work end, wait and output owed to the requesting harness as a later input"
+            } else {
+                "accepted-and-started; end, wait and output owed to the requesting harness as a later input"
+            },
             true,
         );
         result["completion"] = json!({
@@ -215,6 +235,24 @@ pub(crate) fn decode_async(reader: impl BufRead, sent: bool) -> Value {
             }
             result
         }
+    }
+}
+
+/// Missing/null is not a positive failure. Other malformed values establish
+/// neither successful exec nor failed exec and must keep the result uncertain.
+fn started_exec_error(event: &Value, accepted: &Value) -> Result<Option<String>, &'static str> {
+    match event.get("exec_error") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(error)) if !error.is_empty() => {
+            if accepted["durable"] != true
+                || !accepted["root_id"].as_str().is_some_and(|s| !s.is_empty())
+                || !accepted["work"].as_i64().is_some_and(|w| w > 0)
+            {
+                return Err("exec-error-without-usable-acceptance");
+            }
+            Ok(Some(error.clone()))
+        }
+        _ => Err("started-exec-error-invalid"),
     }
 }
 
@@ -249,6 +287,7 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
     use sha2::Digest;
     let mut accepted = false;
     let mut started = false;
+    let mut exec_error: Option<String> = None;
     let mut closed = false;
     let mut output_fault = false;
     let mut order_fault = false;
@@ -317,7 +356,16 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
                 });
             }
             "accepted" if stages.len() == 1 => accepted = true,
-            "started" if accepted && !started => started = true,
+            "started" if accepted && !started => {
+                started = true;
+                match started_exec_error(&event, &stages[0]) {
+                    Ok(error) => exec_error = error,
+                    Err(fault) => {
+                        faults.push(fault.into());
+                        order_fault = true;
+                    }
+                }
+            }
             "output-closed" if started && !closed => {
                 closed = true;
                 if event["bytes"].as_u64() != Some(bytes) {
@@ -416,6 +464,7 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
             "delivery_mode": "sync",
             "outcome": "unknown",
             "meaning": meaning,
+            "exec_error": exec_error,
             "effects_possible": true,
             "retry_safe": false,
             "refusal": null,
@@ -462,6 +511,8 @@ pub(crate) fn decode(reader: impl BufRead, sent: bool) -> Value {
                 "version": 1,
                 "delivery_mode": "sync",
                 "outcome": if complete { "ended" } else { "ended-output-unproven" },
+                "meaning": if exec_error.is_some() { "requested-program-exec-failed" } else { "work-ended" },
+                "exec_error": exec_error,
                 "effects_possible": true,
                 "retry_safe": false,
                 "refusal": null,
@@ -1055,6 +1106,105 @@ mod tests {
                 },
             );
             assert_eq!(result["refusal"]["reason"], "owner-unreachable");
+        }
+    }
+
+    #[test]
+    fn positive_exec_error_preserves_wait_custody_and_async_completion() {
+        let mut failed = started();
+        failed["exec_error"] = json!("No such file or directory (os error 2)");
+        let sync = decode(
+            transcript(&[accepted(), failed.clone(), closed(0), end("code:127", 0)]),
+            true,
+        );
+        assert_eq!(sync["outcome"], "ended");
+        assert_eq!(sync["meaning"], "requested-program-exec-failed");
+        assert_eq!(sync["exec_error"], failed["exec_error"]);
+        assert_eq!(sync["wait"]["exit"]["code"], 127);
+        assert_eq!(sync["output"]["delivery"], "complete");
+        assert_eq!(sync["effects_possible"], true);
+        assert_eq!(sync["retry_safe"], false);
+        let ordinary = decode(
+            transcript(&[
+                accepted(),
+                started(),
+                output(),
+                closed(3),
+                end("code:127", 3),
+            ]),
+            true,
+        );
+        assert_eq!(ordinary["outcome"], "ended");
+        assert_eq!(ordinary["exec_error"], Value::Null);
+        assert_eq!(ordinary["output"]["base64"], "aGkK");
+        let mut accepted = accepted();
+        accepted["delivery"] = json!("async");
+        let detached =
+            json!({"event":"detached", "work":7, "completion":"owed-to-requesting-harness"});
+        let async_result = decode_async(
+            transcript(&[accepted.clone(), failed.clone(), detached]),
+            true,
+        );
+        assert_eq!(async_result["outcome"], "unknown");
+        assert!(
+            async_result["meaning"]
+                .as_str()
+                .unwrap()
+                .starts_with("requested-program-exec-failed")
+        );
+        assert_eq!(async_result["exec_error"], failed["exec_error"]);
+        assert_eq!(
+            async_result["completion"]["delivery"],
+            "owed-to-requesting-harness"
+        );
+        assert_eq!(async_result["wait"], Value::Null);
+        assert_eq!(async_result["effects_possible"], true);
+        assert_eq!(async_result["retry_safe"], false);
+        let incomplete_detach = decode_async(
+            transcript(&[
+                accepted.clone(),
+                failed.clone(),
+                json!({"event":"detached", "work":7}),
+            ]),
+            true,
+        );
+        assert_eq!(incomplete_detach["outcome"], "unknown");
+        assert_eq!(incomplete_detach["completion"], Value::Null);
+        let missing_detach = decode_async(transcript(&[accepted, failed.clone()]), true);
+        assert_eq!(missing_detach["outcome"], "unknown");
+        assert_eq!(missing_detach["completion"], Value::Null);
+        assert_eq!(missing_detach["exec_error"], failed["exec_error"]);
+        let unfinished = decode(transcript(&[accepted_sync(), failed]), true);
+        assert_eq!(unfinished["outcome"], "unknown");
+        assert_eq!(unfinished["wait"], Value::Null);
+        assert_eq!(unfinished["output"]["delivery"], "unproven");
+    }
+
+    #[test]
+    fn malformed_exec_diagnostic_never_proves_running_or_no_start() {
+        for error in [
+            json!(true),
+            json!(127),
+            json!(""),
+            json!({"error":"ENOENT"}),
+        ] {
+            let mut malformed = started();
+            malformed["exec_error"] = error;
+            let sync = decode(
+                transcript(&[accepted(), malformed.clone(), closed(0), end("code:127", 0)]),
+                true,
+            );
+            assert_eq!(sync["outcome"], "unknown");
+            assert_eq!(sync["wait"], Value::Null);
+            let mut accepted = accepted();
+            accepted["delivery"] = json!("async");
+            let result = decode_async(
+                transcript(&[accepted, malformed, json!({"event":"detached", "work":7})]),
+                true,
+            );
+            assert_eq!(result["outcome"], "unknown");
+            assert_eq!(result["completion"], Value::Null);
+            assert_eq!(result["retry_safe"], false);
         }
     }
 
