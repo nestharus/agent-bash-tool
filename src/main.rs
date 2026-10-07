@@ -9,6 +9,7 @@ mod delivery_role;
 mod fresh_run;
 mod guard;
 mod image;
+mod live_capture;
 #[cfg(feature = "private-v30-admission")]
 mod private_v30;
 mod retained_output;

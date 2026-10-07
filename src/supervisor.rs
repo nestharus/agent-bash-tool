@@ -11,6 +11,7 @@ use regex::bytes::Regex;
 
 use crate::cgroup::{self, ActiveCgroup};
 use crate::delivery;
+use crate::live_capture::{Channel, LiveCapture};
 use crate::state::{self, Meta, StatePaths};
 
 const EX_SOFTWARE: i32 = 70;
@@ -1298,6 +1299,7 @@ fn event_loop_state(seed: EventLoopSeed) -> EventLoop {
         root_terminal_sent: false,
         deferred_ready_at: None,
         capture_error: None,
+        live: configured_live_capture(),
     }
 }
 
@@ -1898,6 +1900,8 @@ struct EventLoop {
     root_terminal_sent: bool,
     deferred_ready_at: Option<u64>,
     capture_error: Option<String>,
+    // Optional observation copy only; never custody (see live_capture).
+    live: Option<LiveCapture>,
 }
 
 // Original finalized event stays separate from mutable status/cancellation.
@@ -2347,6 +2351,7 @@ impl EventLoop {
     }
 
     fn handle_stdout_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.observe_live(Channel::Stdout, bytes);
         if self.capture_error.is_some() {
             return Ok(());
         }
@@ -2367,12 +2372,29 @@ impl EventLoop {
         !self.completion_recorded && matcher.push_stdout(bytes)
     }
 
+    // Independent of the required retained-log write and of its failure veto.
+    fn observe_live(&mut self, channel: Channel, bytes: &[u8]) {
+        if let Some(live) = &mut self.live {
+            live.record(channel, bytes);
+        }
+    }
+
     fn close_stdout_if_closed(&mut self, fd: RawFd, closed: bool) {
         if !closed {
             return;
         }
         close_fd(fd);
         self.stdout_fd = None;
+        self.live_output_closed();
+    }
+
+    fn live_output_closed(&self) {
+        if self.stdout_fd.is_none()
+            && self.stderr_fd.is_none()
+            && let Some(live) = &self.live
+        {
+            export_live_capture_fixture(&self.paths, live);
+        }
     }
 
     fn read_stderr(&mut self) -> io::Result<()> {
@@ -2387,6 +2409,7 @@ impl EventLoop {
 
     fn write_stderr_chunks(&mut self, chunks: &[Vec<u8>]) -> io::Result<()> {
         for bytes in chunks {
+            self.observe_live(Channel::Stderr, bytes);
             if self.capture_error.is_none()
                 && let Err(err) = self.log.write_all(bytes)
             {
@@ -2415,6 +2438,7 @@ impl EventLoop {
         }
         close_fd(fd);
         self.stderr_fd = None;
+        self.live_output_closed();
     }
 
     fn read_exec_error(&mut self) {
@@ -2962,6 +2986,64 @@ fn pause_after_capture_error_metadata(paths: &StatePaths) -> io::Result<()> {
 #[cfg(not(feature = "source-fault-tests"))]
 fn pause_after_capture_error_metadata(_paths: &StatePaths) -> io::Result<()> {
     Ok(())
+}
+
+// No consumer exists yet, so the default supervisor holds no capture.
+#[cfg(not(feature = "source-fault-tests"))]
+fn configured_live_capture() -> Option<LiveCapture> {
+    None
+}
+
+#[cfg(not(feature = "source-fault-tests"))]
+fn export_live_capture_fixture(_paths: &StatePaths, _live: &LiveCapture) {}
+
+#[cfg(feature = "source-fault-tests")]
+fn configured_live_capture() -> Option<LiveCapture> {
+    let fault = std::env::var("AGENT_BASH_SOURCE_FAULT").ok()?;
+    let budget = fault.strip_prefix("live-capture:")?.parse().ok()?;
+    Some(LiveCapture::new(budget))
+}
+
+// Fixture readback at output closure, before completion can be recorded. Best
+// effort: an export failure must not reach the supervised outcome either.
+#[cfg(feature = "source-fault-tests")]
+fn export_live_capture_fixture(paths: &StatePaths, live: &LiveCapture) {
+    let Some(read) = live.read_from(crate::live_capture::Position::default()) else {
+        return;
+    };
+    let position = |p: crate::live_capture::Position| {
+        serde_json::json!({
+            "seq": p.seq,
+            "stdout_bytes": p.stdout_bytes,
+            "stderr_bytes": p.stderr_bytes,
+        })
+    };
+    let records: Vec<_> = read
+        .records
+        .iter()
+        .map(|record| {
+            serde_json::json!({
+                "start": position(record.start),
+                "channel": match record.channel {
+                    Channel::Stdout => "stdout",
+                    Channel::Stderr => "stderr",
+                },
+                "bytes": record.bytes,
+            })
+        })
+        .collect();
+    let export = serde_json::json!({
+        "charged": live.charged(),
+        "gap": read.gap.map(|gap| serde_json::json!({
+            "from": position(gap.from),
+            "to": position(gap.to),
+        })),
+        "records": records,
+        "next": position(read.next),
+    });
+    if let Ok(bytes) = serde_json::to_vec(&export) {
+        let _ = state::atomic_write(&paths.state_dir.join("fixture-live-capture.json"), &bytes);
+    }
 }
 
 struct AvailableRead {
