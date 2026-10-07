@@ -17,9 +17,10 @@ completion returns synchronously in-band or asynchronously through the agent mai
   and the workload continues under a surviving supervisor.
 - **Root v1 (new lineage).** When `OULIPOLY_ROOT_BASH_V1` is present, `run` sends the
   command to that root's Bash ingress and nowhere else. No Broker, guardian, probe,
-  state or local execution is used, and nothing is retried. Only `--delivery sync`
-  is served; async delivery (including the CLI default) and the lease, scope and
-  sentinel options are refused before anything is sent, not converted. The result is one
+  state or local execution is used, and nothing is retried. `--delivery sync`
+  and explicit `--delivery async` are served; an omitted delivery (the CLI
+  default), and the lease, scope and sentinel options are refused before anything
+  is sent, not converted. The result is one
   JSON object (`result_surface: "agent-bash-root-v1"`) carrying the root's stage
   lines and the wait status only from its work PID 1 wait. The requester drains
   and validates the full output stream but retains at most its first 64 KiB;
@@ -30,8 +31,16 @@ completion returns synchronously in-band or asynchronously through the agent mai
   base64 payload, and `omitted_bytes` is their difference. Delivery is `partial`
   when count, closure and the end agree but the prefix omits bytes; `complete`
   requires no omission. Faulted or unfinished streams remain `unproven`, with
-  only their observed byte count, and never acquire a guessed wait. Output
-  stages are aggregated with chunk and byte counts. Exit 0 means the object was written,
+  only their observed byte count, and never acquire a guessed wait.
+  A positive `started.exec_error` is also carried as `exec_error`, with
+  `meaning: "requested-program-exec-failed"` on a waited end. `ended` describes
+  the owned work's wait, not successful program exec. Accepted work can have
+  setup effects: `effects_possible` stays true and `retry_safe` stays false.
+  Numeric exit 127 alone never establishes failed exec. Explicit async delivery
+  preserves its completion obligation after failed exec but reports `unknown`
+  for the work's unobserved end, rather than `running`. Missing detach, malformed
+  diagnostic or incomplete stages remain uncertain; no completion is fabricated.
+  Output stages are aggregated with chunk and byte counts. Exit 0 means the object was written,
   not that the command succeeded. The OpenCode adapter renders it and refuses
   child-agent dispatch there. Its root-v1 display additionally bounds the inline
   payload to 48 KiB of rendered UTF-8 text and 1,900 split lines, leaving room
