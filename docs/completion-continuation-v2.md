@@ -58,10 +58,13 @@ part of this path. Local output receipt never changes listener state.
 
 Bash can end its local enqueue responsibility after exact acceptance, or retain
 source material under confirmed durable runner recovery ownership. This does not
-release original/local physical custody. Source cleanup is conservative: v2
-artifacts are not TTL-reaped. Current wire has no source-release transaction that
-joins late listeners and active recovery readers; unbounded retention is visible
-rather than an invented ACK-based cleanup rule.
+release original/local physical custody. The implementation now supports a
+separate, exact source-retention release for qualifying fresh registrations.
+The legacy reaper requires that validated release in addition to its age,
+custody, result and live-identity checks. TTL or output acceptance alone never
+releases v2 data. Historical or unbound sources do not acquire this fresh-source
+release by inference. Read-only [retention preview](retention-preview.md) can
+surface missing release or required validation, but cannot authorize removal.
 
 ## Verification and open pairing edges
 

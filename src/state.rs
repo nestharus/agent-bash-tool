@@ -1036,6 +1036,10 @@ impl ReapConfig {
     fn ttl_ms(self) -> u64 {
         secs_to_ms(self.ttl_secs)
     }
+
+    pub(crate) fn preview_ttl_secs(self) -> u64 {
+        self.ttl_secs.max(24 * 60 * 60)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]

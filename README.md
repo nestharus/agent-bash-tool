@@ -9,6 +9,10 @@ The ordinary build and historical pinned v29 images keep their existing behavior
 
 General-purpose detached bash spooler for AI agents.
 
+For bounded, read-only retention metadata inspection, see
+[retention preview](docs/retention-preview.md). It requires an explicit root and
+does not authorize or perform deletion.
+
 Agents call `agent-bash` instead of raw bash. Every command runs **detached**, regardless of
 whether the agent's harness supports background execution. Callers independently choose whether
 completion returns synchronously in-band or asynchronously through the agent mailbox.

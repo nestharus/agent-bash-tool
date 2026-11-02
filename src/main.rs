@@ -13,6 +13,7 @@ mod live_capture;
 #[cfg(feature = "private-v30-admission")]
 mod private_v30;
 mod retained_output;
+mod retention_preview;
 mod root_v1;
 mod root_work;
 mod state;
@@ -62,6 +63,33 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect explicit legacy handles without locks, reconciliation, or deletion.
+    RetentionPreview {
+        /// Existing absolute legacy state root. No default root is selected.
+        #[arg(long)]
+        root: PathBuf,
+        /// Exact legacy handle; repeat for a bounded cohort.
+        #[arg(
+            long = "handle",
+            required_unless_present = "discover",
+            conflicts_with = "discover"
+        )]
+        handles: Vec<String>,
+        /// Discover a bounded set of legacy handle names in the explicit root.
+        #[arg(long, conflicts_with = "handles")]
+        discover: bool,
+        /// Maximum discovered handles (1..128).
+        #[arg(long, default_value_t = 128)]
+        max_handles: usize,
+        /// Resume directory cookie; requires its unchanged root stamp.
+        #[arg(long, requires = "root_stamp")]
+        resume_offset: Option<i64>,
+        #[arg(long, requires = "resume_offset")]
+        root_stamp: Option<String>,
+        /// Maximum handle and directory entries visited (1..100000).
+        #[arg(long, default_value_t = 4096)]
+        max_entries: usize,
+    },
     /// Spool a command under a surviving detached supervisor.
     Run {
         /// Completion delivery policy. Sync results stay in-band; async results notify the mailbox
@@ -221,7 +249,100 @@ fn main() {
     }
 }
 
+#[cfg(test)]
+mod retention_cli_tests {
+    use super::*;
+
+    #[test]
+    fn preview_requires_explicit_root_and_selection_and_has_no_apply_flag() {
+        assert!(Cli::try_parse_from(["agent-bash", "retention-preview"]).is_err());
+        assert!(
+            Cli::try_parse_from(["agent-bash", "retention-preview", "--root", "/synthetic"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent-bash",
+                "retention-preview",
+                "--root",
+                "/synthetic",
+                "--discover"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent-bash",
+                "retention-preview",
+                "--root",
+                "/synthetic",
+                "--handle",
+                "ab_one"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent-bash",
+                "retention-preview",
+                "--root",
+                "/synthetic",
+                "--discover",
+                "--handle",
+                "ab_one"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent-bash",
+                "retention-preview",
+                "--root",
+                "/synthetic",
+                "--discover",
+                "--apply"
+            ])
+            .is_err()
+        );
+    }
+}
+
 fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
+    if let Command::RetentionPreview {
+        root,
+        handles,
+        discover,
+        max_handles,
+        resume_offset,
+        root_stamp,
+        max_entries,
+    } = &cli.command
+    {
+        let ttl_secs = state::ReapConfig::from_env().preview_ttl_secs();
+        let result = if *discover {
+            retention_preview::discover(
+                root,
+                *max_entries,
+                *max_handles,
+                *resume_offset,
+                root_stamp.as_deref(),
+                ttl_secs,
+            )
+            .and_then(|result| serde_json::to_value(result).map_err(std::io::Error::other))
+        } else if resume_offset.is_some() || root_stamp.is_some() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "checkpoint requires --discover",
+            ))
+        } else {
+            retention_preview::inspect(root, handles, *max_entries, ttl_secs)
+                .and_then(|result| serde_json::to_value(result).map_err(std::io::Error::other))
+        }
+        .map_err(|err| {
+            AppError::new(EX_DATAERR, format!("agent-bash: retention preview: {err}"))
+        })?;
+        return write_root_result(result);
+    }
     // Select the owning root before legacy control/reconciliation can read state.
     // Guard capture and CLI parsing have already happened in main.
     if let Some(ingress) = root_v1::selected() {
@@ -265,6 +386,7 @@ fn run_cli(cli: Cli, guard: AttachedGuard) -> Result<(), AppError> {
     }
     validate_guard(&guard)?;
     match cli.command {
+        Command::RetentionPreview { .. } => unreachable!(),
         Command::CompletionReconcileV2 { .. } => unreachable!(),
         Command::NativeOutput { .. } | Command::NativeAccept { .. } => Err(AppError::new(
             EX_UNAVAILABLE,
